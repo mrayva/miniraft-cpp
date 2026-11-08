@@ -1,70 +1,109 @@
 #include "persist.h"
-#include <iostream>
+#include <filesystem>
+#include <stdexcept>
 
 TDiskState::TDiskState(const std::string& name, uint32_t id)
-    : Entries(Open(name + ".entries." + std::to_string(id)))
-    , Index(Open(name + ".index." + std::to_string(id)))
-    , State(Open(name + ".state." + std::to_string(id)))
 {
-    // TODO: read all an validate
-    State.seekg(0, std::ios_base::end);
-    auto size = State.tellg();
-    if (size == sizeof(LastLogIndex) + sizeof(CurrentTerm) + sizeof(VotedFor)) {
-        State.seekg(0);
-        State.read((char*)&LastLogIndex, sizeof(LastLogIndex));
-        State.read((char*)&CurrentTerm, sizeof(CurrentTerm));
-        State.read((char*)&VotedFor, sizeof(VotedFor));
-    } else {
-        Commit();
+    const auto suffix = "." + std::to_string(id);
+    const auto entriesPath = name + ".entries" + suffix;
+    const auto indexPath = name + ".index" + suffix;
+    const auto statePath = name + ".state" + suffix;
+    const int existing = std::filesystem::exists(entriesPath) +
+        std::filesystem::exists(indexPath) + std::filesystem::exists(statePath);
+    // Never turn a partially missing store into a fresh Raft voter.
+    if (existing != 0 && existing != 3) {
+        throw std::runtime_error("Incomplete Raft storage: " + name);
     }
-    if (LastLogIndex > 0) {
-        LastLogTerm = Get(LastLogIndex)->Term;
+    const bool fresh = existing == 0;
+    Entries = Open(entriesPath, fresh);
+    Index = Open(indexPath, fresh);
+    State = Open(statePath, fresh);
+    if (fresh) {
+        Commit();
+        return;
+    }
+
+    State.seekg(0, std::ios::end);
+    const auto size = State.tellg();
+    if (size != std::streamoff(sizeof(LastLogIndex) + sizeof(CurrentTerm) + sizeof(VotedFor))) {
+        throw std::runtime_error("Invalid Raft metadata size: " + statePath);
+    }
+    State.seekg(0);
+    if (!State.read(reinterpret_cast<char*>(&LastLogIndex), sizeof(LastLogIndex)) ||
+        !State.read(reinterpret_cast<char*>(&CurrentTerm), sizeof(CurrentTerm)) ||
+        !State.read(reinterpret_cast<char*>(&VotedFor), sizeof(VotedFor)) || CurrentTerm == 0) {
+        throw std::runtime_error("Invalid Raft metadata: " + statePath);
+    }
+
+    Index.seekg(0, std::ios::end);
+    const auto indexSize = Index.tellg();
+    if (indexSize < 0 || LastLogIndex > uint64_t(indexSize) / sizeof(uint64_t)) {
+        throw std::runtime_error("Truncated Raft index: " + indexPath);
+    }
+    // Validate the entire selected prefix, not only its last entry. Trailing
+    // bytes can be left by logical truncation and are deliberately ignored.
+    uint64_t expectedOffset = 0;
+    for (uint64_t i = 1; i <= LastLogIndex; ++i) {
+        uint64_t offset;
+        Index.seekg((i - 1) * sizeof(offset));
+        if (!Index.read(reinterpret_cast<char*>(&offset), sizeof(offset)) || offset != expectedOffset) {
+            throw std::runtime_error("Invalid Raft log offset: " + indexPath);
+        }
+        auto entry = Get(i);
+        expectedOffset += entry->Len;
+        LastLogTerm = entry->Term;
     }
 }
 
-std::fstream TDiskState::Open(const std::string& name)
+std::fstream TDiskState::Open(const std::string& name, bool create)
 {
-    auto flags = std::ios::in | std::ios::out | std::ios::binary;
-    std::fstream f(name, flags);
-    if (!f.is_open()) {
-        std::ofstream tmp(name);
-        tmp.close();
-        f.open(name, flags);
+    if (create) {
+        std::ofstream file(name, std::ios::binary);
+        if (!file) throw std::runtime_error("Cannot create file: " + name);
     }
-
-    if (!f.is_open()) {
-        throw std::runtime_error("Cannot open file: " + name);
-    }
-
-    return f;
+    std::fstream file(name, std::ios::in | std::ios::out | std::ios::binary);
+    // An open failure must never fall back to truncating an existing file.
+    if (!file) throw std::runtime_error("Cannot open file: " + name);
+    return file;
 }
 
 TMessageHolder<TMessage> TDiskState::Read() const
 {
-    decltype(TMessage::Type) type;
-    decltype(TMessage::Len) len;
-    if (!Entries.read((char*)&type, sizeof(type))) {
-        throw std::runtime_error("Error on read 1");
+    const auto start = Entries.tellg();
+    Entries.seekg(0, std::ios::end);
+    const auto end = Entries.tellg();
+    if (start < 0 || end < start || end - start < std::streamoff(sizeof(TLogEntry))) {
+        throw std::runtime_error("Truncated Raft log entry");
     }
-    if (!Entries.read((char*)&len, sizeof(len))) {
-        throw std::runtime_error("Error on read 2");
+    Entries.seekg(start);
+    uint32_t type, len;
+    if (!Entries.read(reinterpret_cast<char*>(&type), sizeof(type)) ||
+        !Entries.read(reinterpret_cast<char*>(&len), sizeof(len)) ||
+        type != uint32_t(EMessageType::LOG_ENTRY) || len < sizeof(TLogEntry) ||
+        uint64_t(len) > uint64_t(end - start)) {
+        throw std::runtime_error("Invalid Raft log entry header");
     }
-    auto mes = NewHoldedMessage<TMessage>(type, len);
-    if (!Entries.read((char*)mes->Value, len - sizeof(TMessage))) {
-        throw std::runtime_error("Error on read 3");
+    // Bound the allocation and subtraction by the validated file extent.
+    auto message = NewHoldedMessage<TMessage>(type, len);
+    if (!Entries.read(reinterpret_cast<char*>(message->Value), len - sizeof(TMessage))) {
+        throw std::runtime_error("Cannot read Raft log entry");
     }
-    return mes;
+    return message;
 }
 
 void TDiskState::Write(TMessageHolder<TMessage> message)
 {
-    Entries.write((char*)message.Mes, message->Len);
+    if (!Entries.write(reinterpret_cast<const char*>(message.Mes), message->Len)) {
+        throw std::runtime_error("Cannot write Raft log entry");
+    }
 }
 
 void TDiskState::RemoveLast()
 {
     if (LastLogIndex > 0) {
-        LastLogIndex--;
+        const auto previousTerm = LastLogIndex == 1 ? 0 : Get(LastLogIndex - 1)->Term;
+        --LastLogIndex;
+        LastLogTerm = previousTerm;
         Commit();
     }
 }
@@ -72,43 +111,52 @@ void TDiskState::RemoveLast()
 void TDiskState::Append(TMessageHolder<TLogEntry> entry)
 {
     uint64_t offset = 0;
-    if (Get(LastLogIndex)) { // TODO: optimize
+    if (Get(LastLogIndex)) {
         offset = Entries.tellg();
     }
-
+    // In particular, after truncation to zero the stream may still point into
+    // the old suffix. Always position the output explicitly.
+    Entries.seekp(offset);
     Write(entry);
-    Index.seekg(LastLogIndex * sizeof(offset));
-    Index.write((char*)&offset, sizeof(offset));
+    Index.seekp(LastLogIndex * sizeof(offset));
+    if (!Index.write(reinterpret_cast<const char*>(&offset), sizeof(offset))) {
+        throw std::runtime_error("Cannot write Raft log index");
+    }
     LastLogTerm = entry->Term;
-    LastLogIndex ++;
+    ++LastLogIndex;
     Commit();
 }
 
 TMessageHolder<TLogEntry> TDiskState::Get(int64_t index) const
 {
-    if (index > LastLogIndex || index < 1) {
-        return {};
+    if (index > LastLogIndex || index < 1) return {};
+    uint64_t offset;
+    Index.seekg((index - 1) * sizeof(offset));
+    if (!Index.read(reinterpret_cast<char*>(&offset), sizeof(offset))) {
+        throw std::runtime_error("Cannot read Raft log index");
     }
-
-    uint64_t offset = 0;
-    Index.seekg((index-1) * sizeof(offset));
-    if (!Index.read((char*)&offset, sizeof(offset))) {
-        return {};
+    Entries.seekg(0, std::ios::end);
+    const auto end = Entries.tellg();
+    if (end < 0 || offset > uint64_t(end)) {
+        throw std::runtime_error("Raft log offset outside file");
     }
-
     Entries.seekg(offset);
-    auto entry = Read().Cast<TLogEntry>();
-    return entry;
+    return Read().Cast<TLogEntry>();
 }
 
 void TDiskState::Commit()
 {
-    State.seekg(0);
-    if (!State.write((char*)&LastLogIndex, sizeof(LastLogIndex))) { abort(); }
-    if (!State.write((char*)&CurrentTerm, sizeof(CurrentTerm))) { abort(); }
-    if (!State.write((char*)&VotedFor, sizeof(VotedFor))) { abort(); }
-    State.flush();
-    Index.flush();
+    // Publish buffered log data before metadata. Stream flushing alone is not
+    // a power-loss durability protocol; fsync/atomic publication remain TODO.
     Entries.flush();
+    Index.flush();
+    if (!Entries || !Index) throw std::runtime_error("Cannot flush Raft log");
+    State.seekp(0);
+    if (!State.write(reinterpret_cast<const char*>(&LastLogIndex), sizeof(LastLogIndex)) ||
+        !State.write(reinterpret_cast<const char*>(&CurrentTerm), sizeof(CurrentTerm)) ||
+        !State.write(reinterpret_cast<const char*>(&VotedFor), sizeof(VotedFor))) {
+        throw std::runtime_error("Cannot write Raft metadata");
+    }
+    State.flush();
+    if (!State) throw std::runtime_error("Cannot flush Raft metadata");
 }
-

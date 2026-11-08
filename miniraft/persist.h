@@ -14,7 +14,7 @@ struct TDiskState : IState {
     void Commit() override;
 
 private:
-    std::fstream Open(const std::string& name);
+    std::fstream Open(const std::string& name, bool create);
     TMessageHolder<TMessage> Read() const;
     void Write(TMessageHolder<TMessage>);
 
