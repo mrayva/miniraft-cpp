@@ -22,6 +22,8 @@ The [consensus validation follow-up](docs/consensus-validation.md) checks RPC
 identities and indices, protects committed prefixes and correlates acknowledgements.
 The [application payload follow-up](docs/application-payloads.md) validates KV,
 SQL and dummy-RSM data before access and provides pre-admission validation hooks.
+The [SQL read policy](docs/sql-readonly.md) prevents requests marked as reads
+from executing unreplicated mutations or connection controls.
 
 [![Number of GitHub stars](https://img.shields.io/github/stars/resetius/miniraft-cpp)](https://github.com/resetius/miniraft-cpp/stargazers)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/resetius/miniraft-cpp)
