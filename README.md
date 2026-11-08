@@ -12,6 +12,8 @@ adds checksummed atomic publication with file and directory synchronization.
 The KV example selects it with `--durable`; legacy `--persist` is unchanged.
 The [strong-read follow-up](docs/strong-reads.md) requires a fresh majority for
 `--consistent` reads and rejects pending reads when their leadership term ends.
+The [pending request follow-up](docs/pending-requests.md) prevents replacement
+write acknowledgements and cleans up obsolete or disconnected client requests.
 
 [![Number of GitHub stars](https://img.shields.io/github/stars/resetius/miniraft-cpp)](https://github.com/resetius/miniraft-cpp/stargazers)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/resetius/miniraft-cpp)
