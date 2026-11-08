@@ -32,7 +32,10 @@ The eight tests cover:
 
 Cluster scenarios check commit progress and equality of committed log prefixes.
 These are selected deterministic schedules, not exhaustive state-space exploration.
-Restart and storage crash injection are not covered by the simulator yet.
+The original baseline did not cover restarts or storage crash injection.
+The [application recovery follow-up](application-recovery.md) adds deterministic
+node restarts and committed application-history checks; torn-write simulation
+and broader generated schedules remain open.
 
 ## Reproduce
 
