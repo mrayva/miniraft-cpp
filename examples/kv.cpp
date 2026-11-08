@@ -2,6 +2,7 @@
 
 #include <miniraft/net/server.h>
 #include <miniraft/persist.h>
+#include <miniraft/durable.h>
 
 #include "kv.h"
 
@@ -152,7 +153,7 @@ NNet::TFuture<void> Client(TPoller& poller, TSocket socket, uint32_t flags) {
 }
 
 void usage(const char* prog) {
-    std::cerr << prog << "--client|--server --id myid --node ip:port:id [--node ip:port:id ...] [--persist] [--stale] [--consistent]" << "\n";
+    std::cerr << prog << "--client|--server --id myid --node ip:port:id [--node ip:port:id ...] [--persist|--durable] [--stale] [--consistent]" << "\n";
     exit(0);
 }
 
@@ -164,6 +165,7 @@ int main(int argc, char** argv) {
     uint32_t id = 0;
     bool server = false;
     bool persist = false;
+    bool durable = false;
     uint32_t flags = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--server")) {
@@ -175,6 +177,9 @@ int main(int argc, char** argv) {
             id = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--persist")) {
             persist = true;
+        } else if (!strcmp(argv[i], "--durable")) {
+            persist = true;
+            durable = true;
         } else if (!strcmp(argv[i], "--stale")) {
             flags |= TCommandRequest::EStale;
         } else if (!strcmp(argv[i], "--consistent")) {
@@ -211,7 +216,8 @@ int main(int argc, char** argv) {
         std::shared_ptr<IRsm> rsm = std::make_shared<TKv>();
         std::shared_ptr<IState> state = std::make_shared<TState>();
         if (persist) {
-            state = std::make_shared<TDiskState>("state", myHost.Id);
+            if (durable) state = std::make_shared<TDurableState>("state", myHost.Id);
+            else state = std::make_shared<TDiskState>("state", myHost.Id);
         }
         auto raft = std::make_shared<TRaft>(state, myHost.Id, nodes);
         TPoller::TSocket socket(NNet::TAddress{myHost.Address, myHost.Port}, loop.Poller());

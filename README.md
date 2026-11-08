@@ -7,6 +7,9 @@ validation, build instructions and remaining production release gates.
 The milestone is experimental; durable crash recovery is not established.
 The [persistence recovery follow-up](docs/persistence-recovery.md) rejects
 incomplete or structurally corrupt storage and fixes truncation/restart behavior.
+For new Linux stores, the opt-in [durable state backend](docs/durable-state.md)
+adds checksummed atomic publication with file and directory synchronization.
+The KV example selects it with `--durable`; legacy `--persist` is unchanged.
 
 [![Number of GitHub stars](https://img.shields.io/github/stars/resetius/miniraft-cpp)](https://github.com/resetius/miniraft-cpp/stargazers)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/resetius/miniraft-cpp)
