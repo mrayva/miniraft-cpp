@@ -14,6 +14,8 @@ The [strong-read follow-up](docs/strong-reads.md) requires a fresh majority for
 `--consistent` reads and rejects pending reads when their leadership term ends.
 The [pending request follow-up](docs/pending-requests.md) prevents replacement
 write acknowledgements and cleans up obsolete or disconnected client requests.
+The [forwarding follow-up](docs/forwarding.md) preserves client cookies and binds
+forwarded replies to their original leader, term and outbound peer.
 
 [![Number of GitHub stars](https://img.shields.io/github/stars/resetius/miniraft-cpp)](https://github.com/resetius/miniraft-cpp/stargazers)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/resetius/miniraft-cpp)
