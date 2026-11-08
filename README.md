@@ -26,6 +26,8 @@ The [SQL read policy](docs/sql-readonly.md) prevents requests marked as reads
 from executing unreplicated mutations or connection controls.
 The [SQL application follow-up](docs/sql-application.md) protects managed write
 transactions and commits application progress together with successful changes.
+The [SQL read budget follow-up](docs/sql-read-budgets.md) interrupts expensive
+reads and bounds serialized output before appending each field or separator.
 
 [![Number of GitHub stars](https://img.shields.io/github/stars/resetius/miniraft-cpp)](https://github.com/resetius/miniraft-cpp/stargazers)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/resetius/miniraft-cpp)
