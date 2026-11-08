@@ -169,6 +169,14 @@ void test_truncate_updates_last_term_and_restarts(void**) {
     assert_int_equal(recovered.LastLogTerm, 7);
     assert_int_equal(recovered.Get(1)->Term, 7);
     assert_int_equal(recovered.VotedFor, 2);
+    // Also replace an empty log without reopening: the shared stream position
+    // is still at the end of the removed entry, rather than at byte zero.
+    recovered.RemoveLast();
+    auto replacement = NewHoldedMessage<TLogEntry>();
+    replacement->Term = 6;
+    recovered.Append(replacement);
+    assert_int_equal(recovered.Get(1)->Term, 6);
+    assert_int_equal(recovered.LastLogTerm, 6);
 }
 #ifndef _WIN32
 void test_live_storage_failure_is_fatal(void**) {
