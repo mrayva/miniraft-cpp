@@ -1,7 +1,7 @@
 # Forwarded request lifecycle: v0.1.0-alpha.6
 
 This milestone separates client cookies from forwarding correlation and gives
-forwarded attempts an explicit leader/term/connection lifecycle.
+forwarded attempts an explicit leader/term/peer lifecycle.
 
 ## Reproduced failures
 
@@ -57,7 +57,7 @@ connections without such notification have no deadline here.
 Construct a new processor only with fresh transport sessions: the cookie counter
 is per processor, and this milestone does not provide a durable cross-processor
 session generation. Message struct sizes are unchanged, but EForwarded reserves
-bit 8. Upgrade custom adapters and all cluster nodes together; mixed-version
+flag value 0x08. Upgrade custom adapters and all cluster nodes together; mixed-version
 operation is not validated.
 
 ## Validation and self-review
