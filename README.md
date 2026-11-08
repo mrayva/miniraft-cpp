@@ -20,6 +20,8 @@ The [network framing follow-up](docs/network-frames.md) handles fragmented input
 and enforces type, frame, batch and AppendEntries payload bounds.
 The [consensus validation follow-up](docs/consensus-validation.md) checks RPC
 identities and indices, protects committed prefixes and correlates acknowledgements.
+The [application payload follow-up](docs/application-payloads.md) validates KV,
+SQL and dummy-RSM data before access and provides pre-admission validation hooks.
 
 [![Number of GitHub stars](https://img.shields.io/github/stars/resetius/miniraft-cpp)](https://github.com/resetius/miniraft-cpp/stargazers)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/resetius/miniraft-cpp)

@@ -25,13 +25,21 @@ static uint32_t rand_(uint32_t* seed) {
 
 } // namespace
 
+void TDummyRsm::Validate(TMessageHolder<TCommandRequest> message) const {
+    if (!message || message->Len < sizeof(TCommandRequest) ||
+        (!(message->Flags & TCommandRequest::EWrite) && message->Len < sizeof(TCommandRequest) + sizeof(int64_t)))
+        throw TMessageError("Invalid dummy RSM request");
+}
+
 TMessageHolder<TMessage> TDummyRsm::Read(TMessageHolder<TCommandRequest> message, uint64_t index)
 {
+    if (!message || message->Len < sizeof(TCommandRequest) + sizeof(int64_t))
+        throw TMessageError("Missing log read index");
     int64_t readIndex;
     memcpy(&readIndex, message->Data, sizeof(readIndex));
     if (readIndex > 0 && readIndex <= Log.size()) {
         auto log = Log[readIndex-1];
-        auto size = log->Len - sizeof(TMessage);
+        auto size = log->Len - sizeof(TLogEntry);
         auto mes = NewHoldedMessage<TCommandResponse>(sizeof(TCommandResponse) + size);
         mes->Index = index;
         memcpy(mes->Data, log->Data, size);
@@ -52,6 +60,7 @@ TMessageHolder<TMessage> TDummyRsm::Write(TMessageHolder<TLogEntry> message, uin
 
 TMessageHolder<TLogEntry> TDummyRsm::Prepare(TMessageHolder<TCommandRequest> command)
 {
+    if (!command || command->Len < sizeof(TCommandRequest)) throw TMessageError("Short command");
     auto dataSize = command->Len - sizeof(TCommandRequest);
     auto entry = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry)+dataSize);
     memcpy(entry->Data, command->Data, dataSize);
@@ -755,6 +764,7 @@ void TRequestProcessor::OnWriteRequest(TMessageHolder<TCommandRequest> command, 
 }
 
 void TRequestProcessor::OnCommandRequest(TMessageHolder<TCommandRequest> command, const std::shared_ptr<INode>& replyTo) {
+    Rsm->Validate(command);
     PruneRequests();
     auto flags = command->Flags;
 
@@ -796,7 +806,9 @@ void TRequestProcessor::ProcessCommitted() {
         if (entry->Flags == TLogEntry::EStub) {
             continue;
         }
-        auto reply = Rsm->Write(entry, i);
+        TMessageHolder<TMessage> reply;
+        try { reply = Rsm->Write(entry, i); }
+        catch (...) { std::terminate(); }
         auto pending = PendingWriteTerms.find(i);
         if (pending != PendingWriteTerms.end() && pending->second == entry->Term) {
             WriteAnswers.emplace(i, TAnswer {
@@ -831,7 +843,10 @@ void TRequestProcessor::ProcessWaiting() {
             PendingWriteTerms.erase(w.Index);
             WriteAnswers.erase(w.Index);
         } else {
-            reply = Rsm->Read(std::move(w.Command), w.Index).Cast<TCommandResponse>();
+            try { reply = Rsm->Read(std::move(w.Command), w.Index).Cast<TCommandResponse>(); }
+            catch (const std::exception&) {
+                reply = NewHoldedMessage(TCommandResponse{.Index = w.Index, .ErrorCode = 2});
+            }
         }
         reply->Cookie = cookie;
         w.ReplyTo->Send(std::move(reply));
@@ -849,7 +864,10 @@ void TRequestProcessor::ProcessWaiting() {
         TMessageHolder<TCommandResponse> reply;
         assert (!(w.Command->Flags & TCommandRequest::EWrite));
         auto cookie = w.Command->Cookie;
-        reply = Rsm->Read(std::move(w.Command), w.Index).Cast<TCommandResponse>();
+        try { reply = Rsm->Read(std::move(w.Command), w.Index).Cast<TCommandResponse>(); }
+        catch (const std::exception&) {
+            reply = NewHoldedMessage(TCommandResponse{.Index = w.Index, .ErrorCode = 2});
+        }
         reply->Cookie = cookie;
         w.ReplyTo->Send(std::move(reply));
     }
