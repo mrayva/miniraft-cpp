@@ -22,7 +22,7 @@ RemoveLast now updates LastLogTerm, including when the log becomes empty.
 Append explicitly seeks the write position, so appending after truncation to
 zero overwrites the beginning rather than writing into an obsolete suffix.
 File-open failures no longer fall back to truncating an existing file. Stream
-write/flush errors throw, and buffered entries/index are flushed before metadata.
+write/flush errors are detected, and buffered entries/index are flushed before metadata.
 
 ## Validation and review
 
@@ -30,22 +30,27 @@ Ten new persistence tests cover truncated/oversized metadata, each missing
 storage file, short indexes/entries, invalid entry headers and offsets, zero
 terms, excessive log counts and truncation/restart/replacement. Rejected recovery
 is checked against a byte-for-byte snapshot of every file to verify no mutation.
+An additional POSIX subprocess test verifies that a live storage read failure
+terminates the node rather than escaping as an ordinary network exception.
 The original implementation failed eight of the initial nine tests, including
 a caught segmentation fault on a short index and stale LastLogTerm after removal.
 
 Local Debug/Release core tests and the full ASan/UBSan suite pass: 27 existing
-core tests, eight consensus correctness tests, ten recovery tests and three
-transport tests (48 total). CI runs the same targets on pushes and PRs.
+core tests, eight consensus correctness tests, eleven recovery tests and three
+transport tests (49 total on POSIX; the subprocess test is excluded on Windows). CI runs the same targets on pushes and PRs.
 
 Self-review checked recovery's non-mutating rejection paths, length arithmetic
 before allocation, signed file positions, offset continuity, existing-format
-compatibility and output positions after truncation. No independent reviewer
+compatibility, output positions after truncation and fail-stop behavior in the
+presence of the network layer's generic exception handlers. No independent reviewer
 approval is claimed.
 
 ## Operational contract and remaining gaps
 
-Use one writer per storage set. Storage exceptions are fatal for that node's
-current storage instance; do not catch and continue processing Raft messages.
+Use one writer per storage set. Startup validation throws std::runtime_error.
+Detected live storage read/write/flush errors call std::terminate: the network
+layer catches ordinary exceptions, so throwing alone would allow a node with
+unpersisted state to continue processing.
 Recovery rejection requires restoring verified state or deliberately rebuilding
 the node through a safe cluster procedure; never delete metadata alone to force
 startup. Previously created empty or partial file sets are deliberately rejected.

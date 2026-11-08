@@ -3,6 +3,11 @@
 #include <chrono>
 #include <map>
 #include <iterator>
+#include <exception>
+#ifndef _WIN32
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include <stdarg.h>
 #include <stddef.h>
 #include <setjmp.h>
@@ -165,6 +170,27 @@ void test_truncate_updates_last_term_and_restarts(void**) {
     assert_int_equal(recovered.Get(1)->Term, 7);
     assert_int_equal(recovered.VotedFor, 2);
 }
+#ifndef _WIN32
+void test_live_storage_failure_is_fatal(void**) {
+    TFiles files;
+    files.Seed();
+    const auto child = fork();
+    assert_true(child >= 0);
+    if (child == 0) {
+        std::set_terminate([] { _exit(73); });
+        try {
+            TDiskState state(files.Name, 1);
+            fs::resize_file(files.Path("entries"), 0);
+            state.Get(1);
+        } catch (...) { _exit(74); }
+        _exit(75);
+    }
+    int status = 0;
+    assert_int_equal(waitpid(child, &status, 0), child);
+    assert_true(WIFEXITED(status));
+    assert_int_equal(WEXITSTATUS(status), 73);
+}
+#endif
 }
 
 int main() {
@@ -179,6 +205,9 @@ int main() {
         cmocka_unit_test(test_invalid_term_is_rejected),
         cmocka_unit_test(test_invalid_log_count_is_rejected),
         cmocka_unit_test(test_truncate_updates_last_term_and_restarts),
+#ifndef _WIN32
+        cmocka_unit_test(test_live_storage_failure_is_fatal),
+#endif
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }
