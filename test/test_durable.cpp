@@ -1,5 +1,6 @@
 #include <miniraft/durable.h>
 #include <miniraft/persist.h>
+#include <miniraft/raft.h>
 #include <filesystem>
 #include <fstream>
 #include <chrono>
@@ -277,6 +278,28 @@ void test_get_and_append_do_not_share_mutable_entries(void**) {
     TDurableState state(files.Name, 1);
     assert_int_equal(state.Get(1)->Term, 1);
 }
+void test_raft_election_and_application_replay_after_restart(void**) {
+    TFiles files;
+    uint64_t term = 0, index = 0;
+    for (int restart = 0; restart < 2; ++restart) {
+        auto state = std::make_shared<TDurableState>(files.Name, 1);
+        auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+        raft->ProcessTimeout(ITimeSource::Time{});
+        assert_int_equal(raft->CurrentStateName(), EState::LEADER);
+        assert_true(state->CurrentTerm > term);
+        term = state->CurrentTerm;
+        if (restart == 0) {
+            index = raft->Append(Entry(term, "application-command"));
+            raft->ProcessTimeout(ITimeSource::Time{});
+        }
+        assert_true(raft->GetVolatileState()->CommitIndex >= index);
+        assert_string_equal(Data(*state, index).c_str(), "application-command");
+        auto rsm = std::make_shared<TDummyRsm>();
+        TRequestProcessor processor(raft, rsm, {});
+        processor.ProcessCommitted();
+        assert_int_equal(rsm->LastAppliedIndex, state->LastLogIndex);
+    }
+}
 }
 
 int main() {
@@ -292,6 +315,7 @@ int main() {
         cmocka_unit_test(test_missing_image_is_not_recreated),
         cmocka_unit_test(test_legacy_store_is_not_silently_migrated),
         cmocka_unit_test(test_get_and_append_do_not_share_mutable_entries),
+        cmocka_unit_test(test_raft_election_and_application_replay_after_restart),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }

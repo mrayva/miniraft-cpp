@@ -49,8 +49,9 @@ even if the node had not acknowledged any updates. Do not delete an existing
 store's files to force startup.
 
 Legacy entries/index/state files with the same base name are rejected. There is
-no automatic migration or downgrade: use a new store, or wait for a separately
-validated offline migration tool. A corrupt main image is never replaced by a
+no automatic migration or downgrade. Use this backend for fresh clusters until
+a separately validated offline migration tool exists; do not replace an existing
+node's state with an empty store under the same identity. A corrupt main image is never replaced by a
 seemingly valid temp image.
 
 ## Use
@@ -67,14 +68,15 @@ TDurableState construction throws an explicit unsupported-platform exception.
 
 ## Validation and self-review
 
-Eleven new tests cover publication ordering, 20 process-crash boundaries across
+Twelve new tests cover publication ordering, 20 process-crash boundaries across
 append/truncation/vote/replacement operations, four immediate exits after returned
 updates, five interrupted initializations, a live injected failure, an actual
 write error using a child-only file-size limit, corrupted/truncated images,
-single-writer exclusion, missing images, legacy-store refusal and entry ownership.
+single-writer exclusion, missing images, legacy-store refusal, entry ownership and Raft election/application replay across
+a storage restart.
 There are 31 child-process scenarios; none relies on sleeps or random scheduling.
 
-All 60 tests pass locally under ASan/UBSan, and the core suite passes in Debug
+All 61 tests pass locally under ASan/UBSan, and the core suite passes in Debug
 and Release builds. These process-crash tests do not simulate physical power
 loss or prove a storage controller honors flush commands. Hosted CI executes the
 same targets; its results are separate from local validation.
