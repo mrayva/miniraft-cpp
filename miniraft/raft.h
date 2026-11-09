@@ -79,7 +79,9 @@ struct TVolatileState {
     std::vector<uint64_t> Indices;
 
     TVolatileState& Vote(uint32_t id);
+    // Compatibility helper for all-voter fixtures; mixed roles require IDs below.
     TVolatileState& CommitAdvance(int nservers, const IState& state);
+    TVolatileState& CommitAdvance(const std::vector<uint32_t>& voters, uint32_t self, const IState& state);
     TVolatileState& SetCommitIndex(uint64_t index);
     TVolatileState& SetElectionDue(ITimeSource::Time);
     TVolatileState& SetNextIndex(uint32_t id, uint64_t nextIndex);
@@ -106,7 +108,9 @@ enum class EState: int {
 
 class TRaft {
 public:
-    TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes);
+    // Nodes contains every replication peer; learners may include the local ID.
+    // Roles are fixed in this milestone: no voter promotion/reconfiguration API.
+    TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes, std::vector<uint32_t> learners = {});
 
     void Process(ITimeSource::Time now, TMessageHolder<TMessage> message, const std::shared_ptr<INode>& replyTo = {});
     void ProcessTimeout(ITimeSource::Time now);
@@ -115,6 +119,10 @@ public:
     uint32_t GetLeaderId() const;
     uint64_t GetLastIndex() const;
     std::vector<uint32_t> GetVoterIds() const;
+    std::vector<uint32_t> GetLearnerIds() const { return Learners; }
+    bool IsVoter(uint32_t id) const;
+    // Leader-only, point-in-time log catch-up; not permission to promote.
+    bool IsLearnerCaughtUp(uint32_t id) const;
     // Capture applied state and atomically replace its prefix with a snapshot.
     TSnapshot Compact();
     uint64_t ApproveRead();
@@ -150,6 +158,7 @@ public:
     }
 
     int GetNservers() const {
+        // Voting members only; GetNpeers counts all remote replication targets.
         return Nservers;
     }
 
@@ -180,6 +189,7 @@ private:
 
     uint32_t Id;
     TNodeDict Nodes;
+    std::vector<uint32_t> Voters, Learners;
     int MinVotes;
     int Npeers;
     int Nservers;

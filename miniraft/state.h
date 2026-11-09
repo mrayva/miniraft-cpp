@@ -2,6 +2,7 @@
 
 #include "messages.h"
 #include "snapshot.h"
+#include <algorithm>
 
 struct TStateFields {
     uint64_t CurrentTerm = 1;
@@ -24,6 +25,9 @@ struct IState: TStateFields {
     virtual bool SupportsSnapshots() const { return false; }
     virtual std::shared_ptr<const TSnapshot> GetSnapshot() const { return {}; }
     virtual void InstallSnapshot(const TSnapshot&) { throw std::logic_error("Storage snapshots are unsupported"); }
+    virtual bool SupportsVoterBinding() const { return false; }
+    virtual std::vector<uint32_t> GetBoundVoters() const { return {}; }
+    virtual void BindVoters(const std::vector<uint32_t>&) { throw std::logic_error("Storage voter binding is unsupported"); }
     virtual ~IState() = default;
 
     uint64_t LogTerm(int64_t index = -1) const {
@@ -39,9 +43,31 @@ struct IState: TStateFields {
     }
 };
 
+inline void ValidateFixedVoters(const std::vector<uint32_t>& voters) {
+    if (voters.empty() || voters.size() > TSnapshot::MaxVoters) throw std::invalid_argument("Invalid voter count");
+    uint32_t previous = 0;
+    for (auto id : voters) {
+        if (id <= previous) throw std::invalid_argument("Voters must be positive, sorted and unique");
+        previous = id;
+    }
+}
+inline void ValidateVoterBinding(const IState& state, const std::vector<uint32_t>& old, const std::vector<uint32_t>& voters) {
+    ValidateFixedVoters(voters);
+    if (state.VotedFor && !std::binary_search(voters.begin(), voters.end(), state.VotedFor))
+        throw std::invalid_argument("Stored vote does not name a configured voter");
+    if (!old.empty()) {
+        if (old != voters) throw std::invalid_argument("Persisted voter configuration cannot be changed by restart");
+    } else if (auto snapshot = state.GetSnapshot()) {
+        if (snapshot->Voters != voters) throw std::invalid_argument("Snapshot voter configuration mismatch");
+    } else if (state.CurrentTerm != 1 || state.VotedFor || state.LastLogIndex) {
+        throw std::invalid_argument("Unbound nonfresh store needs a verified snapshot before enabling learners");
+    }
+}
+
 struct TState: IState {
     std::vector<TMessageHolder<TLogEntry>> Log;
     std::shared_ptr<const TSnapshot> Snapshot;
+    std::vector<uint32_t> BoundVoters;
 
     TState() = default;
     TState(uint64_t currentTerm, uint32_t votedFor, const std::vector<TMessageHolder<TLogEntry>>& log)
@@ -74,9 +100,17 @@ struct TState: IState {
     }
 
     bool SupportsSnapshots() const override { return true; }
+    bool SupportsVoterBinding() const override { return true; }
+    std::vector<uint32_t> GetBoundVoters() const override { return BoundVoters; }
+    void BindVoters(const std::vector<uint32_t>& voters) override {
+        ValidateVoterBinding(*this, BoundVoters, voters);
+        BoundVoters = voters;
+    }
     std::shared_ptr<const TSnapshot> GetSnapshot() const override { return Snapshot; }
     void InstallSnapshot(const TSnapshot& snapshot) override {
         EncodeSnapshot(snapshot); // Validate before changing any state.
+        if (!BoundVoters.empty() && snapshot.Voters != BoundVoters)
+            throw std::invalid_argument("Snapshot would change bound voters");
         if (snapshot.Index <= SnapshotIndex || snapshot.Term > CurrentTerm)
             throw std::invalid_argument("Obsolete or future snapshot");
         auto image = std::make_shared<const TSnapshot>(snapshot);

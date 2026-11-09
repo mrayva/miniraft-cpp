@@ -42,6 +42,22 @@ def request(sock, key, value=None, flags=None):
     return index, body[16:]
 
 
+def snapshot_boundary(path):
+    data = path.read_bytes()
+    if data[:8] == b"MRFTD002":
+        length_offset = 40
+    elif data[:8] == b"MRFTD003":
+        voters = struct.unpack("<I", data[40:44])[0]
+        assert 0 < voters <= 4096
+        length_offset = 44 + 4 * voters
+    else:
+        return 0
+    length = struct.unpack("<Q", data[length_offset:length_offset + 8])[0]
+    if not length:
+        return 0
+    return struct.unpack("<Q", data[length_offset + 16:length_offset + 24])[0]
+
+
 def main():
     binary = str(pathlib.Path(sys.argv[1]).resolve())
     with tempfile.TemporaryDirectory(prefix="miniraft-checkpoint-cli-") as directory:
@@ -71,7 +87,10 @@ def main():
                 child.wait(timeout=5)
 
             try:
-                for args in (["--snapshots", "1"], ["--server", "--durable", "--snapshots", "0"]):
+                for args in (["--snapshots", "1"], ["--server", "--durable", "--snapshots", "0"],
+                             ["--learner", "3"], ["--server", "--learner", "3"],
+                             ["--server", "--durable", "--learner", "0"],
+                             ["--server", "--durable", "--learner", "3junk"]):
                     rejected = subprocess.run([binary, *args], cwd=root, stdout=log, stderr=log, timeout=5)
                     assert rejected.returncode != 0
                 process, endpoint = launch()
@@ -85,7 +104,7 @@ def main():
                     time.sleep(0.02)
                 else:
                     raise AssertionError("checkpoint was not published")
-                assert (root / "state.durable.1").read_bytes()[:8] == b"MRFTD002", "compacted durable image was not published"
+                assert snapshot_boundary(root / "state.durable.1") >= index, "compacted durable image was not published"
                 stop(process)
                 process, endpoint = launch(periodic=False)
                 with connect(process, endpoint) as sock:

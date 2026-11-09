@@ -1,5 +1,8 @@
 # Compaction and InstallSnapshot: v0.1.0-alpha.16
 
+The [learner follow-up](learners.md) adds non-voting replication and v3 durable
+voter binding while retaining backward decoding of the v1/v2 formats below.
+
 This milestone adds prefix deletion and follower state transfer to the alpha.15
 KV checkpoint foundation. TState and Linux TDurableState support compacted logs;
 legacy TDiskState does not. KV implements snapshot validation/restoration. SQL and

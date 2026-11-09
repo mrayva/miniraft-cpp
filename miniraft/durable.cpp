@@ -19,6 +19,7 @@ namespace {
 using TBytes = std::vector<uint8_t>;
 constexpr std::array<uint8_t, 8> Magic{'M','R','F','T','D','0','0','1'};
 constexpr std::array<uint8_t, 8> SnapshotMagic{'M','R','F','T','D','0','0','2'};
+constexpr std::array<uint8_t, 8> ConfigurationMagic{'M','R','F','T','D','0','0','3'};
 void Put(TBytes& bytes, uint64_t value, unsigned width) {
     for (unsigned i = 0; i < width; ++i) bytes.push_back(uint8_t(value >> (8 * i)));
 }
@@ -29,13 +30,13 @@ uint64_t Take(const TBytes& bytes, size_t& position, unsigned width) {
     for (unsigned i = 0; i < width; ++i) value |= uint64_t(bytes[position++]) << (8 * i);
     return value;
 }
-uint32_t Checksum(const TBytes& bytes, size_t start, bool versioned = false) {
+uint32_t Checksum(const TBytes& bytes, size_t start, const std::array<uint8_t, 8>* version = nullptr) {
     uint32_t crc = UINT32_MAX;
     const auto update = [&](uint8_t byte) {
         crc ^= byte;
         for (int bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
     };
-    if (versioned) for (auto byte : SnapshotMagic) update(byte);
+    if (version) for (auto byte : *version) update(byte);
     for (size_t i = start; i < bytes.size(); ++i) update(bytes[i]);
     return ~crc;
 }
@@ -94,6 +95,7 @@ TBytes ReadAll(int fd) {
 struct TDurableState::TImpl {
     std::vector<TMessageHolder<TLogEntry>> Log;
     std::shared_ptr<const TSnapshot> Snapshot;
+    std::vector<uint32_t> Voters;
     THook Hook;
     std::string File, Temp;
 #ifdef __linux__
@@ -137,28 +139,42 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
         return;
     }
     const auto bytes = ReadAll(file.Value);
+    const bool configured = std::equal(ConfigurationMagic.begin(), ConfigurationMagic.end(), bytes.begin());
     const bool compacted = std::equal(SnapshotMagic.begin(), SnapshotMagic.end(), bytes.begin());
-    if (!compacted && !std::equal(Magic.begin(), Magic.end(), bytes.begin()))
+    const auto* version = configured ? &ConfigurationMagic : compacted ? &SnapshotMagic : nullptr;
+    if (!version && !std::equal(Magic.begin(), Magic.end(), bytes.begin()))
         throw std::runtime_error("Unknown durable state format");
     size_t position = Magic.size();
     const auto length = Take(bytes, position, 8);
     const auto crc = Take(bytes, position, 4);
-    if (length != bytes.size() - position || crc != Checksum(bytes, position, compacted))
+    if (length != bytes.size() - position || crc != Checksum(bytes, position, version))
         throw std::runtime_error("Durable state length/checksum mismatch");
     CurrentTerm = Take(bytes, position, 8);
     VotedFor = Take(bytes, position, 4);
     const auto count = Take(bytes, position, 8);
-    if (compacted) {
+    if (configured) {
+        const auto voters = Take(bytes, position, 4);
+        if (!voters || voters > TSnapshot::MaxVoters || voters > (bytes.size() - position) / 4)
+            throw std::runtime_error("Invalid durable voter count");
+        for (uint32_t i = 0; i < voters; ++i) Impl->Voters.push_back(Take(bytes, position, 4));
+        try { ValidateFixedVoters(Impl->Voters); }
+        catch (const std::invalid_argument&) { throw std::runtime_error("Invalid durable voter configuration"); }
+    }
+    if (compacted || configured) {
         const auto length = Take(bytes, position, 8);
         if (length > TSnapshot::MaxBytes || length > bytes.size() - position)
             throw std::runtime_error("Invalid embedded snapshot size");
-        auto snapshot = DecodeSnapshot(std::string_view(reinterpret_cast<const char*>(bytes.data() + position), size_t(length)));
-        if (snapshot.Term > CurrentTerm) throw std::runtime_error("Future durable snapshot term");
-        position += size_t(length);
-        SnapshotIndex = snapshot.Index;
-        SnapshotTerm = snapshot.Term;
-        LastLogTerm = SnapshotTerm;
-        Impl->Snapshot = std::make_shared<const TSnapshot>(std::move(snapshot));
+        if (!length && compacted) throw std::runtime_error("Missing embedded snapshot");
+        if (length) {
+            auto snapshot = DecodeSnapshot(std::string_view(reinterpret_cast<const char*>(bytes.data() + position), size_t(length)));
+            if (snapshot.Term > CurrentTerm) throw std::runtime_error("Future durable snapshot term");
+            if (configured && snapshot.Voters != Impl->Voters) throw std::runtime_error("Durable snapshot/voter mismatch");
+            position += size_t(length);
+            SnapshotIndex = snapshot.Index;
+            SnapshotTerm = snapshot.Term;
+            LastLogTerm = SnapshotTerm;
+            Impl->Snapshot = std::make_shared<const TSnapshot>(std::move(snapshot));
+        }
     }
     if (!CurrentTerm || count > uint64_t(INT64_MAX) - SnapshotIndex || count > (bytes.size() - position) / 20)
         throw std::runtime_error("Invalid durable state metadata");
@@ -203,8 +219,15 @@ void TDurableState::Publish()
     Put(payload, CurrentTerm, 8);
     Put(payload, VotedFor, 4);
     Put(payload, Impl->Log.size(), 8);
-    if (Impl->Snapshot) {
-        const auto image = EncodeSnapshot(*Impl->Snapshot);
+    if (!Impl->Voters.empty()) {
+        ValidateFixedVoters(Impl->Voters);
+        if (Impl->Snapshot && Impl->Snapshot->Voters != Impl->Voters)
+            throw std::runtime_error("Snapshot would change bound voters");
+        Put(payload, Impl->Voters.size(), 4);
+        for (auto id : Impl->Voters) Put(payload, id, 4);
+    }
+    if (Impl->Snapshot || !Impl->Voters.empty()) {
+        const auto image = Impl->Snapshot ? EncodeSnapshot(*Impl->Snapshot) : std::string{};
         Put(payload, image.size(), 8);
         payload.insert(payload.end(), image.begin(), image.end());
     }
@@ -218,10 +241,10 @@ void TDurableState::Publish()
         Put(payload, entry->Len - sizeof(TLogEntry), 4);
         payload.insert(payload.end(), entry->Data, entry->Data + entry->Len - sizeof(TLogEntry));
     }
-    const auto& magic = Impl->Snapshot ? SnapshotMagic : Magic;
+    const auto& magic = !Impl->Voters.empty() ? ConfigurationMagic : Impl->Snapshot ? SnapshotMagic : Magic;
     TBytes bytes(magic.begin(), magic.end());
     Put(bytes, payload.size(), 8);
-    Put(bytes, Checksum(payload, 0, bool(Impl->Snapshot)), 4);
+    Put(bytes, Checksum(payload, 0, !Impl->Voters.empty() ? &ConfigurationMagic : Impl->Snapshot ? &SnapshotMagic : nullptr), 4);
     bytes.insert(bytes.end(), payload.begin(), payload.end());
     TFd temp(openat(Impl->Directory.Value, Impl->Temp.c_str(),
                     O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600));
@@ -275,6 +298,8 @@ std::shared_ptr<const TSnapshot> TDurableState::GetSnapshot() const { return Imp
 
 void TDurableState::InstallSnapshot(const TSnapshot& snapshot) {
     EncodeSnapshot(snapshot);
+    if (!Impl->Voters.empty() && snapshot.Voters != Impl->Voters)
+        throw std::invalid_argument("Snapshot would change bound voters");
     if (snapshot.Index <= SnapshotIndex || snapshot.Term > CurrentTerm)
         throw std::invalid_argument("Obsolete or future durable snapshot");
     auto image = std::make_shared<const TSnapshot>(snapshot);
@@ -288,4 +313,13 @@ void TDurableState::InstallSnapshot(const TSnapshot& snapshot) {
     LastLogIndex = SnapshotIndex + Impl->Log.size();
     LastLogTerm = Impl->Log.empty() ? SnapshotTerm : Impl->Log.back()->Term;
     Commit(); // Atomically publishes hard state, snapshot and the selected suffix.
+}
+
+std::vector<uint32_t> TDurableState::GetBoundVoters() const { return Impl->Voters; }
+
+void TDurableState::BindVoters(const std::vector<uint32_t>& voters) {
+    ValidateVoterBinding(*this, Impl->Voters, voters);
+    if (Impl->Voters == voters) return;
+    Impl->Voters = voters;
+    Commit(); // Bind before acknowledging any vote/replication traffic.
 }
