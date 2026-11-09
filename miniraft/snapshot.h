@@ -11,7 +11,7 @@
 class TRaft;
 struct IRsm;
 
-// Local application checkpoint. Full Raft logs are retained in this milestone.
+// Versioned application snapshot, shared by local compaction and state transfer.
 struct TSnapshot {
     static constexpr size_t MaxBytes = 64 * 1024 * 1024;
     static constexpr uint32_t MaxVoters = 4096;
@@ -23,7 +23,7 @@ struct TSnapshot {
 std::string EncodeSnapshot(const TSnapshot& snapshot);
 TSnapshot DecodeSnapshot(std::string_view bytes);
 TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm);
-// Startup only, with a fresh application and the same fully retained local log.
+// Startup only, with a fresh application and a matching local boundary/log.
 void RestoreSnapshot(const TSnapshot& snapshot, const TRaft& raft, IRsm& rsm);
 
 class TSnapshotStore {
@@ -36,8 +36,8 @@ public:
     TSnapshotStore(const TSnapshotStore&) = delete;
     TSnapshotStore& operator=(const TSnapshotStore&) = delete;
     std::optional<TSnapshot> Load();
-    // Failure is catchable: no log is discarded and every published image is a
-    // complete committed checkpoint. Crash recovery may select the old or new one.
+    // Standalone checkpoint export, not the compaction commit point. Failure is
+    // catchable when the authoritative snapshot/log remains in the Raft state.
     void Save(const TSnapshot& snapshot);
 private:
     struct TImpl;

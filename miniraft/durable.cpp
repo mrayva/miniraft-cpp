@@ -1,5 +1,6 @@
 #include "durable.h"
 #include <array>
+#include <climits>
 #include <algorithm>
 #include <filesystem>
 #include <stdexcept>
@@ -17,6 +18,7 @@
 namespace {
 using TBytes = std::vector<uint8_t>;
 constexpr std::array<uint8_t, 8> Magic{'M','R','F','T','D','0','0','1'};
+constexpr std::array<uint8_t, 8> SnapshotMagic{'M','R','F','T','D','0','0','2'};
 void Put(TBytes& bytes, uint64_t value, unsigned width) {
     for (unsigned i = 0; i < width; ++i) bytes.push_back(uint8_t(value >> (8 * i)));
 }
@@ -27,12 +29,14 @@ uint64_t Take(const TBytes& bytes, size_t& position, unsigned width) {
     for (unsigned i = 0; i < width; ++i) value |= uint64_t(bytes[position++]) << (8 * i);
     return value;
 }
-uint32_t Checksum(const TBytes& bytes, size_t start) {
+uint32_t Checksum(const TBytes& bytes, size_t start, bool versioned = false) {
     uint32_t crc = UINT32_MAX;
-    for (size_t i = start; i < bytes.size(); ++i) {
-        crc ^= bytes[i];
+    const auto update = [&](uint8_t byte) {
+        crc ^= byte;
         for (int bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
-    }
+    };
+    if (versioned) for (auto byte : SnapshotMagic) update(byte);
+    for (size_t i = start; i < bytes.size(); ++i) update(bytes[i]);
     return ~crc;
 }
 TMessageHolder<TLogEntry> Clone(TMessageHolder<TLogEntry> entry) {
@@ -89,6 +93,7 @@ TBytes ReadAll(int fd) {
 
 struct TDurableState::TImpl {
     std::vector<TMessageHolder<TLogEntry>> Log;
+    std::shared_ptr<const TSnapshot> Snapshot;
     THook Hook;
     std::string File, Temp;
 #ifdef __linux__
@@ -132,17 +137,30 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
         return;
     }
     const auto bytes = ReadAll(file.Value);
-    if (!std::equal(Magic.begin(), Magic.end(), bytes.begin()))
+    const bool compacted = std::equal(SnapshotMagic.begin(), SnapshotMagic.end(), bytes.begin());
+    if (!compacted && !std::equal(Magic.begin(), Magic.end(), bytes.begin()))
         throw std::runtime_error("Unknown durable state format");
     size_t position = Magic.size();
     const auto length = Take(bytes, position, 8);
     const auto crc = Take(bytes, position, 4);
-    if (length != bytes.size() - position || crc != Checksum(bytes, position))
+    if (length != bytes.size() - position || crc != Checksum(bytes, position, compacted))
         throw std::runtime_error("Durable state length/checksum mismatch");
     CurrentTerm = Take(bytes, position, 8);
     VotedFor = Take(bytes, position, 4);
     const auto count = Take(bytes, position, 8);
-    if (!CurrentTerm || count > (bytes.size() - position) / 20)
+    if (compacted) {
+        const auto length = Take(bytes, position, 8);
+        if (length > TSnapshot::MaxBytes || length > bytes.size() - position)
+            throw std::runtime_error("Invalid embedded snapshot size");
+        auto snapshot = DecodeSnapshot(std::string_view(reinterpret_cast<const char*>(bytes.data() + position), size_t(length)));
+        if (snapshot.Term > CurrentTerm) throw std::runtime_error("Future durable snapshot term");
+        position += size_t(length);
+        SnapshotIndex = snapshot.Index;
+        SnapshotTerm = snapshot.Term;
+        LastLogTerm = SnapshotTerm;
+        Impl->Snapshot = std::make_shared<const TSnapshot>(std::move(snapshot));
+    }
+    if (!CurrentTerm || count > uint64_t(INT64_MAX) - SnapshotIndex || count > (bytes.size() - position) / 20)
         throw std::runtime_error("Invalid durable state metadata");
     for (uint64_t i = 0; i < count; ++i) {
         const auto term = Take(bytes, position, 8);
@@ -160,7 +178,7 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
         LastLogTerm = term;
     }
     if (position != bytes.size()) throw std::runtime_error("Trailing durable state data");
-    LastLogIndex = count;
+    LastLogIndex = SnapshotIndex + count;
     // A crash after rename but before directory fsync may leave a visible new
     // image. Stabilize the selected image and its name before serving requests.
     Sync(file.Value);
@@ -176,14 +194,21 @@ void TDurableState::Publish()
 #ifndef __linux__
     throw std::runtime_error("TDurableState currently requires Linux");
 #else
-    if (!CurrentTerm || LastLogIndex != Impl->Log.size() ||
-        LastLogTerm != (Impl->Log.empty() ? 0 : Impl->Log.back()->Term))
+    if (!CurrentTerm || LastLogIndex > uint64_t(INT64_MAX) || LastLogIndex != SnapshotIndex + Impl->Log.size() ||
+        LastLogTerm != (Impl->Log.empty() ? SnapshotTerm : Impl->Log.back()->Term) ||
+        (Impl->Snapshot ? (Impl->Snapshot->Index != SnapshotIndex || Impl->Snapshot->Term != SnapshotTerm ||
+            SnapshotTerm > CurrentTerm) : (SnapshotIndex != 0 || SnapshotTerm != 0)))
         throw std::runtime_error("Invalid durable state fields");
     TBytes payload;
     Put(payload, CurrentTerm, 8);
     Put(payload, VotedFor, 4);
-    Put(payload, LastLogIndex, 8);
-    uint64_t previousTerm = 0;
+    Put(payload, Impl->Log.size(), 8);
+    if (Impl->Snapshot) {
+        const auto image = EncodeSnapshot(*Impl->Snapshot);
+        Put(payload, image.size(), 8);
+        payload.insert(payload.end(), image.begin(), image.end());
+    }
+    uint64_t previousTerm = SnapshotTerm;
     for (auto entry : Impl->Log) {
         if (!entry->Term || entry->Term < previousTerm || entry->Term > CurrentTerm)
             throw std::runtime_error("Invalid durable log term");
@@ -193,9 +218,10 @@ void TDurableState::Publish()
         Put(payload, entry->Len - sizeof(TLogEntry), 4);
         payload.insert(payload.end(), entry->Data, entry->Data + entry->Len - sizeof(TLogEntry));
     }
-    TBytes bytes(Magic.begin(), Magic.end());
+    const auto& magic = Impl->Snapshot ? SnapshotMagic : Magic;
+    TBytes bytes(magic.begin(), magic.end());
     Put(bytes, payload.size(), 8);
-    Put(bytes, Checksum(payload, 0), 4);
+    Put(bytes, Checksum(payload, 0, bool(Impl->Snapshot)), 4);
     bytes.insert(bytes.end(), payload.begin(), payload.end());
     TFd temp(openat(Impl->Directory.Value, Impl->Temp.c_str(),
                     O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600));
@@ -225,7 +251,7 @@ void TDurableState::Commit()
 void TDurableState::Append(TMessageHolder<TLogEntry> entry)
 {
     Impl->Log.push_back(Clone(entry));
-    LastLogIndex = Impl->Log.size();
+    LastLogIndex = SnapshotIndex + Impl->Log.size();
     LastLogTerm = Impl->Log.back()->Term;
     Commit();
 }
@@ -234,13 +260,32 @@ void TDurableState::RemoveLast()
 {
     if (Impl->Log.empty()) return;
     Impl->Log.pop_back();
-    LastLogIndex = Impl->Log.size();
-    LastLogTerm = Impl->Log.empty() ? 0 : Impl->Log.back()->Term;
+    LastLogIndex = SnapshotIndex + Impl->Log.size();
+    LastLogTerm = Impl->Log.empty() ? SnapshotTerm : Impl->Log.back()->Term;
     Commit();
 }
 
 TMessageHolder<TLogEntry> TDurableState::Get(int64_t index) const
 {
-    if (index < 1 || uint64_t(index) > Impl->Log.size()) return {};
-    return Clone(Impl->Log[index - 1]);
+    if (index < 1 || uint64_t(index) <= SnapshotIndex || uint64_t(index) > LastLogIndex) return {};
+    return Clone(Impl->Log[index - SnapshotIndex - 1]);
+}
+
+std::shared_ptr<const TSnapshot> TDurableState::GetSnapshot() const { return Impl->Snapshot; }
+
+void TDurableState::InstallSnapshot(const TSnapshot& snapshot) {
+    EncodeSnapshot(snapshot);
+    if (snapshot.Index <= SnapshotIndex || snapshot.Term > CurrentTerm)
+        throw std::invalid_argument("Obsolete or future durable snapshot");
+    auto image = std::make_shared<const TSnapshot>(snapshot);
+    std::vector<TMessageHolder<TLogEntry>> suffix;
+    if (snapshot.Index <= LastLogIndex && LogTerm(snapshot.Index) == snapshot.Term)
+        suffix.assign(Impl->Log.begin() + (snapshot.Index - SnapshotIndex), Impl->Log.end());
+    Impl->Log.swap(suffix);
+    Impl->Snapshot = std::move(image);
+    SnapshotIndex = snapshot.Index;
+    SnapshotTerm = snapshot.Term;
+    LastLogIndex = SnapshotIndex + Impl->Log.size();
+    LastLogTerm = Impl->Log.empty() ? SnapshotTerm : Impl->Log.back()->Term;
+    Commit(); // Atomically publishes hard state, snapshot and the selected suffix.
 }

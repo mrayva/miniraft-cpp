@@ -115,3 +115,8 @@ void TKv::LoadSnapshot(std::string_view bytes, uint64_t index) {
     LastAppliedIndex = index;
 }
 
+void TKv::ValidateSnapshot(std::string_view bytes, uint64_t index) const {
+    TKv candidate;
+    candidate.LoadSnapshot(bytes, index);
+}
+

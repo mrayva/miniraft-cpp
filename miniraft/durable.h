@@ -4,8 +4,8 @@
 #include <memory>
 #include <string>
 
-// Linux: atomic full-image replacement, with file and directory fsync.
-// O(log size) per update; intended as a conservative durability baseline.
+// Linux: atomic hard-state + snapshot + suffix replacement, with file/directory
+// fsync. O(snapshot + retained log size) per update: a durability baseline.
 class TDurableState : public IState {
 public:
     enum class EStage { TempCreated, Written, FileSynced, Renamed, DirectorySynced };
@@ -20,6 +20,9 @@ public:
     void Append(TMessageHolder<TLogEntry> entry) override;
     TMessageHolder<TLogEntry> Get(int64_t index) const override;
     void Commit() override;
+    bool SupportsSnapshots() const override { return true; }
+    std::shared_ptr<const TSnapshot> GetSnapshot() const override;
+    void InstallSnapshot(const TSnapshot& snapshot) override;
 private:
     struct TImpl;
     std::unique_ptr<TImpl> Impl;

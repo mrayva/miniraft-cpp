@@ -1,5 +1,9 @@
 # Snapshot foundation: durable KV checkpoints, v0.1.0-alpha.15
 
+The [alpha.16 follow-up](compaction.md) adds compaction and InstallSnapshot and
+changes the behavior of the same `--snapshots` option. This document describes
+the original checkpoint-only baseline.
+
 This milestone adds local application checkpoint creation and restart recovery.
 It retains the entire Raft log. InstallSnapshot RPCs and prefix compaction remain
 unimplemented, so checkpoints improve application recovery but do not bound log

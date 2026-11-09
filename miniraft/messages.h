@@ -27,8 +27,8 @@ enum class EMessageType : uint32_t {
     REQUEST_VOTE_RESPONSE = 3,
     APPEND_ENTRIES_REQUEST = 4,
     APPEND_ENTRIES_RESPONSE = 5,
-    INSTALL_SNAPSHOT_REQUEST = 6, // TODO: not implemented it
-    INSTALL_SNAPSHOT_RESPONSE = 7, // TODO: not implemented it
+    INSTALL_SNAPSHOT_REQUEST = 6,
+    INSTALL_SNAPSHOT_RESPONSE = 7,
     COMMAND_REQUEST = 8,
     COMMAND_RESPONSE = 9,
 };
@@ -93,12 +93,29 @@ static_assert(sizeof(TAppendEntriesRequest) == sizeof(TMessageEx) + 32);
 
 struct TAppendEntriesResponse: public TMessageEx {
     static constexpr EMessageType MessageType = EMessageType::APPEND_ENTRIES_RESPONSE;
+    // Success: matched index. Failure: zero or a compacted-boundary probe hint;
+    // a hint never advances MatchIndex or confirms a read.
     uint64_t MatchIndex;
     uint32_t Success;
     uint32_t Padding = 0;
 };
 
 static_assert(sizeof(TAppendEntriesResponse) == sizeof(TMessageEx) + 16);
+
+struct TInstallSnapshotRequest: public TMessageEx {
+    static constexpr EMessageType MessageType = EMessageType::INSTALL_SNAPSHOT_REQUEST;
+    static constexpr uint32_t MaxChunkBytes = 64 * 1024;
+    uint64_t SnapshotIndex = 0, SnapshotTerm = 0, TotalBytes = 0, Offset = 0;
+    uint32_t LeaderId = 0, Done = 0;
+    char Data[0];
+};
+static_assert(sizeof(TInstallSnapshotRequest) == sizeof(TMessageEx) + 40);
+struct TInstallSnapshotResponse: public TMessageEx {
+    static constexpr EMessageType MessageType = EMessageType::INSTALL_SNAPSHOT_RESPONSE;
+    uint64_t SnapshotIndex = 0, NextOffset = 0;
+    uint32_t Success = 0, Installed = 0;
+};
+static_assert(sizeof(TInstallSnapshotResponse) == sizeof(TMessageEx) + 24);
 
 struct TCommandRequest: public TMessage {
     static constexpr EMessageType MessageType = EMessageType::COMMAND_REQUEST;
@@ -186,7 +203,7 @@ struct TMessageHolder {
     }
 
     bool IsEx() const {
-        return Mes && Mes->Len >= sizeof(TMessageEx) && (2 <= Mes->Type && Mes->Type <= 5);
+        return Mes && Mes->Len >= sizeof(TMessageEx) && (2 <= Mes->Type && Mes->Type <= 7);
     }
 
     template<typename U>

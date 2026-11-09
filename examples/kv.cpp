@@ -102,11 +102,12 @@ NNet::TVoidTask CheckpointLoop(TPoller& poller, std::shared_ptr<TRaft> raft,
         co_await poller.Sleep(std::chrono::seconds(1));
         if (rsm->LastAppliedIndex <= saved || rsm->LastAppliedIndex - saved < interval) continue;
         try {
-            auto snapshot = CaptureSnapshot(*raft, *rsm);
+            auto snapshot = raft->Compact();
             store->Save(snapshot);
             saved = snapshot.Index;
         } catch (const std::exception& error) {
-            // Checkpoints are optional while every log entry is retained.
+            // The durable state image already contains the authoritative snapshot.
+            // A failed standalone checkpoint export can be retried safely.
             std::cerr << "Checkpoint failed: " << error.what() << "\n";
         }
     }
@@ -192,12 +193,14 @@ int main(int argc, char** argv) {
         }
         auto raft = std::make_shared<TRaft>(state, myHost.Id, nodes);
         std::shared_ptr<TSnapshotStore> snapshots;
-        uint64_t savedSnapshot = 0;
+        uint64_t savedSnapshot = state->SnapshotIndex;
         if (snapshotInterval) {
             snapshots = std::make_shared<TSnapshotStore>("state", myHost.Id);
             if (auto snapshot = snapshots->Load()) {
-                RestoreSnapshot(*snapshot, *raft, *rsm);
-                savedSnapshot = snapshot->Index;
+                if (snapshot->Index > state->SnapshotIndex) {
+                    RestoreSnapshot(*snapshot, *raft, *rsm);
+                    savedSnapshot = snapshot->Index;
+                }
             }
         }
         TPoller::TSocket socket(NNet::TAddress{myHost.Address, myHost.Port}, loop.Poller());
