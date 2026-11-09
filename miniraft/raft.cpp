@@ -607,6 +607,13 @@ uint64_t TRaft::GetLastIndex() const {
     return State->LastLogIndex;
 }
 
+std::vector<uint32_t> TRaft::GetVoterIds() const {
+    std::vector<uint32_t> ids{Id};
+    for (const auto& [id, _] : Nodes) ids.push_back(id);
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
 void TRaft::RestoreAppliedIndex(uint64_t index) {
     if (index > uint64_t(INT64_MAX) || index > State->LastLogIndex)
         throw std::invalid_argument("Application progress exceeds recovered Raft log");

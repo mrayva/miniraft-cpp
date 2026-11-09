@@ -3,6 +3,7 @@ add_library(miniraft
     raft.cpp
     persist.cpp
     durable.cpp
+    snapshot.cpp
 )
 
 target_include_directories(miniraft PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

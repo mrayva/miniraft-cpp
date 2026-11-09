@@ -4,6 +4,7 @@
 #include <queue>
 #include <deque>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -27,6 +28,10 @@ struct IRsm {
     virtual TMessageHolder<TMessage> Read(TMessageHolder<TCommandRequest> message, uint64_t index) = 0;
     virtual TMessageHolder<TMessage> Write(TMessageHolder<TLogEntry> message, uint64_t index) = 0;
     virtual TMessageHolder<TLogEntry> Prepare(TMessageHolder<TCommandRequest> message) = 0;
+    virtual std::string SaveSnapshot() const { throw std::logic_error("Application snapshots are unsupported"); }
+    // Implementations must validate completely before atomically replacing state
+    // and LastAppliedIndex. Invoked during startup before request processing.
+    virtual void LoadSnapshot(std::string_view, uint64_t) { throw std::logic_error("Application snapshots are unsupported"); }
 
     // Durable RSMs restore this atomically with application data before constructing
     // TRequestProcessor. It must identify committed progress in the same Raft log.
@@ -101,6 +106,7 @@ public:
     uint64_t Append(TMessageHolder<TLogEntry> entry);
     uint32_t GetLeaderId() const;
     uint64_t GetLastIndex() const;
+    std::vector<uint32_t> GetVoterIds() const;
     uint64_t ApproveRead();
     // Highest barrier confirmed by a fresh majority in this leadership term.
     // Zero means no confirmation (including before a current-term commit).

@@ -3,6 +3,7 @@
 #include <miniraft/net/server.h>
 #include <miniraft/persist.h>
 #include <miniraft/durable.h>
+#include <miniraft/snapshot.h>
 
 #include "kv.h"
 
@@ -94,8 +95,25 @@ NNet::TFuture<void> Client(TPoller& poller, TSocket socket, uint32_t flags) {
     co_return;
 }
 
+template<typename TPoller>
+NNet::TVoidTask CheckpointLoop(TPoller& poller, std::shared_ptr<TRaft> raft,
+    std::shared_ptr<IRsm> rsm, std::shared_ptr<TSnapshotStore> store, uint64_t interval, uint64_t saved) {
+    while (true) {
+        co_await poller.Sleep(std::chrono::seconds(1));
+        if (rsm->LastAppliedIndex <= saved || rsm->LastAppliedIndex - saved < interval) continue;
+        try {
+            auto snapshot = CaptureSnapshot(*raft, *rsm);
+            store->Save(snapshot);
+            saved = snapshot.Index;
+        } catch (const std::exception& error) {
+            // Checkpoints are optional while every log entry is retained.
+            std::cerr << "Checkpoint failed: " << error.what() << "\n";
+        }
+    }
+}
+
 void usage(const char* prog) {
-    std::cerr << prog << "--client|--server --id myid --node ip:port:id [--node ip:port:id ...] [--persist|--durable] [--stale] [--consistent]" << "\n";
+    std::cerr << prog << "--client|--server --id myid --node ip:port:id [--node ip:port:id ...] [--persist|--durable] [--snapshots entries] [--stale] [--consistent]" << "\n";
     exit(0);
 }
 
@@ -108,6 +126,7 @@ int main(int argc, char** argv) {
     bool server = false;
     bool persist = false;
     bool durable = false;
+    uint64_t snapshotInterval = 0;
     uint32_t flags = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--server")) {
@@ -122,6 +141,13 @@ int main(int argc, char** argv) {
         } else if (!strcmp(argv[i], "--durable")) {
             persist = true;
             durable = true;
+        } else if (!strcmp(argv[i], "--snapshots")) {
+            if (i + 1 >= argc) { std::cerr << "--snapshots requires a positive entry interval\n"; return 1; }
+            const std::string_view value(argv[++i]);
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), snapshotInterval);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || !snapshotInterval) {
+                std::cerr << "--snapshots requires a positive entry interval\n"; return 1;
+            }
         } else if (!strcmp(argv[i], "--stale")) {
             flags |= TCommandRequest::EStale;
         } else if (!strcmp(argv[i], "--consistent")) {
@@ -131,6 +157,9 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (snapshotInterval && (!server || !durable)) {
+        std::cerr << "--snapshots requires --server --durable\n"; return 1;
+    }
     using TPoller = NNet::TDefaultPoller;
     std::shared_ptr<ITimeSource> timeSource = std::make_shared<TTimeSource>();
     NNet::TLoop<TPoller> loop;
@@ -162,11 +191,21 @@ int main(int argc, char** argv) {
             else state = std::make_shared<TDiskState>("state", myHost.Id);
         }
         auto raft = std::make_shared<TRaft>(state, myHost.Id, nodes);
+        std::shared_ptr<TSnapshotStore> snapshots;
+        uint64_t savedSnapshot = 0;
+        if (snapshotInterval) {
+            snapshots = std::make_shared<TSnapshotStore>("state", myHost.Id);
+            if (auto snapshot = snapshots->Load()) {
+                RestoreSnapshot(*snapshot, *raft, *rsm);
+                savedSnapshot = snapshot->Index;
+            }
+        }
         TPoller::TSocket socket(NNet::TAddress{myHost.Address, myHost.Port}, loop.Poller());
         socket.Bind();
         socket.Listen();
         TRaftServer server(loop.Poller(), std::move(socket), raft, rsm, nodes, timeSource);
         server.Serve();
+        if (snapshots) CheckpointLoop(loop.Poller(), raft, rsm, snapshots, snapshotInterval, savedSnapshot);
         loop.Loop();
     } else {
         NNet::TAddress addr{hosts[0].Address, hosts[0].Port};
