@@ -71,7 +71,7 @@ void test_short_fixed_frame_is_rejected(void**) {
     stream.Add(uint32_t(EMessageType::REQUEST_VOTE_REQUEST), sizeof(TMessage));
     assert_true(Rejected(stream));
 }
-void test_unknown_and_unimplemented_types_are_rejected(void**) {
+void test_unknown_types_and_short_snapshot_headers_are_rejected(void**) {
     for (auto type : {0u, 6u, 7u, 10u, UINT32_MAX}) {
         TStream stream;
         stream.Add(type, sizeof(TMessage));
@@ -218,13 +218,36 @@ void test_fragmented_roundtrip_keeps_consecutive_frame_boundaries(void**) {
     assert_int_equal(next->Len, sizeof(TCommandRequest));
     assert_int_equal(stream.Position, stream.Bytes.size());
 }
+void test_fragmented_snapshot_request_and_response_roundtrip(void**) {
+    for (uint32_t length : {uint32_t(sizeof(TInstallSnapshotRequest)),
+         uint32_t(sizeof(TInstallSnapshotRequest) + TInstallSnapshotRequest::MaxChunkBytes + 1)}) {
+        TStream invalid; invalid.Add(uint32_t(EMessageType::INSTALL_SNAPSHOT_REQUEST), length);
+        assert_true(Rejected(invalid)); assert_int_equal(invalid.Position, sizeof(TMessage));
+    }
+    auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + 1024);
+    request->Src = 1; request->Dst = 2; request->Term = 3; request->Seqno = 7;
+    request->SnapshotIndex = 100; request->SnapshotTerm = 2;
+    request->TotalBytes = 1024; request->Offset = 0; request->Done = 1; request->LeaderId = 1;
+    memset(request->Data, 's', 1024);
+    auto response = NewHoldedMessage(TMessageEx{.Src = 2, .Dst = 1, .Term = 3, .Seqno = 7},
+        TInstallSnapshotResponse{.SnapshotIndex = 100, .NextOffset = 1024, .Success = 1, .Installed = 1});
+    TStream stream; stream.Chunk = 3;
+    auto send = TMessageWriter(stream).Write(request); send.await_resume();
+    auto reply = TMessageWriter(stream).Write(response); reply.await_resume();
+    stream.Bytes = stream.Output;
+    auto received = Read(stream); assert_true(received.IsEx());
+    auto snapshot = received.Cast<TInstallSnapshotRequest>();
+    assert_int_equal(snapshot->SnapshotIndex, 100); assert_memory_equal(snapshot->Data, request->Data, 1024);
+    auto ack = Read(stream).Cast<TInstallSnapshotResponse>(); assert_true(ack->Installed);
+    assert_int_equal(ack->NextOffset, 1024); assert_int_equal(stream.Position, stream.Bytes.size());
+}
 }
 
 int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_fragmented_header_and_body_are_read_exactly),
         cmocka_unit_test(test_short_fixed_frame_is_rejected),
-        cmocka_unit_test(test_unknown_and_unimplemented_types_are_rejected),
+        cmocka_unit_test(test_unknown_types_and_short_snapshot_headers_are_rejected),
         cmocka_unit_test(test_append_entries_rejects_non_log_child),
         cmocka_unit_test(test_append_entries_rejects_nested_append),
         cmocka_unit_test(test_oversized_frame_is_rejected_before_body_read),
@@ -236,6 +259,7 @@ int main() {
         cmocka_unit_test(test_failed_reader_cannot_resume_at_another_frame),
         cmocka_unit_test(test_writer_validates_entire_batch_before_first_byte),
         cmocka_unit_test(test_fragmented_roundtrip_keeps_consecutive_frame_boundaries),
+        cmocka_unit_test(test_fragmented_snapshot_request_and_response_roundtrip),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }

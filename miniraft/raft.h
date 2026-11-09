@@ -29,8 +29,10 @@ struct IRsm {
     virtual TMessageHolder<TMessage> Write(TMessageHolder<TLogEntry> message, uint64_t index) = 0;
     virtual TMessageHolder<TLogEntry> Prepare(TMessageHolder<TCommandRequest> message) = 0;
     virtual std::string SaveSnapshot() const { throw std::logic_error("Application snapshots are unsupported"); }
+    virtual void ValidateSnapshot(std::string_view, uint64_t) const { throw std::logic_error("Application snapshots are unsupported"); }
     // Implementations must validate completely before atomically replacing state
-    // and LastAppliedIndex. Invoked during startup before request processing.
+    // and LastAppliedIndex. Invoked at startup or during serialized installation;
+    // a failure after durable installation is fatal and requires restart.
     virtual void LoadSnapshot(std::string_view, uint64_t) { throw std::logic_error("Application snapshots are unsupported"); }
 
     // Durable RSMs restore this atomically with application data before constructing
@@ -58,6 +60,12 @@ struct TVolatileState {
     std::unordered_map<uint32_t, uint64_t> ReadAckSeqno;
     std::unordered_map<uint32_t, uint64_t> LastSentSeqno;
     std::unordered_map<uint32_t, std::deque<TAppendRpc>> PendingAppendRpcs;
+    struct TSnapshotRpc {
+        std::shared_ptr<const TSnapshot> Snapshot;
+        std::shared_ptr<const std::string> Bytes;
+        uint64_t Offset = 0, Seqno = 0, SentEnd = 0;
+    };
+    std::unordered_map<uint32_t, TSnapshotRpc> SnapshotRpcs;
     uint32_t LeaderId = 0;
     std::unordered_map<uint32_t, uint64_t> NextIndex;
     std::unordered_map<uint32_t, uint64_t> MatchIndex;
@@ -107,6 +115,8 @@ public:
     uint32_t GetLeaderId() const;
     uint64_t GetLastIndex() const;
     std::vector<uint32_t> GetVoterIds() const;
+    // Capture applied state and atomically replace its prefix with a snapshot.
+    TSnapshot Compact();
     uint64_t ApproveRead();
     // Highest barrier confirmed by a fresh majority in this leadership term.
     // Zero means no confirmation (including before a current-term commit).
@@ -146,6 +156,9 @@ public:
 private:
     friend class TRequestProcessor;
     void RestoreAppliedIndex(uint64_t index);
+    void OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnapshotRequest> message);
+    void OnInstallSnapshot(TMessageHolder<TInstallSnapshotResponse> message);
+    TMessageHolder<TInstallSnapshotRequest> CreateInstallSnapshot(uint32_t nodeId);
     void Candidate(ITimeSource::Time now, TMessageHolder<TMessage> message);
     void Follower(ITimeSource::Time now, TMessageHolder<TMessage> message);
     void Leader(ITimeSource::Time now, TMessageHolder<TMessage> message);
@@ -173,6 +186,15 @@ private:
     std::shared_ptr<IState> State;
     std::unique_ptr<TVolatileState> VolatileState;
     uint64_t Seqno = 1; // zero is reserved for an unconfirmed read
+    std::weak_ptr<IRsm> SnapshotApplication;
+    struct TIncomingSnapshot {
+        uint64_t Term, Index, BoundaryTerm, Total;
+        uint32_t Leader;
+        std::string Bytes;
+    };
+    std::optional<TIncomingSnapshot> IncomingSnapshot;
+    std::shared_ptr<const std::string> EncodedSnapshot;
+    uint64_t EncodedSnapshotIndex = 0;
 
     EState StateName;
     uint32_t Seed = 31337;

@@ -1,5 +1,8 @@
 # Recovered application progress: v0.1.0-alpha.13
 
+The [compaction follow-up](compaction.md) extends this recovery contract to
+embedded snapshots and absolute log boundaries.
+
 After restarting a durable application, Raft's volatile commit index began at
 zero. ProcessCommitted unconditionally copied that zero into LastAppliedIndex,
 discarding the application's recovered marker. Re-establishing commitment then

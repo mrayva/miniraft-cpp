@@ -28,9 +28,9 @@ def receive(sock, size):
     return bytes(data)
 
 
-def request(sock, key, value=None):
+def request(sock, key, value=None, flags=None):
     if value is None:
-        frame = struct.pack("<IIIIH", 8, 24 + len(key), 4, 17, len(key)) + key + bytes(6)
+        frame = struct.pack("<IIIIH", 8, 24 + len(key), 4 if flags is None else flags, 17, len(key)) + key + bytes(6)
     else:
         frame = struct.pack("<IIIIHH", 8, 24 + len(key) + len(value), 1, 17, len(key), len(value)) + key + value + bytes(4)
     sock.sendall(frame)
@@ -48,9 +48,9 @@ def main():
         root = pathlib.Path(directory)
         process = None
         with (root / "output.log").open("w+") as log:
-            def launch(extra=()):
+            def launch(extra=(), periodic=True):
                 endpoint = port()
-                args = [binary, "--server", "--id", "1", "--node", f"127.0.0.1:{endpoint}:1", "--durable", "--snapshots", "1", *extra]
+                args = [binary, "--server", "--id", "1", "--node", f"127.0.0.1:{endpoint}:1", "--durable", *(["--snapshots", "1"] if periodic else []), *extra]
                 child = subprocess.Popen(args, cwd=root, stdout=log, stderr=log, preexec_fn=no_core)
                 return child, endpoint
 
@@ -85,8 +85,9 @@ def main():
                     time.sleep(0.02)
                 else:
                     raise AssertionError("checkpoint was not published")
+                assert (root / "state.durable.1").read_bytes()[:8] == b"MRFTD002", "compacted durable image was not published"
                 stop(process)
-                process, endpoint = launch()
+                process, endpoint = launch(periodic=False)
                 with connect(process, endpoint) as sock:
                     _, value = request(sock, b"a")
                     assert value == b"persisted", value

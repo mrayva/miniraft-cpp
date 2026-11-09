@@ -156,10 +156,17 @@ TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes)
     , StateName(EState::FOLLOWER)
 {
     if (node <= 0 || !State) throw std::invalid_argument("Raft requires a positive ID and state");
+    // Equal seeds make simultaneously started voters campaign in lockstep.
+    // An odd multiplier gives every positive node ID a distinct nonzero stream.
+    Seed = uint32_t(node) * 0x9e3779b9u;
     for (const auto& [id, peer] : Nodes) {
         if (id == 0 || id == Id || !peer)
             throw std::invalid_argument("Invalid Raft peer configuration");
         VolatileState->NextIndex[id] = 1;
+    }
+    if (auto snapshot = State->GetSnapshot()) {
+        if (snapshot->Voters != GetVoterIds()) throw std::invalid_argument("Compacted state voter configuration mismatch");
+        VolatileState->CommitIndex = State->SnapshotIndex;
     }
 }
 
@@ -223,9 +230,9 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
     uint64_t matchIndex = 0;
     uint64_t commitIndex = VolatileState->CommitIndex;
     bool success = false;
-    if (message->PrevLogIndex == 0 ||
+    if (message->PrevLogIndex >= State->SnapshotIndex && (message->PrevLogIndex == 0 ||
         (message->PrevLogIndex <= State->LastLogIndex
-            && State->LogTerm(message->PrevLogIndex) == message->PrevLogTerm))
+            && State->LogTerm(message->PrevLogIndex) == message->PrevLogTerm)))
     {
         success = true;
         auto index = message->PrevLogIndex;
@@ -246,6 +253,7 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
         commitIndex = std::max(commitIndex, std::min(message->LeaderCommit, matchIndex));
     }
 
+    if (!success && message->PrevLogIndex < State->SnapshotIndex) matchIndex = State->SnapshotIndex;
     auto reply = NewHoldedMessage(
         TMessageEx {.Src = Id, .Dst = message->Src, .Term = State->CurrentTerm, .Seqno = message->Seqno},
         TAppendEntriesResponse {.MatchIndex = matchIndex, .Success = success});
@@ -290,6 +298,11 @@ void TRaft::OnAppendEntries(TMessageHolder<TAppendEntriesResponse> message) {
             .SetBatchSize(nodeId, 1024)
             .SetBackOff(nodeId, 1)
             .CommitAdvance(Nservers, *State);
+    } else if (message->MatchIndex > 0) {
+        // A compacted-prefix hint is not replication evidence. Probe its boundary
+        // with AppendEntries before advancing MatchIndex or confirming reads.
+        (*VolatileState).SetNextIndex(nodeId, std::max(VolatileState->MatchIndex[nodeId] + 1, message->MatchIndex + 1))
+            .SetRpcDue(nodeId, ITimeSource::Time{}).SetBatchSize(nodeId, 1).SetBackOff(nodeId, 1);
     } else {
         auto backOff = std::max(VolatileState->BackOff[nodeId], 1);
         auto nextIndex = VolatileState->NextIndex[nodeId] > backOff
@@ -360,6 +373,8 @@ void TRaft::Follower(ITimeSource::Time now, TMessageHolder<TMessage> message) {
         OnRequestVote(now, std::move(maybeRequestVote.Cast()));
     } else if (auto maybeAppendEntries = message.Maybe<TAppendEntriesRequest>()) {
         OnAppendEntries(now, std::move(maybeAppendEntries.Cast()));
+    } else if (auto snapshot = message.Maybe<TInstallSnapshotRequest>()) {
+        OnInstallSnapshot(now, snapshot.Cast());
     }
 }
 
@@ -370,16 +385,22 @@ void TRaft::Candidate(ITimeSource::Time now, TMessageHolder<TMessage> message) {
         OnRequestVote(now, std::move(maybeRequestVote.Cast()));
     } else if (auto maybeAppendEntries = message.Maybe<TAppendEntriesRequest>()) {
         OnAppendEntries(now, std::move(maybeAppendEntries.Cast()));
+    } else if (auto snapshot = message.Maybe<TInstallSnapshotRequest>()) {
+        OnInstallSnapshot(now, snapshot.Cast());
     }
 }
 
 void TRaft::Leader(ITimeSource::Time now, TMessageHolder<TMessage> message) {
-    if (auto maybeAppendEntries = message.Maybe<TAppendEntriesResponse>()) {
+    if (auto snapshot = message.Maybe<TInstallSnapshotResponse>()) {
+        OnInstallSnapshot(snapshot.Cast());
+    } else if (auto maybeAppendEntries = message.Maybe<TAppendEntriesResponse>()) {
         OnAppendEntries(std::move(maybeAppendEntries.Cast()));
     } else if (auto maybeVoteRequest = message.Maybe<TRequestVoteRequest>()) {
         OnRequestVote(now, std::move(maybeVoteRequest.Cast()));
     } else if (auto maybeAppendEntries = message.Maybe<TAppendEntriesRequest>()) {
         OnAppendEntries(now, std::move(maybeAppendEntries.Cast()));
+    } else if (auto snapshot = message.Maybe<TInstallSnapshotRequest>()) {
+        OnInstallSnapshot(now, snapshot.Cast());
     }
 }
 
@@ -398,6 +419,8 @@ void TRaft::Process(ITimeSource::Time now, TMessageHolder<TMessage> message, con
             State->VotedFor = 0;
             State->Commit();
             StateName = EState::FOLLOWER;
+            IncomingSnapshot.reset();
+            VolatileState->SnapshotRpcs.clear();
             VolatileState->LeaderId = 0;
             if (VolatileState->ElectionDue <= now || VolatileState->ElectionDue == ITimeSource::Max) {
                 VolatileState->ElectionDue = MakeElection(now);
@@ -438,7 +461,23 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
     case EMessageType::APPEND_ENTRIES_RESPONSE: {
         auto reply = message.Cast<TAppendEntriesResponse>();
         return reply->Success <= 1 && reply->MatchIndex <= maxIndex &&
-            (reply->Success ? reply->MatchIndex <= State->LastLogIndex : reply->MatchIndex == 0);
+            reply->MatchIndex <= State->LastLogIndex;
+    }
+    case EMessageType::INSTALL_SNAPSHOT_REQUEST: {
+        auto request = message.Cast<TInstallSnapshotRequest>();
+        const auto length = request->Len - sizeof(TInstallSnapshotRequest);
+        return request->LeaderId == header->Src && request->SnapshotIndex > 0 && request->SnapshotIndex <= maxIndex &&
+            request->SnapshotTerm > 0 && request->SnapshotTerm <= header->Term && request->Done <= 1 &&
+            request->TotalBytes >= 44 && request->TotalBytes <= TSnapshot::MaxBytes &&
+            request->Offset <= request->TotalBytes && length > 0 && length <= TInstallSnapshotRequest::MaxChunkBytes &&
+            length <= request->TotalBytes - request->Offset &&
+            bool(request->Done) == (request->Offset + length == request->TotalBytes);
+    }
+    case EMessageType::INSTALL_SNAPSHOT_RESPONSE: {
+        auto response = message.Cast<TInstallSnapshotResponse>();
+        return response->SnapshotIndex > 0 && response->SnapshotIndex <= maxIndex &&
+            response->NextOffset <= TSnapshot::MaxBytes && response->Success <= 1 && response->Installed <= 1 &&
+            (!response->Installed || response->Success) && (response->Success || response->NextOffset == 0);
     }
     case EMessageType::APPEND_ENTRIES_REQUEST: {
         auto append = message.Cast<TAppendEntriesRequest>();
@@ -452,7 +491,7 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
             if (!entry->Term || entry->Term < previousTerm || entry->Term > header->Term) return false;
             previousTerm = entry->Term;
             const auto index = append->PrevLogIndex + i + 1;
-            if (index <= VolatileState->CommitIndex && State->LogTerm(index) != entry->Term) return false;
+            if (index >= State->SnapshotIndex && index <= VolatileState->CommitIndex && State->LogTerm(index) != entry->Term) return false;
         }
         return true;
     }
@@ -483,7 +522,8 @@ void TRaft::LeaderTimeout(ITimeSource::Time now) {
         {
             VolatileState->HeartbeatDue[id] = now + TTimeout::Election / 2;
             VolatileState->RpcDue[id] = now + TTimeout::Rpc;
-            node->Send(CreateAppendEntries(id));
+            if (VolatileState->NextIndex[id] <= State->SnapshotIndex) node->Send(CreateInstallSnapshot(id));
+            else node->Send(CreateAppendEntries(id));
         }
     }
 
@@ -498,7 +538,8 @@ uint64_t TRaft::ApproveRead() {
     // emitted below is newer than this barrier; old replies cannot satisfy it.
     const uint64_t seqno = NextSeqno();
     for (auto& [id, node] : Nodes) {
-        node->Send(CreateAppendEntries(id));
+        if (VolatileState->NextIndex[id] <= State->SnapshotIndex) node->Send(CreateInstallSnapshot(id));
+        else node->Send(CreateAppendEntries(id));
     }
     return seqno;
 }
@@ -525,6 +566,7 @@ void TRaft::ProcessTimeout(ITimeSource::Time now) {
     if (StateName == EState::CANDIDATE || StateName == EState::FOLLOWER) {
         if (VolatileState->ElectionDue <= now) {
             if (State->CurrentTerm == UINT64_MAX) throw std::overflow_error("Raft term exhausted");
+            IncomingSnapshot.reset();
             auto nextVolatileState = std::make_unique<TVolatileState>();
             for (auto [id, _] : Nodes) {
                 nextVolatileState->NextIndex[id] = 1;
@@ -542,6 +584,7 @@ void TRaft::ProcessTimeout(ITimeSource::Time now) {
     if (StateName == EState::CANDIDATE) {
         int nvotes = VolatileState->Votes.size()+1;
         if (nvotes >= MinVotes) {
+            if (State->LastLogIndex >= uint64_t(INT64_MAX)) throw std::overflow_error("Raft log index exhausted");
             auto value = State->LastLogIndex+1;
             decltype(VolatileState->NextIndex) nextIndex;
             decltype(VolatileState->RpcDue) rpcDue;
@@ -614,6 +657,122 @@ std::vector<uint32_t> TRaft::GetVoterIds() const {
     return ids;
 }
 
+TSnapshot TRaft::Compact() {
+    if (!State->SupportsSnapshots()) throw std::logic_error("Storage cannot compact snapshots");
+    auto application = SnapshotApplication.lock();
+    if (!application) throw std::logic_error("Compaction requires a bound application");
+    if (application->LastAppliedIndex == State->SnapshotIndex && State->GetSnapshot()) return *State->GetSnapshot();
+    auto snapshot = CaptureSnapshot(*this, *application);
+    application->ValidateSnapshot(snapshot.Data, snapshot.Index);
+    State->InstallSnapshot(snapshot);
+    return snapshot;
+}
+
+TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t nodeId) {
+    auto snapshot = State->GetSnapshot();
+    if (!snapshot) throw std::logic_error("Missing snapshot for compacted log");
+    if (EncodedSnapshotIndex != snapshot->Index) {
+        EncodedSnapshot = std::make_shared<const std::string>(EncodeSnapshot(*snapshot));
+        EncodedSnapshotIndex = snapshot->Index;
+    }
+    auto& rpc = VolatileState->SnapshotRpcs[nodeId];
+    if (!rpc.Snapshot || rpc.Snapshot->Index != snapshot->Index) {
+        rpc = TVolatileState::TSnapshotRpc{snapshot, EncodedSnapshot};
+        VolatileState->PendingAppendRpcs[nodeId].clear();
+    }
+    const auto count = std::min<uint64_t>(TInstallSnapshotRequest::MaxChunkBytes, rpc.Bytes->size() - rpc.Offset);
+    auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
+    request->Src = Id; request->Dst = nodeId; request->Term = State->CurrentTerm;
+    request->Seqno = rpc.Seqno = NextSeqno();
+    request->SnapshotIndex = snapshot->Index; request->SnapshotTerm = snapshot->Term;
+    request->Offset = rpc.Offset; request->TotalBytes = rpc.Bytes->size();
+    rpc.SentEnd = rpc.Offset + count;
+    request->Done = rpc.SentEnd == rpc.Bytes->size(); request->LeaderId = Id;
+    memcpy(request->Data, rpc.Bytes->data() + rpc.Offset, count);
+    return request;
+}
+
+void TRaft::OnInstallSnapshot(TMessageHolder<TInstallSnapshotResponse> response) {
+    if (response->Term != State->CurrentTerm) return;
+    auto found = VolatileState->SnapshotRpcs.find(response->Src);
+    if (found == VolatileState->SnapshotRpcs.end()) return;
+    auto& rpc = found->second;
+    if (response->Seqno != rpc.Seqno || response->SnapshotIndex != rpc.Snapshot->Index) return;
+    if (!response->Success) {
+        rpc.Offset = 0;
+    } else if (response->Installed) {
+        if (response->NextOffset != rpc.Bytes->size()) return;
+        const auto index = std::max(VolatileState->MatchIndex[response->Src], response->SnapshotIndex);
+        (*VolatileState).SetMatchIndex(response->Src, index).SetNextIndex(response->Src, index + 1)
+            .SetBatchSize(response->Src, 1024).SetBackOff(response->Src, 1).CommitAdvance(Nservers, *State);
+        VolatileState->SnapshotRpcs.erase(found);
+        // Snapshot completion is not a fresh-read acknowledgement. AppendEntries
+        // must still establish the next read barrier and replicate the suffix.
+    } else {
+        if (response->NextOffset < rpc.SentEnd || response->NextOffset >= rpc.Bytes->size()) return;
+        rpc.Offset = response->NextOffset;
+    }
+    VolatileState->RpcDue[response->Src] = ITimeSource::Time{};
+}
+
+void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnapshotRequest> request) {
+    auto reply = [&](bool success, bool installed, uint64_t offset) {
+        Nodes.at(request->Src)->Send(NewHoldedMessage(
+            TMessageEx{.Src = Id, .Dst = request->Src, .Term = State->CurrentTerm, .Seqno = request->Seqno},
+            TInstallSnapshotResponse{.SnapshotIndex = request->SnapshotIndex, .NextOffset = offset,
+                .Success = uint32_t(success), .Installed = uint32_t(installed)}));
+    };
+    if (request->Term < State->CurrentTerm) { reply(false, false, 0); return; }
+    Become(EState::FOLLOWER);
+    VolatileState->LeaderId = request->LeaderId;
+    VolatileState->ElectionDue = MakeElection(now);
+    if (request->SnapshotIndex <= VolatileState->CommitIndex) {
+        const auto term = State->LogTerm(request->SnapshotIndex);
+        const bool covered = request->SnapshotIndex < State->SnapshotIndex || term == request->SnapshotTerm;
+        if (IncomingSnapshot && IncomingSnapshot->Index <= VolatileState->CommitIndex) IncomingSnapshot.reset();
+        reply(covered, covered, covered ? request->TotalBytes : 0);
+        return;
+    }
+    auto application = SnapshotApplication.lock();
+    if (!State->SupportsSnapshots() || !application) { reply(false, false, 0); return; }
+    const bool same = IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
+        IncomingSnapshot->Leader == request->LeaderId && IncomingSnapshot->Index == request->SnapshotIndex &&
+        IncomingSnapshot->BoundaryTerm == request->SnapshotTerm && IncomingSnapshot->Total == request->TotalBytes;
+    if (!same) {
+        if (request->Offset != 0 || (IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
+            IncomingSnapshot->Index > request->SnapshotIndex)) { reply(false, false, 0); return; }
+        IncomingSnapshot = TIncomingSnapshot{request->Term, request->SnapshotIndex, request->SnapshotTerm,
+            request->TotalBytes, request->LeaderId, {}};
+    }
+    auto& bytes = IncomingSnapshot->Bytes;
+    const auto count = request->Len - sizeof(TInstallSnapshotRequest);
+    if (request->Offset > bytes.size()) { reply(false, false, 0); return; }
+    if (request->Offset < bytes.size()) {
+        if (count > bytes.size() - request->Offset ||
+            std::string_view(bytes).substr(request->Offset, count) != std::string_view(request->Data, count)) {
+            IncomingSnapshot.reset(); reply(false, false, 0); return;
+        }
+    } else bytes.append(request->Data, count);
+    if (bytes.size() < request->TotalBytes) { reply(true, false, bytes.size()); return; }
+    TSnapshot snapshot;
+    try {
+        snapshot = DecodeSnapshot(bytes);
+        if (snapshot.Index != request->SnapshotIndex || snapshot.Term != request->SnapshotTerm || snapshot.Voters != GetVoterIds())
+            throw TMessageError("Snapshot metadata mismatch");
+        application->ValidateSnapshot(snapshot.Data, snapshot.Index);
+    } catch (const std::exception&) {
+        IncomingSnapshot.reset(); reply(false, false, 0); return;
+    }
+    try {
+        State->InstallSnapshot(snapshot); // durable snapshot and suffix before application replacement or ACK
+        application->LoadSnapshot(snapshot.Data, snapshot.Index);
+        if (application->LastAppliedIndex != snapshot.Index) std::terminate();
+    } catch (...) { std::terminate(); }
+    VolatileState->CommitIndex = snapshot.Index;
+    IncomingSnapshot.reset();
+    reply(true, true, request->TotalBytes);
+}
+
 void TRaft::RestoreAppliedIndex(uint64_t index) {
     if (index > uint64_t(INT64_MAX) || index > State->LastLogIndex)
         throw std::invalid_argument("Application progress exceeds recovered Raft log");
@@ -626,7 +785,12 @@ TRequestProcessor::TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_pt
     : Raft(std::move(raft)), Rsm(std::move(rsm)), Nodes(nodes)
 {
     if (!Raft || !Rsm) throw std::invalid_argument("Request processor requires Raft and application state");
+    if (auto snapshot = Raft->GetState()->GetSnapshot(); snapshot && Rsm->LastAppliedIndex == 0)
+        RestoreSnapshot(*snapshot, *Raft, *Rsm);
+    if (Rsm->LastAppliedIndex < Raft->GetState()->SnapshotIndex)
+        throw std::invalid_argument("Application progress precedes compacted log");
     Raft->RestoreAppliedIndex(Rsm->LastAppliedIndex);
+    Raft->SnapshotApplication = Rsm;
 }
 
 void TRequestProcessor::CheckStateChange() {

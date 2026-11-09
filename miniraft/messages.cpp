@@ -14,6 +14,12 @@ void ValidateMessageHeader(uint32_t type, uint32_t length, const TMessageLimits&
     case EMessageType::REQUEST_VOTE_RESPONSE: minimum = sizeof(TRequestVoteResponse); break;
     case EMessageType::APPEND_ENTRIES_REQUEST: minimum = sizeof(TAppendEntriesRequest); break;
     case EMessageType::APPEND_ENTRIES_RESPONSE: minimum = sizeof(TAppendEntriesResponse); break;
+    case EMessageType::INSTALL_SNAPSHOT_REQUEST:
+        minimum = sizeof(TInstallSnapshotRequest) + 1;
+        if (length > sizeof(TInstallSnapshotRequest) + TInstallSnapshotRequest::MaxChunkBytes)
+            throw TMessageError("Snapshot chunk exceeds byte limit");
+        fixed = false; break;
+    case EMessageType::INSTALL_SNAPSHOT_RESPONSE: minimum = sizeof(TInstallSnapshotResponse); break;
     case EMessageType::COMMAND_REQUEST: minimum = sizeof(TCommandRequest); fixed = false; break;
     case EMessageType::COMMAND_RESPONSE: minimum = sizeof(TCommandResponse); fixed = false; break;
     default: throw TMessageError("Unknown or unsupported message type");
