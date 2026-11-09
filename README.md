@@ -37,6 +37,9 @@ and tail-only application recovery with `--durable --snapshots N`. Logs remain
 fully retained in that baseline. The [compaction follow-up](docs/compaction.md)
 enables prefix deletion and chunked InstallSnapshot catch-up; fixed membership
 remains required. Upgrade all voters before enabling the new compaction behavior.
+The [learner follow-up](docs/learners.md) adds non-voting catch-up and durable
+voter binding. KV uses `--learner id` on every replica's configuration. Promotion
+and joint-consensus voter changes remain disabled.
 
 [![Number of GitHub stars](https://img.shields.io/github/stars/resetius/miniraft-cpp)](https://github.com/resetius/miniraft-cpp/stargazers)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/resetius/miniraft-cpp)

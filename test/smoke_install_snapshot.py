@@ -7,11 +7,12 @@ import sys
 import tempfile
 import time
 sys.dont_write_bytecode = True
-from smoke_kv_checkpoints import no_core, port, request
+from smoke_kv_checkpoints import no_core, port, request, snapshot_boundary
 
 
 def main():
     binary = str(pathlib.Path(sys.argv[1]).resolve())
+    learner_mode = len(sys.argv) > 2 and sys.argv[2] == "learner"
     with tempfile.TemporaryDirectory(prefix="miniraft-install-snapshot-") as temporary:
         root = pathlib.Path(temporary)
         ports = []
@@ -28,10 +29,12 @@ def main():
             logs.append((directory / "output.log").open("w+"))
         processes = [None] * 3
 
-        def start(index):
+        def start(index, use_role=True):
             args = [binary, "--server", "--id", str(index + 1), "--durable"]
             for node, endpoint in enumerate(ports):
                 args += ["--node", f"127.0.0.1:{endpoint}:{node + 1}"]
+            if learner_mode and use_role:
+                args += ["--learner", "3"]
             if index < 2:
                 args += ["--snapshots", "1"]
             processes[index] = subprocess.Popen(args, cwd=directories[index], stdout=logs[index], stderr=logs[index], preexec_fn=no_core)
@@ -71,7 +74,7 @@ def main():
                     durable = directories[index] / f"state.durable.{index + 1}"
                     if not image.exists() or struct.unpack("<Q", image.read_bytes()[8:16])[0] < last[0]:
                         return False
-                    if durable.read_bytes()[:8] != b"MRFTD002":
+                    if snapshot_boundary(durable) < last[0]:
                         return False
                 return True
             wait_for(compacted, 15)
@@ -87,7 +90,7 @@ def main():
 
             def caught_up():
                 durable = directories[2] / "state.durable.3"
-                return durable.exists() and durable.read_bytes()[:8] == b"MRFTD002" and all(call(2, key)[1] == value for key, value in values.items())
+                return durable.exists() and snapshot_boundary(durable) > 0 and all(call(2, key)[1] == value for key, value in values.items())
             wait_for(caught_up, 25)
             # Node 3 has no periodic snapshotting: its compacted image necessarily
             # came from the InstallSnapshot RPC, not a local checkpoint timer.
@@ -96,13 +99,20 @@ def main():
             wait_for(lambda: call(2, b"tail")[1] == b"after install", 15)
             processes[2].terminate()
             processes[2].wait(timeout=5)
+            if learner_mode:
+                durable = directories[2] / "state.durable.3"
+                before = durable.read_bytes()
+                assert struct.unpack("<I", before[28:32])[0] == 0, "learner persisted a vote"
+                start(2, use_role=False)
+                assert processes[2].wait(timeout=5) != 0, "restart must not promote a learner"
+                assert durable.read_bytes() == before
             start(2)
             wait_for(lambda: caught_up() and call(2, b"tail")[1] == b"after install", 25)
             for log in logs:
                 log.flush(); log.seek(0)
                 output = log.read()
                 assert "ERROR: AddressSanitizer" not in output and "runtime error:" not in output, output
-            print("InstallSnapshot CLI: compacted majority, empty follower catch-up, tail replication and durable restart passed")
+            print(("Learner" if learner_mode else "InstallSnapshot") + " CLI: compacted majority, empty-node catch-up, tail replication and durable restart passed")
         except Exception:
             for index, log in enumerate(logs):
                 log.flush(); log.seek(0)

@@ -99,6 +99,19 @@ TVolatileState& TVolatileState::CommitAdvance(int nservers, const IState& state)
     return *this;
 }
 
+TVolatileState& TVolatileState::CommitAdvance(const std::vector<uint32_t>& voters, uint32_t self, const IState& state) {
+    ValidateFixedVoters(voters);
+    Indices.clear();
+    for (auto id : voters) {
+        auto match = MatchIndex.find(id);
+        Indices.push_back(id == self ? state.LastLogIndex : match == MatchIndex.end() ? 0 : match->second);
+    }
+    std::sort(Indices.begin(), Indices.end());
+    const auto index = std::max(CommitIndex, Indices[(voters.size() - 1) / 2]);
+    if (state.LogTerm(index) == state.CurrentTerm) CommitIndex = index;
+    return *this;
+}
+
 TVolatileState& TVolatileState::SetNextIndex(uint32_t id, uint64_t nextIndex)
 {
     NextIndex[id] = nextIndex;
@@ -145,12 +158,12 @@ TVolatileState& TVolatileState::SetCommitIndex(uint64_t index)
     return *this;
 }
 
-TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes)
+TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes, std::vector<uint32_t> learners)
     : Id(node)
     , Nodes(nodes)
-    , MinVotes((nodes.size()+2+nodes.size()%2)/2)
+    , MinVotes(0) // derived from voting IDs after role validation
     , Npeers(nodes.size())
-    , Nservers(nodes.size()+1)
+    , Nservers(0)
     , State(std::move(state))
     , VolatileState(std::make_unique<TVolatileState>())
     , StateName(EState::FOLLOWER)
@@ -164,6 +177,28 @@ TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes)
             throw std::invalid_argument("Invalid Raft peer configuration");
         VolatileState->NextIndex[id] = 1;
     }
+    Learners = std::move(learners);
+    std::sort(Learners.begin(), Learners.end());
+    uint32_t previous = 0;
+    for (auto id : Learners) {
+        if (id <= previous || (id != Id && !Nodes.contains(id)))
+            throw std::invalid_argument("Invalid or duplicate learner ID");
+        previous = id;
+    }
+    if (!std::binary_search(Learners.begin(), Learners.end(), Id)) Voters.push_back(Id);
+    for (const auto& [id, _] : Nodes)
+        if (!std::binary_search(Learners.begin(), Learners.end(), id)) Voters.push_back(id);
+    std::sort(Voters.begin(), Voters.end());
+    ValidateFixedVoters(Voters);
+    if (!IsVoter(Id) && State->VotedFor)
+        throw std::invalid_argument("A learner store must not contain a vote");
+    Nservers = Voters.size(); MinVotes = Nservers / 2 + 1;
+    if (!Learners.empty() && !State->SupportsVoterBinding())
+        throw std::invalid_argument("Learners require voter-binding-capable storage");
+    const auto bound = State->GetBoundVoters();
+    const bool fresh = State->CurrentTerm == 1 && !State->VotedFor && !State->LastLogIndex;
+    if (State->SupportsVoterBinding() && (!bound.empty() || fresh || State->GetSnapshot() || !Learners.empty()))
+        State->BindVoters(Voters);
     if (auto snapshot = State->GetSnapshot()) {
         if (snapshot->Voters != GetVoterIds()) throw std::invalid_argument("Compacted state voter configuration mismatch");
         VolatileState->CommitIndex = State->SnapshotIndex;
@@ -171,6 +206,11 @@ TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes)
 }
 
 void TRaft::OnRequestVote(ITimeSource::Time now, TMessageHolder<TRequestVoteRequest> message) {
+    if (!IsVoter(Id)) {
+        Nodes.at(message->Src)->Send(NewHoldedMessage(
+            TMessageEx{.Src = Id, .Dst = message->Src, .Term = State->CurrentTerm}, TRequestVoteResponse{.VoteGranted = false}));
+        return;
+    }
     if (message->Term < State->CurrentTerm) {
         auto reply = NewHoldedMessage(
             TMessageEx {.Src = Id, .Dst = message->Src, .Term = State->CurrentTerm},
@@ -297,7 +337,7 @@ void TRaft::OnAppendEntries(TMessageHolder<TAppendEntriesResponse> message) {
             .SetRpcDue(nodeId, ITimeSource::Time{})
             .SetBatchSize(nodeId, 1024)
             .SetBackOff(nodeId, 1)
-            .CommitAdvance(Nservers, *State);
+            .CommitAdvance(Voters, Id, *State);
     } else if (message->MatchIndex > 0) {
         // A compacted-prefix hint is not replication evidence. Probe its boundary
         // with AppendEntries before advancing MatchIndex or confirming reads.
@@ -405,6 +445,8 @@ void TRaft::Leader(ITimeSource::Time now, TMessageHolder<TMessage> message) {
 }
 
 void TRaft::Become(EState newStateName) {
+    if (!IsVoter(Id) && (newStateName == EState::CANDIDATE || newStateName == EState::LEADER))
+        throw std::logic_error("A learner cannot campaign or lead");
     if (StateName != newStateName) {
         StateName = newStateName;
     }
@@ -448,6 +490,11 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
     try { ValidateMessageTree(message); } catch (const TMessageError&) { return false; }
     auto header = message.Cast<TMessageEx>();
     if (header->Dst != Id || !Nodes.contains(header->Src)) return false;
+    if (!IsVoter(header->Src)) {
+        if ((header->Type != uint32_t(EMessageType::APPEND_ENTRIES_RESPONSE) &&
+             header->Type != uint32_t(EMessageType::INSTALL_SNAPSHOT_RESPONSE)) || header->Term != State->CurrentTerm)
+            return false; // Nonvoters cannot campaign, lead or force a term change.
+    }
     constexpr uint64_t maxIndex = INT64_MAX;
     switch (EMessageType(message->Type)) {
     case EMessageType::REQUEST_VOTE_REQUEST: {
@@ -507,6 +554,7 @@ void TRaft::FollowerTimeout(ITimeSource::Time now) {
 
 void TRaft::CandidateTimeout(ITimeSource::Time now) {
     for (auto& [id, node] : Nodes) {
+        if (!IsVoter(id)) continue;
         if (VolatileState->RpcDue[id] <= now) {
             VolatileState->RpcDue[id] = now + TTimeout::Rpc;
             node->Send(CreateVote(id));
@@ -528,7 +576,7 @@ void TRaft::LeaderTimeout(ITimeSource::Time now) {
     }
 
     if (Nservers == 1) {
-        VolatileState->CommitAdvance(Nservers, *State);
+        VolatileState->CommitAdvance(Voters, Id, *State);
     }
 }
 
@@ -549,7 +597,8 @@ uint64_t TRaft::CommitSeqno() const {
         State->LogTerm(VolatileState->CommitIndex) != State->CurrentTerm) return 0;
     std::vector<uint64_t> acknowledgements{Seqno - 1}; // leader's own confirmation
     acknowledgements.reserve(Nservers);
-    for (const auto& [id, _] : Nodes) {
+    for (auto id : Voters) {
+        if (id == Id) continue;
         auto it = VolatileState->ReadAckSeqno.find(id);
         acknowledgements.push_back(it == VolatileState->ReadAckSeqno.end() ? 0 : it->second);
     }
@@ -563,6 +612,7 @@ uint64_t TRaft::NextSeqno() {
 }
 
 void TRaft::ProcessTimeout(ITimeSource::Time now) {
+    if (!IsVoter(Id)) return;
     if (StateName == EState::CANDIDATE || StateName == EState::FOLLOWER) {
         if (VolatileState->ElectionDue <= now) {
             if (State->CurrentTerm == UINT64_MAX) throw std::overflow_error("Raft term exhausted");
@@ -633,6 +683,7 @@ ITimeSource::Time TRaft::MakeElection(ITimeSource::Time now) {
 }
 
 uint64_t TRaft::Append(TMessageHolder<TLogEntry> entry) {
+    if (!IsVoter(Id)) throw std::logic_error("A learner cannot propose log entries");
     if (State->LastLogIndex >= uint64_t(INT64_MAX)) throw std::overflow_error("Raft log index exhausted");
     if (!entry || entry->Type != uint32_t(EMessageType::LOG_ENTRY))
         throw TMessageError("Invalid proposed log entry");
@@ -650,11 +701,15 @@ uint64_t TRaft::GetLastIndex() const {
     return State->LastLogIndex;
 }
 
-std::vector<uint32_t> TRaft::GetVoterIds() const {
-    std::vector<uint32_t> ids{Id};
-    for (const auto& [id, _] : Nodes) ids.push_back(id);
-    std::sort(ids.begin(), ids.end());
-    return ids;
+std::vector<uint32_t> TRaft::GetVoterIds() const { return Voters; }
+
+bool TRaft::IsVoter(uint32_t id) const { return std::binary_search(Voters.begin(), Voters.end(), id); }
+
+bool TRaft::IsLearnerCaughtUp(uint32_t id) const {
+    if (StateName != EState::LEADER || !std::binary_search(Learners.begin(), Learners.end(), id) ||
+        VolatileState->CommitIndex == 0 || State->LogTerm(VolatileState->CommitIndex) != State->CurrentTerm) return false;
+    auto match = VolatileState->MatchIndex.find(id);
+    return match != VolatileState->MatchIndex.end() && match->second >= State->LastLogIndex;
 }
 
 TSnapshot TRaft::Compact() {
@@ -704,7 +759,7 @@ void TRaft::OnInstallSnapshot(TMessageHolder<TInstallSnapshotResponse> response)
         if (response->NextOffset != rpc.Bytes->size()) return;
         const auto index = std::max(VolatileState->MatchIndex[response->Src], response->SnapshotIndex);
         (*VolatileState).SetMatchIndex(response->Src, index).SetNextIndex(response->Src, index + 1)
-            .SetBatchSize(response->Src, 1024).SetBackOff(response->Src, 1).CommitAdvance(Nservers, *State);
+            .SetBatchSize(response->Src, 1024).SetBackOff(response->Src, 1).CommitAdvance(Voters, Id, *State);
         VolatileState->SnapshotRpcs.erase(found);
         // Snapshot completion is not a fresh-read acknowledgement. AppendEntries
         // must still establish the next read barrier and replicate the suffix.

@@ -23,6 +23,9 @@ public:
     bool SupportsSnapshots() const override { return true; }
     std::shared_ptr<const TSnapshot> GetSnapshot() const override;
     void InstallSnapshot(const TSnapshot& snapshot) override;
+    bool SupportsVoterBinding() const override { return true; }
+    std::vector<uint32_t> GetBoundVoters() const override;
+    void BindVoters(const std::vector<uint32_t>& voters) override;
 private:
     struct TImpl;
     std::unique_ptr<TImpl> Impl;

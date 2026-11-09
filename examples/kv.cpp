@@ -114,7 +114,7 @@ NNet::TVoidTask CheckpointLoop(TPoller& poller, std::shared_ptr<TRaft> raft,
 }
 
 void usage(const char* prog) {
-    std::cerr << prog << "--client|--server --id myid --node ip:port:id [--node ip:port:id ...] [--persist|--durable] [--snapshots entries] [--stale] [--consistent]" << "\n";
+    std::cerr << prog << "--client|--server --id myid --node ip:port:id [--node ip:port:id ...] [--persist|--durable] [--snapshots entries] [--learner id ...] [--stale] [--consistent]" << "\n";
     exit(0);
 }
 
@@ -123,6 +123,7 @@ int main(int argc, char** argv) {
     std::vector<THost> hosts;
     THost myHost;
     TNodeDict nodes;
+    std::vector<uint32_t> learners;
     uint32_t id = 0;
     bool server = false;
     bool persist = false;
@@ -149,6 +150,15 @@ int main(int argc, char** argv) {
             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || !snapshotInterval) {
                 std::cerr << "--snapshots requires a positive entry interval\n"; return 1;
             }
+        } else if (!strcmp(argv[i], "--learner")) {
+            if (i + 1 >= argc) { std::cerr << "--learner requires a positive node ID\n"; return 1; }
+            const std::string_view value(argv[++i]);
+            uint32_t learner = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), learner);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || !learner) {
+                std::cerr << "--learner requires a positive node ID\n"; return 1;
+            }
+            learners.push_back(learner);
         } else if (!strcmp(argv[i], "--stale")) {
             flags |= TCommandRequest::EStale;
         } else if (!strcmp(argv[i], "--consistent")) {
@@ -158,6 +168,9 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (!learners.empty() && (!server || !durable)) {
+        std::cerr << "--learner requires --server --durable\n"; return 1;
+    }
     if (snapshotInterval && (!server || !durable)) {
         std::cerr << "--snapshots requires --server --durable\n"; return 1;
     }
@@ -166,7 +179,9 @@ int main(int argc, char** argv) {
     NNet::TLoop<TPoller> loop;
 
     if (server) {
+        std::unordered_set<uint32_t> hostIds;
         for (auto& host : hosts) {
+            if (!hostIds.insert(host.Id).second) { std::cerr << "Duplicate node ID\n"; return 1; }
             if (!host) {
                 std::cerr << "Empty host\n"; return 1;
             }
@@ -191,7 +206,7 @@ int main(int argc, char** argv) {
             if (durable) state = std::make_shared<TDurableState>("state", myHost.Id);
             else state = std::make_shared<TDiskState>("state", myHost.Id);
         }
-        auto raft = std::make_shared<TRaft>(state, myHost.Id, nodes);
+        auto raft = std::make_shared<TRaft>(state, myHost.Id, nodes, learners);
         std::shared_ptr<TSnapshotStore> snapshots;
         uint64_t savedSnapshot = state->SnapshotIndex;
         if (snapshotInterval) {
