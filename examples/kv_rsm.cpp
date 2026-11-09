@@ -2,6 +2,9 @@
 #include "kv_messages.h"
 #include "payload_validation.h"
 #include <string_view>
+#include <algorithm>
+#include <climits>
+#include <miniraft/snapshot_codec.h>
 
 void TKv::Validate(TMessageHolder<TCommandRequest> message) const {
     if (!message || message->Len < sizeof(TCommandRequest)) throw TMessageError("Short KV command");
@@ -67,5 +70,48 @@ TMessageHolder<TLogEntry> TKv::Prepare(TMessageHolder<TCommandRequest> command) 
     auto entry = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry)+dataSize);
     memcpy(entry->Data, command->Data, dataSize);
     return entry;
+}
+
+std::string TKv::SaveSnapshot() const {
+    using namespace NSnapshotCodec;
+    std::vector<std::string_view> keys;
+    for (const auto& [key, _] : H) keys.push_back(key);
+    std::sort(keys.begin(), keys.end());
+    std::string bytes = "MRKV0001";
+    Put(bytes, H.size(), 8);
+    for (auto key : keys) {
+        const auto& value = H.at(std::string(key));
+        if (key.size() > UINT16_MAX || value.size() > UINT16_MAX)
+            throw std::runtime_error("KV snapshot field too large");
+        Put(bytes, key.size(), 4);
+        Put(bytes, value.size(), 4);
+        Append(bytes, key);
+        Append(bytes, value);
+    }
+    return bytes;
+}
+
+void TKv::LoadSnapshot(std::string_view bytes, uint64_t index) {
+    using namespace NSnapshotCodec;
+    if (!index || index > uint64_t(INT64_MAX) || index < LastAppliedIndex || bytes.size() > TSnapshot::MaxBytes)
+        throw std::runtime_error("Invalid KV snapshot progress/size");
+    TReader reader{bytes};
+    if (reader.Read(8) != "MRKV0001") throw std::runtime_error("Unknown KV snapshot format");
+    const auto count = reader.Take(8);
+    if (count > reader.Input.size() / 8) throw std::runtime_error("Invalid KV snapshot count");
+    std::unordered_map<std::string, std::string> candidate;
+    std::string_view previous;
+    for (uint64_t i = 0; i < count; ++i) {
+        const auto keyLength = reader.Take(4), valueLength = reader.Take(4);
+        if (keyLength > UINT16_MAX || valueLength > UINT16_MAX)
+            throw std::runtime_error("KV snapshot field exceeds application limits");
+        const auto key = reader.Read(keyLength), value = reader.Read(valueLength);
+        if (!valueLength || (i && key <= previous)) throw std::runtime_error("Invalid KV snapshot order/value");
+        candidate.emplace(std::string(key), std::string(value));
+        previous = key;
+    }
+    if (!reader.Input.empty()) throw std::runtime_error("Trailing KV snapshot bytes");
+    H.swap(candidate);
+    LastAppliedIndex = index;
 }
 

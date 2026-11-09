@@ -1,0 +1,304 @@
+#include <miniraft/snapshot.h>
+#include <miniraft/snapshot_codec.h>
+#include <miniraft/raft.h>
+#include <miniraft/durable.h>
+#include "../examples/kv.h"
+#include "../examples/kv_messages.h"
+#include <filesystem>
+#include <fstream>
+#include <chrono>
+#include <iterator>
+#ifdef __linux__
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+#include <stdarg.h>
+#include <stddef.h>
+#include <setjmp.h>
+extern "C" {
+#include <cmocka.h>
+}
+
+namespace {
+template<class F> void Reject(F action) {
+    bool rejected = false;
+    try { action(); } catch (const std::exception&) { rejected = true; }
+    assert_true(rejected);
+}
+struct TSink : INode { void Send(TMessageHolder<TMessage>) override {} void Drain() override {} };
+TMessageHolder<TWriteKv> Command(const std::string& key, const std::string& value) {
+    auto command = NewHoldedMessage<TWriteKv>(sizeof(TWriteKv) + key.size() + value.size());
+    command->Flags = TCommandRequest::EWrite;
+    command->KeySize = key.size();
+    command->ValSize = value.size();
+    memcpy(command->TKvEntry::Data, key.data(), key.size());
+    memcpy(command->TKvEntry::Data + key.size(), value.data(), value.size());
+    return command;
+}
+std::string Read(TKv& kv, const std::string& key) {
+    auto command = NewHoldedMessage<TReadKv>(sizeof(TReadKv) + key.size());
+    command->KeySize = key.size();
+    memcpy(command->Data, key.data(), key.size());
+    auto reply = kv.Read(command, kv.LastAppliedIndex).Cast<TCommandResponse>();
+    return std::string(reply->Data, reply->Len - sizeof(TCommandResponse));
+}
+void Apply(TKv& kv, const std::string& key, const std::string& value, uint64_t index) {
+    kv.Write(kv.Prepare(Command(key, value)), index);
+}
+TSnapshot Sample() { return {2, 1, {1, 2, 3}, std::string("a\0b", 3)}; }
+void FixChecksum(std::string& bytes) {
+    bytes.resize(bytes.size() - 4);
+    NSnapshotCodec::Put(bytes, NSnapshotCodec::Checksum(bytes), 4);
+}
+struct TFiles {
+    std::filesystem::path Directory;
+    std::string Name;
+    TFiles() {
+        static unsigned next = 0;
+        Directory = std::filesystem::temp_directory_path() / ("miniraft-snapshot-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" + std::to_string(next++));
+        assert_true(std::filesystem::create_directory(Directory));
+        Name = (Directory / "raft").string();
+    }
+    ~TFiles() { std::error_code ignored; std::filesystem::remove_all(Directory, ignored); }
+    std::string Image() const { return Name + ".snapshot.1"; }
+};
+void test_snapshot_codec_roundtrip_and_all_byte_corruption(void**) {
+    const auto original = Sample();
+    const auto encoded = EncodeSnapshot(original);
+    assert_true(DecodeSnapshot(encoded) == original);
+    for (size_t i = 0; i < encoded.size(); ++i) {
+        auto damaged = encoded;
+        damaged[i] ^= 1;
+        Reject([&] { DecodeSnapshot(damaged); });
+        Reject([&] { DecodeSnapshot(std::string_view(encoded).substr(0, i)); });
+    }
+}
+void test_snapshot_metadata_and_declared_lengths_are_bounded(void**) {
+    auto snapshot = Sample();
+    for (uint64_t index : {uint64_t(0), UINT64_MAX}) {
+        auto bad = snapshot; bad.Index = index;
+        Reject([&] { EncodeSnapshot(bad); });
+    }
+    for (auto voters : {std::vector<uint32_t>{}, std::vector<uint32_t>{0, 1},
+         std::vector<uint32_t>{1, 1}, std::vector<uint32_t>{2, 1}}) {
+        auto bad = snapshot; bad.Voters = voters;
+        Reject([&] { EncodeSnapshot(bad); });
+    }
+    auto bad = snapshot; bad.Term = 0;
+    Reject([&] { EncodeSnapshot(bad); });
+    for (size_t offset : {size_t(0), size_t(8), size_t(16), size_t(24), size_t(28)}) {
+        auto damaged = EncodeSnapshot(snapshot);
+        for (size_t i = offset; i < offset + (offset == 24 ? 4 : 8); ++i) damaged[i] = char(0xff);
+        FixChecksum(damaged); // Exercise semantic validation, not just CRC rejection.
+        if (offset == 16) {
+            // Terms are full-width; UINT64_MAX is valid in the codec.
+            assert_true(DecodeSnapshot(damaged).Term == UINT64_MAX);
+        } else Reject([&] { DecodeSnapshot(damaged); });
+    }
+}
+void test_kv_snapshot_is_canonical_and_binary_safe(void**) {
+    TKv a, b;
+    const std::string binary("a\0z", 3);
+    Apply(a, "z", "last", 1); Apply(a, "a", binary, 2); Apply(a, "gone", "remove", 3); Apply(a, "gone", {}, 4);
+    Apply(b, "a", binary, 1); Apply(b, "z", "last", 2);
+    assert_true(a.SaveSnapshot() == b.SaveSnapshot());
+    TKv restored;
+    restored.LoadSnapshot(a.SaveSnapshot(), 4);
+    assert_int_equal(restored.LastAppliedIndex, 4);
+    assert_true(Read(restored, "a") == binary);
+    assert_true(Read(restored, "z") == "last");
+    assert_true(Read(restored, "gone").empty());
+}
+void test_kv_invalid_snapshot_preserves_existing_state_and_progress(void**) {
+    TKv source, target;
+    Apply(source, "a", "one", 1); Apply(source, "b", "two", 2);
+    Apply(target, "old", "preserved", 1);
+    const auto bytes = source.SaveSnapshot();
+    for (size_t size = 0; size < bytes.size(); ++size) {
+        Reject([&] { target.LoadSnapshot(std::string_view(bytes).substr(0, size), 2); });
+        assert_true(Read(target, "old") == "preserved");
+        assert_int_equal(target.LastAppliedIndex, 1);
+    }
+    auto trailing = bytes + "x";
+    Reject([&] { target.LoadSnapshot(trailing, 2); });
+    auto duplicate = bytes;
+    duplicate[36] = 'a'; // second record's key; duplicate canonical key must fail
+    Reject([&] { target.LoadSnapshot(duplicate, 2); });
+    std::string oversized = "MRKV0001";
+    NSnapshotCodec::Put(oversized, 1, 8);
+    NSnapshotCodec::Put(oversized, 1, 4);
+    NSnapshotCodec::Put(oversized, uint64_t(UINT16_MAX) + 1, 4);
+    NSnapshotCodec::Append(oversized, "a");
+    NSnapshotCodec::Append(oversized, std::string(size_t(UINT16_MAX) + 1, 'x'));
+    Reject([&] { target.LoadSnapshot(oversized, 2); });
+    assert_true(Read(target, "old") == "preserved");
+    assert_int_equal(target.LastAppliedIndex, 1);
+}
+void test_capture_requires_committed_applied_progress(void**) {
+    auto state = std::make_shared<TState>();
+    TRaft raft(state, 1, {});
+    TKv kv;
+    Reject([&] { CaptureSnapshot(raft, kv); });
+    auto entry = kv.Prepare(Command("a", "one"));
+    state->Append(entry);
+    kv.Write(entry, 1);
+    Reject([&] { CaptureSnapshot(raft, kv); });
+    const_cast<TVolatileState*>(raft.GetVolatileState())->CommitIndex = 1;
+    const auto snapshot = CaptureSnapshot(raft, kv);
+    assert_int_equal(snapshot.Index, 1);
+    assert_int_equal(snapshot.Term, 1);
+    assert_true(snapshot.Voters == std::vector<uint32_t>{1});
+}
+void test_restore_rejects_mismatched_log_configuration_and_used_application(void**) {
+    auto state = std::make_shared<TState>();
+    TKv source;
+    auto entry = source.Prepare(Command("a", "one"));
+    state->Append(entry); source.Write(entry, 1);
+    TRaft raft(state, 1, {{2, std::make_shared<TSink>()}, {3, std::make_shared<TSink>()}});
+    const_cast<TVolatileState*>(raft.GetVolatileState())->CommitIndex = 1;
+    auto snapshot = CaptureSnapshot(raft, source);
+    for (int mode = 0; mode < 4; ++mode) {
+        auto bad = snapshot;
+        if (mode == 0) bad.Index = 2;
+        if (mode == 1) bad.Term = 2;
+        if (mode == 2) bad.Voters = {1, 2};
+        if (mode == 3) bad.Data = "invalid KV data";
+        TKv restored;
+        Reject([&] { RestoreSnapshot(bad, raft, restored); });
+        assert_int_equal(restored.LastAppliedIndex, 0);
+        assert_true(Read(restored, "a").empty());
+    }
+    TKv restored;
+    RestoreSnapshot(snapshot, raft, restored);
+    Reject([&] { RestoreSnapshot(snapshot, raft, restored); });
+    assert_true(Read(restored, "a") == "one");
+}
+#ifdef __linux__
+void test_snapshot_store_rejects_oversized_files_and_temp_symlinks(void**) {
+    TFiles files;
+    TSnapshotStore store(files.Name, 1);
+    store.Save(Sample());
+    const auto saved = store.Load();
+    std::filesystem::create_symlink(files.Image(), files.Image() + ".tmp");
+    Reject([&] { store.Save(Sample()); });
+    assert_true(store.Load() == saved);
+    std::filesystem::resize_file(files.Image(), TSnapshot::MaxBytes + 1);
+    Reject([&] { store.Load(); });
+    assert_true(std::filesystem::file_size(files.Image()) == TSnapshot::MaxBytes + 1);
+}
+void test_snapshot_store_roundtrip_lock_and_corrupt_recovery(void**) {
+    TFiles files;
+    {
+        TSnapshotStore store(files.Name, 1);
+        assert_false(store.Load().has_value());
+        Reject([&] { TSnapshotStore second(files.Name, 1); });
+        store.Save(Sample());
+        assert_true(store.Load() == std::optional<TSnapshot>{Sample()});
+    }
+    std::ifstream input(files.Image(), std::ios::binary);
+    std::string bytes(std::istreambuf_iterator<char>(input), {});
+    input.close();
+    bytes.back() ^= 1;
+    { std::ofstream out(files.Image(), std::ios::binary); out.write(bytes.data(), bytes.size()); }
+    TSnapshotStore store(files.Name, 1);
+    Reject([&] { store.Load(); });
+    std::ifstream after(files.Image(), std::ios::binary);
+    assert_true(std::string(std::istreambuf_iterator<char>(after), {}) == bytes);
+}
+void test_snapshot_crash_at_each_publication_boundary(void**) {
+    using TStage = TSnapshotStore::EStage;
+    for (bool initial : {false, true}) for (auto stage : {TStage::TempCreated, TStage::Written,
+         TStage::FileSynced, TStage::Renamed, TStage::DirectorySynced}) {
+        TFiles files;
+        if (!initial) { TSnapshotStore store(files.Name, 1); store.Save(Sample()); }
+        auto updated = Sample(); updated.Index = 3; updated.Data = "new committed state";
+        const auto child = fork();
+        assert_true(child >= 0);
+        if (child == 0) {
+            try {
+                TSnapshotStore store(files.Name, 1, [&](auto point) { if (point == stage) _exit(90); });
+                store.Save(updated);
+            } catch (...) { _exit(91); }
+            _exit(92);
+        }
+        int status = 0;
+        assert_int_equal(waitpid(child, &status, 0), child);
+        assert_true(WIFEXITED(status)); assert_int_equal(WEXITSTATUS(status), 90);
+        TSnapshotStore store(files.Name, 1);
+        auto selected = store.Load();
+        if (stage >= TStage::Renamed) assert_true(selected == std::optional<TSnapshot>{updated});
+        else if (initial) assert_false(selected.has_value());
+        else assert_true(selected == std::optional<TSnapshot>{Sample()});
+    }
+}
+void test_snapshot_publication_error_preserves_old_checkpoint(void**) {
+    TFiles files;
+    { TSnapshotStore store(files.Name, 1); store.Save(Sample()); }
+    TSnapshotStore store(files.Name, 1, [](auto stage) {
+        if (stage == TSnapshotStore::EStage::Written) throw std::runtime_error("injected checkpoint failure");
+    });
+    auto updated = Sample(); updated.Index = 3;
+    Reject([&] { store.Save(updated); });
+    assert_true(store.Load() == std::optional<TSnapshot>{Sample()});
+}
+void test_durable_kv_restart_restores_checkpoint_and_replays_only_tail(void**) {
+    struct TCountingKv : TKv {
+        size_t Applied = 0;
+        TMessageHolder<TMessage> Write(TMessageHolder<TLogEntry> entry, uint64_t index) override {
+            ++Applied; return TKv::Write(entry, index);
+        }
+    };
+    TFiles files;
+    {
+        auto state = std::make_shared<TDurableState>(files.Name, 1);
+        auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+        auto kv = std::make_shared<TKv>();
+        TRequestProcessor processor(raft, kv, {});
+        auto now = ITimeSource::Time{};
+        raft->ProcessTimeout(now);
+        auto write = [&](const std::string& key, const std::string& value) {
+            processor.OnCommandRequest(Command(key, value), {});
+            now += std::chrono::milliseconds(500);
+            raft->ProcessTimeout(now); processor.ProcessCommitted();
+        };
+        write("a", "one");
+        { TSnapshotStore store(files.Name, 1); store.Save(CaptureSnapshot(*raft, *kv)); }
+        write("b", "tail");
+        assert_int_equal(state->LastLogIndex, 3);
+    }
+    auto state = std::make_shared<TDurableState>(files.Name, 1);
+    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+    auto kv = std::make_shared<TCountingKv>();
+    TSnapshotStore store(files.Name, 1);
+    auto snapshot = store.Load(); assert_true(snapshot.has_value());
+    RestoreSnapshot(*snapshot, *raft, *kv);
+    assert_true(Read(*kv, "a") == "one"); assert_true(Read(*kv, "b").empty());
+    TRequestProcessor processor(raft, kv, {});
+    processor.ProcessCommitted(); assert_int_equal(kv->Applied, 0);
+    raft->ProcessTimeout(ITimeSource::Time{}); processor.ProcessCommitted();
+    assert_int_equal(kv->Applied, 1);
+    assert_true(Read(*kv, "a") == "one"); assert_true(Read(*kv, "b") == "tail");
+    assert_int_equal(kv->LastAppliedIndex, 4);
+    assert_int_equal(state->LastLogIndex, 4); // no compaction: every entry is retained
+}
+#endif
+}
+int main() {
+    const CMUnitTest tests[] = {
+        cmocka_unit_test(test_snapshot_codec_roundtrip_and_all_byte_corruption),
+        cmocka_unit_test(test_snapshot_metadata_and_declared_lengths_are_bounded),
+        cmocka_unit_test(test_kv_snapshot_is_canonical_and_binary_safe),
+        cmocka_unit_test(test_kv_invalid_snapshot_preserves_existing_state_and_progress),
+        cmocka_unit_test(test_capture_requires_committed_applied_progress),
+        cmocka_unit_test(test_restore_rejects_mismatched_log_configuration_and_used_application),
+#ifdef __linux__
+        cmocka_unit_test(test_snapshot_store_rejects_oversized_files_and_temp_symlinks),
+        cmocka_unit_test(test_snapshot_store_roundtrip_lock_and_corrupt_recovery),
+        cmocka_unit_test(test_snapshot_crash_at_each_publication_boundary),
+        cmocka_unit_test(test_snapshot_publication_error_preserves_old_checkpoint),
+        cmocka_unit_test(test_durable_kv_restart_restores_checkpoint_and_replays_only_tail),
+#endif
+    };
+    return cmocka_run_group_tests(tests, nullptr, nullptr);
+}

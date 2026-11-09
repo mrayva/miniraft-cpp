@@ -32,6 +32,9 @@ The [application recovery follow-up](docs/application-recovery.md) preserves
 recovered progress and prevents committed commands from being applied again.
 The [legacy log-term follow-up](docs/legacy-log-terms.md) rejects impossible
 stored term sequences before they influence elections or log matching.
+The [snapshot foundation](docs/snapshots.md) adds opt-in durable KV checkpoints
+and tail-only application recovery with `--durable --snapshots N`. Logs remain
+fully retained; compaction, snapshot transfer and membership changes are next.
 
 [![Number of GitHub stars](https://img.shields.io/github/stars/resetius/miniraft-cpp)](https://github.com/resetius/miniraft-cpp/stargazers)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/resetius/miniraft-cpp)
