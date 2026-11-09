@@ -63,6 +63,8 @@ struct TVolatileState {
     struct TSnapshotRpc {
         std::shared_ptr<const TSnapshot> Snapshot;
         std::shared_ptr<const std::string> Bytes;
+        // Seqno identifies the outstanding chunk across retries; zero means
+        // its reply was consumed and the next send needs a fresh identity.
         uint64_t Offset = 0, Seqno = 0, SentEnd = 0;
     };
     std::unordered_map<uint32_t, TSnapshotRpc> SnapshotRpcs;

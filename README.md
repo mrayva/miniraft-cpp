@@ -40,6 +40,8 @@ remains required. Upgrade all voters before enabling the new compaction behavior
 The [learner follow-up](docs/learners.md) adds non-voting catch-up and durable
 voter binding. KV uses `--learner id` on every replica's configuration. Promotion
 and joint-consensus voter changes remain disabled.
+The [snapshot retry follow-up](docs/snapshot-retries.md) prevents timeout retries
+and strong-read traffic from starving delayed snapshot acknowledgements.
 
 [![Number of GitHub stars](https://img.shields.io/github/stars/resetius/miniraft-cpp)](https://github.com/resetius/miniraft-cpp/stargazers)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/resetius/miniraft-cpp)
@@ -72,8 +74,8 @@ log replication, and fault tolerance in a distributed system.
 - **Leader Election** (supported)
 - **Log Replication** (supported)
 - **Persistence** (supported)
-- **Snapshots** (not supported yet)
-- **Membership Change** (not supported yet)
+- **Snapshots** (opt-in KV compaction and InstallSnapshot; Linux durable backend)
+- **Membership Change** (non-voting learners; voting changes not supported yet)
 
 The project focuses on a clear, modular design that leverages C++20 coroutines to simplify asynchronous flows.
 
