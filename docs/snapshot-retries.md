@@ -25,11 +25,30 @@ the leader retransmitted offset zero instead of advancing to 65536. After the fi
 the multi-chunk image completes, the application loads once, duplicate ACKs do
 not consume subsequent chunks, and a new committed tail reaches the receiver.
 
-The full validation set is 224 unit tests plus three CLI tests across 17 CTest
+The release also fixes a reconnect use-after-free discovered by the sanitizer CI
+snapshot CLI test. A writer could start reconnecting before the old reader
+reported its failure. Disconnecting that reader destroyed the pending connector,
+but its socket connect timer still held the coroutine handle. When the timer
+fired, it resumed freed memory. Disconnects now identify the reader's connection
+generation and preserve active connectors; an old reader cannot destroy a newer
+pending or established connection. This is not a general asynchronous shutdown
+or cancellation API.
+
+Two deterministic node lifecycle tests use the real node wrapper and poller with
+a controllable socket awaiter. They cover disconnect during a pending connect
+timer and an old reader failure racing a writer-triggered reconnect, both before
+and after replacement establishment. The first reproduced the same ASan
+use-after-free before the fix. Node template definitions are now in node_impl.h
+so alternate sockets can exercise the production implementation without real
+network timing. The coroio dependency is unchanged.
+
+The full validation set is 226 unit tests plus three CLI tests across 18 CTest
 targets under ASan/UBSan, with 12 Release core targets. Existing tests cover
 partial-transfer restart, stale replies after a reset, leader replacement,
 duplicate installation, corruption, durable publication crashes and strong-read
-isolation. Review is self-review; no independent approval is claimed.
+isolation. Self-review checked connection generation ownership and outstanding
+connector lifetime as well as chunk identity lifetime. No independent approval
+is claimed.
 
 Dynamic promotion/removal and replicated joint-consensus configurations remain
 open. Snapshot catch-up is a prerequisite for promotion, not authorization to

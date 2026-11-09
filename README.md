@@ -41,7 +41,8 @@ The [learner follow-up](docs/learners.md) adds non-voting catch-up and durable
 voter binding. KV uses `--learner id` on every replica's configuration. Promotion
 and joint-consensus voter changes remain disabled.
 The [snapshot retry follow-up](docs/snapshot-retries.md) prevents timeout retries
-and strong-read traffic from starving delayed snapshot acknowledgements.
+and strong-read traffic from starving delayed snapshot acknowledgements, and
+prevents stale reader failures from destroying newer reconnect attempts.
 
 [![Number of GitHub stars](https://img.shields.io/github/stars/resetius/miniraft-cpp)](https://github.com/resetius/miniraft-cpp/stargazers)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/resetius/miniraft-cpp)
