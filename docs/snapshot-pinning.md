@@ -29,10 +29,30 @@ installs the newer image and replicates a committed tail. Existing tests cover
 timeouts, read traffic, duplicate/stale replies, receiver restart, leader change,
 corruption, atomic durable publication and strong-read isolation.
 
-Validation: 227 unit tests and three CLI tests across 18 CTest targets under
+Sanitizer CI also exposed a second reconnect deadline race after alpha.18's
+generation checks. The dependency's finite-deadline connect registers both I/O
+and timer wakeups. After timeout, a late I/O event can resume the retry sleep;
+that sleep's timer may remain queued even after the connector finishes. Destroying
+the completed connector then leaves a timer pointing to freed memory. Preserving
+active connectors alone cannot prevent this case.
+
+MiniRaft now calls the dependency's default connect operation, which registers no
+connect deadline timer. TCP connection failure timing follows the operating
+system, so a failed or blackholed connection may take longer than the former
+100 ms application deadline. A safe bounded application-level connect deadline,
+including cancellation of both wakeup sources, remains open. The coroio dependency
+is unchanged. This is a targeted avoidance of the unsafe deadline path, not a
+general asynchronous cancellation or shutdown implementation.
+
+A deterministic lifecycle regression models a second deadline wakeup surviving
+completion and disconnect; it reproduced the ASan use-after-free with the former
+finite-deadline call and passes with the default connect operation.
+
+Validation: 228 unit tests and three CLI tests across 18 CTest targets under
 ASan/UBSan, plus 12 Release core targets. Self-review checked image ownership,
 encoding reuse, completed-boundary accounting, follow-up transfer selection and
-term replacement. No independent reviewer approval is claimed. Wire messages and
+term replacement, connection wakeup sources and deadline behavior. No independent
+reviewer approval is claimed. Wire messages and
 durable formats are unchanged; no additional migration is required.
 
 This guarantees progress of the selected finite image under eventual chunk
