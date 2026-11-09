@@ -47,6 +47,9 @@ The [snapshot pinning follow-up](docs/snapshot-pinning.md) lets an active transf
 finish while the leader continues compacting newer application state, and avoids
 the dependency's unsafe connect-deadline path. TCP connect failure timing follows
 the OS; a safe bounded application deadline remains open.
+The [proposal admission follow-up](docs/proposal-admission.md) restricts direct
+Append calls to leaders, preventing nonleaders from creating conflicting commands
+at the same log index and term.
 
 [![Number of GitHub stars](https://img.shields.io/github/stars/resetius/miniraft-cpp)](https://github.com/resetius/miniraft-cpp/stargazers)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/resetius/miniraft-cpp)
