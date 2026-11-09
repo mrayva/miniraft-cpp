@@ -738,7 +738,12 @@ TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t no
     const auto count = std::min<uint64_t>(TInstallSnapshotRequest::MaxChunkBytes, rpc.Bytes->size() - rpc.Offset);
     auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
     request->Src = Id; request->Dst = nodeId; request->Term = State->CurrentTerm;
-    request->Seqno = rpc.Seqno = NextSeqno();
+    // A retry sends the same immutable chunk. Keep its identity until a reply
+    // consumes it, otherwise traffic faster than the RTT invalidates every ACK.
+    // Snapshot ACKs never confirm read barriers, so reuse cannot confirm a read
+    // that arrived after the first transmission.
+    if (!rpc.Seqno) rpc.Seqno = NextSeqno();
+    request->Seqno = rpc.Seqno;
     request->SnapshotIndex = snapshot->Index; request->SnapshotTerm = snapshot->Term;
     request->Offset = rpc.Offset; request->TotalBytes = rpc.Bytes->size();
     rpc.SentEnd = rpc.Offset + count;
@@ -752,9 +757,10 @@ void TRaft::OnInstallSnapshot(TMessageHolder<TInstallSnapshotResponse> response)
     auto found = VolatileState->SnapshotRpcs.find(response->Src);
     if (found == VolatileState->SnapshotRpcs.end()) return;
     auto& rpc = found->second;
-    if (response->Seqno != rpc.Seqno || response->SnapshotIndex != rpc.Snapshot->Index) return;
+    if (!rpc.Seqno || response->Seqno != rpc.Seqno || response->SnapshotIndex != rpc.Snapshot->Index) return;
     if (!response->Success) {
         rpc.Offset = 0;
+        rpc.Seqno = 0;
     } else if (response->Installed) {
         if (response->NextOffset != rpc.Bytes->size()) return;
         const auto index = std::max(VolatileState->MatchIndex[response->Src], response->SnapshotIndex);
@@ -766,6 +772,7 @@ void TRaft::OnInstallSnapshot(TMessageHolder<TInstallSnapshotResponse> response)
     } else {
         if (response->NextOffset < rpc.SentEnd || response->NextOffset >= rpc.Bytes->size()) return;
         rpc.Offset = response->NextOffset;
+        rpc.Seqno = 0; // Next chunk gets a new identity; old replies stay stale.
     }
     VolatileState->RpcDue[response->Src] = ITimeSource::Time{};
 }

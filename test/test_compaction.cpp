@@ -55,13 +55,16 @@ struct TCluster {
     std::vector<std::unique_ptr<TRequestProcessor>> Processors{3};
     std::deque<TMessageHolder<TMessage>> Packets;
     std::set<uint32_t> Isolated;
-    TCluster() { for (uint32_t id = 1; id <= 3; ++id) Build(id, std::make_shared<TState>()); }
+    std::vector<uint32_t> Learners;
+    explicit TCluster(std::vector<uint32_t> learners = {}) : Learners(std::move(learners)) {
+        for (uint32_t id = 1; id <= 3; ++id) Build(id, std::make_shared<TState>());
+    }
     void Build(uint32_t id, std::shared_ptr<IState> state) {
         TNodeDict peers;
         for (uint32_t dst = 1; dst <= 3; ++dst) if (dst != id)
             peers[dst] = std::make_shared<TEndpoint>([this](auto message) { Packets.push_back(std::move(message)); });
         Processors[id - 1].reset();
-        Nodes[id - 1] = std::make_shared<TRaft>(state, id, peers);
+        Nodes[id - 1] = std::make_shared<TRaft>(state, id, peers, Learners);
         Apps[id - 1] = std::make_shared<TApplication>();
         Processors[id - 1] = std::make_unique<TRequestProcessor>(Nodes[id - 1], Apps[id - 1], peers);
     }
@@ -174,6 +177,46 @@ void test_partial_transfer_restart_and_delayed_ack_are_safe(void**) {
     assert_int_equal(cluster.Apps[2]->Loads, 1);
     assert_true(Read(*cluster.Apps[2], "c") == std::string(60000, 'c'));
 }
+void ExerciseDelayedSnapshotAcks(bool readTraffic) {
+    for (auto learners : {std::vector<uint32_t>{}, std::vector<uint32_t>{3}}) {
+        TCluster cluster(learners); cluster.Prepare();
+        const auto boundary = cluster.Nodes[0]->GetState()->SnapshotIndex;
+        auto chunk = cluster.SendChunk();
+        size_t chunks = 0;
+        while (true) {
+            assert_true(++chunks < 10);
+            cluster.Deliver(chunk);
+            auto ack = cluster.Take(3, 1, EMessageType::INSTALL_SNAPSHOT_RESPONSE).Cast<TInstallSnapshotResponse>();
+            // Every ACK arrives after several retries. Drop retry packets while
+            // preserving the original successful reply, a valid lossy schedule.
+            for (int retry = 0; retry < 3; ++retry) {
+                if (readTraffic) cluster.Nodes[0]->ApproveRead();
+                else { cluster.Now += std::chrono::seconds(3); cluster.Nodes[0]->ProcessTimeout(cluster.Now); }
+                auto retransmit = cluster.Take(1, 3, EMessageType::INSTALL_SNAPSHOT_REQUEST).Cast<TInstallSnapshotRequest>();
+                assert_int_equal(retransmit->Offset, chunk->Offset);
+                cluster.Packets.clear();
+            }
+            cluster.Deliver(ack);
+            if (ack->Installed) break;
+            cluster.Deliver(ack); // Also stale between consuming an ACK and the next send.
+            auto next = cluster.SendChunk();
+            assert_int_equal(next->Offset, ack->NextOffset);
+            // A duplicate ACK for the previous chunk must not consume the new
+            // chunk's correlation or reset its progress.
+            cluster.Deliver(ack);
+            chunk = next;
+        }
+        assert_true(chunks > 1);
+        assert_int_equal(cluster.Nodes[0]->GetVolatileState()->MatchIndex.at(3), boundary);
+        assert_int_equal(cluster.Apps[2]->Loads, 1);
+        cluster.Write(1, "tail", "after delayed ACKs");
+        cluster.Pump(1, 80);
+        assert_true(Read(*cluster.Apps[2], "tail") == "after delayed ACKs");
+        if (!learners.empty()) assert_true(cluster.Nodes[0]->IsLearnerCaughtUp(3));
+    }
+}
+void test_snapshot_timeout_retries_do_not_starve_delayed_acks(void**) { ExerciseDelayedSnapshotAcks(false); }
+void test_snapshot_read_traffic_does_not_starve_delayed_acks(void**) { ExerciseDelayedSnapshotAcks(true); }
 void test_leader_change_mid_snapshot_rejects_old_chunks(void**) {
     TCluster cluster; cluster.Prepare();
     auto old = cluster.SendChunk(); cluster.AckChunk(old);
@@ -400,6 +443,8 @@ int main() {
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),
         cmocka_unit_test(test_simultaneous_startup_candidates_use_distinct_election_deadlines),
         cmocka_unit_test(test_partial_transfer_restart_and_delayed_ack_are_safe),
+        cmocka_unit_test(test_snapshot_timeout_retries_do_not_starve_delayed_acks),
+        cmocka_unit_test(test_snapshot_read_traffic_does_not_starve_delayed_acks),
         cmocka_unit_test(test_leader_change_mid_snapshot_rejects_old_chunks),
         cmocka_unit_test(test_partial_and_installed_snapshot_acks_do_not_confirm_strong_reads),
         cmocka_unit_test(test_compacted_follower_hint_requires_boundary_probe_before_match),

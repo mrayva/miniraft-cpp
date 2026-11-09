@@ -10,81 +10,6 @@
 #include "server.h"
 
 template<typename TSocket>
-void TNode<TSocket>::Send(TMessageHolder<TMessage> message) {
-    Messages.emplace_back(std::move(message));
-}
-
-template<typename TSocket>
-void TNode<TSocket>::Drain() {
-    if (!Connected) {
-        Connect();
-        return;
-    }
-    if (!Drainer || Drainer.done()) {
-        if (Drainer && Drainer.done()) {
-            Drainer.destroy();
-        }
-        Drainer = DoDrain();
-    }
-}
-
-template<typename TSocket>
-NNet::TVoidSuspendedTask TNode<TSocket>::DoDrain() {
-    try {
-        while (!Messages.empty()) {
-            auto tosend = std::move(Messages); Messages.clear();
-            for (auto&& m : tosend) {
-                co_await TMessageWriter(Socket).Write(std::move(m));
-            }
-        }
-    } catch (const std::exception& ex) {
-        std::cout << "Error on write: " << ex.what() << "\n";
-        Connect();
-    }
-    co_return;
-}
-
-template<typename TSocket>
-void TNode<TSocket>::Disconnect() {
-    Connected = false;
-    if (Drainer) { Drainer.destroy(); Drainer = {}; }
-    if (Connector) { Connector.destroy(); Connector = {}; }
-    std::destroy_at(&Socket);
-    std::construct_at(&Socket);
-}
-
-template<typename TSocket>
-void TNode<TSocket>::Connect() {
-    if (Address && (!Connector || Connector.done())) {
-        if (Connector && Connector.done()) {
-            Connector.destroy();
-        }
-        Connector = DoConnect();
-    }
-}
-
-template<typename TSocket>
-NNet::TVoidSuspendedTask TNode<TSocket>::DoConnect() {
-    std::cout << "Connecting " << Name << "\n";
-    Connected = false;
-    while (!Connected) {
-        try {
-            auto deadline = NNet::TClock::now() + std::chrono::milliseconds(100); // TODO: broken timeout in coroio
-            Socket = SocketFactory(*Address);
-            co_await Socket.Connect(deadline);
-            std::cout << "Connected " << Name << "\n";
-            Connected = true;
-        } catch (const std::exception& ex) {
-            std::cout << "Error on connect: " << Name << " " << ex.what() << "\n";
-        }
-        if (!Connected) {
-            co_await Socket.Poller()->Sleep(std::chrono::milliseconds(1000));
-        }
-    }
-    co_return;
-}
-
-template<typename TSocket>
 NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(TSocket socket) {
     std::shared_ptr<TNode<TSocket>> client;
     try {
@@ -142,6 +67,7 @@ NNet::TVoidTask TRaftServer<TSocket>::OutboundServe(std::shared_ptr<TNode<TSocke
     while (true) {
         bool error = false;
         const bool wasConnected = node->IsConnected();
+        const auto generation = node->GetConnectionGeneration();
         try {
             if (!node->IsConnected()) {
                 throw std::runtime_error("Not connected");
@@ -160,7 +86,7 @@ NNet::TVoidTask TRaftServer<TSocket>::OutboundServe(std::shared_ptr<TNode<TSocke
         }
         if (error) {
             RequestProcessor->OnPeerDisconnected(node);
-            if (wasConnected) node->Disconnect();
+            if (wasConnected) node->Disconnect(generation);
             DrainNodes();
             co_await Poller.Sleep(std::chrono::milliseconds(1000));
         }
