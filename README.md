@@ -43,6 +43,10 @@ and joint-consensus voter changes remain disabled.
 The [snapshot retry follow-up](docs/snapshot-retries.md) prevents timeout retries
 and strong-read traffic from starving delayed snapshot acknowledgements, and
 prevents stale reader failures from destroying newer reconnect attempts.
+The [snapshot pinning follow-up](docs/snapshot-pinning.md) lets an active transfer
+finish while the leader continues compacting newer application state, and avoids
+the dependency's unsafe connect-deadline path. TCP connect failure timing follows
+the OS; a safe bounded application deadline remains open.
 
 [![Number of GitHub stars](https://img.shields.io/github/stars/resetius/miniraft-cpp)](https://github.com/resetius/miniraft-cpp/stargazers)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/resetius/miniraft-cpp)

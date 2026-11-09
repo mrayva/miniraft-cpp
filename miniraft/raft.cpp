@@ -724,17 +724,21 @@ TSnapshot TRaft::Compact() {
 }
 
 TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t nodeId) {
-    auto snapshot = State->GetSnapshot();
-    if (!snapshot) throw std::logic_error("Missing snapshot for compacted log");
-    if (EncodedSnapshotIndex != snapshot->Index) {
-        EncodedSnapshot = std::make_shared<const std::string>(EncodeSnapshot(*snapshot));
-        EncodedSnapshotIndex = snapshot->Index;
-    }
     auto& rpc = VolatileState->SnapshotRpcs[nodeId];
-    if (!rpc.Snapshot || rpc.Snapshot->Index != snapshot->Index) {
+    if (!rpc.Snapshot) {
+        auto snapshot = State->GetSnapshot();
+        if (!snapshot) throw std::logic_error("Missing snapshot for compacted log");
+        if (EncodedSnapshotIndex != snapshot->Index) {
+            EncodedSnapshot = std::make_shared<const std::string>(EncodeSnapshot(*snapshot));
+            EncodedSnapshotIndex = snapshot->Index;
+        }
         rpc = TVolatileState::TSnapshotRpc{snapshot, EncodedSnapshot};
         VolatileState->PendingAppendRpcs[nodeId].clear();
     }
+    // Pin one immutable image until this peer finishes. Periodic compaction
+    // must not restart every chunk; after completion a still-lagging peer can
+    // start a separate transfer of the newest image.
+    const auto& snapshot = rpc.Snapshot;
     const auto count = std::min<uint64_t>(TInstallSnapshotRequest::MaxChunkBytes, rpc.Bytes->size() - rpc.Offset);
     auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
     request->Src = Id; request->Dst = nodeId; request->Term = State->CurrentTerm;

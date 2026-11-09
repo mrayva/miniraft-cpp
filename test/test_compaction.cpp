@@ -217,6 +217,51 @@ void ExerciseDelayedSnapshotAcks(bool readTraffic) {
 }
 void test_snapshot_timeout_retries_do_not_starve_delayed_acks(void**) { ExerciseDelayedSnapshotAcks(false); }
 void test_snapshot_read_traffic_does_not_starve_delayed_acks(void**) { ExerciseDelayedSnapshotAcks(true); }
+void test_compaction_during_each_chunk_cannot_restart_snapshot_catchup(void**) {
+    for (auto learners : {std::vector<uint32_t>{}, std::vector<uint32_t>{3}}) {
+        TCluster cluster(learners); cluster.Prepare();
+        auto chunk = cluster.SendChunk();
+        const auto boundary = chunk->SnapshotIndex;
+        std::weak_ptr<const TSnapshot> original = cluster.Nodes[0]->GetState()->GetSnapshot();
+        size_t chunks = 0;
+        while (true) {
+            assert_true(++chunks < 10);
+            cluster.Deliver(chunk);
+            auto ack = cluster.Take(3, 1, EMessageType::INSTALL_SNAPSHOT_RESPONSE).Cast<TInstallSnapshotResponse>();
+            // Commit and compact again before every ACK arrives, including the
+            // final one. The majority remains healthy while the receiver lags.
+            cluster.Isolated = {3}; cluster.Packets.clear();
+            cluster.Write(1, "latest", std::to_string(chunks));
+            cluster.Nodes[0]->Compact();
+            assert_true(cluster.Nodes[0]->GetState()->SnapshotIndex > boundary);
+            assert_false(original.expired()); // Owned by the active transfer.
+            cluster.Isolated.clear();
+            auto retry = cluster.SendChunk();
+            assert_int_equal(retry->SnapshotIndex, boundary);
+            assert_int_equal(retry->Offset, chunk->Offset);
+            cluster.Packets.clear(); cluster.Deliver(ack);
+            if (ack->Installed) break;
+            chunk = cluster.SendChunk();
+            assert_int_equal(chunk->SnapshotIndex, boundary);
+            assert_int_equal(chunk->Offset, ack->NextOffset);
+        }
+        assert_true(chunks > 1);
+        assert_true(original.expired()); // Completion releases the pinned image.
+        assert_int_equal(cluster.Apps[2]->Loads, 1);
+        assert_int_equal(cluster.Nodes[2]->GetState()->SnapshotIndex, boundary);
+        // The older completed image does not claim the leader's newer prefix.
+        assert_int_equal(cluster.Nodes[0]->GetVolatileState()->MatchIndex.at(3), boundary);
+        assert_true(Read(*cluster.Apps[2], "latest").empty());
+        cluster.Packets.clear();
+        auto newer = cluster.SendChunk();
+        assert_true(newer->SnapshotIndex > boundary); assert_int_equal(newer->Offset, 0);
+        cluster.AckChunk(newer); cluster.Pump(1, 80, true);
+        assert_true(Read(*cluster.Apps[2], "latest") == std::to_string(chunks));
+        cluster.Write(1, "tail", "after compaction during transfer"); cluster.Pump(1, 80);
+        assert_true(Read(*cluster.Apps[2], "tail") == "after compaction during transfer");
+        if (!learners.empty()) assert_true(cluster.Nodes[0]->IsLearnerCaughtUp(3));
+    }
+}
 void test_leader_change_mid_snapshot_rejects_old_chunks(void**) {
     TCluster cluster; cluster.Prepare();
     auto old = cluster.SendChunk(); cluster.AckChunk(old);
@@ -445,6 +490,7 @@ int main() {
         cmocka_unit_test(test_partial_transfer_restart_and_delayed_ack_are_safe),
         cmocka_unit_test(test_snapshot_timeout_retries_do_not_starve_delayed_acks),
         cmocka_unit_test(test_snapshot_read_traffic_does_not_starve_delayed_acks),
+        cmocka_unit_test(test_compaction_during_each_chunk_cannot_restart_snapshot_catchup),
         cmocka_unit_test(test_leader_change_mid_snapshot_rejects_old_chunks),
         cmocka_unit_test(test_partial_and_installed_snapshot_acks_do_not_confirm_strong_reads),
         cmocka_unit_test(test_compacted_follower_hint_requires_boundary_probe_before_match),
