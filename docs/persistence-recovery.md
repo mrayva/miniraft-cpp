@@ -17,6 +17,8 @@ nonzero current term. Recovery validates the complete selected log prefix:
 index extent, contiguous offsets, entry types, minimum lengths and file bounds.
 Unreferenced trailing bytes remain allowed because log truncation is logical.
 The file format and public storage interface are unchanged.
+The [log-term follow-up](legacy-log-terms.md) additionally validates nonzero,
+nondecreasing selected entry terms bounded by CurrentTerm.
 
 RemoveLast now updates LastLogTerm, including when the log becomes empty.
 Append explicitly seeks the write position, so appending after truncation to
