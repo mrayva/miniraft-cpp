@@ -61,6 +61,7 @@ struct TVolatileState {
     std::unordered_map<uint32_t, uint64_t> LastSentSeqno;
     std::unordered_map<uint32_t, std::deque<TAppendRpc>> PendingAppendRpcs;
     struct TSnapshotRpc {
+        // Pinned for this transfer even if the local store compacts again.
         std::shared_ptr<const TSnapshot> Snapshot;
         std::shared_ptr<const std::string> Bytes;
         // Seqno identifies the outstanding chunk across retries; zero means

@@ -1,5 +1,8 @@
 # Snapshot retry progress: v0.1.0-alpha.18
 
+The [alpha.19 follow-up](snapshot-pinning.md) also pins an active transfer across
+local compaction, replacing the image-switching behavior described below.
+
 Timeout retries and strong-read requests could indefinitely stall InstallSnapshot
 catch-up for a healthy follower or learner. Each send replaced the outstanding
 chunk's sequence number. If an ACK arrived after another send, the leader rejected
