@@ -21,6 +21,12 @@ struct IState: TStateFields {
     // Absolute indices; only the suffix after SnapshotIndex has log entries.
     // The boundary term remains available through LogTerm(SnapshotIndex).
     virtual TMessageHolder<TLogEntry> Get(int64_t index) const = 0;
+    // Backends may read a retained entry's term without copying its payload.
+    // The default keeps existing external backends source compatible.
+    virtual uint64_t RetainedLogTerm(int64_t index) const {
+        auto entry = Get(index);
+        return entry ? entry->Term : 0;
+    }
     virtual void Commit() = 0;
     virtual bool SupportsSnapshots() const { return false; }
     virtual std::shared_ptr<const TSnapshot> GetSnapshot() const { return {}; }
@@ -38,7 +44,7 @@ struct IState: TStateFields {
         if (index < 1 || uint64_t(index) < SnapshotIndex || index > LastLogIndex) {
             return 0;
         } else {
-            return Get(index)->Term;
+            return RetainedLogTerm(index);
         }
     }
 };
@@ -115,6 +121,10 @@ struct TState: IState {
     TMessageHolder<TLogEntry> Get(int64_t index) const override {
         if (index < 1 || uint64_t(index) <= SnapshotIndex || uint64_t(index) > LastLogIndex) return {};
         return CloneEntry(Log[index - SnapshotIndex - 1]);
+    }
+    uint64_t RetainedLogTerm(int64_t index) const override {
+        if (index < 1 || uint64_t(index) <= SnapshotIndex || uint64_t(index) > LastLogIndex) return 0;
+        return Log[index - SnapshotIndex - 1]->Term;
     }
 
     bool SupportsSnapshots() const override { return true; }

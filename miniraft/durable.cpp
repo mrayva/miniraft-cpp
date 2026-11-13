@@ -294,6 +294,11 @@ TMessageHolder<TLogEntry> TDurableState::Get(int64_t index) const
     return Clone(Impl->Log[index - SnapshotIndex - 1]);
 }
 
+uint64_t TDurableState::RetainedLogTerm(int64_t index) const {
+    if (index < 1 || uint64_t(index) <= SnapshotIndex || uint64_t(index) > LastLogIndex) return 0;
+    return Impl->Log[index - SnapshotIndex - 1]->Term;
+}
+
 std::shared_ptr<const TSnapshot> TDurableState::GetSnapshot() const { return Impl->Snapshot; }
 
 void TDurableState::InstallSnapshot(const TSnapshot& snapshot) {

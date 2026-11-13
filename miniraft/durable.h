@@ -19,6 +19,7 @@ public:
     void RemoveLast() override;
     void Append(TMessageHolder<TLogEntry> entry) override;
     TMessageHolder<TLogEntry> Get(int64_t index) const override;
+    uint64_t RetainedLogTerm(int64_t index) const override;
     void Commit() override;
     bool SupportsSnapshots() const override { return true; }
     std::shared_ptr<const TSnapshot> GetSnapshot() const override;
