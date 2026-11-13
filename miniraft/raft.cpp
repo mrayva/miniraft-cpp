@@ -198,6 +198,8 @@ TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes, st
     if (!Learners.empty() && !State->SupportsVoterBinding())
         throw std::invalid_argument("Learners require voter-binding-capable storage");
     const auto bound = State->GetBoundVoters();
+    if (auto snapshot = State->GetSnapshot(); snapshot && snapshot->IsJoint())
+        throw std::invalid_argument("Joint snapshot recovery is unsupported");
     const bool fresh = State->CurrentTerm == 1 && !State->VotedFor && !State->LastLogIndex;
     if (State->SupportsVoterBinding() && (!bound.empty() || fresh || State->GetSnapshot() || !Learners.empty()))
         State->BindVoters(Voters);
@@ -793,8 +795,32 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     if (request->SnapshotIndex <= VolatileState->CommitIndex) {
         const auto term = State->LogTerm(request->SnapshotIndex);
         const bool covered = request->SnapshotIndex < State->SnapshotIndex || term == request->SnapshotTerm;
-        if (IncomingSnapshot && IncomingSnapshot->Index <= VolatileState->CommitIndex) IncomingSnapshot.reset();
-        reply(covered, covered, covered ? request->TotalBytes : 0);
+        if (!covered) { reply(false, false, 0); return; }
+        // A covered image needs no application replacement, but must first be
+        // identified as a supported fixed-membership format. Accumulate a short
+        // prefix when a peer splits the magic across multiple valid chunks.
+        const bool same = IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
+            IncomingSnapshot->Leader == request->LeaderId && IncomingSnapshot->Index == request->SnapshotIndex &&
+            IncomingSnapshot->BoundaryTerm == request->SnapshotTerm && IncomingSnapshot->Total == request->TotalBytes;
+        if (!same) {
+            if (request->Offset != 0 || (IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
+                IncomingSnapshot->Index > request->SnapshotIndex)) { reply(false, false, 0); return; }
+            IncomingSnapshot = TIncomingSnapshot{request->Term, request->SnapshotIndex, request->SnapshotTerm,
+                request->TotalBytes, request->LeaderId, {}};
+        }
+        auto& prefix = IncomingSnapshot->Bytes;
+        const auto count = request->Len - sizeof(TInstallSnapshotRequest);
+        if (request->Offset > prefix.size()) { reply(false, false, 0); return; }
+        if (request->Offset < prefix.size()) {
+            if (count > prefix.size() - request->Offset ||
+                std::string_view(prefix).substr(request->Offset, count) != std::string_view(request->Data, count)) {
+                IncomingSnapshot.reset(); reply(false, false, 0); return;
+            }
+        } else prefix.append(request->Data, count);
+        if (prefix.size() < 8) { reply(true, false, prefix.size()); return; }
+        const bool supported = std::string_view(prefix).substr(0, 8) == "MRFTS001";
+        IncomingSnapshot.reset();
+        reply(supported, supported, supported ? request->TotalBytes : 0);
         return;
     }
     auto application = SnapshotApplication.lock();
@@ -817,11 +843,14 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             IncomingSnapshot.reset(); reply(false, false, 0); return;
         }
     } else bytes.append(request->Data, count);
+    if (bytes.size() >= 8 && std::string_view(bytes).substr(0, 8) != "MRFTS001") {
+        IncomingSnapshot.reset(); reply(false, false, 0); return;
+    }
     if (bytes.size() < request->TotalBytes) { reply(true, false, bytes.size()); return; }
     TSnapshot snapshot;
     try {
         snapshot = DecodeSnapshot(bytes);
-        if (snapshot.Index != request->SnapshotIndex || snapshot.Term != request->SnapshotTerm || snapshot.Voters != GetVoterIds())
+        if (snapshot.IsJoint() || snapshot.Index != request->SnapshotIndex || snapshot.Term != request->SnapshotTerm || snapshot.Voters != GetVoterIds())
             throw TMessageError("Snapshot metadata mismatch");
         application->ValidateSnapshot(snapshot.Data, snapshot.Index);
     } catch (const std::exception&) {

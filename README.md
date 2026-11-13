@@ -56,6 +56,9 @@ The [term lookup follow-up](docs/term-lookups.md) avoids copying full payloads
 when Raft needs only a retained entry's term.
 The [joint quorum foundation](docs/joint-quorum.md) adds and tests dual-majority
 arithmetic for future membership changes; live voter reconfiguration remains disabled.
+The [joint snapshot metadata foundation](docs/joint-snapshots.md) adds a versioned
+representation for a joint configuration at a snapshot boundary; runtime adoption
+and membership changes remain disabled.
 The [message buffer follow-up](docs/message-extents.md) checks allocated buffer
 and batch extents before accepting locally constructed frames.
 
