@@ -44,9 +44,11 @@ static_assert(sizeof(TMessage) == 8);
 
 struct TLogEntry: public TMessage {
     static constexpr EMessageType MessageType = EMessageType::LOG_ENTRY;
-    enum EFlags {
+    enum EFlags : uint64_t {
         ENone = 0,
         EStub = 1,
+        // Reserved for configuration entries; live use remains disabled.
+        EConfiguration = uint64_t(1) << 63,
     };
     uint64_t Term = 1;
     uint64_t Flags = 0;

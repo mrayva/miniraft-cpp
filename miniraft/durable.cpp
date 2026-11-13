@@ -299,6 +299,11 @@ uint64_t TDurableState::RetainedLogTerm(int64_t index) const {
     if (index < 1 || uint64_t(index) <= SnapshotIndex || uint64_t(index) > LastLogIndex) return 0;
     return Impl->Log[index - SnapshotIndex - 1]->Term;
 }
+uint64_t TDurableState::RetainedLogFlags(int64_t index) const {
+    if (index < 1 || uint64_t(index) <= SnapshotIndex || uint64_t(index) > LastLogIndex)
+        throw std::out_of_range("Missing retained log entry");
+    return Impl->Log[index - SnapshotIndex - 1]->Flags;
+}
 
 std::shared_ptr<const TSnapshot> TDurableState::GetSnapshot() const { return Impl->Snapshot; }
 
