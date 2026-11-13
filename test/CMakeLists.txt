@@ -13,6 +13,7 @@ endmacro()
 
 if (CMOCKA_FOUND)
 ut(test_raft test_raft.cpp miniraft)
+ut(test_quorum test_quorum.cpp miniraft)
 ut(test_correctness test_correctness.cpp miniraft)
 ut(test_forwarding test_forwarding.cpp miniraft)
 ut(test_message_safety test_message_safety.cpp miniraft)

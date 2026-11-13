@@ -100,14 +100,15 @@ TVolatileState& TVolatileState::CommitAdvance(int nservers, const IState& state)
 }
 
 TVolatileState& TVolatileState::CommitAdvance(const std::vector<uint32_t>& voters, uint32_t self, const IState& state) {
-    ValidateFixedVoters(voters);
-    Indices.clear();
-    for (auto id : voters) {
+    return CommitAdvance(TQuorum(voters), self, state);
+}
+
+TVolatileState& TVolatileState::CommitAdvance(const TQuorum& quorum, uint32_t self, const IState& state) {
+    const auto quorumIndex = quorum.Value([&](uint32_t id) {
         auto match = MatchIndex.find(id);
-        Indices.push_back(id == self ? state.LastLogIndex : match == MatchIndex.end() ? 0 : match->second);
-    }
-    std::sort(Indices.begin(), Indices.end());
-    const auto index = std::max(CommitIndex, Indices[(voters.size() - 1) / 2]);
+        return id == self ? state.LastLogIndex : match == MatchIndex.end() ? uint64_t(0) : match->second;
+    }, &Indices);
+    const auto index = std::max(CommitIndex, quorumIndex);
     if (state.LogTerm(index) == state.CurrentTerm) CommitIndex = index;
     return *this;
 }
@@ -190,6 +191,7 @@ TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes, st
         if (!std::binary_search(Learners.begin(), Learners.end(), id)) Voters.push_back(id);
     std::sort(Voters.begin(), Voters.end());
     ValidateFixedVoters(Voters);
+    VotingQuorum.emplace(Voters);
     if (!IsVoter(Id) && State->VotedFor)
         throw std::invalid_argument("A learner store must not contain a vote");
     Nservers = Voters.size(); MinVotes = Nservers / 2 + 1;
@@ -337,7 +339,7 @@ void TRaft::OnAppendEntries(TMessageHolder<TAppendEntriesResponse> message) {
             .SetRpcDue(nodeId, ITimeSource::Time{})
             .SetBatchSize(nodeId, 1024)
             .SetBackOff(nodeId, 1)
-            .CommitAdvance(Voters, Id, *State);
+            .CommitAdvance(*VotingQuorum, Id, *State);
     } else if (message->MatchIndex > 0) {
         // A compacted-prefix hint is not replication evidence. Probe its boundary
         // with AppendEntries before advancing MatchIndex or confirming reads.
@@ -576,7 +578,7 @@ void TRaft::LeaderTimeout(ITimeSource::Time now) {
     }
 
     if (Nservers == 1) {
-        VolatileState->CommitAdvance(Voters, Id, *State);
+        VolatileState->CommitAdvance(*VotingQuorum, Id, *State);
     }
 }
 
@@ -595,15 +597,11 @@ uint64_t TRaft::ApproveRead() {
 uint64_t TRaft::CommitSeqno() const {
     if (StateName != EState::LEADER || VolatileState->CommitIndex == 0 ||
         State->LogTerm(VolatileState->CommitIndex) != State->CurrentTerm) return 0;
-    std::vector<uint64_t> acknowledgements{Seqno - 1}; // leader's own confirmation
-    acknowledgements.reserve(Nservers);
-    for (auto id : Voters) {
-        if (id == Id) continue;
+    return VotingQuorum->Value([&](uint32_t id) -> uint64_t {
+        if (id == Id) return Seqno - 1; // leader's own confirmation
         auto it = VolatileState->ReadAckSeqno.find(id);
-        acknowledgements.push_back(it == VolatileState->ReadAckSeqno.end() ? 0 : it->second);
-    }
-    std::sort(acknowledgements.begin(), acknowledgements.end());
-    return acknowledgements[(Nservers - 1) / 2];
+        return it == VolatileState->ReadAckSeqno.end() ? 0 : it->second;
+    });
 }
 
 uint64_t TRaft::NextSeqno() {
@@ -632,8 +630,7 @@ void TRaft::ProcessTimeout(ITimeSource::Time now) {
     }
 
     if (StateName == EState::CANDIDATE) {
-        int nvotes = VolatileState->Votes.size()+1;
-        if (nvotes >= MinVotes) {
+        if (VotingQuorum->HasQuorum(VolatileState->Votes, Id)) {
             if (State->LastLogIndex >= uint64_t(INT64_MAX)) throw std::overflow_error("Raft log index exhausted");
             auto value = State->LastLogIndex+1;
             decltype(VolatileState->NextIndex) nextIndex;
@@ -770,7 +767,7 @@ void TRaft::OnInstallSnapshot(TMessageHolder<TInstallSnapshotResponse> response)
         if (response->NextOffset != rpc.Bytes->size()) return;
         const auto index = std::max(VolatileState->MatchIndex[response->Src], response->SnapshotIndex);
         (*VolatileState).SetMatchIndex(response->Src, index).SetNextIndex(response->Src, index + 1)
-            .SetBatchSize(response->Src, 1024).SetBackOff(response->Src, 1).CommitAdvance(Voters, Id, *State);
+            .SetBatchSize(response->Src, 1024).SetBackOff(response->Src, 1).CommitAdvance(*VotingQuorum, Id, *State);
         VolatileState->SnapshotRpcs.erase(found);
         // Snapshot completion is not a fresh-read acknowledgement. AppendEntries
         // must still establish the next read barrier and replicate the suffix.

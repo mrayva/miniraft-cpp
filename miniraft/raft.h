@@ -12,6 +12,7 @@
 #include "messages.h"
 #include "timesource.h"
 #include "state.h"
+#include "quorum.h"
 
 struct INode {
     virtual ~INode() = default;
@@ -85,6 +86,7 @@ struct TVolatileState {
     // Compatibility helper for all-voter fixtures; mixed roles require IDs below.
     TVolatileState& CommitAdvance(int nservers, const IState& state);
     TVolatileState& CommitAdvance(const std::vector<uint32_t>& voters, uint32_t self, const IState& state);
+    TVolatileState& CommitAdvance(const TQuorum& quorum, uint32_t self, const IState& state);
     TVolatileState& SetCommitIndex(uint64_t index);
     TVolatileState& SetElectionDue(ITimeSource::Time);
     TVolatileState& SetNextIndex(uint32_t id, uint64_t nextIndex);
@@ -195,6 +197,7 @@ private:
     uint32_t Id;
     TNodeDict Nodes;
     std::vector<uint32_t> Voters, Learners;
+    std::optional<TQuorum> VotingQuorum;
     int MinVotes;
     int Npeers;
     int Nservers;
