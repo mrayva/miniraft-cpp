@@ -116,10 +116,70 @@ TConfigurationHistory TConfigurationHistory::Observe(uint64_t index, TMessageHol
     if (!entry.HasValidExtent() || entry->Type != uint32_t(EMessageType::LOG_ENTRY) ||
         entry->Len < sizeof(TLogEntry) || entry.PayloadSize)
         throw std::invalid_argument("Invalid ordinary log entry");
-    if ((entry->Flags & TLogEntry::EConfiguration) || !entry->Term ||
-        Through >= uint64_t(INT64_MAX) || index != Through + 1 || entry->Term < ThroughLogTerm)
+    return ObserveMetadata(index, entry->Term, entry->Flags);
+}
+
+TConfigurationHistory TConfigurationHistory::ObserveMetadata(uint64_t index, uint64_t term, uint64_t flags) const {
+    if ((flags & TLogEntry::EConfiguration) || !term ||
+        Through >= uint64_t(INT64_MAX) || index != Through + 1 || term < ThroughLogTerm)
         throw std::invalid_argument("Ordinary entry does not extend the trusted history");
     TConfigurationHistory next = *this;
-    next.Through = index; next.ThroughLogTerm = entry->Term;
+    next.Through = index; next.ThroughLogTerm = term;
     return next;
+}
+
+TConfigurationScan ScanConfigurationHistory(const IState& state,
+    TConfigurationHistory baseline, uint64_t commitIndex) {
+    if (!state.CurrentTerm || state.LastLogIndex > uint64_t(INT64_MAX) ||
+        state.SnapshotIndex > state.LastLogIndex || state.SnapshotTerm > state.CurrentTerm ||
+        state.LastLogTerm > state.CurrentTerm ||
+        baseline.ThroughIndex() != state.SnapshotIndex || baseline.ThroughTerm() != state.SnapshotTerm ||
+        commitIndex < state.SnapshotIndex || commitIndex > state.LastLogIndex)
+        throw std::invalid_argument("Invalid configuration scan boundaries");
+
+    const auto snapshot = state.GetSnapshot();
+    if (state.SnapshotIndex) {
+        if (!snapshot) throw std::invalid_argument("Missing configuration scan snapshot");
+        ValidateSnapshot(*snapshot);
+        if (snapshot->Index != state.SnapshotIndex || snapshot->Term != state.SnapshotTerm)
+            throw std::invalid_argument("Configuration scan snapshot boundary mismatch");
+        if (snapshot->IsJoint()) {
+            const auto expected = TConfigurationHistory::FromJointSnapshot(*snapshot);
+            if (!baseline.IsJoint() || baseline.OldVoters() != expected.OldVoters() ||
+                baseline.NewVoters() != expected.NewVoters() ||
+                baseline.ConfigurationIndex() != expected.ConfigurationIndex() ||
+                baseline.ConfigurationTerm() != expected.ConfigurationTerm())
+                throw std::invalid_argument("Joint snapshot baseline mismatch");
+        } else if (baseline.IsJoint() || baseline.OldVoters() != snapshot->Voters) {
+            throw std::invalid_argument("Fixed snapshot baseline mismatch");
+        }
+    } else if (snapshot || state.SnapshotTerm || baseline.IsJoint()) {
+        throw std::invalid_argument("Invalid empty snapshot boundary");
+    }
+    if (!baseline.IsJoint()) {
+        const auto bound = state.GetBoundVoters();
+        if (!bound.empty() && bound != baseline.OldVoters())
+            throw std::invalid_argument("Configuration baseline differs from bound voters");
+    }
+
+    auto latest = baseline;
+    auto committed = baseline;
+    for (uint64_t index = state.SnapshotIndex + 1; index <= state.LastLogIndex; ++index) {
+        const auto term = state.RetainedLogTerm(index);
+        const auto flags = state.RetainedLogFlags(index);
+        if (!term || term > state.CurrentTerm) throw std::invalid_argument("Invalid retained log term");
+        if (flags & TLogEntry::EConfiguration) {
+            auto entry = state.Get(index);
+            if (!entry.HasValidExtent() || entry->Len < sizeof(TLogEntry) ||
+                entry->Term != term || entry->Flags != flags)
+                throw std::invalid_argument("Inconsistent configuration entry metadata");
+            latest = latest.Advance(index, entry);
+        } else {
+            latest = latest.ObserveMetadata(index, term, flags);
+        }
+        if (index == commitIndex) committed = latest;
+    }
+    if (latest.ThroughTerm() != state.LastLogTerm)
+        throw std::invalid_argument("Configuration scan last term mismatch");
+    return {committed, latest};
 }

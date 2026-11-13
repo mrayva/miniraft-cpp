@@ -32,6 +32,8 @@ public:
     static TConfigurationHistory FromJointSnapshot(const TSnapshot& snapshot);
     // Visit every retained entry in index order; neither method changes *this.
     TConfigurationHistory Observe(uint64_t index, TMessageHolder<TLogEntry> entry) const;
+    // Metadata must come from a trusted, already validated storage backend.
+    TConfigurationHistory ObserveMetadata(uint64_t index, uint64_t term, uint64_t flags) const;
     TConfigurationHistory Advance(uint64_t index, TMessageHolder<TLogEntry> entry) const;
 
     bool IsJoint() const { return !New.empty(); }
@@ -46,3 +48,18 @@ private:
     std::vector<uint32_t> Old, New;
     uint64_t ConfigIndex = 0, ConfigTerm = 0, Through = 0, ThroughLogTerm = 0;
 };
+
+struct IState;
+struct TConfigurationScan {
+    TConfigurationHistory Committed;
+    TConfigurationHistory Latest;
+    bool HasUncommittedConfiguration() const {
+        return Committed.ConfigurationIndex() != Latest.ConfigurationIndex() ||
+            Committed.ConfigurationTerm() != Latest.ConfigurationTerm();
+    }
+};
+
+// Offline, read-only validation. The caller supplies and must substantiate both
+// the baseline and the commit boundary; neither is proven by this scan.
+TConfigurationScan ScanConfigurationHistory(const IState& state,
+    TConfigurationHistory baseline, uint64_t commitIndex);

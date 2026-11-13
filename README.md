@@ -63,6 +63,8 @@ The [configuration entry foundation](docs/configuration-entries.md) defines an
 experimental entry codec and rejects that entry kind in the fixed-membership runtime.
 The [configuration history validator](docs/configuration-history.md) checks an
 offline retained-log sequence against a trusted baseline or joint snapshot.
+The [configuration log scanner](docs/configuration-scan.md) validates a retained
+suffix at a caller-supplied commit boundary and at its end.
 The [message buffer follow-up](docs/message-extents.md) checks allocated buffer
 and batch extents before accepting locally constructed frames.
 
