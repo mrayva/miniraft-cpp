@@ -27,6 +27,8 @@ struct TSnapshot {
 };
 std::string EncodeSnapshot(const TSnapshot& snapshot);
 TSnapshot DecodeSnapshot(std::string_view bytes);
+// Validate metadata and size without copying the application image.
+void ValidateSnapshot(const TSnapshot& snapshot);
 TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm);
 // Startup only, with a fresh application and a matching local boundary/log.
 void RestoreSnapshot(const TSnapshot& snapshot, const TRaft& raft, IRsm& rsm);

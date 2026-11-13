@@ -5,6 +5,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 namespace {
 using namespace NSnapshotCodec;
@@ -65,4 +66,60 @@ TConfigurationRecord DecodeConfigurationEntry(TMessageHolder<TLogEntry> entry) {
         throw std::invalid_argument("Configuration entry term or length mismatch");
     Validate(record);
     return record;
+}
+
+TConfigurationHistory TConfigurationHistory::Stable(std::vector<uint32_t> voters,
+    uint64_t configurationIndex, uint64_t configurationTerm, uint64_t throughIndex, uint64_t throughTerm) {
+    ValidateFixedVoters(voters);
+    if (throughIndex > uint64_t(INT64_MAX) || configurationIndex > throughIndex ||
+        ((configurationIndex == 0) != (configurationTerm == 0)) ||
+        ((throughIndex == 0) != (throughTerm == 0)) || configurationTerm > throughTerm ||
+        (configurationIndex && configurationIndex == throughIndex && configurationTerm != throughTerm))
+        throw std::invalid_argument("Invalid configuration history baseline");
+    TConfigurationHistory history;
+    history.Old = std::move(voters); history.ConfigIndex = configurationIndex;
+    history.ConfigTerm = configurationTerm; history.Through = throughIndex; history.ThroughLogTerm = throughTerm;
+    return history;
+}
+
+TConfigurationHistory TConfigurationHistory::FromJointSnapshot(const TSnapshot& snapshot) {
+    ValidateSnapshot(snapshot);
+    if (!snapshot.IsJoint()) throw std::invalid_argument("Snapshot does not identify a joint configuration");
+    TConfigurationHistory history;
+    history.Old = snapshot.Voters; history.New = snapshot.JointVoters;
+    history.ConfigIndex = snapshot.ConfigurationIndex; history.ConfigTerm = snapshot.ConfigurationTerm;
+    history.Through = snapshot.Index; history.ThroughLogTerm = snapshot.Term;
+    return history;
+}
+
+TConfigurationHistory TConfigurationHistory::Advance(uint64_t index, TMessageHolder<TLogEntry> entry) const {
+    const auto record = DecodeConfigurationEntry(std::move(entry));
+    if (Through >= uint64_t(INT64_MAX) || index != Through + 1 || record.Term < ThroughLogTerm ||
+        record.PreviousIndex != ConfigIndex || record.PreviousTerm != ConfigTerm)
+        throw std::invalid_argument("Configuration entry does not extend the trusted history");
+    TConfigurationHistory next = *this;
+    if (!IsJoint()) {
+        if (record.Phase != EConfigurationPhase::Joint || record.OldVoters != Old)
+            throw std::invalid_argument("Expected a joint configuration from the stable voter set");
+        next.New = record.NewVoters;
+    } else {
+        if (record.Phase != EConfigurationPhase::Stable || record.OldVoters != Old || record.NewVoters != New)
+            throw std::invalid_argument("Expected the stable successor of the joint configuration");
+        next.Old = New; next.New.clear();
+    }
+    next.ConfigIndex = next.Through = index;
+    next.ConfigTerm = next.ThroughLogTerm = record.Term;
+    return next;
+}
+
+TConfigurationHistory TConfigurationHistory::Observe(uint64_t index, TMessageHolder<TLogEntry> entry) const {
+    if (!entry.HasValidExtent() || entry->Type != uint32_t(EMessageType::LOG_ENTRY) ||
+        entry->Len < sizeof(TLogEntry) || entry.PayloadSize)
+        throw std::invalid_argument("Invalid ordinary log entry");
+    if ((entry->Flags & TLogEntry::EConfiguration) || !entry->Term ||
+        Through >= uint64_t(INT64_MAX) || index != Through + 1 || entry->Term < ThroughLogTerm)
+        throw std::invalid_argument("Ordinary entry does not extend the trusted history");
+    TConfigurationHistory next = *this;
+    next.Through = index; next.ThroughLogTerm = entry->Term;
+    return next;
 }

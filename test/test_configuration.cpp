@@ -37,6 +37,77 @@ struct TEndpoint : INode {
     void Send(TMessageHolder<TMessage>) override { ++Sent; }
     void Drain() override {}
 };
+TMessageHolder<TLogEntry> Ordinary(uint64_t term) {
+    auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = term; return entry;
+}
+void test_history_validates_joint_stable_chain_and_independent_rollback(void**) {
+    auto initial = TConfigurationHistory::Stable({1, 2, 3}, 0, 0, 0, 0);
+    auto prefix = initial.Observe(1, Ordinary(1));
+    auto joint = Joint(); joint.Term = 2; joint.PreviousIndex = joint.PreviousTerm = 0;
+    auto pending = prefix.Advance(2, EncodeConfigurationEntry(joint));
+    assert_true(pending.IsJoint());
+    assert_true(pending.OldVoters() == joint.OldVoters); assert_true(pending.NewVoters() == joint.NewVoters);
+    assert_int_equal(pending.ConfigurationIndex(), 2); assert_int_equal(pending.ConfigurationTerm(), 2);
+    auto scanned = pending.Observe(3, Ordinary(2));
+    auto final = joint; final.Phase = EConfigurationPhase::Stable; final.Term = 3;
+    final.PreviousIndex = 2; final.PreviousTerm = 2;
+    auto stable = scanned.Advance(4, EncodeConfigurationEntry(final));
+    assert_false(stable.IsJoint()); assert_true(stable.OldVoters() == joint.NewVoters);
+    assert_int_equal(stable.ConfigurationIndex(), 4); assert_int_equal(stable.ThroughTerm(), 3);
+    // A replacement branch starts from the unchanged prior prefix.
+    auto replacement = joint; replacement.Term = 3; replacement.NewVoters = {3, 5, 6};
+    auto alternate = prefix.Advance(2, EncodeConfigurationEntry(replacement));
+    assert_true(alternate.NewVoters() == replacement.NewVoters);
+    assert_true(pending.NewVoters() == joint.NewVoters);
+    assert_false(prefix.IsJoint()); assert_int_equal(prefix.ThroughIndex(), 1);
+}
+void test_history_from_joint_snapshot_requires_a_consistent_identity(void**) {
+    TSnapshot snapshot{8, 4, {1, 2, 3}, "opaque"};
+    snapshot.JointVoters = {3, 4, 5}; snapshot.ConfigurationIndex = 5; snapshot.ConfigurationTerm = 3;
+    auto history = TConfigurationHistory::FromJointSnapshot(snapshot);
+    assert_true(history.IsJoint()); assert_int_equal(history.ConfigurationIndex(), 5);
+    assert_int_equal(history.ConfigurationTerm(), 3); assert_int_equal(history.ThroughIndex(), 8);
+    assert_int_equal(history.ThroughTerm(), 4);
+    auto final = Joint(); final.Phase = EConfigurationPhase::Stable; final.Term = 4;
+    final.PreviousIndex = 5; final.PreviousTerm = 3;
+    auto stable = history.Advance(9, EncodeConfigurationEntry(final));
+    assert_false(stable.IsJoint()); assert_true(stable.OldVoters() == final.NewVoters);
+    auto fixed = snapshot; fixed.JointVoters.clear(); fixed.ConfigurationIndex = fixed.ConfigurationTerm = 0;
+    Reject([&] { TConfigurationHistory::FromJointSnapshot(fixed); });
+    auto inconsistent = snapshot; inconsistent.ConfigurationIndex = inconsistent.Index;
+    Reject([&] { TConfigurationHistory::FromJointSnapshot(inconsistent); });
+    Reject([&] { TConfigurationHistory::Stable({1}, 4, 2, 4, 3); });
+    Reject([&] { TConfigurationHistory::Stable({1}, 5, 1, 4, 3); });
+    Reject([&] { TConfigurationHistory::Stable({1}, 0, 0, 1, 0); });
+}
+void test_history_rejects_skips_wrong_predecessors_and_term_regression(void**) {
+    auto base = TConfigurationHistory::Stable({1, 2, 3}, 0, 0, 0, 0);
+    auto joint = Joint(); joint.Term = 2; joint.PreviousIndex = joint.PreviousTerm = 0;
+    auto entry = EncodeConfigurationEntry(joint);
+    Reject([&] { base.Advance(2, entry); });
+    Reject([&] { base.Observe(2, Ordinary(1)); });
+    Reject([&] { base.Observe(1, entry); });
+    Reject([&] { base.Advance(1, Ordinary(1)); });
+    auto wrong = joint; wrong.OldVoters = {1, 2, 4};
+    Reject([&] { base.Advance(1, EncodeConfigurationEntry(wrong)); });
+    auto prefix = base.Observe(1, Ordinary(3));
+    Reject([&] { prefix.Advance(2, entry); });
+    Reject([&] { prefix.Observe(2, Ordinary(2)); });
+    auto valid = joint; valid.Term = 3;
+    auto pending = prefix.Advance(2, EncodeConfigurationEntry(valid));
+    wrong = valid; wrong.Phase = EConfigurationPhase::Stable; wrong.PreviousIndex = 2; wrong.PreviousTerm = 3;
+    wrong.NewVoters = {3, 4, 6};
+    Reject([&] { pending.Advance(3, EncodeConfigurationEntry(wrong)); });
+    wrong = valid; wrong.PreviousIndex = 2; wrong.PreviousTerm = 3;
+    Reject([&] { pending.Advance(3, EncodeConfigurationEntry(wrong)); });
+    auto corrupt = EncodeConfigurationEntry(valid); corrupt->Data[0] ^= 1;
+    Reject([&] { prefix.Advance(2, corrupt); });
+    auto exhausted = TConfigurationHistory::Stable({1}, 0, 0, uint64_t(INT64_MAX), 1);
+    Reject([&] { exhausted.Observe(UINT64_MAX, Ordinary(1)); });
+    Reject([&] { exhausted.Advance(UINT64_MAX, entry); });
+    assert_false(prefix.IsJoint()); assert_int_equal(prefix.ThroughIndex(), 1);
+    assert_true(pending.IsJoint()); assert_int_equal(pending.ThroughIndex(), 2);
+}
 void test_configuration_roundtrips_both_phases_and_bounded_maximum(void**) {
     auto record = Joint();
     for (auto phase : {EConfigurationPhase::Joint, EConfigurationPhase::Stable}) {
@@ -178,10 +249,47 @@ void test_legacy_restart_uses_safe_flag_lookup_and_preserves_files(void**) {
     }
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 }
+void test_offline_history_scan_after_durable_snapshot_and_restart(void**) {
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-history-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const auto name = (dir / "raft").string(); const auto path = name + ".durable.1";
+    TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0, {1}, {1, 2}};
+    auto final = joint; final.Phase = EConfigurationPhase::Stable; final.Term = 3;
+    final.PreviousIndex = 2; final.PreviousTerm = 2;
+    {
+        auto state = std::make_shared<TDurableState>(name, 1);
+        { TRaft bootstrap(state, 1, {}); }
+        state->Append(Ordinary(1)); state->InstallSnapshot({1, 1, {1}, "fixed image"});
+        state->CurrentTerm = 3; state->Commit();
+        state->Append(EncodeConfigurationEntry(joint)); state->Append(Ordinary(2));
+        state->Append(EncodeConfigurationEntry(final));
+    }
+    std::ifstream input(path, std::ios::binary); std::string before(std::istreambuf_iterator<char>(input), {}); input.close();
+    {
+        auto state = std::make_shared<TDurableState>(name, 1);
+        // This fixture explicitly knows that index 1 precedes any config entry.
+        auto history = TConfigurationHistory::Stable({1}, 0, 0, state->SnapshotIndex, state->SnapshotTerm);
+        history = history.Advance(2, state->Get(2));
+        assert_true(history.IsJoint());
+        history = history.Observe(3, state->Get(3));
+        history = history.Advance(4, state->Get(4));
+        assert_false(history.IsJoint()); assert_true(history.OldVoters() == final.NewVoters);
+        assert_int_equal(history.ConfigurationIndex(), 4);
+        Reject([&] { TRaft disabled(state, 1, {}); });
+        assert_true(state->GetSnapshot()->Data == "fixed image");
+    }
+    std::ifstream after(path, std::ios::binary);
+    assert_true(std::string(std::istreambuf_iterator<char>(after), {}) == before);
+    std::error_code ignored; std::filesystem::remove_all(dir, ignored);
+}
 #endif
 }
 int main() {
     const CMUnitTest tests[] = {
+        cmocka_unit_test(test_history_validates_joint_stable_chain_and_independent_rollback),
+        cmocka_unit_test(test_history_from_joint_snapshot_requires_a_consistent_identity),
+        cmocka_unit_test(test_history_rejects_skips_wrong_predecessors_and_term_regression),
         cmocka_unit_test(test_configuration_roundtrips_both_phases_and_bounded_maximum),
         cmocka_unit_test(test_configuration_rejects_invalid_fields_and_valid_crc_corruption),
         cmocka_unit_test(test_configuration_rpc_and_proposal_are_rejected_before_mutation),
@@ -189,6 +297,7 @@ int main() {
 #ifdef __linux__
         cmocka_unit_test(test_durable_restart_rejects_reserved_entry_without_rewriting),
         cmocka_unit_test(test_legacy_restart_uses_safe_flag_lookup_and_preserves_files),
+        cmocka_unit_test(test_offline_history_scan_after_durable_snapshot_and_restart),
 #endif
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);

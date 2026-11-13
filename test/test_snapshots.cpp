@@ -100,7 +100,7 @@ void test_joint_snapshot_codec_roundtrip_and_corruption(void**) {
     }
 }
 void test_joint_snapshot_metadata_rejects_invalid_boundaries_and_voters(void**) {
-    for (int mode = 0; mode < 9; ++mode) {
+    for (int mode = 0; mode < 10; ++mode) {
         auto bad = JointSample();
         if (mode == 0) bad.JointVoters.clear();
         if (mode == 1) bad.JointVoters = {0, 1};
@@ -111,6 +111,7 @@ void test_joint_snapshot_metadata_rejects_invalid_boundaries_and_voters(void**) 
         if (mode == 6) bad.ConfigurationIndex = bad.Index + 1;
         if (mode == 7) bad.ConfigurationTerm = 0;
         if (mode == 8) bad.ConfigurationTerm = bad.Term + 1;
+        if (mode == 9) { bad.Term = 2; bad.ConfigurationIndex = bad.Index; bad.ConfigurationTerm = 1; }
         Reject([&] { EncodeSnapshot(bad); });
     }
     for (size_t offset : {size_t(36), size_t(44), size_t(52)}) {
@@ -122,6 +123,10 @@ void test_joint_snapshot_metadata_rejects_invalid_boundaries_and_voters(void**) 
     auto empty = EncodeSnapshot(JointSample());
     for (size_t i = 36; i < 56; ++i) empty[i] = 0;
     FixChecksum(empty); Reject([&] { DecodeSnapshot(empty); });
+    auto mismatch = EncodeSnapshot(JointSample());
+    mismatch[16] = 2; // snapshot term
+    mismatch[36] = 2; // configuration index equals the snapshot index
+    FixChecksum(mismatch); Reject([&] { DecodeSnapshot(mismatch); });
 }
 void test_joint_snapshot_cannot_be_installed_or_restored_by_fixed_runtime(void**) {
     auto snapshot = JointSample();

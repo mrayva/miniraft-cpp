@@ -1,5 +1,8 @@
 # Joint snapshot metadata foundation: v0.1.0-alpha.25
 
+The [alpha.27 follow-up](configuration-history.md) requires the configuration
+term to equal the snapshot term when both refer to the same index.
+
 This step adds an experimental snapshot representation for a joint configuration
 effective at the included snapshot boundary. MRFTS002 records the old and new
 sorted voter sets plus the configuration entry's index and term. Its index must

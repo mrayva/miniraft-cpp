@@ -34,7 +34,8 @@ void Validate(const TSnapshot& snapshot) {
     if (snapshot.IsJoint()) {
         if (snapshot.JointVoters.empty() || !snapshot.ConfigurationIndex ||
             snapshot.ConfigurationIndex > snapshot.Index || !snapshot.ConfigurationTerm ||
-            snapshot.ConfigurationTerm > snapshot.Term)
+            snapshot.ConfigurationTerm > snapshot.Term ||
+            (snapshot.ConfigurationIndex == snapshot.Index && snapshot.ConfigurationTerm != snapshot.Term))
             throw std::runtime_error("Invalid joint snapshot configuration boundary");
         validateVoters(snapshot.JointVoters);
     }
@@ -64,6 +65,8 @@ void Sync(int fd) {
 }
 #endif
 }
+
+void ValidateSnapshot(const TSnapshot& snapshot) { Validate(snapshot); }
 
 std::string EncodeSnapshot(const TSnapshot& snapshot) {
     Validate(snapshot);
