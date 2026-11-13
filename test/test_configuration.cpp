@@ -108,6 +108,84 @@ void test_history_rejects_skips_wrong_predecessors_and_term_regression(void**) {
     assert_false(prefix.IsJoint()); assert_int_equal(prefix.ThroughIndex(), 1);
     assert_true(pending.IsJoint()); assert_int_equal(pending.ThroughIndex(), 2);
 }
+struct TCountingState : TState {
+    mutable unsigned Gets = 0;
+    TMessageHolder<TLogEntry> Get(int64_t index) const override { ++Gets; return TState::Get(index); }
+};
+struct TMismatchedMetadataState : TState {
+    uint64_t RetainedLogTerm(int64_t index) const override { return TState::RetainedLogTerm(index) + 1; }
+};
+void test_scan_separates_commit_and_replaced_suffix(void**) {
+    TCountingState state; state.CurrentTerm = 3;
+    auto large = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 1024 * 1024); large->Term = 1;
+    TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0, {1}, {1, 2}};
+    auto final = joint; final.Phase = EConfigurationPhase::Stable; final.Term = 3;
+    final.PreviousIndex = 2; final.PreviousTerm = 2;
+    state.Append(large); state.Append(EncodeConfigurationEntry(joint));
+    state.Append(Ordinary(2)); state.Append(EncodeConfigurationEntry(final));
+    auto base = TConfigurationHistory::Stable({1}, 0, 0, 0, 0);
+    auto scan = ScanConfigurationHistory(state, base, 2);
+    assert_true(scan.Committed.IsJoint()); assert_int_equal(scan.Committed.ThroughIndex(), 2);
+    assert_false(scan.Latest.IsJoint()); assert_true(scan.Latest.OldVoters() == final.NewVoters);
+    assert_true(scan.HasUncommittedConfiguration()); assert_int_equal(state.Gets, 2);
+    scan = ScanConfigurationHistory(state, base, 4);
+    assert_false(scan.HasUncommittedConfiguration()); assert_int_equal(scan.Committed.ThroughIndex(), 4);
+    state.RemoveLast();
+    scan = ScanConfigurationHistory(state, base, 2);
+    assert_true(scan.Latest.IsJoint()); assert_false(scan.HasUncommittedConfiguration());
+    state.Append(EncodeConfigurationEntry(final));
+    scan = ScanConfigurationHistory(state, base, 1);
+    assert_false(scan.Committed.IsJoint()); assert_true(scan.HasUncommittedConfiguration());
+    Reject([&] { base.ObserveMetadata(1, 1, TLogEntry::EConfiguration); });
+    Reject([&] { base.ObserveMetadata(2, 1, 0); });
+}
+void test_scan_from_joint_snapshot_and_rejects_mismatched_baselines(void**) {
+    TSnapshot snapshot{2, 2, {1, 2}, "image"};
+    snapshot.JointVoters = {2, 3}; snapshot.ConfigurationIndex = 2; snapshot.ConfigurationTerm = 2;
+    // Synthetic offline state: runtime storage deliberately rejects joint snapshots.
+    TState state; state.Snapshot = std::make_shared<TSnapshot>(snapshot);
+    state.SnapshotIndex = state.LastLogIndex = 2; state.SnapshotTerm = state.LastLogTerm = 2;
+    state.CurrentTerm = 3; state.Append(Ordinary(2));
+    TConfigurationRecord final{EConfigurationPhase::Stable, 3, 2, 2, {1, 2}, {2, 3}};
+    state.Append(EncodeConfigurationEntry(final));
+    auto base = TConfigurationHistory::FromJointSnapshot(snapshot);
+    auto scan = ScanConfigurationHistory(state, base, 2);
+    assert_true(scan.Committed.IsJoint()); assert_false(scan.Latest.IsJoint());
+    assert_true(scan.Latest.OldVoters() == final.NewVoters); assert_true(scan.HasUncommittedConfiguration());
+    assert_false(ScanConfigurationHistory(state, base, 4).HasUncommittedConfiguration());
+    Reject([&] { ScanConfigurationHistory(state, base, 1); });
+    Reject([&] { ScanConfigurationHistory(state, base, 5); });
+    Reject([&] { ScanConfigurationHistory(state, TConfigurationHistory::Stable({1, 2}, 0, 0, 2, 2), 2); });
+    auto wrong = snapshot; wrong.JointVoters = {2, 4};
+    Reject([&] { ScanConfigurationHistory(state, TConfigurationHistory::FromJointSnapshot(wrong), 2); });
+    state.LastLogTerm = 2;
+    Reject([&] { ScanConfigurationHistory(state, base, 2); });
+}
+void test_scan_fails_closed_on_invalid_suffix(void**) {
+    TState state; state.CurrentTerm = 3;
+    auto base = TConfigurationHistory::Stable({1}, 0, 0, 0, 0);
+    state.Append(Ordinary(2));
+    TConfigurationRecord wrong{EConfigurationPhase::Joint, 3, 1, 2, {1}, {1, 2}};
+    state.Append(EncodeConfigurationEntry(wrong));
+    const auto fields = static_cast<TStateFields>(state);
+    Reject([&] { ScanConfigurationHistory(state, base, 1); });
+    assert_true(static_cast<TStateFields>(state) == fields); assert_int_equal(base.ThroughIndex(), 0);
+    state.RemoveLast(); state.Append(Ordinary(1));
+    Reject([&] { ScanConfigurationHistory(state, base, 1); });
+    state.RemoveLast(); state.Append(Ordinary(3));
+    state.BoundVoters = {2};
+    Reject([&] { ScanConfigurationHistory(state, base, 1); });
+    state.BoundVoters.clear(); state.CurrentTerm = 2;
+    Reject([&] { ScanConfigurationHistory(state, base, 1); });
+    TState corrupt; corrupt.CurrentTerm = 3;
+    TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0, {1}, {1, 2}};
+    auto damaged = EncodeConfigurationEntry(joint); damaged->Data[0] ^= 1;
+    corrupt.Append(damaged);
+    Reject([&] { ScanConfigurationHistory(corrupt, base, 0); });
+    TMismatchedMetadataState mismatch; mismatch.CurrentTerm = 3;
+    mismatch.Append(EncodeConfigurationEntry(joint));
+    Reject([&] { ScanConfigurationHistory(mismatch, base, 0); });
+}
 void test_configuration_roundtrips_both_phases_and_bounded_maximum(void**) {
     auto record = Joint();
     for (auto phase : {EConfigurationPhase::Joint, EConfigurationPhase::Stable}) {
@@ -270,6 +348,10 @@ void test_offline_history_scan_after_durable_snapshot_and_restart(void**) {
         auto state = std::make_shared<TDurableState>(name, 1);
         // This fixture explicitly knows that index 1 precedes any config entry.
         auto history = TConfigurationHistory::Stable({1}, 0, 0, state->SnapshotIndex, state->SnapshotTerm);
+        const auto scan = ScanConfigurationHistory(*state, history, 2);
+        assert_true(scan.Committed.IsJoint()); assert_false(scan.Latest.IsJoint());
+        assert_true(scan.Latest.OldVoters() == final.NewVoters);
+        assert_true(scan.HasUncommittedConfiguration());
         history = history.Advance(2, state->Get(2));
         assert_true(history.IsJoint());
         history = history.Observe(3, state->Get(3));
@@ -290,6 +372,9 @@ int main() {
         cmocka_unit_test(test_history_validates_joint_stable_chain_and_independent_rollback),
         cmocka_unit_test(test_history_from_joint_snapshot_requires_a_consistent_identity),
         cmocka_unit_test(test_history_rejects_skips_wrong_predecessors_and_term_regression),
+        cmocka_unit_test(test_scan_separates_commit_and_replaced_suffix),
+        cmocka_unit_test(test_scan_from_joint_snapshot_and_rejects_mismatched_baselines),
+        cmocka_unit_test(test_scan_fails_closed_on_invalid_suffix),
         cmocka_unit_test(test_configuration_roundtrips_both_phases_and_bounded_maximum),
         cmocka_unit_test(test_configuration_rejects_invalid_fields_and_valid_crc_corruption),
         cmocka_unit_test(test_configuration_rpc_and_proposal_are_rejected_before_mutation),
