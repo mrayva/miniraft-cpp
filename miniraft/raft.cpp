@@ -200,6 +200,13 @@ TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes, st
     const auto bound = State->GetBoundVoters();
     if (auto snapshot = State->GetSnapshot(); snapshot && snapshot->IsJoint())
         throw std::invalid_argument("Joint snapshot recovery is unsupported");
+    if (State->SnapshotIndex > State->LastLogIndex || State->LastLogIndex > uint64_t(INT64_MAX))
+        throw std::invalid_argument("Invalid retained log bounds");
+    // Reject before binding voters or serving traffic. Current Raft cannot
+    // interpret configuration entries, including uncommitted suffix entries.
+    for (uint64_t index = State->SnapshotIndex + 1; index <= State->LastLogIndex; ++index)
+        if (State->RetainedLogFlags(index) & TLogEntry::EConfiguration)
+            throw std::invalid_argument("Configuration log recovery is unsupported");
     const bool fresh = State->CurrentTerm == 1 && !State->VotedFor && !State->LastLogIndex;
     if (State->SupportsVoterBinding() && (!bound.empty() || fresh || State->GetSnapshot() || !Learners.empty()))
         State->BindVoters(Voters);
@@ -539,6 +546,7 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
         auto previousTerm = append->PrevLogTerm;
         for (uint32_t i = 0; i < message.PayloadSize; ++i) {
             auto entry = message.Payload[i].Cast<TLogEntry>();
+            if (entry->Flags & TLogEntry::EConfiguration) return false;
             if (!entry->Term || entry->Term < previousTerm || entry->Term > header->Term) return false;
             previousTerm = entry->Term;
             const auto index = append->PrevLogIndex + i + 1;
@@ -688,6 +696,8 @@ uint64_t TRaft::Append(TMessageHolder<TLogEntry> entry) {
     if (!entry.HasValidExtent() || entry->Type != uint32_t(EMessageType::LOG_ENTRY))
         throw TMessageError("Invalid proposed log entry");
     ValidateMessageTree(entry);
+    if (entry->Flags & TLogEntry::EConfiguration)
+        throw TMessageError("Configuration proposals are unsupported");
     entry->Term = State->CurrentTerm;
     State->Append(std::move(entry));
     return State->LastLogIndex;
@@ -1090,6 +1100,8 @@ void TRequestProcessor::ProcessCommitted() {
     auto& state = Raft->GetState();
     for (auto i = Rsm->LastAppliedIndex+1; i <= commitIndex; i++) {
         auto entry = state->Get(i);
+        if (entry->Flags & TLogEntry::EConfiguration)
+            throw std::logic_error("Configuration application is unsupported");
         if (entry->Flags == TLogEntry::EStub) {
             continue;
         }

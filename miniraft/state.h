@@ -27,6 +27,12 @@ struct IState: TStateFields {
         auto entry = Get(index);
         return entry ? entry->Term : 0;
     }
+    // Used during startup to reject unsupported retained entry kinds.
+    virtual uint64_t RetainedLogFlags(int64_t index) const {
+        auto entry = Get(index);
+        if (!entry) throw std::runtime_error("Missing retained log entry");
+        return entry->Flags;
+    }
     virtual void Commit() = 0;
     virtual bool SupportsSnapshots() const { return false; }
     virtual std::shared_ptr<const TSnapshot> GetSnapshot() const { return {}; }
@@ -126,6 +132,11 @@ struct TState: IState {
     uint64_t RetainedLogTerm(int64_t index) const override {
         if (index < 1 || uint64_t(index) <= SnapshotIndex || uint64_t(index) > LastLogIndex) return 0;
         return Log[index - SnapshotIndex - 1]->Term;
+    }
+    uint64_t RetainedLogFlags(int64_t index) const override {
+        if (index < 1 || uint64_t(index) <= SnapshotIndex || uint64_t(index) > LastLogIndex)
+            throw std::out_of_range("Missing retained log entry");
+        return Log[index - SnapshotIndex - 1]->Flags;
     }
 
     bool SupportsSnapshots() const override { return true; }

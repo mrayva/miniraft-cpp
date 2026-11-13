@@ -59,6 +59,8 @@ arithmetic for future membership changes; live voter reconfiguration remains dis
 The [joint snapshot metadata foundation](docs/joint-snapshots.md) adds a versioned
 representation for a joint configuration at a snapshot boundary; runtime adoption
 and membership changes remain disabled.
+The [configuration entry foundation](docs/configuration-entries.md) defines an
+experimental entry codec and rejects that entry kind in the fixed-membership runtime.
 The [message buffer follow-up](docs/message-extents.md) checks allocated buffer
 and batch extents before accepting locally constructed frames.
 
