@@ -156,9 +156,11 @@ requires std::derived_from<T, TMessage>
 struct TMessageHolder {
     T* Mes;
     std::shared_ptr<char[]> RawData;
+    size_t Capacity = 0; // Allocated bytes accessible starting at Mes.
 
     uint32_t PayloadSize = 0;
     std::shared_ptr<TMessageHolder<TMessage>[]> Payload;
+    size_t PayloadCapacity = 0;
 
     TMessageHolder()
         : Mes(nullptr)
@@ -169,11 +171,14 @@ struct TMessageHolder {
     TMessageHolder(U* u,
         const std::shared_ptr<char[]>& rawData,
         uint32_t payloadSize = 0,
-        const std::shared_ptr<TMessageHolder<TMessage>[]>& payload = {})
+        const std::shared_ptr<TMessageHolder<TMessage>[]>& payload = {}, size_t capacity = 0,
+        size_t payloadCapacity = 0)
         : Mes(u)
         , RawData(rawData)
+        , Capacity(capacity)
         , PayloadSize(payloadSize)
         , Payload(payload)
+        , PayloadCapacity(payloadCapacity)
     { }
 
     template<typename U>
@@ -181,13 +186,16 @@ struct TMessageHolder {
     TMessageHolder(const TMessageHolder<U>& other)
         : Mes(other.Mes)
         , RawData(other.RawData)
+        , Capacity(other.Capacity)
         , PayloadSize(other.PayloadSize)
         , Payload(other.Payload)
+        , PayloadCapacity(other.PayloadCapacity)
     { }
 
     void InitPayload(uint32_t size) {
         PayloadSize = size;
         Payload = std::shared_ptr<TMessageHolder<TMessage>[]>(new TMessageHolder<TMessage>[size]);
+        PayloadCapacity = size;
     }
 
     T* operator->() {
@@ -202,17 +210,22 @@ struct TMessageHolder {
         return !!Mes;
     }
 
+    bool HasValidExtent() const {
+        return Mes && RawData && Capacity >= sizeof(TMessage) &&
+            Mes->Len >= sizeof(TMessage) && Mes->Len <= Capacity;
+    }
+
     bool IsEx() const {
-        return Mes && Mes->Len >= sizeof(TMessageEx) && (2 <= Mes->Type && Mes->Type <= 7);
+        return HasValidExtent() && Mes->Len >= sizeof(TMessageEx) && (2 <= Mes->Type && Mes->Type <= 7);
     }
 
     template<typename U>
     requires std::derived_from<U, T>
     TMessageHolder<U> Cast() {
-        if (!Mes || Mes->Len < sizeof(U) ||
+        if (!HasValidExtent() || Mes->Len < sizeof(U) ||
             (U::MessageType != EMessageType::NONE && Mes->Type != uint32_t(U::MessageType)))
             throw std::bad_cast();
-        return TMessageHolder<U>(static_cast<U*>(Mes), RawData, PayloadSize, Payload);
+        return TMessageHolder<U>(static_cast<U*>(Mes), RawData, PayloadSize, Payload, Capacity, PayloadCapacity);
     }
 
     template<typename U>
@@ -233,7 +246,7 @@ struct TMessageHolder {
             }
         };
 
-        return Mes && Mes->Len >= sizeof(U) && Mes->Type == static_cast<uint32_t>(U::MessageType)
+        return HasValidExtent() && Mes->Len >= sizeof(U) && Mes->Type == static_cast<uint32_t>(U::MessageType)
             ? Maybe { *this }
             : Maybe { };
     }
@@ -258,7 +271,7 @@ requires std::derived_from<T, TMessage>
 TMessageHolder<T> NewHoldedMessage(uint32_t type, size_t len)
 {
     T* mes = NewMessage<T>(type, len);
-    return TMessageHolder<T>(mes, std::shared_ptr<char[]>(reinterpret_cast<char*>(mes)));
+    return TMessageHolder<T>(mes, std::shared_ptr<char[]>(reinterpret_cast<char*>(mes)), 0, {}, len);
 }
 
 template<typename T>

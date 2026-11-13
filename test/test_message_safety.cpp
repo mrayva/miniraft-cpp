@@ -127,6 +127,34 @@ void test_invalid_proposal_does_not_mutate_persistent_state(void**) {
         assert_int_equal(entry->Term, 99);
     }
 }
+void test_declared_length_cannot_exceed_actual_proposal_buffer(void**) {
+    auto state = std::make_shared<TState>();
+    TRaft raft(state, 1, {}); raft.Become(EState::LEADER);
+    auto entry = NewHoldedMessage<TLogEntry>();
+    entry->Len = sizeof(TLogEntry) + 8;
+    bool rejected = false;
+    try { raft.Append(entry); } catch (const TMessageError&) { rejected = true; }
+    assert_true(rejected);
+    assert_int_equal(state->LastLogIndex, 0);
+}
+void test_invalid_holder_extents_are_rejected_before_batch_access(void**) {
+    auto shortEntry = NewHoldedMessage<TLogEntry>();
+    shortEntry->Len += 8;
+    assert_false(shortEntry.Maybe<TLogEntry>());
+    bool rejected = false;
+    try { ValidateMessageTree(shortEntry); } catch (const TMessageError&) { rejected = true; }
+    assert_true(rejected);
+    auto append = NewHoldedMessage(TAppendEntriesRequest{.Nentries = 2});
+    append.InitPayload(1); append.Payload[0] = NewHoldedMessage<TLogEntry>();
+    append.PayloadSize = 2;
+    rejected = false;
+    try { ValidateMessageTree(append); } catch (const TMessageError&) { rejected = true; }
+    assert_true(rejected);
+    append.PayloadSize = 1; append->Nentries = 1; append.Payload[0] = shortEntry;
+    rejected = false;
+    try { ValidateMessageTree(append); } catch (const TMessageError&) { rejected = true; }
+    assert_true(rejected);
+}
 }
 int main() {
     const CMUnitTest tests[] = {
@@ -138,6 +166,8 @@ int main() {
         cmocka_unit_test(test_short_wrong_type_and_empty_casts_are_rejected),
         cmocka_unit_test(test_raft_batches_respect_budget_and_continue_replication),
         cmocka_unit_test(test_invalid_proposal_does_not_mutate_persistent_state),
+        cmocka_unit_test(test_declared_length_cannot_exceed_actual_proposal_buffer),
+        cmocka_unit_test(test_invalid_holder_extents_are_rejected_before_batch_access),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }

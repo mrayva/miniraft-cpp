@@ -686,9 +686,9 @@ uint64_t TRaft::Append(TMessageHolder<TLogEntry> entry) {
     if (!IsVoter(Id)) throw std::logic_error("A learner cannot propose log entries");
     if (StateName != EState::LEADER) throw std::logic_error("Only a leader can propose log entries");
     if (State->LastLogIndex >= uint64_t(INT64_MAX)) throw std::overflow_error("Raft log index exhausted");
-    if (!entry || entry->Type != uint32_t(EMessageType::LOG_ENTRY))
+    if (!entry.HasValidExtent() || entry->Type != uint32_t(EMessageType::LOG_ENTRY))
         throw TMessageError("Invalid proposed log entry");
-    ValidateMessageHeader(entry->Type, entry->Len);
+    ValidateMessageTree(entry);
     entry->Term = State->CurrentTerm;
     State->Append(std::move(entry));
     return State->LastLogIndex;
@@ -1017,6 +1017,9 @@ void TRequestProcessor::OnWriteRequest(TMessageHolder<TCommandRequest> command, 
 }
 
 void TRequestProcessor::OnCommandRequest(TMessageHolder<TCommandRequest> command, const std::shared_ptr<INode>& replyTo) {
+    if (!command.HasValidExtent() || command->Type != uint32_t(EMessageType::COMMAND_REQUEST))
+        throw TMessageError("Invalid command request");
+    ValidateMessageTree(command);
     Rsm->Validate(command);
     PruneRequests();
     auto flags = command->Flags;
@@ -1030,6 +1033,9 @@ void TRequestProcessor::OnCommandRequest(TMessageHolder<TCommandRequest> command
 
 void TRequestProcessor::OnCommandResponse(TMessageHolder<TCommandResponse> command,
                                          const std::shared_ptr<INode>& peer) {
+    if (!command.HasValidExtent() || command->Type != uint32_t(EMessageType::COMMAND_RESPONSE))
+        throw TMessageError("Invalid command response");
+    ValidateMessageTree(command);
     PruneRequests();
     auto it = Forwarded.find(command->Cookie);
     if (it == Forwarded.end() || !peer || it->second.Peer != peer) return;

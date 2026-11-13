@@ -41,7 +41,7 @@ uint32_t Checksum(const TBytes& bytes, size_t start, const std::array<uint8_t, 8
     return ~crc;
 }
 TMessageHolder<TLogEntry> Clone(TMessageHolder<TLogEntry> entry) {
-    if (!entry.Mes || entry->Len < sizeof(TLogEntry) || entry->Type != uint32_t(EMessageType::LOG_ENTRY))
+    if (!entry.HasValidExtent() || entry->Len < sizeof(TLogEntry) || entry->Type != uint32_t(EMessageType::LOG_ENTRY))
         throw std::runtime_error("Invalid durable log entry");
     auto copy = NewHoldedMessage<TLogEntry>(entry->Len);
     memcpy(copy.Mes, entry.Mes, entry->Len);
