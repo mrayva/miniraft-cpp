@@ -314,6 +314,41 @@ TMessageHolder<TInstallSnapshotRequest> Chunk(const TSnapshot& snapshot, std::st
     message->Offset = offset; message->TotalBytes = bytes.size(); message->Done = offset + count == bytes.size();
     message->LeaderId = 1; memcpy(message->Data, bytes.data() + offset, count); return message;
 }
+void test_joint_snapshot_is_rejected_even_if_boundary_is_already_covered(void**) {
+    TKv source; source.Write(source.Prepare(Command("a", "old")), 5);
+    TSnapshot fixed{5, 1, {1, 2}, source.SaveSnapshot()};
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> replies;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) { replies.push_back(message.template Cast<TInstallSnapshotResponse>()); });
+    auto state = std::make_shared<TState>();
+    auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}});
+    auto app = std::make_shared<TApplication>(); TRequestProcessor processor(raft, app, {});
+    auto fixedBytes = EncodeSnapshot(fixed);
+    raft->Process({}, Chunk(fixed, fixedBytes, 0, fixedBytes.size()));
+    assert_true(replies.back()->Installed); assert_int_equal(app->Loads, 1);
+    auto joint = fixed; joint.JointVoters = {2, 3}; joint.ConfigurationIndex = 4; joint.ConfigurationTerm = 1;
+    const auto bytes = EncodeSnapshot(joint);
+    const auto before = static_cast<TStateFields>(*state);
+    raft->Process({}, Chunk(joint, bytes, 0, bytes.size()));
+    assert_false(replies.back()->Success); assert_false(replies.back()->Installed);
+    assert_true(static_cast<TStateFields>(*state) == before); assert_int_equal(app->Loads, 1);
+    // A supported covered snapshot can also identify its magic across chunks.
+    raft->Process({}, Chunk(fixed, fixedBytes, 0, 4));
+    assert_true(replies.back()->Success); assert_false(replies.back()->Installed);
+    assert_int_equal(replies.back()->NextOffset, 4);
+    raft->Process({}, Chunk(fixed, fixedBytes, 4, 4));
+    assert_true(replies.back()->Success); assert_true(replies.back()->Installed);
+    assert_int_equal(replies.back()->NextOffset, fixedBytes.size());
+    raft->Process({}, Chunk(joint, bytes, 0, 4));
+    assert_true(replies.back()->Success); assert_false(replies.back()->Installed);
+    raft->Process({}, Chunk(joint, bytes, 4, 4));
+    assert_false(replies.back()->Success); assert_false(replies.back()->Installed);
+    joint.Index = 6;
+    const auto newer = EncodeSnapshot(joint);
+    raft->Process({}, Chunk(joint, newer, 0, newer.size()));
+    assert_false(replies.back()->Success); assert_false(replies.back()->Installed);
+    assert_true(static_cast<TStateFields>(*state) == before); assert_int_equal(app->Loads, 1);
+    assert_true(Read(*app, "a") == "old");
+}
 void test_corrupt_snapshot_and_invalid_headers_cannot_mutate_application(void**) {
     TKv source; source.Write(source.Prepare(Command("a", "new")), 5);
     TSnapshot snapshot{5, 1, {1, 2}, source.SaveSnapshot()};
@@ -515,6 +550,7 @@ int main() {
         cmocka_unit_test(test_partial_and_installed_snapshot_acks_do_not_confirm_strong_reads),
         cmocka_unit_test(test_compacted_follower_hint_requires_boundary_probe_before_match),
         cmocka_unit_test(test_corrupt_snapshot_and_invalid_headers_cannot_mutate_application),
+        cmocka_unit_test(test_joint_snapshot_is_rejected_even_if_boundary_is_already_covered),
         cmocka_unit_test(test_remote_snapshot_retains_suffix_without_applying_it_before_commit),
         cmocka_unit_test(test_snapshot_boundary_index_exhaustion_does_not_append_wrapped_noop),
         cmocka_unit_test(test_memory_snapshot_boundary_retains_matching_suffix_and_replaces_conflict),

@@ -46,6 +46,12 @@ void Apply(TKv& kv, const std::string& key, const std::string& value, uint64_t i
     kv.Write(kv.Prepare(Command(key, value)), index);
 }
 TSnapshot Sample() { return {2, 1, {1, 2, 3}, std::string("a\0b", 3)}; }
+TSnapshot JointSample() {
+    auto snapshot = Sample();
+    snapshot.JointVoters = {3, 4, 5};
+    snapshot.ConfigurationIndex = 1; snapshot.ConfigurationTerm = 1;
+    return snapshot;
+}
 void FixChecksum(std::string& bytes) {
     bytes.resize(bytes.size() - 4);
     NSnapshotCodec::Put(bytes, NSnapshotCodec::Checksum(bytes), 4);
@@ -73,6 +79,65 @@ void test_snapshot_codec_roundtrip_and_all_byte_corruption(void**) {
         Reject([&] { DecodeSnapshot(damaged); });
         Reject([&] { DecodeSnapshot(std::string_view(encoded).substr(0, i)); });
     }
+}
+void test_joint_snapshot_codec_roundtrip_and_corruption(void**) {
+    auto fixed = EncodeSnapshot(Sample());
+    // Golden v1 image, including the original CRC and embedded NUL byte.
+    const std::string hex = "4d5246545330303102000000000000000100000000000000030000000300000000000000010000000200000003000000610062e0c541c6";
+    std::string golden;
+    for (size_t i = 0; i < hex.size(); i += 2) golden.push_back(char(std::stoul(hex.substr(i, 2), nullptr, 16)));
+    assert_true(fixed == golden);
+    assert_true(DecodeSnapshot(golden) == Sample());
+    assert_false(DecodeSnapshot(fixed).IsJoint());
+    const auto original = JointSample();
+    const auto encoded = EncodeSnapshot(original);
+    assert_true(encoded.substr(0, 8) == "MRFTS002");
+    assert_true(DecodeSnapshot(encoded) == original);
+    for (size_t i = 0; i < encoded.size(); ++i) {
+        auto damaged = encoded; damaged[i] ^= 1;
+        Reject([&] { DecodeSnapshot(damaged); });
+        Reject([&] { DecodeSnapshot(std::string_view(encoded).substr(0, i)); });
+    }
+}
+void test_joint_snapshot_metadata_rejects_invalid_boundaries_and_voters(void**) {
+    for (int mode = 0; mode < 9; ++mode) {
+        auto bad = JointSample();
+        if (mode == 0) bad.JointVoters.clear();
+        if (mode == 1) bad.JointVoters = {0, 1};
+        if (mode == 2) bad.JointVoters = {1, 1};
+        if (mode == 3) bad.JointVoters = {2, 1};
+        if (mode == 4) bad.JointVoters.resize(TSnapshot::MaxVoters + 1, 1);
+        if (mode == 5) bad.ConfigurationIndex = 0;
+        if (mode == 6) bad.ConfigurationIndex = bad.Index + 1;
+        if (mode == 7) bad.ConfigurationTerm = 0;
+        if (mode == 8) bad.ConfigurationTerm = bad.Term + 1;
+        Reject([&] { EncodeSnapshot(bad); });
+    }
+    for (size_t offset : {size_t(36), size_t(44), size_t(52)}) {
+        auto damaged = EncodeSnapshot(JointSample());
+        const auto width = offset == 52 ? 4 : 8;
+        for (size_t i = offset; i < offset + width; ++i) damaged[i] = char(0xff);
+        FixChecksum(damaged); Reject([&] { DecodeSnapshot(damaged); });
+    }
+    auto empty = EncodeSnapshot(JointSample());
+    for (size_t i = 36; i < 56; ++i) empty[i] = 0;
+    FixChecksum(empty); Reject([&] { DecodeSnapshot(empty); });
+}
+void test_joint_snapshot_cannot_be_installed_or_restored_by_fixed_runtime(void**) {
+    auto snapshot = JointSample();
+    auto state = std::make_shared<TState>();
+    state->Append(NewHoldedMessage<TLogEntry>()); state->Append(NewHoldedMessage<TLogEntry>());
+    const auto before = static_cast<TStateFields>(*state);
+    Reject([&] { state->InstallSnapshot(snapshot); });
+    assert_true(static_cast<TStateFields>(*state) == before);
+    TRaft raft(state, 1, {{2, std::make_shared<TSink>()}, {3, std::make_shared<TSink>()}});
+    TKv app;
+    Reject([&] { RestoreSnapshot(snapshot, raft, app); });
+    assert_int_equal(app.LastAppliedIndex, 0);
+    auto recovered = std::make_shared<TState>();
+    recovered->Snapshot = std::make_shared<const TSnapshot>(snapshot);
+    Reject([&] { TRaft unsupported(recovered, 1, {{2, std::make_shared<TSink>()}, {3, std::make_shared<TSink>()}}); });
+    assert_true(recovered->GetBoundVoters().empty());
 }
 void test_snapshot_metadata_and_declared_lengths_are_bounded(void**) {
     auto snapshot = Sample();
@@ -175,6 +240,35 @@ void test_restore_rejects_mismatched_log_configuration_and_used_application(void
     assert_true(Read(restored, "a") == "one");
 }
 #ifdef __linux__
+void test_joint_snapshot_export_roundtrips_but_durable_state_rejects_it(void**) {
+    TFiles files;
+    { TSnapshotStore exportStore(files.Name, 1); exportStore.Save(JointSample());
+      assert_true(exportStore.Load().value() == JointSample()); }
+    const auto path = files.Name + ".durable.1";
+    {
+        auto state = std::make_shared<TDurableState>(files.Name, 1);
+        TRaft raft(state, 1, {{2, std::make_shared<TSink>()}, {3, std::make_shared<TSink>()}});
+        const auto before = static_cast<TStateFields>(*state);
+        std::ifstream input(path, std::ios::binary); std::string bytes(std::istreambuf_iterator<char>(input), {}); input.close();
+        Reject([&] { state->InstallSnapshot(JointSample()); });
+        assert_true(static_cast<TStateFields>(*state) == before);
+        std::ifstream after(path, std::ios::binary);
+        assert_true(std::string(std::istreambuf_iterator<char>(after), {}) == bytes);
+    }
+    // Synthesize a well-checksummed v3 store containing the unsupported image.
+    std::ifstream input(path, std::ios::binary); std::string bytes(std::istreambuf_iterator<char>(input), {}); input.close();
+    assert_true(bytes.substr(0, 8) == "MRFTD003");
+    const auto image = EncodeSnapshot(JointSample());
+    for (int i = 0; i < 8; ++i) bytes[56 + i] = char(uint64_t(image.size()) >> (8 * i));
+    bytes.insert(64, image);
+    for (int i = 0; i < 8; ++i) bytes[8 + i] = char(uint64_t(bytes.size() - 20) >> (8 * i));
+    const auto crc = NSnapshotCodec::Checksum(bytes.substr(0, 8) + bytes.substr(20));
+    for (int i = 0; i < 4; ++i) bytes[16 + i] = char(crc >> (8 * i));
+    { std::ofstream output(path, std::ios::binary | std::ios::trunc); output.write(bytes.data(), bytes.size()); }
+    Reject([&] { TDurableState state(files.Name, 1); });
+    std::ifstream after(path, std::ios::binary);
+    assert_true(std::string(std::istreambuf_iterator<char>(after), {}) == bytes);
+}
 void test_snapshot_store_rejects_oversized_files_and_temp_symlinks(void**) {
     TFiles files;
     TSnapshotStore store(files.Name, 1);
@@ -287,12 +381,16 @@ void test_durable_kv_restart_restores_checkpoint_and_replays_only_tail(void**) {
 int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_snapshot_codec_roundtrip_and_all_byte_corruption),
+        cmocka_unit_test(test_joint_snapshot_codec_roundtrip_and_corruption),
+        cmocka_unit_test(test_joint_snapshot_metadata_rejects_invalid_boundaries_and_voters),
+        cmocka_unit_test(test_joint_snapshot_cannot_be_installed_or_restored_by_fixed_runtime),
         cmocka_unit_test(test_snapshot_metadata_and_declared_lengths_are_bounded),
         cmocka_unit_test(test_kv_snapshot_is_canonical_and_binary_safe),
         cmocka_unit_test(test_kv_invalid_snapshot_preserves_existing_state_and_progress),
         cmocka_unit_test(test_capture_requires_committed_applied_progress),
         cmocka_unit_test(test_restore_rejects_mismatched_log_configuration_and_used_application),
 #ifdef __linux__
+        cmocka_unit_test(test_joint_snapshot_export_roundtrips_but_durable_state_rejects_it),
         cmocka_unit_test(test_snapshot_store_rejects_oversized_files_and_temp_symlinks),
         cmocka_unit_test(test_snapshot_store_roundtrip_lock_and_corrupt_recovery),
         cmocka_unit_test(test_snapshot_crash_at_each_publication_boundary),

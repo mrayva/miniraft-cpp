@@ -64,6 +64,7 @@ inline void ValidateVoterBinding(const IState& state, const std::vector<uint32_t
     if (!old.empty()) {
         if (old != voters) throw std::invalid_argument("Persisted voter configuration cannot be changed by restart");
     } else if (auto snapshot = state.GetSnapshot()) {
+        if (snapshot->IsJoint()) throw std::invalid_argument("Joint snapshot recovery is unsupported");
         if (snapshot->Voters != voters) throw std::invalid_argument("Snapshot voter configuration mismatch");
     } else if (state.CurrentTerm != 1 || state.VotedFor || state.LastLogIndex) {
         throw std::invalid_argument("Unbound nonfresh store needs a verified snapshot before enabling learners");
@@ -136,6 +137,7 @@ struct TState: IState {
     }
     std::shared_ptr<const TSnapshot> GetSnapshot() const override { return Snapshot; }
     void InstallSnapshot(const TSnapshot& snapshot) override {
+        if (snapshot.IsJoint()) throw std::invalid_argument("Joint snapshot installation is unsupported");
         EncodeSnapshot(snapshot); // Validate before changing any state.
         if (!BoundVoters.empty() && snapshot.Voters != BoundVoters)
             throw std::invalid_argument("Snapshot would change bound voters");

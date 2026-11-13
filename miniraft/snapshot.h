@@ -18,6 +18,11 @@ struct TSnapshot {
     uint64_t Index = 0, Term = 0;
     std::vector<uint32_t> Voters;
     std::string Data;
+    // Optional joint configuration effective at this snapshot boundary.
+    // Runtime installation is disabled until membership recovery is implemented.
+    std::vector<uint32_t> JointVoters;
+    uint64_t ConfigurationIndex = 0, ConfigurationTerm = 0;
+    bool IsJoint() const { return !JointVoters.empty() || ConfigurationIndex || ConfigurationTerm; }
     bool operator==(const TSnapshot&) const = default;
 };
 std::string EncodeSnapshot(const TSnapshot& snapshot);

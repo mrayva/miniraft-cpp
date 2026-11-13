@@ -15,20 +15,33 @@
 namespace {
 using namespace NSnapshotCodec;
 constexpr std::string_view Magic = "MRFTS001";
+constexpr std::string_view JointMagic = "MRFTS002";
 void Validate(const TSnapshot& snapshot) {
     if (!snapshot.Index || snapshot.Index > uint64_t(INT64_MAX) || !snapshot.Term ||
         snapshot.Voters.empty() || snapshot.Voters.size() > TSnapshot::MaxVoters ||
-        snapshot.Data.size() > TSnapshot::MaxBytes - 40 - 4 * snapshot.Voters.size())
+        snapshot.JointVoters.size() > TSnapshot::MaxVoters ||
+        snapshot.Data.size() > TSnapshot::MaxBytes - (snapshot.IsJoint() ? 60 : 40) -
+            4 * (snapshot.Voters.size() + snapshot.JointVoters.size()))
         throw std::runtime_error("Invalid snapshot metadata/size");
-    uint32_t previous = 0;
-    for (auto voter : snapshot.Voters) {
-        if (voter <= previous) throw std::runtime_error("Snapshot voters must be positive, sorted and unique");
-        previous = voter;
+    const auto validateVoters = [](const auto& voters) {
+        uint32_t previous = 0;
+        for (auto voter : voters) {
+            if (voter <= previous) throw std::runtime_error("Snapshot voters must be positive, sorted and unique");
+            previous = voter;
+        }
+    };
+    validateVoters(snapshot.Voters);
+    if (snapshot.IsJoint()) {
+        if (snapshot.JointVoters.empty() || !snapshot.ConfigurationIndex ||
+            snapshot.ConfigurationIndex > snapshot.Index || !snapshot.ConfigurationTerm ||
+            snapshot.ConfigurationTerm > snapshot.Term)
+            throw std::runtime_error("Invalid joint snapshot configuration boundary");
+        validateVoters(snapshot.JointVoters);
     }
 }
 void CheckLocalLog(const TSnapshot& snapshot, const TRaft& raft) {
     Validate(snapshot);
-    if (snapshot.Voters != raft.GetVoterIds() || snapshot.Index > raft.GetLastIndex() ||
+    if (snapshot.IsJoint() || snapshot.Voters != raft.GetVoterIds() || snapshot.Index > raft.GetLastIndex() ||
         snapshot.Term > raft.GetState()->CurrentTerm ||
         raft.GetState()->LogTerm(snapshot.Index) != snapshot.Term)
         throw std::runtime_error("Snapshot does not match retained log and fixed configuration");
@@ -54,12 +67,18 @@ void Sync(int fd) {
 
 std::string EncodeSnapshot(const TSnapshot& snapshot) {
     Validate(snapshot);
-    std::string out(Magic);
+    std::string out(snapshot.IsJoint() ? JointMagic : Magic);
     Put(out, snapshot.Index, 8);
     Put(out, snapshot.Term, 8);
     Put(out, snapshot.Voters.size(), 4);
     Put(out, snapshot.Data.size(), 8);
+    if (snapshot.IsJoint()) {
+        Put(out, snapshot.ConfigurationIndex, 8);
+        Put(out, snapshot.ConfigurationTerm, 8);
+        Put(out, snapshot.JointVoters.size(), 4);
+    }
     for (auto voter : snapshot.Voters) Put(out, voter, 4);
+    for (auto voter : snapshot.JointVoters) Put(out, voter, 4);
     Append(out, snapshot.Data);
     Put(out, Checksum(out), 4);
     return out;
@@ -72,15 +91,26 @@ TSnapshot DecodeSnapshot(std::string_view bytes) {
     if (Checksum(bytes.substr(0, bytes.size() - 4)) != trailer.Take(4))
         throw std::runtime_error("Snapshot checksum mismatch");
     TReader reader{bytes.substr(0, bytes.size() - 4)};
-    if (reader.Read(Magic.size()) != Magic) throw std::runtime_error("Unknown snapshot format");
+    const auto magic = reader.Read(Magic.size());
+    const bool joint = magic == JointMagic;
+    if (!joint && magic != Magic) throw std::runtime_error("Unknown snapshot format");
     TSnapshot snapshot;
     snapshot.Index = reader.Take(8);
     snapshot.Term = reader.Take(8);
     const auto count = reader.Take(4);
     const auto length = reader.Take(8);
-    if (count > TSnapshot::MaxVoters || count > reader.Input.size() / 4)
+    uint64_t newCount = 0;
+    if (joint) {
+        snapshot.ConfigurationIndex = reader.Take(8);
+        snapshot.ConfigurationTerm = reader.Take(8);
+        newCount = reader.Take(4);
+    }
+    if (count > TSnapshot::MaxVoters || newCount > TSnapshot::MaxVoters ||
+        count + newCount > reader.Input.size() / 4)
         throw std::runtime_error("Invalid snapshot voter count");
     for (uint32_t i = 0; i < count; ++i) snapshot.Voters.push_back(reader.Take(4));
+    for (uint32_t i = 0; i < newCount; ++i) snapshot.JointVoters.push_back(reader.Take(4));
+    if (joint && !snapshot.IsJoint()) throw std::runtime_error("Empty joint snapshot configuration");
     if (length > reader.Input.size()) throw std::runtime_error("Invalid snapshot data length");
     snapshot.Data = reader.Read(size_t(length));
     if (!reader.Input.empty()) throw std::runtime_error("Trailing snapshot data");
