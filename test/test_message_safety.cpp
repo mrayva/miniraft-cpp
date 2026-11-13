@@ -39,6 +39,22 @@ struct TEndpoint : INode {
     }
     void Drain() override {}
 };
+struct TCountingState : TState {
+    mutable unsigned Reads = 0;
+    TMessageHolder<TLogEntry> Get(int64_t index) const override {
+        ++Reads; return TState::Get(index);
+    }
+};
+void test_memory_term_lookup_avoids_copying_full_entry(void**) {
+    TCountingState state;
+    auto entry = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 1024 * 1024);
+    entry->Term = 1; entry->Data[0] = 'x'; state.Append(entry);
+    for (int i = 0; i < 20; ++i) assert_int_equal(state.LogTerm(1), 1);
+    assert_int_equal(state.Reads, 0);
+    auto copy = state.Get(1); copy->Term = 9; copy->Data[0] = 'y';
+    assert_int_equal(state.LogTerm(1), 1);
+    assert_int_equal(state.Get(1)->Data[0], 'x');
+}
 void test_memory_log_does_not_alias_proposed_or_read_entries(void**) {
     auto entry = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 1);
     entry->Data[0] = 'a';
@@ -114,6 +130,7 @@ void test_invalid_proposal_does_not_mutate_persistent_state(void**) {
 }
 int main() {
     const CMUnitTest tests[] = {
+        cmocka_unit_test(test_memory_term_lookup_avoids_copying_full_entry),
         cmocka_unit_test(test_memory_log_does_not_alias_proposed_or_read_entries),
         cmocka_unit_test(test_memory_log_constructor_owns_initial_entries),
         cmocka_unit_test(test_memory_state_copies_do_not_share_mutable_log_entries),

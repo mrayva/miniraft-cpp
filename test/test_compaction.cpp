@@ -413,6 +413,26 @@ struct TFiles {
     }
     ~TFiles() { std::error_code ignored; std::filesystem::remove_all(Directory, ignored); }
 };
+struct TCountingDurable : TDurableState {
+    using TDurableState::TDurableState;
+    mutable unsigned Reads = 0;
+    TMessageHolder<TLogEntry> Get(int64_t index) const override {
+        ++Reads; return TDurableState::Get(index);
+    }
+};
+void test_durable_term_lookup_avoids_payload_copies_across_compaction(void**) {
+    TFiles files; TCountingDurable state(files.Name, 1);
+    auto entry = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 1024 * 1024);
+    entry->Data[0] = 'x'; state.Append(entry); state.Append(entry);
+    state.InstallSnapshot({1, 1, {1}, "image"});
+    for (int i = 0; i < 20; ++i) {
+        assert_int_equal(state.LogTerm(1), 1); assert_int_equal(state.LogTerm(2), 1);
+        assert_int_equal(state.LogTerm(3), 0);
+    }
+    assert_int_equal(state.Reads, 0);
+    auto read = state.Get(2); read->Data[0] = 'y'; read->Term = 2;
+    assert_int_equal(state.LogTerm(2), 1); assert_int_equal(state.Get(2)->Data[0], 'x');
+}
 void test_durable_compacted_boundary_survives_restart(void**) {
     TFiles files;
     { TDurableState state(files.Name, 1); ExerciseBoundary(state); }
@@ -499,6 +519,7 @@ int main() {
         cmocka_unit_test(test_snapshot_boundary_index_exhaustion_does_not_append_wrapped_noop),
         cmocka_unit_test(test_memory_snapshot_boundary_retains_matching_suffix_and_replaces_conflict),
 #ifdef __linux__
+        cmocka_unit_test(test_durable_term_lookup_avoids_payload_copies_across_compaction),
         cmocka_unit_test(test_durable_compacted_boundary_survives_restart),
         cmocka_unit_test(test_snapshot_and_suffix_are_atomic_at_every_publication_stage),
         cmocka_unit_test(test_compaction_reclaims_durable_prefix_bytes),

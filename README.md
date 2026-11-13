@@ -52,6 +52,8 @@ Append calls to leaders, preventing nonleaders from creating conflicting command
 at the same log index and term.
 The [memory log ownership follow-up](docs/memory-log-ownership.md) prevents
 caller-owned entry buffers from changing entries already stored in TState.
+The [term lookup follow-up](docs/term-lookups.md) avoids copying full payloads
+when Raft needs only a retained entry's term.
 
 [![Number of GitHub stars](https://img.shields.io/github/stars/resetius/miniraft-cpp)](https://github.com/resetius/miniraft-cpp/stargazers)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/resetius/miniraft-cpp)
