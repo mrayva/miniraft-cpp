@@ -65,20 +65,38 @@ inline void ValidateVoterBinding(const IState& state, const std::vector<uint32_t
 }
 
 struct TState: IState {
+    static TMessageHolder<TLogEntry> CloneEntry(const TMessageHolder<TLogEntry>& entry) {
+        if (!entry || entry->Type != uint32_t(EMessageType::LOG_ENTRY) || entry->Len < sizeof(TLogEntry))
+            throw std::invalid_argument("Invalid in-memory log entry");
+        auto copy = NewHoldedMessage<TLogEntry>(entry->Len);
+        memcpy(copy.Mes, entry.Mes, entry->Len);
+        return copy;
+    }
     std::vector<TMessageHolder<TLogEntry>> Log;
     std::shared_ptr<const TSnapshot> Snapshot;
     std::vector<uint32_t> BoundVoters;
 
     TState() = default;
     TState(uint64_t currentTerm, uint32_t votedFor, const std::vector<TMessageHolder<TLogEntry>>& log)
-        : Log(log)
     {
+        for (const auto& entry : log) Log.push_back(CloneEntry(entry));
         CurrentTerm = currentTerm;
         VotedFor = votedFor;
         if (!log.empty()) {
             LastLogIndex = log.size();
             LastLogTerm = log.back()->Term;
         }
+    }
+    TState(const TState& other) : IState(other), Snapshot(other.Snapshot), BoundVoters(other.BoundVoters) {
+        for (const auto& entry : other.Log) Log.push_back(CloneEntry(entry));
+    }
+    TState& operator=(const TState& other) {
+        if (this != &other) {
+            TState copy(other);
+            static_cast<TStateFields&>(*this) = copy;
+            Log.swap(copy.Log); Snapshot.swap(copy.Snapshot); BoundVoters.swap(copy.BoundVoters);
+        }
+        return *this;
     }
 
     void RemoveLast() override {
@@ -89,14 +107,14 @@ struct TState: IState {
     }
 
     void Append(TMessageHolder<TLogEntry> entry) override {
-        Log.emplace_back(std::move(entry));
+        Log.emplace_back(CloneEntry(entry));
         LastLogIndex = SnapshotIndex + Log.size();
         LastLogTerm = Log.back()->Term;
     }
 
     TMessageHolder<TLogEntry> Get(int64_t index) const override {
         if (index < 1 || uint64_t(index) <= SnapshotIndex || uint64_t(index) > LastLogIndex) return {};
-        return Log[index - SnapshotIndex - 1];
+        return CloneEntry(Log[index - SnapshotIndex - 1]);
     }
 
     bool SupportsSnapshots() const override { return true; }

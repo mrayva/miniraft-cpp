@@ -39,6 +39,34 @@ struct TEndpoint : INode {
     }
     void Drain() override {}
 };
+void test_memory_log_does_not_alias_proposed_or_read_entries(void**) {
+    auto entry = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 1);
+    entry->Data[0] = 'a';
+    TState state;
+    state.Append(entry);
+    entry->Term = 9; entry->Data[0] = 'b';
+    auto read = state.Get(1);
+    assert_int_equal(read->Term, 1); assert_int_equal(read->Data[0], 'a');
+    read->Term = 7; read->Data[0] = 'c';
+    assert_int_equal(state.Get(1)->Term, 1); assert_int_equal(state.Get(1)->Data[0], 'a');
+    assert_int_equal(state.LastLogTerm, 1);
+}
+void test_memory_log_constructor_owns_initial_entries(void**) {
+    auto entry = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 1);
+    entry->Data[0] = 'x';
+    TState state(1, 0, {entry});
+    entry->Data[0] = 'y'; entry->Term = 2;
+    assert_int_equal(state.Get(1)->Data[0], 'x'); assert_int_equal(state.LogTerm(1), 1);
+}
+void test_memory_state_copies_do_not_share_mutable_log_entries(void**) {
+    TState source; source.Append(NewHoldedMessage<TLogEntry>());
+    TState copied(source), assigned; assigned = source;
+    source.Log[0]->Term = 4;
+    assert_int_equal(copied.LogTerm(1), 1);
+    assert_int_equal(assigned.LogTerm(1), 1);
+    copied.Log[0]->Term = 5;
+    assert_int_equal(assigned.LogTerm(1), 1);
+}
 void test_raft_batches_respect_budget_and_continue_replication(void**) {
     auto state = std::make_shared<TState>();
     state->CurrentTerm = 2;
@@ -86,6 +114,9 @@ void test_invalid_proposal_does_not_mutate_persistent_state(void**) {
 }
 int main() {
     const CMUnitTest tests[] = {
+        cmocka_unit_test(test_memory_log_does_not_alias_proposed_or_read_entries),
+        cmocka_unit_test(test_memory_log_constructor_owns_initial_entries),
+        cmocka_unit_test(test_memory_state_copies_do_not_share_mutable_log_entries),
         cmocka_unit_test(test_typed_allocations_reject_undersized_storage),
         cmocka_unit_test(test_short_wrong_type_and_empty_casts_are_rejected),
         cmocka_unit_test(test_raft_batches_respect_budget_and_continue_replication),

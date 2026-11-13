@@ -50,6 +50,8 @@ the OS; a safe bounded application deadline remains open.
 The [proposal admission follow-up](docs/proposal-admission.md) restricts direct
 Append calls to leaders, preventing nonleaders from creating conflicting commands
 at the same log index and term.
+The [memory log ownership follow-up](docs/memory-log-ownership.md) prevents
+caller-owned entry buffers from changing entries already stored in TState.
 
 [![Number of GitHub stars](https://img.shields.io/github/stars/resetius/miniraft-cpp)](https://github.com/resetius/miniraft-cpp/stargazers)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/resetius/miniraft-cpp)

@@ -208,6 +208,21 @@ void test_nonleader_proposal_rejection_preserves_store_and_input(void**) {
         assert_int_equal(entry->Term, 77);
     }
 }
+void test_mutating_proposal_after_append_cannot_change_committed_command(void**) {
+    TCluster cluster(3); cluster.Elect(1); cluster.Replicate(1);
+    TWriteClient leader(cluster.Nodes[0]), follower(cluster.Nodes[1]), other(cluster.Nodes[2]);
+    auto entry = LogValue("valid");
+    auto index = cluster.Nodes[0]->Append(entry);
+    memcpy(entry->Data, "rogue", 5);
+    cluster.Replicate(1, true, true);
+    leader.Poll(); follower.Poll(); other.Poll();
+    for (auto* client : {&leader, &follower, &other}) {
+        assert_int_equal(client->Rsm->Applied.size(), 1);
+        assert_string_equal(client->Rsm->Applied[0].c_str(), "valid");
+    }
+    assert_true(cluster.Nodes[0]->GetVolatileState()->CommitIndex >= index);
+    cluster.AssertCommittedPrefix();
+}
 
 void test_follower_proposal_cannot_diverge_same_term_committed_command(void**) {
     TCluster cluster(3); cluster.Elect(1); cluster.Replicate(1);
@@ -877,6 +892,7 @@ void test_cluster_restart_preserves_applied_history_and_rebuilds_volatile_applic
 int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_nonleader_proposal_rejection_preserves_store_and_input),
+        cmocka_unit_test(test_mutating_proposal_after_append_cannot_change_committed_command),
         cmocka_unit_test(test_follower_proposal_cannot_diverge_same_term_committed_command),
         cmocka_unit_test(test_recovered_application_progress_is_not_rewound),
         cmocka_unit_test(test_application_progress_never_decreases_on_lower_commit_input),
