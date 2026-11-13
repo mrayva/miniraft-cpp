@@ -33,6 +33,7 @@ void ValidateMessageTree(const TMessageHolder<TMessage>& message, const TMessage
     uint64_t remaining = limits.MaxBatchBytes;
     auto validate = [&](const auto& frame, bool child) {
         if (!frame) throw TMessageError("Missing message");
+        if (!frame.HasValidExtent()) throw TMessageError("Message length exceeds its buffer");
         ValidateMessageHeader(frame->Type, frame->Len, limits);
         if (frame->Len > remaining) throw TMessageError("Message batch exceeds byte limit");
         remaining -= frame->Len;
@@ -45,7 +46,7 @@ void ValidateMessageTree(const TMessageHolder<TMessage>& message, const TMessage
     if (message->Type != uint32_t(EMessageType::APPEND_ENTRIES_REQUEST)) return;
     auto copy = message;
     const auto count = copy.Cast<TAppendEntriesRequest>()->Nentries;
-    if (count > limits.MaxEntries || count != message.PayloadSize || (count && !message.Payload))
+    if (count > limits.MaxEntries || count != message.PayloadSize || count > message.PayloadCapacity || (count && !message.Payload))
         throw TMessageError("Invalid AppendEntries entry count");
     for (uint32_t i = 0; i < count; ++i) validate(message.Payload[i], true);
 }

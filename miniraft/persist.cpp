@@ -114,6 +114,7 @@ TMessageHolder<TMessage> TDiskState::Read() const
 
 void TDiskState::Write(TMessageHolder<TMessage> message)
 {
+    if (!message.HasValidExtent()) Fail("Invalid Raft log entry buffer");
     if (!Entries.write(reinterpret_cast<const char*>(message.Mes), message->Len)) {
         Fail("Cannot write Raft log entry");
     }

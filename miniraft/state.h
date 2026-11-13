@@ -72,7 +72,7 @@ inline void ValidateVoterBinding(const IState& state, const std::vector<uint32_t
 
 struct TState: IState {
     static TMessageHolder<TLogEntry> CloneEntry(const TMessageHolder<TLogEntry>& entry) {
-        if (!entry || entry->Type != uint32_t(EMessageType::LOG_ENTRY) || entry->Len < sizeof(TLogEntry))
+        if (!entry.HasValidExtent() || entry->Type != uint32_t(EMessageType::LOG_ENTRY) || entry->Len < sizeof(TLogEntry))
             throw std::invalid_argument("Invalid in-memory log entry");
         auto copy = NewHoldedMessage<TLogEntry>(entry->Len);
         memcpy(copy.Mes, entry.Mes, entry->Len);

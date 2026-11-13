@@ -64,6 +64,27 @@ struct TFollower {
     }
 };
 
+void test_malformed_forwarded_reply_does_not_consume_route(void**) {
+    TFollower follower; TClient client;
+    follower.Request(client, 42);
+    auto response = follower.Response(0);
+    response->Len += 8;
+    bool rejected = false;
+    try { follower.Processor.OnCommandResponse(response, follower.Leader); }
+    catch (const TMessageError&) { rejected = true; }
+    assert_true(rejected); assert_true(client.Replies.empty());
+    auto wrong = follower.Response(0);
+    wrong->Type = uint32_t(EMessageType::LOG_ENTRY);
+    rejected = false;
+    try { follower.Processor.OnCommandResponse(wrong, follower.Leader); }
+    catch (const TMessageError&) { rejected = true; }
+    assert_true(rejected); assert_true(client.Replies.empty());
+    follower.Reply(0);
+    assert_int_equal(client.Replies.size(), 1);
+    assert_int_equal(client.Replies[0].Cookie, 42);
+    assert_string_equal(client.Replies[0].Data.c_str(), "answer");
+}
+
 void test_nonzero_client_cookies_are_forwarded(void**) {
     for (uint32_t cookie : {42u, UINT32_MAX}) {
         TFollower follower;
@@ -225,6 +246,7 @@ void test_peer_disconnect_cancels_once_and_does_not_reuse_cookies(void**) {
 
 int main() {
     const CMUnitTest tests[] = {
+        cmocka_unit_test(test_malformed_forwarded_reply_does_not_consume_route),
         cmocka_unit_test(test_nonzero_client_cookies_are_forwarded),
         cmocka_unit_test(test_zero_client_cookie_is_restored),
         cmocka_unit_test(test_forwarding_copies_request_and_marks_one_hop),
