@@ -54,6 +54,8 @@ The [memory log ownership follow-up](docs/memory-log-ownership.md) prevents
 caller-owned entry buffers from changing entries already stored in TState.
 The [term lookup follow-up](docs/term-lookups.md) avoids copying full payloads
 when Raft needs only a retained entry's term.
+The [joint quorum foundation](docs/joint-quorum.md) adds and tests dual-majority
+arithmetic for future membership changes; live voter reconfiguration remains disabled.
 The [message buffer follow-up](docs/message-extents.md) checks allocated buffer
 and batch extents before accepting locally constructed frames.
 
