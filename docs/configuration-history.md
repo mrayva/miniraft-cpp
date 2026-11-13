@@ -1,0 +1,48 @@
+# Offline configuration history validation: v0.1.0-alpha.27
+
+TConfigurationHistory checks a sequence of retained log entries against a trusted
+configuration baseline. It joins the experimental configuration-entry codec with
+the joint-snapshot metadata and checks that joint and stable records have the
+expected predecessor index/term and voter sets. A stable configuration can advance
+to a joint one; that joint configuration can advance to a stable record naming the
+same old and new sets. A successful stable transition selects the new voters.
+
+The caller visits every retained entry in order: Observe handles ordinary entries,
+and Advance handles configuration entries. Both return a new history value and
+leave the original unchanged on success or failure. They reject index gaps,
+nonpositive or decreasing terms, malformed records, wrong predecessors, wrong voter
+sets and invalid phase transitions. A caller can retain a previous value and scan
+a replacement branch from that point. This models validation of rollback; it does
+not truncate a live log or decide when a configuration becomes active.
+
+FromJointSnapshot validates the snapshot metadata and starts at its included
+index and term, using its joint configuration identity. Stable accepts an explicit
+configuration identity and scanned-prefix boundary. The caller must establish that
+baseline independently: a v1 fixed snapshot contains voter IDs but does not prove
+the latest configuration entry's identity. Passing a zero identity asserts that no
+earlier configuration entry exists. Decode and authenticate any persisted input as
+appropriate before supplying it. The validator does not prove commitment, cluster
+identity, promotion readiness, log completeness outside the supplied sequence or
+the correctness of the caller's trusted baseline.
+
+Joint snapshot metadata now rejects a configuration term different from the
+snapshot term when both indices are equal: one log index cannot have two terms.
+Earlier alpha.25 tooling could encode such structurally inconsistent v2 images;
+they are now rejected and are not rewritten automatically. The live runtime never
+accepted joint snapshots. Fixed v1 snapshot encoding and existing durable formats
+are unchanged.
+
+Tests cover joint/stable chains, alternate branches, joint snapshot boundaries,
+invalid baseline identities, skipped entries, stale terms, wrong sets and
+predecessors, malformed entries, index exhaustion and CRC-valid snapshot metadata
+corruption. A durable test scans configuration entries after a fixed snapshot and
+restart, confirms the fixture's known bootstrap baseline, and verifies that Raft
+still rejects the unsupported entries without rewriting storage. Full tests also
+cover existing snapshot installation and learner catch-up.
+
+This is offline validation, not live reconfiguration. Joint entry activation and
+rollback, durable configuration recovery, snapshot installation across membership
+transitions, promotion gates and transport discovery remain open. Self-review
+checked contiguous scanning, term and predecessor relationships, immutable branch
+results, snapshot boundary consistency and the unknown-v1-identity case. No
+independent reviewer approval is claimed.
