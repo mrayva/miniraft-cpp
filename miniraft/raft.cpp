@@ -192,8 +192,11 @@ TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes, st
     std::sort(Voters.begin(), Voters.end());
     ValidateFixedVoters(Voters);
     VotingQuorum.emplace(Voters);
+    if (!State->CurrentTerm) throw std::invalid_argument("Stored Raft term must be positive");
     if (!IsVoter(Id) && State->VotedFor)
         throw std::invalid_argument("A learner store must not contain a vote");
+    if (State->VotedFor && !IsVoter(State->VotedFor))
+        throw std::invalid_argument("Stored vote does not name a configured voter");
     Nservers = Voters.size(); MinVotes = Nservers / 2 + 1;
     if (!Learners.empty() && !State->SupportsVoterBinding())
         throw std::invalid_argument("Learners require voter-binding-capable storage");
