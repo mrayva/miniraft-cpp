@@ -30,6 +30,7 @@ public:
         uint64_t configurationIndex, uint64_t configurationTerm,
         uint64_t throughIndex, uint64_t throughTerm);
     static TConfigurationHistory FromJointSnapshot(const TSnapshot& snapshot);
+    static TConfigurationHistory FromStableSnapshot(const TSnapshot& snapshot);
     // Visit every retained entry in index order; neither method changes *this.
     TConfigurationHistory Observe(uint64_t index, TMessageHolder<TLogEntry> entry) const;
     // Metadata must come from a trusted, already validated storage backend.

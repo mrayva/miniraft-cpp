@@ -99,6 +99,43 @@ void test_joint_snapshot_codec_roundtrip_and_corruption(void**) {
         Reject([&] { DecodeSnapshot(std::string_view(encoded).substr(0, i)); });
     }
 }
+void test_stable_configuration_snapshot_codec_and_runtime_guards(void**) {
+    auto snapshot = Sample(); snapshot.StableConfiguration = true;
+    snapshot.ConfigurationIndex = 1; snapshot.ConfigurationTerm = 1;
+    const auto encoded = EncodeSnapshot(snapshot);
+    assert_true(encoded.substr(0, 8) == "MRFTS003");
+    assert_true(DecodeSnapshot(encoded) == snapshot); assert_false(snapshot.IsJoint());
+    for (size_t i = 0; i < encoded.size(); ++i) {
+        auto damaged = encoded; damaged[i] ^= 1;
+        Reject([&] { DecodeSnapshot(damaged); });
+        Reject([&] { DecodeSnapshot(std::string_view(encoded).substr(0, i)); });
+    }
+    for (int mode = 0; mode < 6; ++mode) {
+        auto bad = snapshot;
+        if (mode == 0) bad.ConfigurationIndex = 0;
+        if (mode == 1) bad.ConfigurationIndex = 3;
+        if (mode == 2) bad.ConfigurationTerm = 0;
+        if (mode == 3) bad.ConfigurationTerm = 2;
+        if (mode == 4) { bad.Term = 2; bad.ConfigurationIndex = 2; bad.ConfigurationTerm = 1; }
+        if (mode == 5) bad.JointVoters = {3, 4};
+        Reject([&] { EncodeSnapshot(bad); });
+    }
+    for (size_t offset : {size_t(36), size_t(44)}) {
+        auto damaged = encoded;
+        for (size_t i = offset; i < offset + 8; ++i) damaged[i] = char(0xff);
+        FixChecksum(damaged); Reject([&] { DecodeSnapshot(damaged); });
+    }
+    auto memory = std::make_shared<TState>();
+    Reject([&] { memory->InstallSnapshot(snapshot); });
+    memory->Snapshot = std::make_shared<const TSnapshot>(snapshot);
+    Reject([&] { TRaft unsupported(memory, 1, {{2, std::make_shared<TSink>()}, {3, std::make_shared<TSink>()}}); });
+    assert_true(memory->GetBoundVoters().empty());
+#ifdef __linux__
+    TFiles files;
+    { TSnapshotStore store(files.Name, 1); store.Save(snapshot); assert_true(store.Load().value() == snapshot); }
+    { TDurableState state(files.Name, 1); Reject([&] { state.InstallSnapshot(snapshot); }); }
+#endif
+}
 void test_joint_snapshot_metadata_rejects_invalid_boundaries_and_voters(void**) {
     for (int mode = 0; mode < 10; ++mode) {
         auto bad = JointSample();
@@ -245,6 +282,25 @@ void test_restore_rejects_mismatched_log_configuration_and_used_application(void
     assert_true(Read(restored, "a") == "one");
 }
 #ifdef __linux__
+void test_stable_configuration_snapshot_durable_recovery_fails_closed(void**) {
+    TFiles files; const auto path = files.Name + ".durable.1";
+    { auto state = std::make_shared<TDurableState>(files.Name, 1);
+      TRaft raft(state, 1, {{2, std::make_shared<TSink>()}, {3, std::make_shared<TSink>()}}); }
+    std::ifstream input(path, std::ios::binary); std::string bytes(std::istreambuf_iterator<char>(input), {}); input.close();
+    assert_true(bytes.substr(0, 8) == "MRFTD003");
+    auto snapshot = Sample(); snapshot.StableConfiguration = true;
+    snapshot.ConfigurationIndex = 1; snapshot.ConfigurationTerm = 1;
+    const auto image = EncodeSnapshot(snapshot);
+    for (int i = 0; i < 8; ++i) bytes[56 + i] = char(uint64_t(image.size()) >> (8 * i));
+    bytes.insert(64, image);
+    for (int i = 0; i < 8; ++i) bytes[8 + i] = char(uint64_t(bytes.size() - 20) >> (8 * i));
+    const auto crc = NSnapshotCodec::Checksum(bytes.substr(0, 8) + bytes.substr(20));
+    for (int i = 0; i < 4; ++i) bytes[16 + i] = char(crc >> (8 * i));
+    { std::ofstream output(path, std::ios::binary | std::ios::trunc); output.write(bytes.data(), bytes.size()); }
+    Reject([&] { TDurableState state(files.Name, 1); });
+    std::ifstream after(path, std::ios::binary);
+    assert_true(std::string(std::istreambuf_iterator<char>(after), {}) == bytes);
+}
 void test_joint_snapshot_export_roundtrips_but_durable_state_rejects_it(void**) {
     TFiles files;
     { TSnapshotStore exportStore(files.Name, 1); exportStore.Save(JointSample());
@@ -387,6 +443,7 @@ int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_snapshot_codec_roundtrip_and_all_byte_corruption),
         cmocka_unit_test(test_joint_snapshot_codec_roundtrip_and_corruption),
+        cmocka_unit_test(test_stable_configuration_snapshot_codec_and_runtime_guards),
         cmocka_unit_test(test_joint_snapshot_metadata_rejects_invalid_boundaries_and_voters),
         cmocka_unit_test(test_joint_snapshot_cannot_be_installed_or_restored_by_fixed_runtime),
         cmocka_unit_test(test_snapshot_metadata_and_declared_lengths_are_bounded),
@@ -395,6 +452,7 @@ int main() {
         cmocka_unit_test(test_capture_requires_committed_applied_progress),
         cmocka_unit_test(test_restore_rejects_mismatched_log_configuration_and_used_application),
 #ifdef __linux__
+        cmocka_unit_test(test_stable_configuration_snapshot_durable_recovery_fails_closed),
         cmocka_unit_test(test_joint_snapshot_export_roundtrips_but_durable_state_rejects_it),
         cmocka_unit_test(test_snapshot_store_rejects_oversized_files_and_temp_symlinks),
         cmocka_unit_test(test_snapshot_store_roundtrip_lock_and_corrupt_recovery),

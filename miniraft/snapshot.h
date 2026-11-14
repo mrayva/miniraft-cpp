@@ -22,7 +22,10 @@ struct TSnapshot {
     // Runtime installation is disabled until membership recovery is implemented.
     std::vector<uint32_t> JointVoters;
     uint64_t ConfigurationIndex = 0, ConfigurationTerm = 0;
-    bool IsJoint() const { return !JointVoters.empty() || ConfigurationIndex || ConfigurationTerm; }
+    // Experimental stable-configuration identity; fixed runtime rejects it.
+    bool StableConfiguration = false;
+    bool IsJoint() const { return !JointVoters.empty() || (!StableConfiguration && (ConfigurationIndex || ConfigurationTerm)); }
+    bool HasConfigurationMetadata() const { return StableConfiguration || IsJoint(); }
     bool operator==(const TSnapshot&) const = default;
 };
 std::string EncodeSnapshot(const TSnapshot& snapshot);

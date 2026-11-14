@@ -65,6 +65,8 @@ The [configuration history validator](docs/configuration-history.md) checks an
 offline retained-log sequence against a trusted baseline or joint snapshot.
 The [configuration log scanner](docs/configuration-scan.md) validates a retained
 suffix at a caller-supplied commit boundary and at its end.
+The [stable configuration snapshot foundation](docs/stable-configuration-snapshots.md)
+preserves configuration identity for offline recovery validation.
 The [snapshot term validation fix](docs/snapshot-committed-terms.md) rejects
 snapshot boundaries that contradict the follower's committed prefix.
 The [message buffer follow-up](docs/message-extents.md) checks allocated buffer

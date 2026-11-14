@@ -84,12 +84,18 @@ TConfigurationHistory TConfigurationHistory::Stable(std::vector<uint32_t> voters
 
 TConfigurationHistory TConfigurationHistory::FromJointSnapshot(const TSnapshot& snapshot) {
     ValidateSnapshot(snapshot);
-    if (!snapshot.IsJoint()) throw std::invalid_argument("Snapshot does not identify a joint configuration");
+    if (!snapshot.IsJoint() || snapshot.StableConfiguration) throw std::invalid_argument("Snapshot does not identify a joint configuration");
     TConfigurationHistory history;
     history.Old = snapshot.Voters; history.New = snapshot.JointVoters;
     history.ConfigIndex = snapshot.ConfigurationIndex; history.ConfigTerm = snapshot.ConfigurationTerm;
     history.Through = snapshot.Index; history.ThroughLogTerm = snapshot.Term;
     return history;
+}
+
+TConfigurationHistory TConfigurationHistory::FromStableSnapshot(const TSnapshot& snapshot) {
+    ValidateSnapshot(snapshot);
+    if (!snapshot.StableConfiguration) throw std::invalid_argument("Snapshot does not identify a stable configuration");
+    return Stable(snapshot.Voters, snapshot.ConfigurationIndex, snapshot.ConfigurationTerm, snapshot.Index, snapshot.Term);
 }
 
 TConfigurationHistory TConfigurationHistory::Advance(uint64_t index, TMessageHolder<TLogEntry> entry) const {
@@ -150,7 +156,9 @@ TConfigurationScan ScanConfigurationHistory(const IState& state,
                 baseline.ConfigurationIndex() != expected.ConfigurationIndex() ||
                 baseline.ConfigurationTerm() != expected.ConfigurationTerm())
                 throw std::invalid_argument("Joint snapshot baseline mismatch");
-        } else if (baseline.IsJoint() || baseline.OldVoters() != snapshot->Voters) {
+        } else if (baseline.IsJoint() || baseline.OldVoters() != snapshot->Voters ||
+            (snapshot->StableConfiguration && (baseline.ConfigurationIndex() != snapshot->ConfigurationIndex ||
+                baseline.ConfigurationTerm() != snapshot->ConfigurationTerm))) {
             throw std::invalid_argument("Fixed snapshot baseline mismatch");
         }
     } else if (snapshot || state.SnapshotTerm || baseline.IsJoint()) {

@@ -167,7 +167,7 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
         if (!length && compacted) throw std::runtime_error("Missing embedded snapshot");
         if (length) {
             auto snapshot = DecodeSnapshot(std::string_view(reinterpret_cast<const char*>(bytes.data() + position), size_t(length)));
-            if (snapshot.IsJoint()) throw std::runtime_error("Joint snapshot recovery is unsupported");
+            if (snapshot.HasConfigurationMetadata()) throw std::runtime_error("Configuration snapshot recovery is unsupported");
             if (snapshot.Term > CurrentTerm) throw std::runtime_error("Future durable snapshot term");
             if (configured && snapshot.Voters != Impl->Voters) throw std::runtime_error("Durable snapshot/voter mismatch");
             position += size_t(length);
@@ -309,7 +309,7 @@ uint64_t TDurableState::RetainedLogFlags(int64_t index) const {
 std::shared_ptr<const TSnapshot> TDurableState::GetSnapshot() const { return Impl->Snapshot; }
 
 void TDurableState::InstallSnapshot(const TSnapshot& snapshot) {
-    if (snapshot.IsJoint()) throw std::invalid_argument("Joint snapshot installation is unsupported");
+    if (snapshot.HasConfigurationMetadata()) throw std::invalid_argument("Configuration snapshot installation is unsupported");
     EncodeSnapshot(snapshot);
     if (!Impl->Voters.empty() && snapshot.Voters != Impl->Voters)
         throw std::invalid_argument("Snapshot would change bound voters");

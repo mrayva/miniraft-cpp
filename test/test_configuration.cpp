@@ -161,6 +161,31 @@ void test_scan_from_joint_snapshot_and_rejects_mismatched_baselines(void**) {
     state.LastLogTerm = 2;
     Reject([&] { ScanConfigurationHistory(state, base, 2); });
 }
+void test_scan_from_stable_configuration_snapshot(void**) {
+    TSnapshot snapshot{5, 2, {1, 2}, "image"}; snapshot.StableConfiguration = true;
+    snapshot.ConfigurationIndex = 4; snapshot.ConfigurationTerm = 2;
+    auto decoded = DecodeSnapshot(EncodeSnapshot(snapshot));
+    auto baseline = TConfigurationHistory::FromStableSnapshot(decoded);
+    assert_false(baseline.IsJoint()); assert_int_equal(baseline.ConfigurationIndex(), 4);
+    TState state; state.Snapshot = std::make_shared<TSnapshot>(decoded);
+    state.SnapshotIndex = state.LastLogIndex = 5; state.SnapshotTerm = state.LastLogTerm = 2;
+    state.CurrentTerm = 3;
+    TConfigurationRecord joint{EConfigurationPhase::Joint, 3, 4, 2, {1, 2}, {2, 3}};
+    state.Append(EncodeConfigurationEntry(joint));
+    auto scan = ScanConfigurationHistory(state, baseline, 5);
+    assert_false(scan.Committed.IsJoint()); assert_true(scan.Latest.IsJoint());
+    assert_true(scan.HasUncommittedConfiguration());
+    auto wrong = TConfigurationHistory::Stable({1, 2}, 0, 0, 5, 2);
+    Reject([&] { ScanConfigurationHistory(state, wrong, 5); });
+    wrong = TConfigurationHistory::Stable({1, 2}, 4, 1, 5, 2);
+    Reject([&] { ScanConfigurationHistory(state, wrong, 5); });
+    Reject([&] { TConfigurationHistory::FromJointSnapshot(decoded); });
+    Reject([&] { TConfigurationHistory::FromStableSnapshot(TSnapshot{5, 2, {1, 2}, "legacy"}); });
+    Reject([&] { state.InstallSnapshot(snapshot); });
+    auto wrongPredecessor = joint; wrongPredecessor.PreviousIndex = 3;
+    state.RemoveLast(); state.Append(EncodeConfigurationEntry(wrongPredecessor));
+    Reject([&] { ScanConfigurationHistory(state, baseline, 5); });
+}
 void test_scan_fails_closed_on_invalid_suffix(void**) {
     TState state; state.CurrentTerm = 3;
     auto base = TConfigurationHistory::Stable({1}, 0, 0, 0, 0);
@@ -374,6 +399,7 @@ int main() {
         cmocka_unit_test(test_history_rejects_skips_wrong_predecessors_and_term_regression),
         cmocka_unit_test(test_scan_separates_commit_and_replaced_suffix),
         cmocka_unit_test(test_scan_from_joint_snapshot_and_rejects_mismatched_baselines),
+        cmocka_unit_test(test_scan_from_stable_configuration_snapshot),
         cmocka_unit_test(test_scan_fails_closed_on_invalid_suffix),
         cmocka_unit_test(test_configuration_roundtrips_both_phases_and_bounded_maximum),
         cmocka_unit_test(test_configuration_rejects_invalid_fields_and_valid_crc_corruption),

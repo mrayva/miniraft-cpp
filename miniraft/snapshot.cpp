@@ -16,11 +16,12 @@ namespace {
 using namespace NSnapshotCodec;
 constexpr std::string_view Magic = "MRFTS001";
 constexpr std::string_view JointMagic = "MRFTS002";
+constexpr std::string_view StableMagic = "MRFTS003";
 void Validate(const TSnapshot& snapshot) {
     if (!snapshot.Index || snapshot.Index > uint64_t(INT64_MAX) || !snapshot.Term ||
         snapshot.Voters.empty() || snapshot.Voters.size() > TSnapshot::MaxVoters ||
         snapshot.JointVoters.size() > TSnapshot::MaxVoters ||
-        snapshot.Data.size() > TSnapshot::MaxBytes - (snapshot.IsJoint() ? 60 : 40) -
+        snapshot.Data.size() > TSnapshot::MaxBytes - (snapshot.StableConfiguration ? 56 : snapshot.IsJoint() ? 60 : 40) -
             4 * (snapshot.Voters.size() + snapshot.JointVoters.size()))
         throw std::runtime_error("Invalid snapshot metadata/size");
     const auto validateVoters = [](const auto& voters) {
@@ -31,8 +32,8 @@ void Validate(const TSnapshot& snapshot) {
         }
     };
     validateVoters(snapshot.Voters);
-    if (snapshot.IsJoint()) {
-        if (snapshot.JointVoters.empty() || !snapshot.ConfigurationIndex ||
+    if (snapshot.HasConfigurationMetadata()) {
+        if ((snapshot.StableConfiguration ? !snapshot.JointVoters.empty() : snapshot.JointVoters.empty()) || !snapshot.ConfigurationIndex ||
             snapshot.ConfigurationIndex > snapshot.Index || !snapshot.ConfigurationTerm ||
             snapshot.ConfigurationTerm > snapshot.Term ||
             (snapshot.ConfigurationIndex == snapshot.Index && snapshot.ConfigurationTerm != snapshot.Term))
@@ -42,7 +43,7 @@ void Validate(const TSnapshot& snapshot) {
 }
 void CheckLocalLog(const TSnapshot& snapshot, const TRaft& raft) {
     Validate(snapshot);
-    if (snapshot.IsJoint() || snapshot.Voters != raft.GetVoterIds() || snapshot.Index > raft.GetLastIndex() ||
+    if (snapshot.HasConfigurationMetadata() || snapshot.Voters != raft.GetVoterIds() || snapshot.Index > raft.GetLastIndex() ||
         snapshot.Term > raft.GetState()->CurrentTerm ||
         raft.GetState()->LogTerm(snapshot.Index) != snapshot.Term)
         throw std::runtime_error("Snapshot does not match retained log and fixed configuration");
@@ -70,15 +71,15 @@ void ValidateSnapshot(const TSnapshot& snapshot) { Validate(snapshot); }
 
 std::string EncodeSnapshot(const TSnapshot& snapshot) {
     Validate(snapshot);
-    std::string out(snapshot.IsJoint() ? JointMagic : Magic);
+    std::string out(snapshot.StableConfiguration ? StableMagic : snapshot.IsJoint() ? JointMagic : Magic);
     Put(out, snapshot.Index, 8);
     Put(out, snapshot.Term, 8);
     Put(out, snapshot.Voters.size(), 4);
     Put(out, snapshot.Data.size(), 8);
-    if (snapshot.IsJoint()) {
+    if (snapshot.HasConfigurationMetadata()) {
         Put(out, snapshot.ConfigurationIndex, 8);
         Put(out, snapshot.ConfigurationTerm, 8);
-        Put(out, snapshot.JointVoters.size(), 4);
+        if (!snapshot.StableConfiguration) Put(out, snapshot.JointVoters.size(), 4);
     }
     for (auto voter : snapshot.Voters) Put(out, voter, 4);
     for (auto voter : snapshot.JointVoters) Put(out, voter, 4);
@@ -96,17 +97,19 @@ TSnapshot DecodeSnapshot(std::string_view bytes) {
     TReader reader{bytes.substr(0, bytes.size() - 4)};
     const auto magic = reader.Read(Magic.size());
     const bool joint = magic == JointMagic;
-    if (!joint && magic != Magic) throw std::runtime_error("Unknown snapshot format");
+    const bool stable = magic == StableMagic;
+    if (!joint && !stable && magic != Magic) throw std::runtime_error("Unknown snapshot format");
     TSnapshot snapshot;
+    snapshot.StableConfiguration = stable;
     snapshot.Index = reader.Take(8);
     snapshot.Term = reader.Take(8);
     const auto count = reader.Take(4);
     const auto length = reader.Take(8);
     uint64_t newCount = 0;
-    if (joint) {
+    if (joint || stable) {
         snapshot.ConfigurationIndex = reader.Take(8);
         snapshot.ConfigurationTerm = reader.Take(8);
-        newCount = reader.Take(4);
+        if (joint) newCount = reader.Take(4);
     }
     if (count > TSnapshot::MaxVoters || newCount > TSnapshot::MaxVoters ||
         count + newCount > reader.Input.size() / 4)
