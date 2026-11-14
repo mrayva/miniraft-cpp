@@ -12,7 +12,7 @@ The caller must independently establish the baseline and commit index: the scan
 does not prove that any entry is committed, recover a commit index, authenticate
 the snapshot, or establish cluster identity. A fixed v1 snapshot does not identify
 its latest configuration entry, so its configuration identity must come from
-other trusted information. A joint snapshot contains that identity and the scan
+other trusted information. Experimental stable and joint snapshots contain that identity and the scan
 checks that the supplied baseline matches it. The scan checks snapshot and log
 boundaries, bound fixed voters, terms, configuration predecessors, and transitions.
 It requires a consistent, externally serialized view of the state; it does not

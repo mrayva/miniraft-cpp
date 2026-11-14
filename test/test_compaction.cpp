@@ -357,6 +357,15 @@ void test_joint_snapshot_is_rejected_even_if_boundary_is_already_covered(void**)
     assert_true(replies.back()->Success); assert_false(replies.back()->Installed);
     raft->Process({}, Chunk(joint, bytes, 4, 4));
     assert_false(replies.back()->Success); assert_false(replies.back()->Installed);
+    auto stable = fixed; stable.StableConfiguration = true; stable.ConfigurationIndex = 4; stable.ConfigurationTerm = 1;
+    auto stableBytes = EncodeSnapshot(stable);
+    raft->Process({}, Chunk(stable, stableBytes, 0, 4));
+    assert_true(replies.back()->Success); assert_false(replies.back()->Installed);
+    raft->Process({}, Chunk(stable, stableBytes, 4, 4));
+    assert_false(replies.back()->Success); assert_false(replies.back()->Installed);
+    stable.Index = 6; stableBytes = EncodeSnapshot(stable);
+    raft->Process({}, Chunk(stable, stableBytes, 0, stableBytes.size()));
+    assert_false(replies.back()->Success); assert_false(replies.back()->Installed);
     joint.Index = 6;
     const auto newer = EncodeSnapshot(joint);
     raft->Process({}, Chunk(joint, newer, 0, newer.size()));

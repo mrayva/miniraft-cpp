@@ -198,8 +198,8 @@ TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes, st
     if (!Learners.empty() && !State->SupportsVoterBinding())
         throw std::invalid_argument("Learners require voter-binding-capable storage");
     const auto bound = State->GetBoundVoters();
-    if (auto snapshot = State->GetSnapshot(); snapshot && snapshot->IsJoint())
-        throw std::invalid_argument("Joint snapshot recovery is unsupported");
+    if (auto snapshot = State->GetSnapshot(); snapshot && snapshot->HasConfigurationMetadata())
+        throw std::invalid_argument("Configuration snapshot recovery is unsupported");
     if (State->SnapshotIndex > State->LastLogIndex || State->LastLogIndex > uint64_t(INT64_MAX))
         throw std::invalid_argument("Invalid retained log bounds");
     // Reject before binding voters or serving traffic. Current Raft cannot
@@ -868,7 +868,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     TSnapshot snapshot;
     try {
         snapshot = DecodeSnapshot(bytes);
-        if (snapshot.IsJoint() || snapshot.Index != request->SnapshotIndex || snapshot.Term != request->SnapshotTerm || snapshot.Voters != GetVoterIds())
+        if (snapshot.HasConfigurationMetadata() || snapshot.Index != request->SnapshotIndex || snapshot.Term != request->SnapshotTerm || snapshot.Voters != GetVoterIds())
             throw TMessageError("Snapshot metadata mismatch");
         application->ValidateSnapshot(snapshot.Data, snapshot.Index);
     } catch (const std::exception&) {
