@@ -152,7 +152,7 @@ struct TState: IState {
         EncodeSnapshot(snapshot); // Validate before changing any state.
         if (!BoundVoters.empty() && snapshot.Voters != BoundVoters)
             throw std::invalid_argument("Snapshot would change bound voters");
-        if (snapshot.Index <= SnapshotIndex || snapshot.Term > CurrentTerm)
+        if (snapshot.Index <= SnapshotIndex || snapshot.Term < SnapshotTerm || snapshot.Term > CurrentTerm)
             throw std::invalid_argument("Obsolete or future snapshot");
         auto image = std::make_shared<const TSnapshot>(snapshot);
         std::vector<TMessageHolder<TLogEntry>> suffix;

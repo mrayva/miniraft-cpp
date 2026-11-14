@@ -21,3 +21,8 @@ valid later snapshot still installs. This check detects these specific committed
 term contradictions; it does not authenticate peers or prove snapshot contents
 match the committed application state. Membership changes and joint snapshot
 installation remain disabled. No wire or storage format changes.
+
+The in-memory and durable storage APIs also reject a replacement snapshot whose
+term is below the existing compacted boundary term. This protects direct storage
+callers even when they bypass RPC validation. Rejection leaves the selected
+snapshot, retained suffix and durable image unchanged.
