@@ -177,11 +177,9 @@ TConfigurationScan ScanConfigurationHistory(const IState& state,
     } else if (snapshot || state.SnapshotTerm || baseline.IsJoint()) {
         throw std::invalid_argument("Invalid empty snapshot boundary");
     }
-    if (!baseline.IsJoint()) {
-        const auto bound = state.GetBoundVoters();
-        if (!bound.empty() && bound != baseline.OldVoters())
-            throw std::invalid_argument("Configuration baseline differs from bound voters");
-    }
+    const auto bound = state.GetBoundVoters();
+    if (!bound.empty() && bound != baseline.OldVoters())
+        throw std::invalid_argument("Configuration baseline differs from bound voters");
 
     auto latest = baseline;
     auto committed = baseline;

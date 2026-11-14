@@ -19,16 +19,17 @@ bounded before allocation. Fixed snapshots continue to encode as MRFTS001 with
 exactly the previous bytes; a golden v1 image tests compatibility. The standalone
 snapshot store can export and load v2 images for testing or offline tooling.
 
-This is a format foundation, not live joint consensus or complete configuration
-history. Current Raft nodes reject joint snapshot restore, installation and
-durable recovery; compaction still creates only fixed-voter snapshots. A covered
-snapshot is acknowledged only after its prefix identifies the supported v1
-format, including when the prefix arrives in several chunks. Unsupported joint
-images are rejected without replacing application data or publishing a joint
-snapshot. A valid higher-term RPC header can still update durable hard state
-before its unsupported snapshot contents are recognized.
-These rules avoid falsely acknowledging a joint image merely because its index
-is already committed locally.
+This is a format and offline persistence foundation, not live joint consensus or
+complete configuration history. A bound memory or durable store can install and
+recover a joint snapshot when its persisted voter list matches the snapshot's old
+voter set. Raft startup and RPC paths still reject joint snapshots, and compaction
+still creates only fixed-voter snapshots. A covered snapshot is acknowledged only
+after its prefix identifies the supported v1 format, including when the prefix
+arrives in several chunks. Unsupported joint images are rejected without
+replacing application data or publishing a joint snapshot. A valid higher-term
+RPC header can still update durable hard state before its unsupported snapshot
+contents are recognized. These rules avoid falsely acknowledging a joint image
+merely because its index is already committed locally.
 
 Older binaries do not understand MRFTS002 and may acknowledge an already-covered
 image without checking its version. Do not send or activate joint snapshots in a
@@ -41,9 +42,9 @@ configuration is committed and is not an authoritative Raft checkpoint.
 
 Tests cover a golden v1 image, joint round-trip, every-byte corruption and
 truncation, semantic corruption with valid CRC, bounds and ordering, standalone
-publication, rejected memory/durable installation and durable recovery without
-rewriting the image, and network rejection both above and below the commit boundary.
-They also cover a supported v1 prefix split across chunks. The snapshot struct's
+publication, bound durable round-trip, runtime rejection without rewriting the
+image, and network rejection both above and below the commit boundary. They also
+cover a supported v1 prefix split across chunks. The snapshot struct's
 in-memory layout changes; rebuild the library and dependents together. Self-review
 checked version dispatch, bounds, immutable voter binding, covered acknowledgments
 and fail-closed recovery. No independent reviewer approval is claimed.

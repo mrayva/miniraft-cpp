@@ -69,8 +69,18 @@ void test_configuration_snapshot_projection_and_history_resume(void**) {
     auto resumed = restoredStable.Advance(5, EncodeConfigurationEntry(next));
     assert_true(resumed.IsJoint()); assert_true(resumed.NewVoters() == next.NewVoters);
     assert_true(pending.NewVoters() == joint.NewVoters); assert_false(stable.IsJoint());
-    TState state; Reject([&] { state.InstallSnapshot(pendingSnapshot); });
-    Reject([&] { state.InstallSnapshot(stableSnapshot); });
+    TState jointState; jointState.BindVoters(pendingSnapshot.Voters);
+    jointState.CurrentTerm = pendingSnapshot.Term;
+    jointState.InstallSnapshot(pendingSnapshot);
+    assert_true(*jointState.GetSnapshot() == pendingSnapshot);
+    TState stableState; stableState.BindVoters(stableSnapshot.Voters);
+    stableState.CurrentTerm = stableSnapshot.Term;
+    stableState.InstallSnapshot(stableSnapshot);
+    assert_true(*stableState.GetSnapshot() == stableSnapshot);
+    TState unbound; unbound.CurrentTerm = pendingSnapshot.Term;
+    Reject([&] { unbound.InstallSnapshot(pendingSnapshot); });
+    unbound.Snapshot = std::make_shared<TSnapshot>(pendingSnapshot);
+    Reject([&] { unbound.BindVoters(pendingSnapshot.Voters); });
 }
 void test_history_validates_joint_stable_chain_and_independent_rollback(void**) {
     auto initial = TConfigurationHistory::Stable({1, 2, 3}, 0, 0, 0, 0);
@@ -177,9 +187,10 @@ void test_scan_separates_commit_and_replaced_suffix(void**) {
 void test_scan_from_joint_snapshot_and_rejects_mismatched_baselines(void**) {
     TSnapshot snapshot{2, 2, {1, 2}, "image"};
     snapshot.JointVoters = {2, 3}; snapshot.ConfigurationIndex = 2; snapshot.ConfigurationTerm = 2;
-    // Synthetic offline state: runtime storage deliberately rejects joint snapshots.
+    // Synthetic offline state with the original voter set durably bound.
     TState state; state.Snapshot = std::make_shared<TSnapshot>(snapshot);
     state.SnapshotIndex = state.LastLogIndex = 2; state.SnapshotTerm = state.LastLogTerm = 2;
+    state.BoundVoters = snapshot.Voters;
     state.CurrentTerm = 3; state.Append(Ordinary(2));
     TConfigurationRecord final{EConfigurationPhase::Stable, 3, 2, 2, {1, 2}, {2, 3}};
     state.Append(EncodeConfigurationEntry(final));
@@ -193,6 +204,9 @@ void test_scan_from_joint_snapshot_and_rejects_mismatched_baselines(void**) {
     Reject([&] { ScanConfigurationHistory(state, TConfigurationHistory::Stable({1, 2}, 0, 0, 2, 2), 2); });
     auto wrong = snapshot; wrong.JointVoters = {2, 4};
     Reject([&] { ScanConfigurationHistory(state, TConfigurationHistory::FromJointSnapshot(wrong), 2); });
+    state.BoundVoters = {1, 2, 4};
+    Reject([&] { ScanConfigurationHistory(state, base, 2); });
+    state.BoundVoters = snapshot.Voters;
     state.LastLogTerm = 2;
     Reject([&] { ScanConfigurationHistory(state, base, 2); });
 }

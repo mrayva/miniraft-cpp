@@ -352,17 +352,47 @@ void test_startup_restores_stale_application_from_durable_snapshot_boundary(void
     assert_int_equal(raft->GetVolatileState()->CommitIndex, 2);
 }
 #ifdef __linux__
-void test_stable_configuration_snapshot_durable_recovery_fails_closed(void**) {
+void test_stable_configuration_snapshot_durable_roundtrip_but_runtime_rejects(void**) {
     TFiles files; const auto path = files.Name + ".durable.1";
-    { auto state = std::make_shared<TDurableState>(files.Name, 1);
-      TRaft raft(state, 1, {{2, std::make_shared<TSink>()}, {3, std::make_shared<TSink>()}}); }
-    std::ifstream input(path, std::ios::binary); std::string bytes(std::istreambuf_iterator<char>(input), {}); input.close();
-    assert_true(bytes.substr(0, 8) == "MRFTD003");
+    auto snapshot = Sample(); snapshot.StableConfiguration = true;
+    snapshot.ConfigurationIndex = 1; snapshot.ConfigurationTerm = 1;
+    {
+        TDurableState state(files.Name, 1);
+        state.BindVoters(snapshot.Voters);
+        state.InstallSnapshot(snapshot);
+    }
+    std::string bytes;
+    {
+        TDurableState state(files.Name, 1);
+        assert_true(state.GetBoundVoters() == snapshot.Voters);
+        assert_true(*state.GetSnapshot() == snapshot);
+        std::ifstream input(path, std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(input), {});
+    }
+    Reject([&] { TRaft raft(std::make_shared<TDurableState>(files.Name, 1), 1,
+                           {{2, std::make_shared<TSink>()}, {3, std::make_shared<TSink>()}}); });
+    std::ifstream after(path, std::ios::binary);
+    assert_true(std::string(std::istreambuf_iterator<char>(after), {}) == bytes);
+}
+void test_unbound_durable_configuration_snapshot_recovery_fails_closed(void**) {
+    TFiles files; const auto path = files.Name + ".durable.1";
+    {
+        TDurableState state(files.Name, 1);
+        state.InstallSnapshot(Sample());
+    }
+    std::ifstream input(path, std::ios::binary);
+    std::string bytes(std::istreambuf_iterator<char>(input), {}); input.close();
+    assert_true(bytes.substr(0, 8) == "MRFTD002");
     auto snapshot = Sample(); snapshot.StableConfiguration = true;
     snapshot.ConfigurationIndex = 1; snapshot.ConfigurationTerm = 1;
     const auto image = EncodeSnapshot(snapshot);
-    for (int i = 0; i < 8; ++i) bytes[56 + i] = char(uint64_t(image.size()) >> (8 * i));
-    bytes.insert(64, image);
+    constexpr size_t imageLengthOffset = 40;
+    constexpr size_t imageOffset = 48;
+    uint64_t oldLength = 0;
+    for (int i = 0; i < 8; ++i) oldLength |= uint64_t(uint8_t(bytes[imageLengthOffset + i])) << (8 * i);
+    assert_true(oldLength == bytes.size() - imageOffset);
+    bytes.replace(imageOffset, size_t(oldLength), image);
+    for (int i = 0; i < 8; ++i) bytes[imageLengthOffset + i] = char(uint64_t(image.size()) >> (8 * i));
     for (int i = 0; i < 8; ++i) bytes[8 + i] = char(uint64_t(bytes.size() - 20) >> (8 * i));
     const auto crc = NSnapshotCodec::Checksum(bytes.substr(0, 8) + bytes.substr(20));
     for (int i = 0; i < 4; ++i) bytes[16 + i] = char(crc >> (8 * i));
@@ -371,32 +401,32 @@ void test_stable_configuration_snapshot_durable_recovery_fails_closed(void**) {
     std::ifstream after(path, std::ios::binary);
     assert_true(std::string(std::istreambuf_iterator<char>(after), {}) == bytes);
 }
-void test_joint_snapshot_export_roundtrips_but_durable_state_rejects_it(void**) {
+void test_joint_snapshot_export_and_durable_roundtrip_but_runtime_rejects(void**) {
     TFiles files;
     { TSnapshotStore exportStore(files.Name, 1); exportStore.Save(JointSample());
       assert_true(exportStore.Load().value() == JointSample()); }
     const auto path = files.Name + ".durable.1";
     {
-        auto state = std::make_shared<TDurableState>(files.Name, 1);
-        TRaft raft(state, 1, {{2, std::make_shared<TSink>()}, {3, std::make_shared<TSink>()}});
-        const auto before = static_cast<TStateFields>(*state);
-        std::ifstream input(path, std::ios::binary); std::string bytes(std::istreambuf_iterator<char>(input), {}); input.close();
-        Reject([&] { state->InstallSnapshot(JointSample()); });
-        assert_true(static_cast<TStateFields>(*state) == before);
-        std::ifstream after(path, std::ios::binary);
-        assert_true(std::string(std::istreambuf_iterator<char>(after), {}) == bytes);
+        TDurableState state(files.Name, 1);
+        state.BindVoters(JointSample().Voters);
+        state.InstallSnapshot(JointSample());
     }
-    // Synthesize a well-checksummed v3 store containing the unsupported image.
-    std::ifstream input(path, std::ios::binary); std::string bytes(std::istreambuf_iterator<char>(input), {}); input.close();
-    assert_true(bytes.substr(0, 8) == "MRFTD003");
-    const auto image = EncodeSnapshot(JointSample());
-    for (int i = 0; i < 8; ++i) bytes[56 + i] = char(uint64_t(image.size()) >> (8 * i));
-    bytes.insert(64, image);
-    for (int i = 0; i < 8; ++i) bytes[8 + i] = char(uint64_t(bytes.size() - 20) >> (8 * i));
-    const auto crc = NSnapshotCodec::Checksum(bytes.substr(0, 8) + bytes.substr(20));
-    for (int i = 0; i < 4; ++i) bytes[16 + i] = char(crc >> (8 * i));
-    { std::ofstream output(path, std::ios::binary | std::ios::trunc); output.write(bytes.data(), bytes.size()); }
-    Reject([&] { TDurableState state(files.Name, 1); });
+    std::string bytes;
+    {
+        TDurableState state(files.Name, 1);
+        assert_true(state.GetBoundVoters() == JointSample().Voters);
+        assert_true(*state.GetSnapshot() == JointSample());
+        const auto before = static_cast<TStateFields>(state);
+        auto mismatched = JointSample(); mismatched.Voters = {1, 2, 4};
+        std::ifstream input(path, std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(input), {});
+        Reject([&] { state.InstallSnapshot(mismatched); });
+        assert_true(static_cast<TStateFields>(state) == before);
+        std::ifstream unchanged(path, std::ios::binary);
+        assert_true(std::string(std::istreambuf_iterator<char>(unchanged), {}) == bytes);
+    }
+    Reject([&] { TRaft raft(std::make_shared<TDurableState>(files.Name, 1), 1,
+                           {{2, std::make_shared<TSink>()}, {3, std::make_shared<TSink>()}}); });
     std::ifstream after(path, std::ios::binary);
     assert_true(std::string(std::istreambuf_iterator<char>(after), {}) == bytes);
 }
@@ -525,8 +555,9 @@ int main() {
         cmocka_unit_test(test_restore_rejects_mismatched_log_configuration_and_used_application),
         cmocka_unit_test(test_startup_restores_stale_application_from_durable_snapshot_boundary),
 #ifdef __linux__
-        cmocka_unit_test(test_stable_configuration_snapshot_durable_recovery_fails_closed),
-        cmocka_unit_test(test_joint_snapshot_export_roundtrips_but_durable_state_rejects_it),
+        cmocka_unit_test(test_stable_configuration_snapshot_durable_roundtrip_but_runtime_rejects),
+        cmocka_unit_test(test_unbound_durable_configuration_snapshot_recovery_fails_closed),
+        cmocka_unit_test(test_joint_snapshot_export_and_durable_roundtrip_but_runtime_rejects),
         cmocka_unit_test(test_snapshot_store_rejects_oversized_files_and_temp_symlinks),
         cmocka_unit_test(test_snapshot_store_roundtrip_lock_and_corrupt_recovery),
         cmocka_unit_test(test_snapshot_crash_at_each_publication_boundary),

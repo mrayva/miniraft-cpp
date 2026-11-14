@@ -77,7 +77,11 @@ including on learners.
 The [snapshot pin budget follow-up](docs/snapshot-pin-budget.md) bounds outgoing
 transfer retention to two image generations and defers local compaction at the cap.
 The [stable configuration snapshot foundation](docs/stable-configuration-snapshots.md)
-preserves configuration identity for offline recovery validation.
+preserves configuration identity for offline recovery validation. Bound storage
+can persist these metadata snapshots across restart for offline scanning; Raft
+still rejects runtime adoption and membership changes remain disabled.
+The [durable configuration snapshot follow-up](docs/durable-configuration-snapshots.md)
+documents its voter-binding requirement and recovery boundary.
 The [snapshot term validation fix](docs/snapshot-committed-terms.md) rejects
 snapshot boundaries that contradict the follower's committed prefix.
 The [message buffer follow-up](docs/message-extents.md) checks allocated buffer
