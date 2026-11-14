@@ -336,6 +336,21 @@ void test_restore_rejects_mismatched_log_configuration_and_used_application(void
     Reject([&] { RestoreSnapshot(snapshot, raft, restored); });
     assert_true(Read(restored, "a") == "one");
 }
+void test_startup_restores_stale_application_from_durable_snapshot_boundary(void**) {
+    auto state = std::make_shared<TState>();
+    TKv source; Apply(source, "snapshot", "committed", 2);
+    TSnapshot snapshot{2, 1, {1}, source.SaveSnapshot()};
+    state->InstallSnapshot(snapshot);
+    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+
+    auto stale = std::make_shared<TKv>(); Apply(*stale, "stale", "must be replaced", 1);
+    assert_int_equal(stale->LastAppliedIndex, 1);
+    TRequestProcessor processor(raft, stale, {});
+    assert_int_equal(stale->LastAppliedIndex, 2);
+    assert_true(Read(*stale, "snapshot") == "committed");
+    assert_true(Read(*stale, "stale").empty());
+    assert_int_equal(raft->GetVolatileState()->CommitIndex, 2);
+}
 #ifdef __linux__
 void test_stable_configuration_snapshot_durable_recovery_fails_closed(void**) {
     TFiles files; const auto path = files.Name + ".durable.1";
@@ -508,6 +523,7 @@ int main() {
         cmocka_unit_test(test_kv_invalid_snapshot_preserves_existing_state_and_progress),
         cmocka_unit_test(test_capture_requires_committed_applied_progress),
         cmocka_unit_test(test_restore_rejects_mismatched_log_configuration_and_used_application),
+        cmocka_unit_test(test_startup_restores_stale_application_from_durable_snapshot_boundary),
 #ifdef __linux__
         cmocka_unit_test(test_stable_configuration_snapshot_durable_recovery_fails_closed),
         cmocka_unit_test(test_joint_snapshot_export_roundtrips_but_durable_state_rejects_it),

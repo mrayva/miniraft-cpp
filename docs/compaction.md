@@ -5,8 +5,9 @@ voter binding while retaining backward decoding of the v1/v2 formats below.
 
 This milestone adds prefix deletion and follower state transfer to the alpha.15
 KV checkpoint foundation. TState and Linux TDurableState support compacted logs;
-legacy TDiskState does not. KV implements snapshot validation/restoration. SQL and
-dummy state machines remain unsupported for compaction and installation.
+legacy TDiskState does not. KV implements snapshot validation/restoration. SQL
+support is described in [the SQL snapshot follow-up](sql-snapshots.md); the dummy
+state machine remains unsupported for compaction and installation.
 
 ## Operation and compatibility
 
@@ -25,8 +26,9 @@ remote installation writes v2; downgrading that store is unsupported. Fixed vote
 IDs must match the embedded snapshot. Static `--node` edits remain unsafe as a
 membership-change mechanism.
 
-Startup restores a fresh application from the embedded snapshot before request
-processing, even when periodic snapshots are disabled. A newer standalone
+Startup restores an application behind the embedded snapshot before request
+processing, including after a crash between durable publication and application
+replacement. A newer standalone
 checkpoint can restore progress within the retained suffix; an older one never
 replaces embedded state. With periodic snapshots enabled, an existing corrupt
 standalone file is still rejected conservatively. Snapshot recovery never resets
@@ -142,8 +144,8 @@ Publication-stage process crashes do not replace hardware power-cut testing.
 Membership remains fixed. Learners, catch-up gates, replicated joint-consensus
 configuration entries, leader removal and corresponding quorum/read changes are
 next. All participating applications/backends must support snapshots before
-compaction is enabled; no capability negotiation is implemented. SQL snapshots,
-asynchronous/COW capture, disk-streamed transfer, bounded transport queues, total
-heap quotas, cluster/store authentication and independent review remain open.
+compaction is enabled; no capability negotiation is implemented. Asynchronous/COW
+capture, disk-streamed transfer, bounded transport queues, total heap quotas,
+cluster/store authentication and independent review remain open.
 The conservative backend still rewrites the entire snapshot and retained suffix
 on each update, and capture/publication runs synchronously on the event loop.

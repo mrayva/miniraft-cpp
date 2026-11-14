@@ -48,6 +48,11 @@ set_tests_properties(test_install_snapshot_cli PROPERTIES TIMEOUT 120)
 add_test(NAME test_learner_cli COMMAND ${Python3_EXECUTABLE}
   ${CMAKE_CURRENT_SOURCE_DIR}/smoke_install_snapshot.py $<TARGET_FILE:kv> learner)
 set_tests_properties(test_learner_cli PROPERTIES TIMEOUT 120)
+if(SQLite3_FOUND)
+add_test(NAME test_sql_snapshots_cli COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/smoke_sql_snapshots.py $<TARGET_FILE:sql>)
+set_tests_properties(test_sql_snapshots_cli PROPERTIES TIMEOUT 60)
+endif()
 endif()
 endif()
 endif()

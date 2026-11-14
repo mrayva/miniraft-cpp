@@ -38,14 +38,17 @@ IRsm gains optional SaveSnapshot/LoadSnapshot callbacks; the defaults throw an
 unsupported-operation error. KV implements canonical, sorted, binary-safe state
 encoding. Restore validates the entire image into a temporary map before swapping
 state and progress. Key/value lengths retain the KV wire format's 65,535-byte
-limits. SQL and the dummy application do not implement snapshots in this release.
+limits. SQL snapshot support is described in [its follow-up](sql-snapshots.md);
+the dummy application still does not implement snapshots.
 
 CaptureSnapshot requires a nonzero applied index no greater than the known commit
 index or retained log end. Metadata records its index, term and sorted fixed voter
-IDs. RestoreSnapshot requires a fresh application and an exact voter-set match;
+IDs. RestoreSnapshot requires an application behind the snapshot and an exact voter-set match;
 the boundary index must exist in the local log with the same term, not newer than
-CurrentTerm. Restore does not overwrite current term or votedFor. These APIs must
-run serialized, with restore only during startup before request processing.
+CurrentTerm. Startup restore can recover a process stopped after durable Raft
+snapshot publication but before application replacement. Restore does not
+overwrite current term or votedFor. These APIs must run serialized, with restore
+only during startup before request processing.
 
 The versioned image contains little-endian fields in this order:
 
@@ -119,5 +122,5 @@ These follow the snapshot metadata/state-transfer requirements in
 [Raft section 7](https://raft.github.io/raft.pdf) and the overlapping-quorum
 configuration protocol in section 6. Editing the static `--node` list is not a
 membership-change protocol. Snapshots do not make such edits safe. This release
-keeps fixed membership and leaves full compaction, transfer, dynamic membership,
-background capture, SQL snapshots and independent review as open release gates.
+keeps fixed membership. Background capture and independent review remain open
+release gates.
