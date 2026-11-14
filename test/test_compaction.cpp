@@ -3,6 +3,7 @@
 #include <miniraft/snapshot_codec.h>
 #include "../examples/kv.h"
 #include "../examples/kv_messages.h"
+#include <algorithm>
 #include <deque>
 #include <functional>
 #include <set>
@@ -346,11 +347,31 @@ void test_joint_snapshot_is_rejected_even_if_boundary_is_already_covered(void**)
     raft->Process({}, Chunk(joint, bytes, 0, bytes.size()));
     assert_false(replies.back()->Success); assert_false(replies.back()->Installed);
     assert_true(static_cast<TStateFields>(*state) == before); assert_int_equal(app->Loads, 1);
-    // A supported covered snapshot can also identify its magic across chunks.
-    raft->Process({}, Chunk(fixed, fixedBytes, 0, 4));
-    assert_true(replies.back()->Success); assert_false(replies.back()->Installed);
-    assert_int_equal(replies.back()->NextOffset, 4);
-    raft->Process({}, Chunk(fixed, fixedBytes, 4, 4));
+
+    // Covered fast-path ACKs still require the embedded boundary and voter set
+    // to match the request and this node's fixed membership.
+    auto wrongVoters = fixed; wrongVoters.Voters = {1, 3};
+    auto wrongVoterBytes = EncodeSnapshot(wrongVoters);
+    raft->Process({}, Chunk(wrongVoters, wrongVoterBytes, 0, wrongVoterBytes.size()));
+    assert_false(replies.back()->Success); assert_false(replies.back()->Installed);
+    assert_true(static_cast<TStateFields>(*state) == before); assert_int_equal(app->Loads, 1);
+
+    auto wrongBoundary = fixed; wrongBoundary.Index = 4;
+    auto wrongBoundaryBytes = EncodeSnapshot(wrongBoundary);
+    raft->Process({}, Chunk(fixed, wrongBoundaryBytes, 0, wrongBoundaryBytes.size()));
+    assert_false(replies.back()->Success); assert_false(replies.back()->Installed);
+    assert_true(static_cast<TStateFields>(*state) == before); assert_int_equal(app->Loads, 1);
+
+    // The metadata-only probe remains bounded and handles a split prefix.
+    const size_t metadataBytes = 36 + 4 * fixed.Voters.size();
+    for (size_t offset = 0; offset < metadataBytes; offset += 4) {
+        const auto count = std::min<size_t>(4, metadataBytes - offset);
+        raft->Process({}, Chunk(fixed, fixedBytes, offset, static_cast<uint32_t>(count)));
+        if (offset + count < metadataBytes) {
+            assert_true(replies.back()->Success); assert_false(replies.back()->Installed);
+            assert_int_equal(replies.back()->NextOffset, offset + count);
+        }
+    }
     assert_true(replies.back()->Success); assert_true(replies.back()->Installed);
     assert_int_equal(replies.back()->NextOffset, fixedBytes.size());
     raft->Process({}, Chunk(joint, bytes, 0, 4));
