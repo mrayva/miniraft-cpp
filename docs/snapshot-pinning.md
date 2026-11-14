@@ -16,10 +16,11 @@ prefix. Snapshot ACKs still cannot confirm strong-read barriers.
 
 Failed chunks restart the pinned image from offset zero. Leadership changes still
 discard outgoing transfer contexts. One image/encoding pair is retained per
-active peer transfer, with sharing between transfers of the same image. A stalled
-peer may keep an older image alive while the store compacts; total snapshot memory
-is not independent of the configured peer count. This does not introduce a
-resource quota or general transfer cancellation API.
+active peer transfer, with sharing between transfers of the same image. The
+[alpha.43 pin budget](snapshot-pin-budget.md) later capped active retention to two
+distinct image generations and defers further compaction until a transfer
+completes. It does not add a byte quota for all Raft, application, transport and
+temporary snapshot memory, or a general transfer cancellation API.
 
 A deterministic regression commits and compacts new data before every chunk ACK,
 including the final ACK, for both voter and learner receivers. The old code fails

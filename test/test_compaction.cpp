@@ -278,6 +278,52 @@ void test_compaction_during_each_chunk_cannot_restart_snapshot_catchup(void**) {
         if (!learners.empty()) assert_true(cluster.Nodes[0]->IsLearnerCaughtUp(3));
     }
 }
+void test_compaction_is_deferred_until_one_pinned_generation_finishes(void**) {
+    TCluster cluster({3}); cluster.Prepare();
+    auto firstChunk = cluster.SendChunk();
+    const auto firstIndex = firstChunk->SnapshotIndex;
+    cluster.Deliver(firstChunk); // Lose the ACK; peer 3 keeps the first image pinned.
+    cluster.Packets.clear();
+    auto* progress = const_cast<TVolatileState*>(cluster.Nodes[0]->GetVolatileState());
+    assert_true(progress->SnapshotRpcs.contains(3));
+
+    cluster.Isolated = {3};
+    cluster.Write(1, "generation", "two");
+    auto second = cluster.Nodes[0]->Compact();
+    assert_true(second.Index > firstIndex);
+    cluster.Write(1, "generation", "three");
+    assert_true(cluster.Apps[0]->LastAppliedIndex > second.Index);
+
+    // Force a second peer to begin a transfer from the newer generation.
+    progress->NextIndex[2] = 1;
+    cluster.Packets.clear();
+    cluster.Nodes[0]->ApproveRead();
+    auto secondChunk = cluster.Take(1, 2, EMessageType::INSTALL_SNAPSHOT_REQUEST).Cast<TInstallSnapshotRequest>();
+    assert_int_equal(secondChunk->SnapshotIndex, second.Index);
+    assert_int_equal(progress->SnapshotRpcs.at(3).Snapshot->Index, firstIndex);
+    assert_int_equal(progress->SnapshotRpcs.at(2).Snapshot->Index, second.Index);
+
+    const auto storedBoundary = cluster.Nodes[0]->GetState()->SnapshotIndex;
+    const auto storedLastIndex = cluster.Nodes[0]->GetState()->LastLogIndex;
+    const auto appliedIndex = cluster.Apps[0]->LastAppliedIndex;
+    Reject([&] { cluster.Nodes[0]->Compact(); });
+    assert_int_equal(cluster.Nodes[0]->GetState()->SnapshotIndex, storedBoundary);
+    assert_int_equal(cluster.Nodes[0]->GetState()->LastLogIndex, storedLastIndex);
+    assert_int_equal(cluster.Apps[0]->LastAppliedIndex, appliedIndex);
+    assert_true(progress->SnapshotRpcs.contains(2)); assert_true(progress->SnapshotRpcs.contains(3));
+
+    // Once peer 2 completes, compaction can advance while peer 3 still owns
+    // its older immutable image.
+    cluster.Deliver(secondChunk);
+    auto ack = cluster.Take(2, 1, EMessageType::INSTALL_SNAPSHOT_RESPONSE).Cast<TInstallSnapshotResponse>();
+    cluster.Deliver(ack);
+    assert_true(ack->Installed);
+    assert_false(progress->SnapshotRpcs.contains(2)); assert_true(progress->SnapshotRpcs.contains(3));
+    cluster.Packets.clear();
+    auto latest = cluster.Nodes[0]->Compact();
+    assert_true(latest.Index > storedBoundary);
+    assert_int_equal(cluster.Nodes[0]->GetState()->SnapshotIndex, latest.Index);
+}
 void test_leader_change_mid_snapshot_rejects_old_chunks(void**) {
     TCluster cluster; cluster.Prepare();
     auto old = cluster.SendChunk(); cluster.AckChunk(old);
@@ -792,6 +838,7 @@ int main() {
         cmocka_unit_test(test_snapshot_timeout_retries_do_not_starve_delayed_acks),
         cmocka_unit_test(test_snapshot_read_traffic_does_not_starve_delayed_acks),
         cmocka_unit_test(test_compaction_during_each_chunk_cannot_restart_snapshot_catchup),
+        cmocka_unit_test(test_compaction_is_deferred_until_one_pinned_generation_finishes),
         cmocka_unit_test(test_leader_change_mid_snapshot_rejects_old_chunks),
         cmocka_unit_test(test_partial_and_installed_snapshot_acks_do_not_confirm_strong_reads),
         cmocka_unit_test(test_compacted_follower_hint_requires_boundary_probe_before_match),
