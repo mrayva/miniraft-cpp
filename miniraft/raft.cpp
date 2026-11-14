@@ -790,7 +790,7 @@ void TRaft::OnInstallSnapshot(TMessageHolder<TInstallSnapshotResponse> response)
         // Snapshot completion is not a fresh-read acknowledgement. AppendEntries
         // must still establish the next read barrier and replicate the suffix.
     } else {
-        if (response->NextOffset < rpc.SentEnd || response->NextOffset >= rpc.Bytes->size()) return;
+        if (response->NextOffset != rpc.SentEnd || response->NextOffset >= rpc.Bytes->size()) return;
         rpc.Offset = response->NextOffset;
         rpc.Seqno = 0; // Next chunk gets a new identity; old replies stay stale.
     }
