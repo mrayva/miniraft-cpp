@@ -10,8 +10,9 @@ Incoming snapshot requests are now checked before term or role changes. A
 snapshot after the committed prefix must have a boundary term at least as large
 as the term at the follower's commit index. If the requested boundary itself is
 committed and still known locally, its term must match. A boundary older than the
-local snapshot cannot be checked this way because its individual term has been
-compacted. Invalid requests are dropped, consistent with other malformed RPCs.
+local snapshot cannot be checked for equality because its individual term has been
+compacted, but its term must not exceed the local snapshot term. Invalid requests
+are dropped, consistent with other malformed RPCs.
 Each chunk is checked again, including when commitment advances mid-transfer.
 
 Deterministic tests reproduce the prior mutation with both retained and compacted

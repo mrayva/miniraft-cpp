@@ -403,6 +403,27 @@ void test_corrupt_snapshot_and_invalid_headers_cannot_mutate_application(void**)
     assert_int_equal(app->LastAppliedIndex, 5); assert_int_equal(app->Loads, 1);
 }
 
+void test_older_snapshot_cannot_exceed_compacted_boundary_term(void**) {
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> replies;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) { replies.push_back(message.template Cast<TInstallSnapshotResponse>()); });
+    auto state = std::make_shared<TState>(); state->CurrentTerm = 2;
+    TKv image; image.Write(image.Prepare(Command("key", "committed")), 5);
+    state->InstallSnapshot({5, 2, {1, 2}, image.SaveSnapshot()});
+    auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}});
+    auto app = std::make_shared<TApplication>(); TRequestProcessor processor(raft, app, {});
+    const auto before = static_cast<TStateFields>(*state);
+    TSnapshot older{3, 3, {1, 2}, image.SaveSnapshot()};
+    auto bytes = EncodeSnapshot(older); auto invalid = Chunk(older, bytes, 0, bytes.size()); invalid->Term = 9;
+    raft->Process({}, invalid);
+    assert_true(replies.empty()); assert_true(static_cast<TStateFields>(*state) == before);
+    assert_int_equal(app->Loads, 1); assert_true(Read(*app, "key") == "committed");
+    for (uint64_t term : {1, 2}) {
+        older.Term = term; bytes = EncodeSnapshot(older);
+        raft->Process({}, Chunk(older, bytes, 0, bytes.size()));
+        assert_true(replies.back()->Success); assert_true(replies.back()->Installed);
+        assert_int_equal(app->Loads, 1); assert_int_equal(state->SnapshotIndex, 5);
+    }
+}
 void test_newer_snapshot_cannot_regress_committed_term(void**) {
     for (bool compacted : {false, true}) {
         std::vector<TMessageHolder<TInstallSnapshotResponse>> replies;
@@ -699,6 +720,7 @@ int main() {
         cmocka_unit_test(test_compacted_follower_hint_requires_boundary_probe_before_match),
         cmocka_unit_test(test_corrupt_snapshot_and_invalid_headers_cannot_mutate_application),
         cmocka_unit_test(test_newer_snapshot_cannot_regress_committed_term),
+        cmocka_unit_test(test_older_snapshot_cannot_exceed_compacted_boundary_term),
         cmocka_unit_test(test_snapshot_is_rechecked_when_commit_advances_mid_transfer),
         cmocka_unit_test(test_memory_snapshot_storage_rejects_term_regression),
         cmocka_unit_test(test_joint_snapshot_is_rejected_even_if_boundary_is_already_covered),
