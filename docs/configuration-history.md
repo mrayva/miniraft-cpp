@@ -1,5 +1,16 @@
 # Offline configuration history validation: v0.1.0-alpha.27
 
+`TConfigurationHistory::MakeSnapshot` projects the history at its through-index
+and term into an offline snapshot. It selects MRFTS002 for a joint configuration,
+MRFTS003 for a stable configuration with a known configuration entry, and the
+legacy MRFTS001 format when the trusted baseline asserts no earlier configuration
+entry. That legacy format does not encode or prove the zero-identity assertion.
+The caller must independently establish that the history boundary is committed
+and that the supplied application image corresponds exactly to that boundary.
+The method validates snapshot metadata and size; it does not capture application
+state, compact or mutate storage, establish commitment, or activate voters.
+Experimental configuration snapshots remain rejected by the live runtime.
+
 TConfigurationHistory checks a sequence of retained log entries against a trusted
 configuration baseline. It joins the experimental configuration-entry codec with
 the joint-snapshot metadata and checks that joint and stable records have the

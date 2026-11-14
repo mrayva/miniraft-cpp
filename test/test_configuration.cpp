@@ -40,6 +40,38 @@ struct TEndpoint : INode {
 TMessageHolder<TLogEntry> Ordinary(uint64_t term) {
     auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = term; return entry;
 }
+void test_configuration_snapshot_projection_and_history_resume(void**) {
+    auto initial = TConfigurationHistory::Stable({1, 2, 3}, 0, 0, 0, 0);
+    Reject([&] { initial.MakeSnapshot("empty boundary"); });
+    auto prefix = initial.Observe(1, Ordinary(1));
+    const auto bootstrap = prefix.MakeSnapshot("bootstrap");
+    assert_true(EncodeSnapshot(bootstrap).substr(0, 8) == "MRFTS001");
+    assert_int_equal(bootstrap.Index, 1); assert_int_equal(bootstrap.Term, 1);
+    assert_false(bootstrap.HasConfigurationMetadata());
+    auto joint = Joint(); joint.Term = 2; joint.PreviousIndex = joint.PreviousTerm = 0;
+    auto pending = prefix.Advance(2, EncodeConfigurationEntry(joint)).Observe(3, Ordinary(2));
+    const auto pendingSnapshot = pending.MakeSnapshot(std::string("j\0x", 3));
+    const auto jointBytes = EncodeSnapshot(pendingSnapshot);
+    assert_true(jointBytes.substr(0, 8) == "MRFTS002");
+    auto restoredJoint = TConfigurationHistory::FromJointSnapshot(DecodeSnapshot(jointBytes));
+    assert_int_equal(restoredJoint.ThroughIndex(), 3); assert_int_equal(restoredJoint.ConfigurationIndex(), 2);
+    assert_true(restoredJoint.OldVoters() == joint.OldVoters); assert_true(restoredJoint.NewVoters() == joint.NewVoters);
+    auto final = joint; final.Phase = EConfigurationPhase::Stable; final.Term = 3;
+    final.PreviousIndex = 2; final.PreviousTerm = 2;
+    auto stable = restoredJoint.Advance(4, EncodeConfigurationEntry(final));
+    const auto stableSnapshot = stable.MakeSnapshot("stable");
+    const auto stableBytes = EncodeSnapshot(stableSnapshot);
+    assert_true(stableBytes.substr(0, 8) == "MRFTS003");
+    auto restoredStable = TConfigurationHistory::FromStableSnapshot(DecodeSnapshot(stableBytes));
+    assert_int_equal(restoredStable.ConfigurationIndex(), 4); assert_int_equal(restoredStable.ConfigurationTerm(), 3);
+    assert_true(restoredStable.OldVoters() == joint.NewVoters); assert_false(restoredStable.IsJoint());
+    TConfigurationRecord next{EConfigurationPhase::Joint, 3, 4, 3, joint.NewVoters, {3, 4, 6}};
+    auto resumed = restoredStable.Advance(5, EncodeConfigurationEntry(next));
+    assert_true(resumed.IsJoint()); assert_true(resumed.NewVoters() == next.NewVoters);
+    assert_true(pending.NewVoters() == joint.NewVoters); assert_false(stable.IsJoint());
+    TState state; Reject([&] { state.InstallSnapshot(pendingSnapshot); });
+    Reject([&] { state.InstallSnapshot(stableSnapshot); });
+}
 void test_history_validates_joint_stable_chain_and_independent_rollback(void**) {
     auto initial = TConfigurationHistory::Stable({1, 2, 3}, 0, 0, 0, 0);
     auto prefix = initial.Observe(1, Ordinary(1));
@@ -128,6 +160,9 @@ void test_scan_separates_commit_and_replaced_suffix(void**) {
     assert_true(scan.Committed.IsJoint()); assert_int_equal(scan.Committed.ThroughIndex(), 2);
     assert_false(scan.Latest.IsJoint()); assert_true(scan.Latest.OldVoters() == final.NewVoters);
     assert_true(scan.HasUncommittedConfiguration()); assert_int_equal(state.Gets, 2);
+    const auto committedImage = scan.Committed.MakeSnapshot("committed image");
+    assert_true(committedImage.IsJoint()); assert_int_equal(committedImage.Index, 2);
+    assert_int_equal(committedImage.ConfigurationIndex, 2);
     scan = ScanConfigurationHistory(state, base, 4);
     assert_false(scan.HasUncommittedConfiguration()); assert_int_equal(scan.Committed.ThroughIndex(), 4);
     state.RemoveLast();
@@ -394,6 +429,7 @@ void test_offline_history_scan_after_durable_snapshot_and_restart(void**) {
 }
 int main() {
     const CMUnitTest tests[] = {
+        cmocka_unit_test(test_configuration_snapshot_projection_and_history_resume),
         cmocka_unit_test(test_history_validates_joint_stable_chain_and_independent_rollback),
         cmocka_unit_test(test_history_from_joint_snapshot_requires_a_consistent_identity),
         cmocka_unit_test(test_history_rejects_skips_wrong_predecessors_and_term_regression),
