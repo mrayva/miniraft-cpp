@@ -542,6 +542,8 @@ void TRaft::Process(ITimeSource::Time now, TMessageHolder<TMessage> message, con
             StateName = EState::FOLLOWER;
             IncomingSnapshot.reset();
             VolatileState->SnapshotRpcs.clear();
+            EncodedSnapshot.reset();
+            EncodedSnapshotIndex = 0;
             VolatileState->LeaderId = 0;
             if (VolatileState->ElectionDue <= now || VolatileState->ElectionDue == ITimeSource::Max) {
                 VolatileState->ElectionDue = MakeElection(now);
@@ -846,9 +848,18 @@ TSnapshot TRaft::Compact() {
     auto application = SnapshotApplication.lock();
     if (!application) throw std::logic_error("Compaction requires a bound application");
     if (application->LastAppliedIndex == State->SnapshotIndex && State->GetSnapshot()) return *State->GetSnapshot();
+    std::unordered_set<uint64_t> pinnedGenerations;
+    for (const auto& [_, rpc] : VolatileState->SnapshotRpcs)
+        if (rpc.Snapshot) pinnedGenerations.insert(rpc.Snapshot->Index);
+    if (pinnedGenerations.size() >= TVolatileState::MaxPinnedSnapshotGenerations)
+        throw std::runtime_error("Compaction deferred while snapshot transfers pin multiple generations");
     auto snapshot = CaptureSnapshot(*this, *application);
     application->ValidateSnapshot(snapshot.Data, snapshot.Index);
     State->InstallSnapshot(snapshot);
+    // Outstanding transfers own their immutable encoded bytes; discard any
+    // otherwise-retained encoding of the old local snapshot.
+    EncodedSnapshot.reset();
+    EncodedSnapshotIndex = 0;
     return snapshot;
 }
 

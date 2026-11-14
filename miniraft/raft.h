@@ -56,6 +56,9 @@ using TNodeDict = std::unordered_map<uint32_t, std::shared_ptr<INode>>;
 struct TVolatileState {
     struct TAppendRpc { uint64_t Seqno, LastIndex; };
     static constexpr size_t MaxPendingAppendRpcs = 256;
+    // Distinct snapshot images retained by active peer transfers. New
+    // compaction is deferred when this many generations are already pinned.
+    static constexpr size_t MaxPinnedSnapshotGenerations = 2;
     uint64_t CommitIndex = 0;
     // Successful current-term RPC acknowledgements, separately from log indices.
     std::unordered_map<uint32_t, uint64_t> ReadAckSeqno;
@@ -136,6 +139,8 @@ public:
     void AddLearnerTarget(uint32_t id, std::shared_ptr<INode> node);
     std::shared_ptr<INode> RemoveLearnerTarget(uint32_t id);
     // Capture applied state and atomically replace its prefix with a snapshot.
+    // Throws without mutation while two distinct generations remain pinned by
+    // outgoing peer transfers; callers may retry after a transfer completes.
     TSnapshot Compact();
     uint64_t ApproveRead();
     // Highest barrier confirmed by a fresh majority in this leadership term.
