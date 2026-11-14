@@ -394,6 +394,53 @@ void test_joint_snapshot_is_rejected_even_if_boundary_is_already_covered(void**)
     assert_true(static_cast<TStateFields>(*state) == before); assert_int_equal(app->Loads, 1);
     assert_true(Read(*app, "a") == "old");
 }
+void test_idle_partial_snapshot_expires_on_learner_despite_heartbeats(void**) {
+    auto state = std::make_shared<TState>();
+    state->BindVoters({1});
+    auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = 1; state->Append(entry);
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> replies;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) {
+        if (message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_RESPONSE))
+            replies.push_back(message.template Cast<TInstallSnapshotResponse>());
+    });
+    auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}}, std::vector<uint32_t>{2});
+    auto app = std::make_shared<TApplication>(); TRequestProcessor processor(raft, app, {});
+    TKv source; source.Write(source.Prepare(Command("key", "value")), 1);
+    TSnapshot snapshot{1, 1, {1}, source.SaveSnapshot()};
+    const auto bytes = EncodeSnapshot(snapshot);
+
+    raft->Process({}, Chunk(snapshot, bytes, 0, 8));
+    assert_true(replies.back()->Success); assert_false(replies.back()->Installed);
+    assert_int_equal(replies.back()->NextOffset, 8); assert_int_equal(app->Loads, 0);
+
+    // Ordinary leader contact keeps Raft's election timer fresh, but must not
+    // keep an abandoned multi-chunk snapshot allocation alive.
+    const auto heartbeatAt = ITimeSource::Time{} + std::chrono::seconds(20);
+    auto heartbeat = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 2, .Term = 3},
+        TAppendEntriesRequest{.PrevLogIndex = 1, .PrevLogTerm = 1, .LeaderCommit = 0, .LeaderId = 1});
+    raft->Process(heartbeatAt, heartbeat);
+    // A matching retry is valid transfer activity and refreshes the deadline.
+    raft->Process(heartbeatAt, Chunk(snapshot, bytes, 0, 8));
+    assert_true(replies.back()->Success); assert_int_equal(replies.back()->NextOffset, 8);
+    const auto nextChunkAt = heartbeatAt + std::chrono::seconds(10);
+    raft->ProcessTimeout(nextChunkAt);
+    raft->Process(nextChunkAt, Chunk(snapshot, bytes, 8, 8));
+    assert_true(replies.back()->Success); assert_int_equal(replies.back()->NextOffset, 16);
+
+    // A continuation after expiry is rejected with offset zero so the leader
+    // restarts from the beginning instead of extending a discarded image.
+    const auto expiredAt = nextChunkAt + TTimeout::SnapshotTransferIdle + std::chrono::milliseconds(1);
+    raft->ProcessTimeout(expiredAt);
+    raft->Process(expiredAt, Chunk(snapshot, bytes, 16, 8));
+    assert_false(replies.back()->Success); assert_false(replies.back()->Installed);
+    assert_int_equal(replies.back()->NextOffset, 0); assert_int_equal(app->Loads, 0);
+    assert_int_equal(app->LastAppliedIndex, 0); assert_int_equal(state->SnapshotIndex, 0);
+
+    raft->Process(expiredAt, Chunk(snapshot, bytes, 0, static_cast<uint32_t>(bytes.size())));
+    assert_true(replies.back()->Success); assert_true(replies.back()->Installed);
+    assert_int_equal(app->Loads, 1); assert_int_equal(app->LastAppliedIndex, 1);
+    assert_true(Read(*app, "key") == "value");
+}
 void test_corrupt_snapshot_and_invalid_headers_cannot_mutate_application(void**) {
     TKv source; source.Write(source.Prepare(Command("a", "new")), 5);
     TSnapshot snapshot{5, 1, {1, 2}, source.SaveSnapshot()};
@@ -754,6 +801,7 @@ int main() {
         cmocka_unit_test(test_snapshot_is_rechecked_when_commit_advances_mid_transfer),
         cmocka_unit_test(test_memory_snapshot_storage_rejects_term_regression),
         cmocka_unit_test(test_joint_snapshot_is_rejected_even_if_boundary_is_already_covered),
+        cmocka_unit_test(test_idle_partial_snapshot_expires_on_learner_despite_heartbeats),
         cmocka_unit_test(test_remote_snapshot_retains_suffix_without_applying_it_before_commit),
         cmocka_unit_test(test_snapshot_boundary_index_exhaustion_does_not_append_wrapped_noop),
         cmocka_unit_test(test_memory_storage_rejects_index_exhaustion),

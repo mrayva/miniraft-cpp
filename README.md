@@ -71,6 +71,9 @@ The [network learner follow-up](docs/online-learner-network.md) connects that
 API to the built-in server's runtime drain loop.
 The [covered-snapshot follow-up](docs/covered-snapshot-identity.md) validates
 snapshot boundary and voter metadata before acknowledging an already-covered image.
+The [snapshot transfer expiry follow-up](docs/snapshot-transfer-expiry.md)
+releases incomplete incoming images after 30 seconds without a valid chunk,
+including on learners.
 The [stable configuration snapshot foundation](docs/stable-configuration-snapshots.md)
 preserves configuration identity for offline recovery validation.
 The [snapshot term validation fix](docs/snapshot-committed-terms.md) rejects

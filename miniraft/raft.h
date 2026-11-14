@@ -213,6 +213,7 @@ private:
     struct TIncomingSnapshot {
         uint64_t Term, Index, BoundaryTerm, Total;
         uint32_t Leader;
+        ITimeSource::Time LastProgress;
         std::string Bytes;
     };
     std::optional<TIncomingSnapshot> IncomingSnapshot;

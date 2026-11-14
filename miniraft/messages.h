@@ -151,6 +151,9 @@ struct TTimeout {
     static constexpr std::chrono::milliseconds Election = std::chrono::milliseconds(5000);
     static constexpr std::chrono::milliseconds Heartbeat = std::chrono::milliseconds(1000);
     static constexpr std::chrono::milliseconds Rpc = std::chrono::milliseconds(10000);
+    // Keep partial snapshot transfers across normal RPC retries, but bound how
+    // long an idle receiver retains the accumulated image.
+    static constexpr std::chrono::milliseconds SnapshotTransferIdle = std::chrono::seconds(30);
 };
 
 template<typename T>
