@@ -312,7 +312,7 @@ void TDurableState::InstallSnapshot(const TSnapshot& snapshot) {
     EncodeSnapshot(snapshot);
     if (!Impl->Voters.empty() && snapshot.Voters != Impl->Voters)
         throw std::invalid_argument("Snapshot would change bound voters");
-    if (snapshot.Index <= SnapshotIndex || snapshot.Term > CurrentTerm)
+    if (snapshot.Index <= SnapshotIndex || snapshot.Term < SnapshotTerm || snapshot.Term > CurrentTerm)
         throw std::invalid_argument("Obsolete or future durable snapshot");
     auto image = std::make_shared<const TSnapshot>(snapshot);
     std::vector<TMessageHolder<TLogEntry>> suffix;

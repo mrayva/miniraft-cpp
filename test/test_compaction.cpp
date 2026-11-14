@@ -476,6 +476,38 @@ void test_snapshot_is_rechecked_when_commit_advances_mid_transfer(void**) {
     assert_true(replies.back()->Installed); assert_true(Read(*app, "key") == "future");
 }
 
+void CheckSnapshotStorageTerm(IState& state, std::function<std::string()> image = [] { return std::string{}; }) {
+    state.CurrentTerm = 2; state.Commit();
+    state.InstallSnapshot({2, 2, {1}, "committed"});
+    auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = 2; state.Append(entry);
+    const auto before = static_cast<TStateFields>(state);
+    const auto beforeImage = image();
+    Reject([&] { state.InstallSnapshot({4, 1, {1}, "regressed"}); });
+    assert_true(static_cast<TStateFields>(state) == before);
+    assert_true(image() == beforeImage);
+    assert_true(state.GetSnapshot()->Data == "committed"); assert_int_equal(state.LogTerm(3), 2);
+    state.InstallSnapshot({4, 2, {1}, "valid"});
+    assert_int_equal(state.SnapshotIndex, 4); assert_true(state.GetSnapshot()->Data == "valid");
+}
+void test_memory_snapshot_storage_rejects_term_regression(void**) {
+    TState state; CheckSnapshotStorageTerm(state);
+}
+#ifdef __linux__
+void test_durable_snapshot_storage_rejects_term_regression(void**) {
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-term-boundary-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    auto name = (dir / "raft").string();
+    { TDurableState state(name, 1); CheckSnapshotStorageTerm(state, [&] {
+        std::ifstream input(name + ".durable.1", std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input), {});
+      }); }
+    { TDurableState state(name, 1); assert_int_equal(state.SnapshotIndex, 4);
+      assert_int_equal(state.SnapshotTerm, 2); assert_true(state.GetSnapshot()->Data == "valid"); }
+    std::error_code ignored; std::filesystem::remove_all(dir, ignored);
+}
+#endif
+
 void test_remote_snapshot_retains_suffix_without_applying_it_before_commit(void**) {
     auto state = std::make_shared<TState>();
     TKv prefix;
@@ -641,11 +673,13 @@ int main() {
         cmocka_unit_test(test_corrupt_snapshot_and_invalid_headers_cannot_mutate_application),
         cmocka_unit_test(test_newer_snapshot_cannot_regress_committed_term),
         cmocka_unit_test(test_snapshot_is_rechecked_when_commit_advances_mid_transfer),
+        cmocka_unit_test(test_memory_snapshot_storage_rejects_term_regression),
         cmocka_unit_test(test_joint_snapshot_is_rejected_even_if_boundary_is_already_covered),
         cmocka_unit_test(test_remote_snapshot_retains_suffix_without_applying_it_before_commit),
         cmocka_unit_test(test_snapshot_boundary_index_exhaustion_does_not_append_wrapped_noop),
         cmocka_unit_test(test_memory_snapshot_boundary_retains_matching_suffix_and_replaces_conflict),
 #ifdef __linux__
+        cmocka_unit_test(test_durable_snapshot_storage_rejects_term_regression),
         cmocka_unit_test(test_durable_term_lookup_avoids_payload_copies_across_compaction),
         cmocka_unit_test(test_durable_compacted_boundary_survives_restart),
         cmocka_unit_test(test_snapshot_and_suffix_are_atomic_at_every_publication_stage),
