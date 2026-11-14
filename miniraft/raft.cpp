@@ -524,8 +524,14 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
     case EMessageType::INSTALL_SNAPSHOT_REQUEST: {
         auto request = message.Cast<TInstallSnapshotRequest>();
         const auto length = request->Len - sizeof(TInstallSnapshotRequest);
+        // A later boundary cannot have an older term than the committed prefix.
+        // For an already committed, retained boundary, the terms must match.
         return request->LeaderId == header->Src && request->SnapshotIndex > 0 && request->SnapshotIndex <= maxIndex &&
             request->SnapshotTerm > 0 && request->SnapshotTerm <= header->Term && request->Done <= 1 &&
+            (request->SnapshotIndex <= VolatileState->CommitIndex ||
+                request->SnapshotTerm >= State->LogTerm(VolatileState->CommitIndex)) &&
+            (request->SnapshotIndex > VolatileState->CommitIndex || request->SnapshotIndex < State->SnapshotIndex ||
+                request->SnapshotTerm == State->LogTerm(request->SnapshotIndex)) &&
             request->TotalBytes >= 44 && request->TotalBytes <= TSnapshot::MaxBytes &&
             request->Offset <= request->TotalBytes && length > 0 && length <= TInstallSnapshotRequest::MaxChunkBytes &&
             length <= request->TotalBytes - request->Offset &&
