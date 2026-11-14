@@ -61,15 +61,20 @@ struct TCluster {
     std::deque<TMessageHolder<TMessage>> Packets;
     std::vector<uint32_t> VoteTargets;
     std::set<uint32_t> Isolated;
-    TCluster() { for (uint32_t id = 1; id <= 4; ++id) Build(id, std::make_shared<TState>()); }
+    bool StageVoterLearner = false;
+    explicit TCluster(bool stageVoterLearner = false) : StageVoterLearner(stageVoterLearner) {
+        for (uint32_t id = 1; id <= 4; ++id) Build(id, std::make_shared<TState>());
+    }
     void Build(uint32_t id, std::shared_ptr<IState> state) {
         auto peers = Peers(id);
+        if (StageVoterLearner && id != 4) peers.erase(4);
         for (auto& [_, peer] : peers) peer = std::make_shared<TEndpoint>([this](auto message) {
             if (message->Type == uint32_t(EMessageType::REQUEST_VOTE_REQUEST)) VoteTargets.push_back(message.template Cast<TMessageEx>()->Dst);
             Packets.push_back(std::move(message));
         });
         Processors[id - 1].reset();
-        Nodes[id - 1] = std::make_shared<TRaft>(state, id, peers, std::vector<uint32_t>{4});
+        Nodes[id - 1] = std::make_shared<TRaft>(state, id, peers,
+            StageVoterLearner && id != 4 ? std::vector<uint32_t>{} : std::vector<uint32_t>{4});
         Apps[id - 1] = std::make_shared<TApp>();
         Processors[id - 1] = std::make_unique<TRequestProcessor>(Nodes[id - 1], Apps[id - 1], peers);
     }
@@ -236,6 +241,165 @@ void test_nonfresh_unbound_store_requires_snapshot_proof_for_learners(void**) {
     TRaft adopted(state, 1, Peers(1), {4});
     assert_true(state->GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
 }
+void test_online_learner_staging_snapshot_catchup_and_quorum_isolation(void**) {
+    TCluster cluster(true); cluster.Elect(1);
+    for (const std::string key : {"a", "b", "c"}) cluster.Write(key, std::string(60000, key[0]));
+    auto leader = cluster.Nodes[0]; const auto fixed = leader->GetVoterIds();
+    const auto snapshot = leader->Compact(); assert_true(snapshot.Index > 1);
+    auto endpoint = std::make_shared<TEndpoint>([&](auto message) { cluster.Packets.push_back(std::move(message)); });
+    const auto fields = static_cast<TStateFields>(*leader->GetState());
+    Reject([&] { leader->AddLearnerTarget(2, endpoint); });
+    leader->AddLearnerTarget(4, endpoint);
+    assert_true(static_cast<TStateFields>(*leader->GetState()) == fields);
+    assert_true(leader->GetState()->GetBoundVoters() == fixed);
+    assert_true(leader->GetVoterIds() == fixed); assert_int_equal(leader->GetNservers(), 3);
+    assert_int_equal(leader->GetNpeers(), 3); assert_false(leader->IsLearnerCaughtUp(4));
+    assert_true(leader->GetLearnerIds() == std::vector<uint32_t>({4}));
+    cluster.Pump(1, 120, true);
+    assert_true(leader->IsLearnerCaughtUp(4)); assert_int_equal(cluster.Apps[3]->Loads, 1);
+    assert_true(Read(*cluster.Apps[3], "c") == std::string(60000, 'c'));
+    Reject([&] { TRaft promoted(leader->GetState(), 1, Peers(1)); });
+    assert_true(leader->GetState()->GetBoundVoters() == fixed);
+    const auto before = leader->GetVolatileState()->CommitIndex;
+    cluster.Isolated = {2, 3}; cluster.Write("uncommitted", "value");
+    assert_true(leader->GetVolatileState()->MatchIndex.at(4) > before);
+    assert_int_equal(leader->GetVolatileState()->CommitIndex, before);
+    assert_true(Read(*cluster.Apps[0], "uncommitted").empty());
+    size_t replies = 0;
+    auto client = std::make_shared<TEndpoint>([&](auto message) {
+        assert_int_equal(message.template Cast<TCommandResponse>()->ErrorCode, 0); ++replies;
+    });
+    auto read = NewHoldedMessage<TReadKv>(sizeof(TReadKv) + 1);
+    read->Flags = TCommandRequest::EConsistent; read->KeySize = 1; read->Data[0] = 'a';
+    cluster.Processors[0]->OnCommandRequest(read, client); cluster.Pump();
+    assert_int_equal(replies, 0);
+    cluster.Isolated = {3}; cluster.Pump(1, 80);
+    assert_int_equal(replies, 1);
+    assert_true(Read(*cluster.Apps[0], "uncommitted") == "value");
+    assert_true(leader->IsLearnerCaughtUp(4));
+}
+void test_online_learner_removal_and_stale_reply_after_readdition(void**) {
+    TCluster cluster(true); cluster.Elect(1); cluster.Pump();
+    auto leader = cluster.Nodes[0];
+    auto endpoint = std::make_shared<TEndpoint>([&](auto message) { cluster.Packets.push_back(std::move(message)); });
+    leader->AddLearnerTarget(4, endpoint); cluster.Pump(); assert_true(leader->IsLearnerCaughtUp(4));
+    leader->ApproveRead();
+    TMessageHolder<TMessage> request;
+    for (auto it = cluster.Packets.begin(); it != cluster.Packets.end(); ++it) {
+        auto header = it->Cast<TMessageEx>();
+        if (header->Src == 1 && header->Dst == 4 && header->Type == uint32_t(EMessageType::APPEND_ENTRIES_REQUEST)) {
+            request = *it; cluster.Packets.erase(it); break;
+        }
+    }
+    assert_true(bool(request));
+    cluster.Nodes[3]->Process(cluster.Now, request);
+    TMessageHolder<TMessage> delayed;
+    for (auto it = cluster.Packets.begin(); it != cluster.Packets.end(); ++it) {
+        auto header = it->Cast<TMessageEx>();
+        if (header->Src == 4 && header->Dst == 1 && header->Type == uint32_t(EMessageType::APPEND_ENTRIES_RESPONSE)) {
+            delayed = *it; cluster.Packets.erase(it); break;
+        }
+    }
+    assert_true(bool(delayed)); cluster.Packets.clear();
+    assert_true(leader->RemoveLearnerTarget(4) == endpoint);
+    assert_true(leader->GetLearnerIds().empty()); assert_int_equal(leader->GetNpeers(), 2);
+    assert_false(leader->IsLearnerCaughtUp(4));
+    leader->Process(cluster.Now, delayed); // no longer a configured peer
+    leader->AddLearnerTarget(4, endpoint);
+    cluster.Now += std::chrono::seconds(3); leader->ProcessTimeout(cluster.Now);
+    leader->Process(cluster.Now, delayed); // old RPC identity cannot confirm the new target
+    assert_false(leader->IsLearnerCaughtUp(4));
+    assert_int_equal(leader->GetVolatileState()->MatchIndex.at(4), 0);
+    cluster.Drain(); cluster.Pump(); assert_true(leader->IsLearnerCaughtUp(4));
+    assert_true(leader->GetVoterIds() == std::vector<uint32_t>({1, 2, 3}));
+}
+void test_online_learner_removal_during_snapshot_and_delayed_ack(void**) {
+    TCluster cluster(true); cluster.Elect(1);
+    for (const std::string key : {"a", "b", "c"}) cluster.Write(key, std::string(60000, key[0]));
+    auto leader = cluster.Nodes[0]; leader->Compact();
+    auto endpoint = std::make_shared<TEndpoint>([&](auto message) { cluster.Packets.push_back(std::move(message)); });
+    const auto nextSnapshot = [&]() -> TMessageHolder<TMessage> {
+        for (int attempt = 0; attempt < 40; ++attempt) {
+            cluster.Now += std::chrono::seconds(3); leader->ProcessTimeout(cluster.Now);
+            size_t budget = 1000;
+            while (!cluster.Packets.empty()) {
+                assert_true(budget-- > 0);
+                auto message = cluster.Packets.front(); cluster.Packets.pop_front();
+                auto header = message.Cast<TMessageEx>();
+                if (header->Src == 1 && header->Dst == 4 && header->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_REQUEST))
+                    return message;
+                cluster.Nodes[header->Dst - 1]->Process(cluster.Now, message);
+                cluster.Processors[header->Dst - 1]->ProcessCommitted();
+            }
+        }
+        fail_msg("Learner did not enter snapshot transfer"); return {};
+    };
+    leader->AddLearnerTarget(4, endpoint);
+    auto first = nextSnapshot(); const auto firstSeq = first.Cast<TMessageEx>()->Seqno;
+    cluster.Nodes[3]->Process(cluster.Now, first);
+    TMessageHolder<TMessage> delayed;
+    for (auto it = cluster.Packets.begin(); it != cluster.Packets.end(); ++it) {
+        auto header = it->Cast<TMessageEx>();
+        if (header->Src == 4 && header->Dst == 1 && header->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_RESPONSE)) {
+            delayed = *it; cluster.Packets.erase(it); break;
+        }
+    }
+    assert_true(bool(delayed)); assert_false(delayed.Cast<TInstallSnapshotResponse>()->Installed);
+    assert_true(leader->GetVolatileState()->SnapshotRpcs.contains(4));
+    assert_true(leader->RemoveLearnerTarget(4) == endpoint);
+    assert_false(leader->GetVolatileState()->SnapshotRpcs.contains(4)); cluster.Packets.clear();
+    leader->AddLearnerTarget(4, endpoint);
+    auto replacement = nextSnapshot(); const auto replacementSeq = replacement.Cast<TMessageEx>()->Seqno;
+    assert_true(replacementSeq != firstSeq);
+    leader->Process(cluster.Now, delayed);
+    const auto& pending = leader->GetVolatileState()->SnapshotRpcs.at(4);
+    assert_int_equal(pending.Seqno, replacementSeq); assert_int_equal(pending.Offset, 0);
+    cluster.Nodes[3]->Process(cluster.Now, replacement); cluster.Drain(); cluster.Pump(1, 120, true);
+    assert_true(leader->IsLearnerCaughtUp(4)); assert_int_equal(cluster.Apps[3]->Loads, 1);
+    assert_true(Read(*cluster.Apps[3], "c") == std::string(60000, 'c'));
+}
+void test_online_learner_requires_reconciliation_after_leader_change(void**) {
+    TCluster cluster(true); cluster.Elect(1);
+    auto endpoint = std::make_shared<TEndpoint>([&](auto message) { cluster.Packets.push_back(std::move(message)); });
+    cluster.Nodes[0]->AddLearnerTarget(4, endpoint); cluster.Pump();
+    assert_true(cluster.Nodes[0]->IsLearnerCaughtUp(4));
+    cluster.Isolated = {1}; cluster.Elect(2); cluster.Pump(2);
+    assert_true(cluster.Nodes[1]->GetLearnerIds().empty());
+    assert_false(cluster.Nodes[1]->IsLearnerCaughtUp(4));
+    cluster.Nodes[1]->AddLearnerTarget(4, endpoint); cluster.Pump(2);
+    assert_true(cluster.Nodes[1]->IsLearnerCaughtUp(4));
+    cluster.Processors[1]->OnCommandRequest(Command("after", "failover"), {}); cluster.Pump(2, 80);
+    assert_true(Read(*cluster.Apps[3], "after") == "failover");
+    assert_true(cluster.Nodes[1]->GetVoterIds() == std::vector<uint32_t>({1, 2, 3}));
+    cluster.Isolated.clear(); cluster.Pump(2, 80);
+    assert_int_equal(cluster.Nodes[0]->CurrentStateName(), EState::FOLLOWER);
+    assert_true(cluster.Nodes[0]->GetLearnerIds() == std::vector<uint32_t>({4}));
+}
+void test_online_learner_staging_rejects_invalid_calls(void**) {
+    auto state = std::make_shared<TState>(); auto raft = std::make_shared<TRaft>(state, 1, Peers(1, 3));
+    auto endpoint = std::make_shared<TEndpoint>();
+    Reject([&] { raft->AddLearnerTarget(4, endpoint); });
+    Reject([&] { raft->RemoveLearnerTarget(2); });
+    raft->ProcessTimeout({}); // candidate; no remote votes
+    Reject([&] { raft->AddLearnerTarget(4, endpoint); });
+    auto single = std::make_shared<TRaft>(std::make_shared<TState>(), 1, TNodeDict{});
+    single->ProcessTimeout({}); assert_int_equal(single->CurrentStateName(), EState::LEADER);
+    for (uint32_t id : {0u, 1u}) Reject([&] { single->AddLearnerTarget(id, endpoint); });
+    Reject([&] { single->AddLearnerTarget(2, {}); });
+    single->AddLearnerTarget(2, endpoint);
+    Reject([&] { single->AddLearnerTarget(2, endpoint); });
+    Reject([&] { single->RemoveLearnerTarget(1); });
+    Reject([&] { single->RemoveLearnerTarget(3); });
+    assert_true(single->GetVoterIds() == std::vector<uint32_t>({1}));
+    assert_int_equal(single->GetNservers(), 1); assert_int_equal(single->GetNpeers(), 1);
+    auto unbound = std::make_shared<TState>(); unbound->CurrentTerm = 2;
+    unbound->Append(NewHoldedMessage<TLogEntry>());
+    TRaft oldStore(unbound, 1, {}); oldStore.ProcessTimeout({});
+    assert_int_equal(oldStore.CurrentStateName(), EState::LEADER);
+    assert_true(unbound->GetBoundVoters().empty());
+    Reject([&] { oldStore.AddLearnerTarget(2, endpoint); });
+    assert_true(oldStore.GetLearnerIds().empty()); assert_int_equal(oldStore.GetNpeers(), 0);
+}
 void test_recovered_hard_state_must_match_fixed_voters(void**) {
     for (int mode = 0; mode < 2; ++mode) {
         auto state = std::make_shared<TState>();
@@ -360,6 +524,36 @@ void test_legacy_disk_backend_cannot_enable_learner_roles(void**) {
     Reject([&] { TRaft raft(state, 4, Peers(4), {4}); });
     assert_int_equal(state->CurrentTerm, 1); assert_int_equal(state->VotedFor, 0);
 }
+void test_legacy_leader_cannot_stage_online_learner(void**) {
+    TFiles files; auto state = std::make_shared<TDiskState>(files.Name, 1);
+    TRaft raft(state, 1, {}); raft.ProcessTimeout({});
+    assert_int_equal(raft.CurrentStateName(), EState::LEADER);
+    const auto fields = static_cast<TStateFields>(*state);
+    Reject([&] { raft.AddLearnerTarget(2, std::make_shared<TEndpoint>()); });
+    assert_true(static_cast<TStateFields>(*state) == fields);
+    assert_true(raft.GetLearnerIds().empty()); assert_int_equal(raft.GetNpeers(), 0);
+}
+void test_online_learner_staging_does_not_change_durable_binding(void**) {
+    TFiles files; const auto path = files.Name + ".durable.1";
+    {
+        auto state = std::make_shared<TDurableState>(files.Name, 1); TRaft raft(state, 1, {});
+        raft.ProcessTimeout({}); assert_int_equal(raft.CurrentStateName(), EState::LEADER);
+        std::ifstream input(path, std::ios::binary); std::string before(std::istreambuf_iterator<char>(input), {}); input.close();
+        auto endpoint = std::make_shared<TEndpoint>(); raft.AddLearnerTarget(2, endpoint);
+        assert_true(state->GetBoundVoters() == std::vector<uint32_t>({1}));
+        std::ifstream afterAdd(path, std::ios::binary);
+        assert_true(std::string(std::istreambuf_iterator<char>(afterAdd), {}) == before);
+        assert_true(raft.RemoveLearnerTarget(2) == endpoint);
+        std::ifstream afterRemove(path, std::ios::binary);
+        assert_true(std::string(std::istreambuf_iterator<char>(afterRemove), {}) == before);
+        raft.AddLearnerTarget(2, endpoint); // Leave staged at process shutdown.
+        std::ifstream afterReadd(path, std::ios::binary);
+        assert_true(std::string(std::istreambuf_iterator<char>(afterReadd), {}) == before);
+    }
+    auto recovered = std::make_shared<TDurableState>(files.Name, 1);
+    TRaft raft(recovered, 1, {});
+    assert_true(raft.GetLearnerIds().empty()); assert_true(recovered->GetBoundVoters() == std::vector<uint32_t>({1}));
+}
 #endif
 }
 int main() {
@@ -374,6 +568,11 @@ int main() {
         cmocka_unit_test(test_learner_snapshot_catchup_status_and_restart_preserve_role),
         cmocka_unit_test(test_restart_cannot_promote_learner_or_change_voters_but_can_add_transport),
         cmocka_unit_test(test_nonfresh_unbound_store_requires_snapshot_proof_for_learners),
+        cmocka_unit_test(test_online_learner_staging_snapshot_catchup_and_quorum_isolation),
+        cmocka_unit_test(test_online_learner_removal_and_stale_reply_after_readdition),
+        cmocka_unit_test(test_online_learner_removal_during_snapshot_and_delayed_ack),
+        cmocka_unit_test(test_online_learner_requires_reconciliation_after_leader_change),
+        cmocka_unit_test(test_online_learner_staging_rejects_invalid_calls),
         cmocka_unit_test(test_recovered_hard_state_must_match_fixed_voters),
 #ifdef __linux__
         cmocka_unit_test(test_legacy_recovered_vote_outside_voters_preserves_storage),
@@ -382,6 +581,8 @@ int main() {
         cmocka_unit_test(test_durable_v3_corrupt_roles_fail_without_rewriting),
         cmocka_unit_test(test_durable_v2_snapshot_adoption_preserves_vote_log_and_application),
         cmocka_unit_test(test_legacy_disk_backend_cannot_enable_learner_roles),
+        cmocka_unit_test(test_legacy_leader_cannot_stage_online_learner),
+        cmocka_unit_test(test_online_learner_staging_does_not_change_durable_binding),
 #endif
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
