@@ -120,6 +120,7 @@ struct TState: IState {
     }
 
     void Append(TMessageHolder<TLogEntry> entry) override {
+        if (LastLogIndex >= uint64_t(INT64_MAX)) throw std::overflow_error("Raft log index exhausted");
         Log.emplace_back(CloneEntry(entry));
         LastLogIndex = SnapshotIndex + Log.size();
         LastLogTerm = Log.back()->Term;

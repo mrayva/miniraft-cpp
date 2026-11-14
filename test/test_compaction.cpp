@@ -539,6 +539,33 @@ void test_snapshot_boundary_index_exhaustion_does_not_append_wrapped_noop(void**
     assert_true(state->LastLogIndex == uint64_t(INT64_MAX));
     assert_int_equal(state->LastLogTerm, 1);
 }
+void CheckStorageIndexExhaustion(IState& state, std::function<std::string()> image = [] { return std::string{}; }) {
+    state.InstallSnapshot({uint64_t(INT64_MAX) - 1, 1, {1}, "boundary"});
+    auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = 1; state.Append(entry);
+    assert_true(state.LastLogIndex == uint64_t(INT64_MAX));
+    const auto before = static_cast<TStateFields>(state); const auto beforeImage = image();
+    Reject([&] { state.Append(entry); });
+    assert_true(static_cast<TStateFields>(state) == before); assert_true(image() == beforeImage);
+    assert_int_equal(state.LogTerm(INT64_MAX), 1); assert_true(state.GetSnapshot()->Data == "boundary");
+}
+void test_memory_storage_rejects_index_exhaustion(void**) {
+    TState state; CheckStorageIndexExhaustion(state);
+}
+#ifdef __linux__
+void test_durable_storage_rejects_index_exhaustion(void**) {
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-index-limit-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    auto name = (dir / "raft").string();
+    { TDurableState state(name, 1); CheckStorageIndexExhaustion(state, [&] {
+        std::ifstream input(name + ".durable.1", std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input), {});
+      }); }
+    { TDurableState state(name, 1); assert_true(state.LastLogIndex == uint64_t(INT64_MAX));
+      assert_int_equal(state.LogTerm(INT64_MAX), 1); }
+    std::error_code ignored; std::filesystem::remove_all(dir, ignored);
+}
+#endif
 
 void ExerciseBoundary(IState& state) {
     state.CurrentTerm = 3; state.VotedFor = 2; state.Commit();
@@ -677,9 +704,11 @@ int main() {
         cmocka_unit_test(test_joint_snapshot_is_rejected_even_if_boundary_is_already_covered),
         cmocka_unit_test(test_remote_snapshot_retains_suffix_without_applying_it_before_commit),
         cmocka_unit_test(test_snapshot_boundary_index_exhaustion_does_not_append_wrapped_noop),
+        cmocka_unit_test(test_memory_storage_rejects_index_exhaustion),
         cmocka_unit_test(test_memory_snapshot_boundary_retains_matching_suffix_and_replaces_conflict),
 #ifdef __linux__
         cmocka_unit_test(test_durable_snapshot_storage_rejects_term_regression),
+        cmocka_unit_test(test_durable_storage_rejects_index_exhaustion),
         cmocka_unit_test(test_durable_term_lookup_avoids_payload_copies_across_compaction),
         cmocka_unit_test(test_durable_compacted_boundary_survives_restart),
         cmocka_unit_test(test_snapshot_and_suffix_are_atomic_at_every_publication_stage),

@@ -274,6 +274,7 @@ void TDurableState::Commit()
 
 void TDurableState::Append(TMessageHolder<TLogEntry> entry)
 {
+    if (LastLogIndex >= uint64_t(INT64_MAX)) throw std::overflow_error("Raft log index exhausted");
     Impl->Log.push_back(Clone(entry));
     LastLogIndex = SnapshotIndex + Impl->Log.size();
     LastLogTerm = Impl->Log.back()->Term;
