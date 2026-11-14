@@ -198,20 +198,30 @@ TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes, st
     if (!Learners.empty() && !State->SupportsVoterBinding())
         throw std::invalid_argument("Learners require voter-binding-capable storage");
     const auto bound = State->GetBoundVoters();
-    if (auto snapshot = State->GetSnapshot(); snapshot && snapshot->HasConfigurationMetadata())
-        throw std::invalid_argument("Configuration snapshot recovery is unsupported");
     if (State->SnapshotIndex > State->LastLogIndex || State->LastLogIndex > uint64_t(INT64_MAX))
         throw std::invalid_argument("Invalid retained log bounds");
+    const auto snapshot = State->GetSnapshot();
+    if (snapshot) {
+        ValidateSnapshot(*snapshot);
+        if (snapshot->HasConfigurationMetadata())
+            throw std::invalid_argument("Configuration snapshot recovery is unsupported");
+        if (snapshot->Index != State->SnapshotIndex || snapshot->Term != State->SnapshotTerm ||
+            snapshot->Term > State->CurrentTerm || snapshot->Voters != Voters ||
+            State->LastLogTerm < State->SnapshotTerm || State->LastLogTerm > State->CurrentTerm ||
+            (State->LastLogIndex == State->SnapshotIndex && State->LastLogTerm != State->SnapshotTerm))
+            throw std::invalid_argument("Compacted state snapshot boundary mismatch");
+    } else if (State->SnapshotIndex || State->SnapshotTerm) {
+        throw std::invalid_argument("Compacted state is missing its snapshot");
+    }
     // Reject before binding voters or serving traffic. Current Raft cannot
     // interpret configuration entries, including uncommitted suffix entries.
     for (uint64_t index = State->SnapshotIndex + 1; index <= State->LastLogIndex; ++index)
         if (State->RetainedLogFlags(index) & TLogEntry::EConfiguration)
             throw std::invalid_argument("Configuration log recovery is unsupported");
     const bool fresh = State->CurrentTerm == 1 && !State->VotedFor && !State->LastLogIndex;
-    if (State->SupportsVoterBinding() && (!bound.empty() || fresh || State->GetSnapshot() || !Learners.empty()))
+    if (State->SupportsVoterBinding() && (!bound.empty() || fresh || snapshot || !Learners.empty()))
         State->BindVoters(Voters);
-    if (auto snapshot = State->GetSnapshot()) {
-        if (snapshot->Voters != GetVoterIds()) throw std::invalid_argument("Compacted state voter configuration mismatch");
+    if (snapshot) {
         VolatileState->CommitIndex = State->SnapshotIndex;
     }
 }
