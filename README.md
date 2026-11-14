@@ -67,6 +67,8 @@ The [configuration log scanner](docs/configuration-scan.md) validates a retained
 suffix at a caller-supplied commit boundary and at its end.
 The [online learner staging API](docs/online-learner-staging.md) lets embedders
 add and remove leader-local, non-voting replication targets.
+The [network learner follow-up](docs/online-learner-network.md) connects that
+API to the built-in server's runtime drain loop.
 The [stable configuration snapshot foundation](docs/stable-configuration-snapshots.md)
 preserves configuration identity for offline recovery validation.
 The [snapshot term validation fix](docs/snapshot-committed-terms.md) rejects

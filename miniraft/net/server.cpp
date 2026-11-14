@@ -43,15 +43,46 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(TSocket socket) {
 
 template<typename TSocket>
 void TRaftServer<TSocket>::Serve() {
+    if (Serving) throw std::logic_error("Raft server is already serving");
+    Serving = true;
     Idle();
     InboundServe();
     std::vector<NNet::TVoidTask> tasks;
-    for (auto& node : Nodes) {
-        auto realNode = std::dynamic_pointer_cast<TNode<TSocket>>(node);
-        if (realNode) {
-            tasks.emplace_back(OutboundServe(realNode));
-        }
+    for (auto& [id, node] : PeerNodes) {
+        // Learners only receive replication and reply through their own
+        // configured voter connections. They cannot receive forwarded client
+        // commands, so no outbound response reader is needed for them.
+        if (Raft->IsVoter(id)) tasks.emplace_back(OutboundServe(node));
     }
+}
+
+template<typename TSocket>
+void TRaftServer<TSocket>::AddLearnerTarget(uint32_t id, std::shared_ptr<TNode<TSocket>> node) {
+    if (!node) throw std::invalid_argument("Learner target endpoint is null");
+    auto [peer, insertedPeer] = PeerNodes.emplace(id, node);
+    if (!insertedPeer) throw std::invalid_argument("Duplicate network peer ID");
+
+    bool insertedNode = false;
+    try {
+        insertedNode = Nodes.insert(node).second;
+        if (!insertedNode) throw std::invalid_argument("Learner endpoint is already registered");
+        Raft->AddLearnerTarget(id, node);
+    } catch (...) {
+        if (insertedNode) Nodes.erase(node);
+        PeerNodes.erase(peer);
+        throw;
+    }
+}
+
+template<typename TSocket>
+std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::RemoveLearnerTarget(uint32_t id) {
+    auto peer = PeerNodes.find(id);
+    if (peer == PeerNodes.end()) throw std::invalid_argument("Unknown network learner target");
+    auto endpoint = peer->second;
+    Raft->RemoveLearnerTarget(id); // Rejects voters and nonleaders before server state changes.
+    Nodes.erase(endpoint);
+    PeerNodes.erase(peer);
+    return endpoint;
 }
 
 template<typename TSocket>

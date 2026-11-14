@@ -40,9 +40,11 @@ Memory TState supports role binding for library tests/volatile deployments, but
 only the durable backend preserves that binding across actual process loss.
 Legacy TDiskState does not support learner mode.
 
-The KV CLI and built-in server use static transport discovery. Library embedders
-can use [online learner staging](online-learner-staging.md) on the current leader;
-that local, non-voting replication target is not persisted or cluster membership.
+The KV CLI uses static transport discovery. Library embedders can use
+[online learner staging](online-learner-staging.md) on the current leader, and
+`TRaftServer` can attach its `TNode` endpoint through
+[network learner staging](online-learner-network.md). That local, non-voting
+replication target is not persisted or cluster membership.
 Deleting `--learner 4` to turn it into a voter is rejected for bound stores; it is
 not a membership-change procedure. Voter-set changes remain disabled.
 

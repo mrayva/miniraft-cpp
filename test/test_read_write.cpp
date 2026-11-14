@@ -4,6 +4,8 @@
 #include <iostream>
 #include <memory>
 #include <functional>
+#include <stdexcept>
+#include <vector>
 
 #include <miniraft/messages.h>
 #include <miniraft/raft.h>
@@ -153,11 +155,65 @@ void test_read_write_payload(void**) {
     h1.destroy(); h2.destroy();
 }
 
+void test_server_stages_and_removes_runtime_learner(void**) {
+    NNet::TLoop<NNet::TPoll> loop;
+    auto timeSource = std::make_shared<TTimeSource>();
+    auto raft = std::make_shared<TRaft>(std::make_shared<TState>(), 1, TNodeDict{});
+    raft->Become(EState::LEADER);
+    NNet::TSocket listener(NNet::TAddress{"127.0.0.1", 0}, loop.Poller());
+    TRaftServer<NNet::TSocket> server(
+        loop.Poller(), std::move(listener), raft, std::make_shared<TDummyRsm>(), TNodeDict{}, timeSource);
+    auto makeEndpoint = [&] {
+        return std::make_shared<TNode<NNet::TSocket>>(
+            [&](const NNet::TAddress& addr) { return NNet::TSocket(addr, loop.Poller()); },
+            "learner", NNet::TAddress{"127.0.0.1", 65534}, timeSource);
+    };
+    auto endpoint = makeEndpoint();
+
+    server.AddLearnerTarget(2, endpoint);
+    assert_true(raft->GetLearnerIds() == std::vector<uint32_t>({2}));
+    assert_int_equal(raft->GetNpeers(), 1);
+    assert_int_equal(raft->GetNservers(), 1);
+
+    bool duplicateRejected = false;
+    try {
+        server.AddLearnerTarget(2, makeEndpoint());
+    } catch (const std::invalid_argument&) {
+        duplicateRejected = true;
+    }
+    assert_true(duplicateRejected);
+    assert_true(raft->GetLearnerIds() == std::vector<uint32_t>({2}));
+
+    auto removed = server.RemoveLearnerTarget(2);
+    assert_true(removed == endpoint);
+    assert_true(raft->GetLearnerIds().empty());
+    assert_int_equal(raft->GetNpeers(), 0);
+
+    raft->Become(EState::FOLLOWER);
+    bool nonleaderRejected = false;
+    try {
+        server.AddLearnerTarget(3, makeEndpoint());
+    } catch (const std::logic_error&) {
+        nonleaderRejected = true;
+    }
+    assert_true(nonleaderRejected);
+    assert_true(raft->GetLearnerIds().empty());
+    assert_int_equal(raft->GetNpeers(), 0);
+
+    raft->Become(EState::LEADER);
+    auto retryEndpoint = makeEndpoint();
+    server.AddLearnerTarget(3, retryEndpoint);
+    assert_true(raft->GetLearnerIds() == std::vector<uint32_t>({3}));
+    assert_true(server.RemoveLearnerTarget(3) == retryEndpoint);
+    assert_true(raft->GetLearnerIds().empty());
+}
+
 int main() {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_message_send_recv),
         cmocka_unit_test(test_read_write),
         cmocka_unit_test(test_read_write_payload),
+        cmocka_unit_test(test_server_stages_and_removes_runtime_learner),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 };
