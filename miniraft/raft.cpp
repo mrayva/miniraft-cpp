@@ -1021,7 +1021,7 @@ TRequestProcessor::TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_pt
     : Raft(std::move(raft)), Rsm(std::move(rsm)), Nodes(nodes)
 {
     if (!Raft || !Rsm) throw std::invalid_argument("Request processor requires Raft and application state");
-    if (auto snapshot = Raft->GetState()->GetSnapshot(); snapshot && Rsm->LastAppliedIndex == 0)
+    if (auto snapshot = Raft->GetState()->GetSnapshot(); snapshot && Rsm->LastAppliedIndex < snapshot->Index)
         RestoreSnapshot(*snapshot, *Raft, *Rsm);
     if (Rsm->LastAppliedIndex < Raft->GetState()->SnapshotIndex)
         throw std::invalid_argument("Application progress precedes compacted log");

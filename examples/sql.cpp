@@ -1,8 +1,10 @@
 #include <sqlite3.h>
+#include <charconv>
 #include <iostream>
 
 #include <miniraft/raft.h>
 #include <miniraft/persist.h>
+#include <miniraft/durable.h>
 #include <miniraft/net/server.h>
 #include "payload_validation.h"
 
@@ -67,8 +69,22 @@ NNet::TFuture<void> Client(TPoller& poller, TSocket socket) {
     co_return;
 }
 
+template<typename TPoller>
+NNet::TVoidTask CompactLoop(TPoller& poller, std::shared_ptr<TRaft> raft,
+    std::shared_ptr<IRsm> rsm, uint64_t interval, uint64_t saved) {
+    while (true) {
+        co_await poller.Sleep(std::chrono::seconds(1));
+        if (rsm->LastAppliedIndex <= saved || rsm->LastAppliedIndex - saved < interval) continue;
+        try {
+            saved = raft->Compact().Index;
+        } catch (const std::exception& error) {
+            std::cerr << "SQL compaction deferred/failed: " << error.what() << "\n";
+        }
+    }
+}
+
 void usage(const char* prog) {
-    std::cerr << prog << "--client|--server --id myid --node ip:port:id [--node ip:port:id ...]" << "\n";
+    std::cerr << prog << "--client|--server --id myid --node ip:port:id [--node ip:port:id ...] [--durable] [--snapshots entries]" << "\n";
     exit(0);
 }
 
@@ -80,6 +96,8 @@ int main(int argc, char** argv)
     TNodeDict nodes;
     uint32_t id = 0;
     bool server = false;
+    bool durable = false;
+    uint64_t snapshotInterval = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--server")) {
             server = true;
@@ -88,9 +106,22 @@ int main(int argc, char** argv)
             hosts.push_back(THost{argv[++i]});
         } else if (!strcmp(argv[i], "--id") && i < argc - 1) {
             id = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--durable")) {
+            durable = true;
+        } else if (!strcmp(argv[i], "--snapshots")) {
+            if (i + 1 >= argc) { std::cerr << "--snapshots requires a positive entry interval\n"; return 1; }
+            const std::string_view value(argv[++i]);
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), snapshotInterval);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || !snapshotInterval) {
+                std::cerr << "--snapshots requires a positive entry interval\n"; return 1;
+            }
         } else if (!strcmp(argv[i], "--help")) {
             usage(argv[0]);
         }
+    }
+
+    if (snapshotInterval && (!server || !durable)) {
+        std::cerr << "--snapshots requires --server --durable\n"; return 1;
     }
 
     using TPoller = NNet::TDefaultPoller;
@@ -118,13 +149,17 @@ int main(int argc, char** argv)
         }
 
         std::shared_ptr<IRsm> rsm = std::make_shared<TSql>("sql_file.db", myHost.Id);
-        auto state = std::make_shared<TDiskState>("sql_state", myHost.Id);
+        std::shared_ptr<IState> state = durable
+            ? std::static_pointer_cast<IState>(std::make_shared<TDurableState>("sql_state", myHost.Id))
+            : std::static_pointer_cast<IState>(std::make_shared<TDiskState>("sql_state", myHost.Id));
         auto raft = std::make_shared<TRaft>(state, myHost.Id, nodes);
+        const auto savedSnapshot = state->SnapshotIndex;
         TPoller::TSocket socket(NNet::TAddress{myHost.Address, myHost.Port}, loop.Poller());
         socket.Bind();
         socket.Listen();
         TRaftServer server(loop.Poller(), std::move(socket), raft, rsm, nodes, timeSource);
         server.Serve();
+        if (snapshotInterval) CompactLoop(loop.Poller(), raft, rsm, snapshotInterval, savedSnapshot);
         loop.Loop();
     } else {
         NNet::TAddress addr{hosts[0].Address, hosts[0].Port};

@@ -137,7 +137,9 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm) {
 
 void RestoreSnapshot(const TSnapshot& snapshot, const TRaft& raft, IRsm& rsm) {
     CheckLocalLog(snapshot, raft);
-    if (rsm.LastAppliedIndex != 0) throw std::runtime_error("Snapshot restore requires a fresh application");
+    if (rsm.LastAppliedIndex >= snapshot.Index)
+        throw std::runtime_error("Application is not behind the snapshot");
+    rsm.ValidateSnapshot(snapshot.Data, snapshot.Index);
     rsm.LoadSnapshot(snapshot.Data, snapshot.Index);
     if (rsm.LastAppliedIndex != snapshot.Index) throw std::runtime_error("Application failed to restore snapshot progress");
 }

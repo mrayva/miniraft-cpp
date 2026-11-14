@@ -1,4 +1,5 @@
 #include "../examples/sql_rsm.h"
+#include <miniraft/durable.h>
 #include <miniraft/persist.h>
 #include <filesystem>
 #include <chrono>
@@ -153,6 +154,118 @@ struct TDatabase {
         assert_int_equal(rc, SQLITE_OK);
     }
 };
+void test_sql_snapshot_roundtrip_and_rejection_are_atomic(void**) {
+    TDatabase sourceFile, targetFile;
+    std::string image;
+    {
+        TSql source(sourceFile.Path, 1);
+        Seed(source);
+        assert_true(Apply(source, "INSERT INTO t VALUES ('second')", 2).empty());
+        image = source.SaveSnapshot();
+        assert_true(image.substr(0, 16) == std::string("SQLite format 3\0", 16));
+        source.ValidateSnapshot(image, 2);
+        Reject([&] { source.ValidateSnapshot(image, 3); });
+        auto corrupt = image; corrupt[0] ^= 1;
+        Reject([&] { source.ValidateSnapshot(corrupt, 2); });
+    }
+    {
+        TSql target(targetFile.Path, 1);
+        Seed(target);
+        auto corrupt = image; corrupt[0] ^= 1;
+        Reject([&] { target.LoadSnapshot(corrupt, 2); });
+        Reject([&] { target.LoadSnapshot(image, 3); });
+        assert_int_equal(target.LastAppliedIndex, 1);
+        assert_true(ReadText(target, "SELECT value FROM t") == "value\noriginal\n");
+
+        target.LoadSnapshot(image, 2);
+        assert_int_equal(target.LastAppliedIndex, 2);
+        assert_true(ReadText(target, "SELECT value FROM t ORDER BY rowid") == "value\noriginal\nsecond\n");
+    }
+    {
+        TSql restored(targetFile.Path, 1);
+        assert_int_equal(restored.LastAppliedIndex, 2);
+        assert_true(ReadText(restored, "SELECT count(*) FROM t") == "count(*)\n2\n");
+    }
+}
+void test_sql_snapshot_installation_busy_failure_preserves_database(void**) {
+    TDatabase sourceFile, targetFile;
+    TSql source(sourceFile.Path, 1); Seed(source);
+    assert_true(Apply(source, "INSERT INTO t VALUES ('snapshot')", 2).empty());
+    const auto image = source.SaveSnapshot();
+    TSql target(targetFile.Path, 1); Seed(target);
+
+    sqlite3* other = nullptr;
+    assert_int_equal(sqlite3_open((targetFile.Path + ".1").c_str(), &other), SQLITE_OK);
+    assert_int_equal(sqlite3_exec(other, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr), SQLITE_OK);
+    Reject([&] { target.LoadSnapshot(image, 2); });
+    assert_int_equal(target.LastAppliedIndex, 1);
+    assert_true(ReadText(target, "SELECT value FROM t") == "value\noriginal\n");
+    assert_int_equal(sqlite3_exec(other, "ROLLBACK", nullptr, nullptr, nullptr), SQLITE_OK);
+    assert_int_equal(sqlite3_close(other), SQLITE_OK);
+
+    target.LoadSnapshot(image, 2);
+    assert_int_equal(target.LastAppliedIndex, 2);
+    assert_true(ReadText(target, "SELECT value FROM t") == "value\noriginal\nsnapshot\n");
+}
+void test_sql_snapshot_includes_committed_wal_pages(void**) {
+    TDatabase file;
+    TSql source(file.Path, 1);
+    Seed(source);
+
+    sqlite3* wal = nullptr;
+    assert_int_equal(sqlite3_open((file.Path + ".1").c_str(), &wal), SQLITE_OK);
+    assert_int_equal(sqlite3_exec(wal, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr), SQLITE_OK);
+    assert_int_equal(sqlite3_close(wal), SQLITE_OK);
+    assert_true(Apply(source, "INSERT INTO t VALUES ('committed in WAL')", 2).empty());
+
+    const auto image = source.SaveSnapshot();
+    assert_int_equal(static_cast<unsigned char>(image[18]), 1);
+    assert_int_equal(static_cast<unsigned char>(image[19]), 1);
+    TSql restored(":memory:", 2);
+    restored.LoadSnapshot(image, 2);
+    assert_true(ReadText(restored, "SELECT value FROM t ORDER BY rowid") ==
+        "value\noriginal\ncommitted in WAL\n");
+}
+void test_sql_snapshot_page_size_mismatch_rejects_before_replacement(void**) {
+    TDatabase sourceFile, targetFile;
+    sourceFile.External("PRAGMA page_size=8192; VACUUM");
+    TSql source(sourceFile.Path, 1);
+    Seed(source);
+    const auto image = source.SaveSnapshot();
+    TSql target(targetFile.Path, 1);
+    Seed(target);
+
+    Reject([&] { target.ValidateSnapshot(image, 1); });
+    assert_int_equal(target.LastAppliedIndex, 1);
+    assert_true(ReadText(target, "SELECT value FROM t") == "value\noriginal\n");
+}
+void test_sql_startup_restores_application_left_behind_raft_snapshot(void**) {
+    TDatabase sourceFile, targetFile;
+    TSql source(sourceFile.Path, 1); Seed(source);
+    assert_true(Apply(source, "INSERT INTO t VALUES ('committed')", 2).empty());
+    TSnapshot snapshot{2, 1, {1}, source.SaveSnapshot()};
+    { TSql stale(targetFile.Path, 1); Seed(stale); }
+    const auto raftPath = (targetFile.Directory / "raft").string();
+    { TDurableState state(raftPath, 1); state.InstallSnapshot(snapshot); }
+
+    {
+        auto state = std::make_shared<TDurableState>(raftPath, 1);
+        auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+        auto sql = std::make_shared<TSql>(targetFile.Path, 1);
+        assert_int_equal(sql->LastAppliedIndex, 1);
+        TRequestProcessor processor(raft, sql, {});
+        assert_int_equal(sql->LastAppliedIndex, 2);
+        assert_true(ReadText(*sql, "SELECT value FROM t ORDER BY rowid") == "value\noriginal\ncommitted\n");
+    }
+    {
+        auto state = std::make_shared<TDurableState>(raftPath, 1);
+        auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+        auto sql = std::make_shared<TSql>(targetFile.Path, 1);
+        TRequestProcessor processor(raft, sql, {});
+        assert_int_equal(sql->LastAppliedIndex, 2);
+        assert_true(ReadText(*sql, "SELECT count(*) FROM t") == "count(*)\n2\n");
+    }
+}
 void test_sql_write_cannot_escape_managed_transaction(void**) {
     for (const std::string control : {"COMMIT", "END", "ROLLBACK", "BEGIN", "SAVEPOINT x", "RELEASE x",
          "PRAGMA user_version=7", "ATTACH ':memory:' AS other"}) {
@@ -434,6 +547,11 @@ int main() {
         cmocka_unit_test(test_sql_write_handles_trailing_comment_without_losing_progress),
         cmocka_unit_test(test_sql_automatic_rollback_is_consumed_without_partial_data),
         cmocka_unit_test(test_sql_metadata_failure_rolls_back_data_and_does_not_advance),
+        cmocka_unit_test(test_sql_snapshot_roundtrip_and_rejection_are_atomic),
+        cmocka_unit_test(test_sql_snapshot_installation_busy_failure_preserves_database),
+        cmocka_unit_test(test_sql_snapshot_includes_committed_wal_pages),
+        cmocka_unit_test(test_sql_snapshot_page_size_mismatch_rejects_before_replacement),
+        cmocka_unit_test(test_sql_startup_restores_application_left_behind_raft_snapshot),
         cmocka_unit_test(test_sql_progress_restores_full_uint64_range),
         cmocka_unit_test(test_sql_invalid_progress_fails_closed),
         cmocka_unit_test(test_sql_busy_write_does_not_consume_entry),

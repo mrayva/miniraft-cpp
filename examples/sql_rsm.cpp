@@ -74,6 +74,123 @@ struct TReadBudget {
     }
 };
 using TStatement = std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)>;
+constexpr size_t MaxSqlSnapshotBytes = TSnapshot::MaxBytes - 40 - 4 * TSnapshot::MaxVoters;
+
+struct TSnapshotDatabase {
+    // Keep the deserialize buffer alive until after the connection closes.
+    std::unique_ptr<unsigned char, decltype(&sqlite3_free)> Buffer{nullptr, sqlite3_free};
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)> Db{nullptr, sqlite3_close_v2};
+};
+
+TSnapshotDatabase OpenSnapshotDatabase(std::string_view bytes) {
+    if (bytes.size() < 100 || bytes.size() > MaxSqlSnapshotBytes)
+        throw TMessageError("Invalid SQL snapshot size");
+    TSnapshotDatabase result;
+    constexpr size_t MalformedImageReadSlack = 20;
+    result.Buffer.reset(static_cast<unsigned char*>(sqlite3_malloc64(bytes.size() + MalformedImageReadSlack)));
+    if (!result.Buffer) throw std::bad_alloc();
+    memcpy(result.Buffer.get(), bytes.data(), bytes.size());
+    memset(result.Buffer.get() + bytes.size(), 0, MalformedImageReadSlack);
+    if (result.Buffer.get()[18] != 1 || result.Buffer.get()[19] != 1)
+        throw TMessageError("SQL snapshot is not a standalone rollback-mode image");
+
+    sqlite3* raw = nullptr;
+    const int opened = sqlite3_open_v2(":memory:", &raw,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_MEMORY, nullptr);
+    result.Db.reset(raw);
+    if (opened != SQLITE_OK) throw TMessageError("Cannot open SQL snapshot database");
+    const int rc = sqlite3_deserialize(result.Db.get(), "main", result.Buffer.get(),
+        sqlite3_int64(bytes.size()), sqlite3_int64(bytes.size()), SQLITE_DESERIALIZE_READONLY);
+    if (rc != SQLITE_OK) throw TMessageError("Invalid SQL snapshot database image");
+    return result;
+}
+
+uint64_t SnapshotAppliedIndex(sqlite3* db) {
+    sqlite3_stmt* raw = nullptr;
+    const int prepared = sqlite3_prepare_v2(db,
+        "SELECT value FROM raft_metadata_ WHERE key='LastAppliedIndex'", -1, &raw, nullptr);
+    TStatement statement(raw, sqlite3_finalize);
+    if (prepared != SQLITE_OK || !statement) throw TMessageError("SQL snapshot has no progress metadata");
+    int rc = sqlite3_step(statement.get());
+    if (rc != SQLITE_ROW || sqlite3_column_type(statement.get(), 0) != SQLITE_TEXT)
+        throw TMessageError("Invalid SQL snapshot progress metadata");
+    const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(statement.get(), 0));
+    const auto length = sqlite3_column_bytes(statement.get(), 0);
+    if (!text || length <= 0) throw TMessageError("Invalid SQL snapshot progress metadata");
+    uint64_t index = 0;
+    const auto parsed = std::from_chars(text, text + length, index);
+    if (parsed.ec != std::errc{} || parsed.ptr != text + length || !index || index > uint64_t(INT64_MAX))
+        throw TMessageError("Invalid SQL snapshot progress metadata");
+    if (sqlite3_step(statement.get()) != SQLITE_DONE)
+        throw TMessageError("Duplicate SQL snapshot progress metadata");
+    return index;
+}
+
+void ValidateSnapshotDatabase(sqlite3* db, uint64_t index) {
+    if (!index || index > uint64_t(INT64_MAX)) throw TMessageError("Invalid SQL snapshot index");
+    sqlite3_stmt* raw = nullptr;
+    const int prepared = sqlite3_prepare_v2(db, "PRAGMA quick_check(1)", -1, &raw, nullptr);
+    TStatement statement(raw, sqlite3_finalize);
+    if (prepared != SQLITE_OK || !statement)
+        throw TMessageError(std::string("Cannot run SQL snapshot integrity check: ") + sqlite3_errmsg(db));
+    const int check = sqlite3_step(statement.get());
+    if (check != SQLITE_ROW || sqlite3_column_type(statement.get(), 0) != SQLITE_TEXT)
+        throw TMessageError(std::string("Cannot read SQL snapshot integrity check: ") + sqlite3_errmsg(db));
+    const auto* result = reinterpret_cast<const char*>(sqlite3_column_text(statement.get(), 0));
+    const auto length = sqlite3_column_bytes(statement.get(), 0);
+    if (!result || std::string_view(result, size_t(length)) != "ok")
+        throw TMessageError("SQL snapshot integrity check failed: " +
+            std::string(result ? result : "<null>", result ? size_t(length) : 6));
+    if (sqlite3_step(statement.get()) != SQLITE_DONE)
+        throw TMessageError("SQL snapshot integrity check failed");
+    if (SnapshotAppliedIndex(db) != index)
+        throw TMessageError("SQL snapshot application progress does not match its boundary");
+}
+
+uint64_t ReadPragmaInteger(sqlite3* db, const char* pragma) {
+    sqlite3_stmt* raw = nullptr;
+    const std::string query = std::string("PRAGMA ") + pragma;
+    const int prepared = sqlite3_prepare_v2(db, query.c_str(), -1, &raw, nullptr);
+    TStatement statement(raw, sqlite3_finalize);
+    if (prepared != SQLITE_OK || !statement || sqlite3_step(statement.get()) != SQLITE_ROW ||
+        sqlite3_column_type(statement.get(), 0) != SQLITE_INTEGER)
+        throw TMessageError("Cannot inspect SQL snapshot size");
+    const auto value = sqlite3_column_int64(statement.get(), 0);
+    if (value <= 0 || sqlite3_step(statement.get()) != SQLITE_DONE)
+        throw TMessageError("Invalid SQL snapshot size metadata");
+    return uint64_t(value);
+}
+
+void ValidateSnapshotForTarget(sqlite3* snapshot, sqlite3* target, uint64_t index) {
+    ValidateSnapshotDatabase(snapshot, index);
+    if (!sqlite3_get_autocommit(target))
+        throw TMessageError("Cannot replace SQL state during a transaction");
+    if (ReadPragmaInteger(snapshot, "page_size") != ReadPragmaInteger(target, "page_size"))
+        throw TMessageError("SQL snapshot page size does not match the target database");
+}
+
+TSnapshotDatabase CopyDatabaseToMemory(sqlite3* source, uint64_t pageSize) {
+    TSnapshotDatabase result;
+    sqlite3* raw = nullptr;
+    const int opened = sqlite3_open_v2(":memory:", &raw,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_MEMORY, nullptr);
+    result.Db.reset(raw);
+    if (opened != SQLITE_OK) throw TMessageError("Cannot open SQL snapshot database");
+
+    // SQLite's backup API requires matching page sizes for an in-memory
+    // destination. Set it before copying any pages.
+    const auto setPageSize = std::string("PRAGMA page_size = ") + std::to_string(pageSize);
+    if (sqlite3_exec(result.Db.get(), setPageSize.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK)
+        throw TMessageError("Cannot configure SQL snapshot page size");
+
+    sqlite3_backup* backup = sqlite3_backup_init(result.Db.get(), "main", source, "main");
+    if (!backup) throw TMessageError("Cannot begin SQL snapshot capture");
+    const int copied = sqlite3_backup_step(backup, -1);
+    const int finished = sqlite3_backup_finish(backup);
+    if (copied != SQLITE_DONE || finished != SQLITE_OK)
+        throw TMessageError("Cannot complete SQL snapshot capture");
+    return result;
+}
 }
 
 std::string TSql::ExecuteRead(const std::string& q) {
@@ -254,5 +371,48 @@ TMessageHolder<TLogEntry> TSql::Prepare(TMessageHolder<TCommandRequest> command)
     auto entry = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry)+dataSize);
     memcpy(entry->Data, command->Data, dataSize);
     return entry;
+}
+
+std::string TSql::SaveSnapshot() const {
+    if (!LastAppliedIndex || LastAppliedIndex > uint64_t(INT64_MAX) || !sqlite3_get_autocommit(Db))
+        throw TMessageError("SQL snapshot requires committed application progress");
+    const auto pages = ReadPragmaInteger(Db, "page_count");
+    const auto pageSize = ReadPragmaInteger(Db, "page_size");
+    if (pages > MaxSqlSnapshotBytes / pageSize)
+        throw TMessageError("SQL snapshot exceeds the maximum image size");
+    auto consistent = CopyDatabaseToMemory(Db, pageSize);
+    sqlite3_int64 size = 0;
+    auto* bytes = sqlite3_serialize(consistent.Db.get(), "main", &size, 0);
+    std::unique_ptr<unsigned char, decltype(&sqlite3_free)> image(bytes, sqlite3_free);
+    if (!bytes || size <= 0 || uint64_t(size) > MaxSqlSnapshotBytes)
+        throw TMessageError("Cannot serialize SQL snapshot within the size limit");
+    std::string result(reinterpret_cast<const char*>(bytes), size_t(size));
+    if (result.size() < 100 ||
+        !((static_cast<unsigned char>(result[18]) == 1 && static_cast<unsigned char>(result[19]) == 1) ||
+          (static_cast<unsigned char>(result[18]) == 2 && static_cast<unsigned char>(result[19]) == 2)))
+        throw TMessageError("Unsupported SQL snapshot database format");
+    // SQLite documents this conversion for deserializing a complete database
+    // image. Backup copied all WAL-visible pages above, so rollback mode is now
+    // the correct self-contained representation.
+    result[18] = 1;
+    result[19] = 1;
+    return result;
+}
+
+void TSql::ValidateSnapshot(std::string_view bytes, uint64_t index) const {
+    auto image = OpenSnapshotDatabase(bytes);
+    ValidateSnapshotForTarget(image.Db.get(), Db, index);
+}
+
+void TSql::LoadSnapshot(std::string_view bytes, uint64_t index) {
+    auto image = OpenSnapshotDatabase(bytes);
+    ValidateSnapshotForTarget(image.Db.get(), Db, index);
+    sqlite3_backup* backup = sqlite3_backup_init(Db, "main", image.Db.get(), "main");
+    if (!backup) throw TMessageError("Cannot begin SQL snapshot installation");
+    const int copied = sqlite3_backup_step(backup, -1);
+    const int finished = sqlite3_backup_finish(backup);
+    if (copied != SQLITE_DONE || finished != SQLITE_OK)
+        throw TMessageError("Cannot atomically install SQL snapshot");
+    LastAppliedIndex = index;
 }
 

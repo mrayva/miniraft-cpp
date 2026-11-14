@@ -82,6 +82,9 @@ The [snapshot term validation fix](docs/snapshot-committed-terms.md) rejects
 snapshot boundaries that contradict the follower's committed prefix.
 The [message buffer follow-up](docs/message-extents.md) checks allocated buffer
 and batch extents before accepting locally constructed frames.
+The [SQL snapshot follow-up](docs/sql-snapshots.md) adds bounded SQLite snapshot
+capture, validated restore and recovery from an application checkpoint left
+behind a durably installed Raft snapshot.
 
 [![Number of GitHub stars](https://img.shields.io/github/stars/resetius/miniraft-cpp)](https://github.com/resetius/miniraft-cpp/stargazers)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/resetius/miniraft-cpp)
