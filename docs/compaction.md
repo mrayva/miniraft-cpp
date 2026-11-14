@@ -39,7 +39,10 @@ entries after SnapshotIndex, while LogTerm at the boundary returns SnapshotTerm.
 LastLogIndex and all RPC/application indices remain absolute. Appends, truncation,
 votes, current-term commitment and strong reads use these absolute boundaries.
 Truncation cannot remove a snapshot. Election no-op creation also checks signed
-index exhaustion, now reachable without allocating an enormous prefix.
+index exhaustion, now reachable without allocating an enormous prefix. Memory
+and durable storage reject a direct append once the last index is INT64_MAX,
+before mutating the log or publishing an image. Appending the entry at INT64_MAX
+itself remains valid when the previous index is INT64_MAX - 1.
 
 An installation retains the suffix only when the local entry at the included
 index has the same term. Otherwise its uncommitted log is discarded. A follower
