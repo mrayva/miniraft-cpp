@@ -98,6 +98,19 @@ TConfigurationHistory TConfigurationHistory::FromStableSnapshot(const TSnapshot&
     return Stable(snapshot.Voters, snapshot.ConfigurationIndex, snapshot.ConfigurationTerm, snapshot.Index, snapshot.Term);
 }
 
+TSnapshot TConfigurationHistory::MakeSnapshot(std::string data) const {
+    TSnapshot snapshot{Through, ThroughLogTerm, Old, std::move(data)};
+    if (IsJoint()) {
+        snapshot.JointVoters = New;
+        snapshot.ConfigurationIndex = ConfigIndex; snapshot.ConfigurationTerm = ConfigTerm;
+    } else if (ConfigIndex) {
+        snapshot.StableConfiguration = true;
+        snapshot.ConfigurationIndex = ConfigIndex; snapshot.ConfigurationTerm = ConfigTerm;
+    }
+    ValidateSnapshot(snapshot);
+    return snapshot;
+}
+
 TConfigurationHistory TConfigurationHistory::Advance(uint64_t index, TMessageHolder<TLogEntry> entry) const {
     const auto record = DecodeConfigurationEntry(std::move(entry));
     if (Through >= uint64_t(INT64_MAX) || index != Through + 1 || record.Term < ThroughLogTerm ||

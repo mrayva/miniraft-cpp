@@ -36,6 +36,9 @@ public:
     // Metadata must come from a trusted, already validated storage backend.
     TConfigurationHistory ObserveMetadata(uint64_t index, uint64_t term, uint64_t flags) const;
     TConfigurationHistory Advance(uint64_t index, TMessageHolder<TLogEntry> entry) const;
+    // Offline projection only. The caller must establish that ThroughIndex is
+    // committed and that data is the application image at exactly that index.
+    TSnapshot MakeSnapshot(std::string data) const;
 
     bool IsJoint() const { return !New.empty(); }
     const std::vector<uint32_t>& OldVoters() const { return Old; }
