@@ -37,10 +37,13 @@ the persisted current term or vote.
 Raft startup validates a recovered snapshot before binding voters: its image,
 index and term must agree with the storage boundary, its voter set must match
 the fixed configuration, and the last term must be consistent with the
-boundary and current term. A nonzero boundary without an image is rejected.
-Custom backends remain responsible for validating the retained entries and
-supplying a consistent, serialized view; these boundary checks are not a
-complete storage audit or proof of snapshot contents.
+boundary and current term. It scans retained terms for nonzero, nondecreasing
+values no newer than the current term and verifies the recorded last term. A
+nonzero boundary without an image is rejected. Custom backends must report
+accurate entry metadata, validate payloads, and supply a consistent, serialized
+view; these checks are not a complete storage audit or proof of snapshot contents.
+The scan uses `RetainedLogTerm`; backends relying on its default implementation
+may read full entry payloads at startup.
 
 SnapshotIndex/SnapshotTerm identify the last included entry. Get only returns
 entries after SnapshotIndex, while LogTerm at the boundary returns SnapshotTerm.
