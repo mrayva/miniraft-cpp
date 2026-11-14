@@ -167,12 +167,20 @@ public:
         , RequestProcessor(std::make_shared<TRequestProcessor>(raft, rsm, nodes))
         , TimeSource(ts)
     {
-        for (const auto& [_, node] : nodes) {
+        for (const auto& [id, node] : nodes) {
             Nodes.insert(node);
+            if (auto realNode = std::dynamic_pointer_cast<TNode<TSocket>>(node)) {
+                PeerNodes.emplace(id, std::move(realNode));
+            }
         }
     }
 
     void Serve();
+
+    // Runtime learner targets are replication-only endpoints. Calls must be
+    // serialized with the poller loop and other Raft processing.
+    void AddLearnerTarget(uint32_t id, std::shared_ptr<TNode<TSocket>> node);
+    std::shared_ptr<TNode<TSocket>> RemoveLearnerTarget(uint32_t id);
 
 private:
     NNet::TVoidTask InboundServe();
@@ -187,7 +195,9 @@ private:
     std::shared_ptr<TRaft> Raft;
     std::shared_ptr<TRequestProcessor> RequestProcessor;
     std::unordered_set<std::shared_ptr<INode>> Nodes;
+    std::unordered_map<uint32_t, std::shared_ptr<TNode<TSocket>>> PeerNodes;
     std::shared_ptr<ITimeSource> TimeSource;
+    bool Serving = false;
 
     // for debug
     TStateFields PersistentFields;

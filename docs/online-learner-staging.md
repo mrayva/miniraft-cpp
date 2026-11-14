@@ -23,9 +23,9 @@ other voters. The embedding application must reconcile targets on a new leader
 and after restart; a previous leader retains its local list if it becomes a
 follower. Removing a target drops replication progress and pending RPCs, and a
 subsequent add starts a fresh probe. Delayed responses cannot satisfy new RPCs.
-The existing KV CLI and `TRaftServer` still use static transport setup and do not
-expose these APIs; embedders must arrange endpoint draining and inbound delivery.
-Older binaries must not be mixed with learner configurations because they treat
+The KV CLI still uses static transport setup. `TRaftServer` runtime integration
+is described in [network learner staging](online-learner-network.md). Older
+binaries must not be mixed with learner configurations because they treat
 unmarked peers as voters.
 
 Deterministic tests cover live add, snapshot catch-up, voter partitions and strong
