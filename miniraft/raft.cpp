@@ -696,6 +696,12 @@ uint64_t TRaft::NextSeqno() {
 }
 
 void TRaft::ProcessTimeout(ITimeSource::Time now) {
+    // Learners do not campaign, so their election timeout cannot be used to
+    // reclaim an interrupted InstallSnapshot transfer. Expire partial images
+    // independently of role and ordinary heartbeat activity.
+    if (IncomingSnapshot && now >= IncomingSnapshot->LastProgress &&
+        now - IncomingSnapshot->LastProgress >= TTimeout::SnapshotTransferIdle)
+        IncomingSnapshot.reset();
     if (!IsVoter(Id)) return;
     if (StateName == EState::CANDIDATE || StateName == EState::FOLLOWER) {
         if (VolatileState->ElectionDue <= now) {
@@ -929,7 +935,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             if (request->Offset != 0 || (IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
                 IncomingSnapshot->Index > request->SnapshotIndex)) { reply(false, false, 0); return; }
             IncomingSnapshot = TIncomingSnapshot{request->Term, request->SnapshotIndex, request->SnapshotTerm,
-                request->TotalBytes, request->LeaderId, {}};
+                request->TotalBytes, request->LeaderId, now, {}};
         }
         auto& prefix = IncomingSnapshot->Bytes;
         const auto count = request->Len - sizeof(TInstallSnapshotRequest);
@@ -940,6 +946,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
                 IncomingSnapshot.reset(); reply(false, false, 0); return;
             }
         } else prefix.append(request->Data, count);
+        IncomingSnapshot->LastProgress = now;
         const auto probe = ProbeCoveredFixedSnapshot(prefix, request->TotalBytes,
             request->SnapshotIndex, request->SnapshotTerm, GetVoterIds());
         if (!probe.Complete) { reply(true, false, prefix.size()); return; }
@@ -956,7 +963,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         if (request->Offset != 0 || (IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
             IncomingSnapshot->Index > request->SnapshotIndex)) { reply(false, false, 0); return; }
         IncomingSnapshot = TIncomingSnapshot{request->Term, request->SnapshotIndex, request->SnapshotTerm,
-            request->TotalBytes, request->LeaderId, {}};
+            request->TotalBytes, request->LeaderId, now, {}};
     }
     auto& bytes = IncomingSnapshot->Bytes;
     const auto count = request->Len - sizeof(TInstallSnapshotRequest);
@@ -967,6 +974,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             IncomingSnapshot.reset(); reply(false, false, 0); return;
         }
     } else bytes.append(request->Data, count);
+    IncomingSnapshot->LastProgress = now;
     if (bytes.size() >= 8 && std::string_view(bytes).substr(0, 8) != "MRFTS001") {
         IncomingSnapshot.reset(); reply(false, false, 0); return;
     }
