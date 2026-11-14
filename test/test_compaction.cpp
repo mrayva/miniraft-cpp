@@ -177,6 +177,21 @@ void test_partial_transfer_restart_and_delayed_ack_are_safe(void**) {
     assert_int_equal(cluster.Apps[2]->Loads, 1);
     assert_true(Read(*cluster.Apps[2], "c") == std::string(60000, 'c'));
 }
+void test_snapshot_partial_ack_cannot_skip_unsent_bytes(void**) {
+    TCluster cluster; cluster.Prepare();
+    auto chunk = cluster.SendChunk();
+    const auto end = chunk->Offset + chunk->Len - sizeof(TInstallSnapshotRequest);
+    assert_true(end + 1 < chunk->TotalBytes);
+    auto invalid = NewHoldedMessage(TMessageEx{.Src = 3, .Dst = 1, .Term = chunk->Term, .Seqno = chunk->Seqno},
+        TInstallSnapshotResponse{.SnapshotIndex = chunk->SnapshotIndex, .NextOffset = end + 1, .Success = 1});
+    cluster.Deliver(invalid);
+    auto retry = cluster.SendChunk();
+    assert_int_equal(retry->Offset, chunk->Offset); assert_int_equal(retry->Seqno, chunk->Seqno);
+    cluster.AckChunk(retry); auto next = cluster.SendChunk();
+    assert_int_equal(next->Offset, end);
+    cluster.AckChunk(next); cluster.Pump(1, 80, true);
+    assert_int_equal(cluster.Apps[2]->Loads, 1);
+}
 void ExerciseDelayedSnapshotAcks(bool readTraffic) {
     for (auto learners : {std::vector<uint32_t>{}, std::vector<uint32_t>{3}}) {
         TCluster cluster(learners); cluster.Prepare();
@@ -616,6 +631,7 @@ int main() {
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),
         cmocka_unit_test(test_simultaneous_startup_candidates_use_distinct_election_deadlines),
         cmocka_unit_test(test_partial_transfer_restart_and_delayed_ack_are_safe),
+        cmocka_unit_test(test_snapshot_partial_ack_cannot_skip_unsent_bytes),
         cmocka_unit_test(test_snapshot_timeout_retries_do_not_starve_delayed_acks),
         cmocka_unit_test(test_snapshot_read_traffic_does_not_starve_delayed_acks),
         cmocka_unit_test(test_compaction_during_each_chunk_cannot_restart_snapshot_catchup),

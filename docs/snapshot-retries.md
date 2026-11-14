@@ -1,5 +1,10 @@
 # Snapshot retry progress: v0.1.0-alpha.18
 
+Follow-up: partial acknowledgements must report exactly the end of the
+outstanding chunk. Previously a larger offset could skip unsent bytes. An
+invalid acknowledgement now leaves the chunk outstanding for retry; a
+deterministic regression verifies retry and eventual installation.
+
 The [alpha.19 follow-up](snapshot-pinning.md) also pins an active transfer across
 local compaction, replacing the image-switching behavior described below.
 
