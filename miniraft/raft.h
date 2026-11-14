@@ -114,7 +114,7 @@ enum class EState: int {
 class TRaft {
 public:
     // Nodes contains every replication peer; learners may include the local ID.
-    // Roles are fixed in this milestone: no voter promotion/reconfiguration API.
+    // Voter roles remain fixed; learner replication targets can be staged locally.
     TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes, std::vector<uint32_t> learners = {});
 
     void Process(ITimeSource::Time now, TMessageHolder<TMessage> message, const std::shared_ptr<INode>& replyTo = {});
@@ -130,6 +130,11 @@ public:
     bool IsVoter(uint32_t id) const;
     // Leader-only, point-in-time log catch-up; not permission to promote.
     bool IsLearnerCaughtUp(uint32_t id) const;
+    // Leader-local replication staging; not a membership change. Caller owns
+    // endpoint lifecycle, reconciles targets after failover/restart, and must
+    // serialize these calls with all Raft processing.
+    void AddLearnerTarget(uint32_t id, std::shared_ptr<INode> node);
+    std::shared_ptr<INode> RemoveLearnerTarget(uint32_t id);
     // Capture applied state and atomically replace its prefix with a snapshot.
     TSnapshot Compact();
     uint64_t ApproveRead();

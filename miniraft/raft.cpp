@@ -746,6 +746,43 @@ std::vector<uint32_t> TRaft::GetVoterIds() const { return Voters; }
 
 bool TRaft::IsVoter(uint32_t id) const { return std::binary_search(Voters.begin(), Voters.end(), id); }
 
+void TRaft::AddLearnerTarget(uint32_t id, std::shared_ptr<INode> node) {
+    if (StateName != EState::LEADER) throw std::logic_error("Only a leader can stage a learner");
+    if (!id || id == Id || !node || Nodes.contains(id) || IsVoter(id) ||
+        std::binary_search(Learners.begin(), Learners.end(), id))
+        throw std::invalid_argument("Invalid or duplicate learner target");
+    if (!State->SupportsVoterBinding() || State->GetBoundVoters() != Voters)
+        throw std::logic_error("Learner staging requires a bound voter configuration");
+    if (Nodes.size() >= size_t(INT_MAX)) throw std::overflow_error("Too many replication targets");
+    // Build all allocating changes before publishing any part of the target.
+    auto nodes = Nodes;
+    auto learners = Learners;
+    auto nextIndex = VolatileState->NextIndex;
+    nodes.emplace(id, std::move(node));
+    learners.insert(std::lower_bound(learners.begin(), learners.end(), id), id);
+    nextIndex.emplace(id, State->LastLogIndex + 1);
+    Nodes.swap(nodes); Learners.swap(learners); VolatileState->NextIndex.swap(nextIndex);
+    Npeers = int(Nodes.size());
+}
+
+std::shared_ptr<INode> TRaft::RemoveLearnerTarget(uint32_t id) {
+    if (StateName != EState::LEADER) throw std::logic_error("Only a leader can remove a learner target");
+    auto learner = std::lower_bound(Learners.begin(), Learners.end(), id);
+    auto peer = Nodes.find(id);
+    if (id == Id || learner == Learners.end() || *learner != id || peer == Nodes.end() || IsVoter(id))
+        throw std::invalid_argument("Unknown learner target");
+    auto node = peer->second;
+    Nodes.erase(peer); Learners.erase(learner);
+    VolatileState->NextIndex.erase(id); VolatileState->MatchIndex.erase(id);
+    VolatileState->ReadAckSeqno.erase(id); VolatileState->LastSentSeqno.erase(id);
+    VolatileState->PendingAppendRpcs.erase(id); VolatileState->SnapshotRpcs.erase(id);
+    VolatileState->HeartbeatDue.erase(id); VolatileState->RpcDue.erase(id);
+    VolatileState->BatchSize.erase(id); VolatileState->BackOff.erase(id);
+    VolatileState->Votes.erase(id);
+    Npeers = int(Nodes.size());
+    return node;
+}
+
 bool TRaft::IsLearnerCaughtUp(uint32_t id) const {
     if (StateName != EState::LEADER || !std::binary_search(Learners.begin(), Learners.end(), id) ||
         VolatileState->CommitIndex == 0 || State->LogTerm(VolatileState->CommitIndex) != State->CurrentTerm) return false;
