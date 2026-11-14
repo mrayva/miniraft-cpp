@@ -236,6 +236,19 @@ void test_nonfresh_unbound_store_requires_snapshot_proof_for_learners(void**) {
     TRaft adopted(state, 1, Peers(1), {4});
     assert_true(state->GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
 }
+void test_recovered_hard_state_must_match_fixed_voters(void**) {
+    for (int mode = 0; mode < 2; ++mode) {
+        auto state = std::make_shared<TState>();
+        state->CurrentTerm = mode == 0 ? 2 : 0; state->VotedFor = mode == 0 ? 4 : 0;
+        const auto before = static_cast<TStateFields>(*state);
+        Reject([&] { TRaft invalid(state, 1, Peers(1, 3)); });
+        assert_true(static_cast<TStateFields>(*state) == before); assert_true(state->GetBoundVoters().empty());
+    }
+    for (uint32_t vote : {0u, 1u, 2u}) {
+        auto state = std::make_shared<TState>(); state->CurrentTerm = 2; state->VotedFor = vote;
+        TRaft valid(state, 1, Peers(1, 3)); assert_int_equal(state->VotedFor, vote);
+    }
+}
 #ifdef __linux__
 struct TFiles {
     std::filesystem::path Directory; std::string Name;
@@ -246,6 +259,24 @@ struct TFiles {
     }
     ~TFiles() { std::error_code ignored; std::filesystem::remove_all(Directory, ignored); }
 };
+void test_legacy_recovered_vote_outside_voters_preserves_storage(void**) {
+    TFiles files;
+    { TDiskState state(files.Name, 1); state.CurrentTerm = 2; state.VotedFor = 4; state.Commit(); }
+    std::vector<std::string> before;
+    for (auto suffix : {".entries.1", ".index.1", ".state.1"}) {
+        std::ifstream input(files.Name + suffix, std::ios::binary);
+        before.emplace_back(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    }
+    { auto state = std::make_shared<TDiskState>(files.Name, 1);
+      const auto fields = static_cast<TStateFields>(*state);
+      Reject([&] { TRaft invalid(state, 1, Peers(1, 3)); });
+      assert_true(static_cast<TStateFields>(*state) == fields); }
+    size_t i = 0;
+    for (auto suffix : {".entries.1", ".index.1", ".state.1"}) {
+        std::ifstream input(files.Name + suffix, std::ios::binary);
+        assert_true(std::string(std::istreambuf_iterator<char>(input), {}) == before[i++]);
+    }
+}
 void test_durable_voter_binding_is_atomic_before_first_vote(void**) {
     using TStage = TDurableState::EStage;
     for (auto stage : {TStage::TempCreated, TStage::Written, TStage::FileSynced, TStage::Renamed, TStage::DirectorySynced}) {
@@ -343,7 +374,9 @@ int main() {
         cmocka_unit_test(test_learner_snapshot_catchup_status_and_restart_preserve_role),
         cmocka_unit_test(test_restart_cannot_promote_learner_or_change_voters_but_can_add_transport),
         cmocka_unit_test(test_nonfresh_unbound_store_requires_snapshot_proof_for_learners),
+        cmocka_unit_test(test_recovered_hard_state_must_match_fixed_voters),
 #ifdef __linux__
+        cmocka_unit_test(test_legacy_recovered_vote_outside_voters_preserves_storage),
         cmocka_unit_test(test_durable_voter_binding_is_atomic_before_first_vote),
         cmocka_unit_test(test_durable_learner_snapshot_suffix_and_role_survive_restart),
         cmocka_unit_test(test_durable_v3_corrupt_roles_fail_without_rewriting),
