@@ -70,7 +70,8 @@ inline void ValidateVoterBinding(const IState& state, const std::vector<uint32_t
     if (!old.empty()) {
         if (old != voters) throw std::invalid_argument("Persisted voter configuration cannot be changed by restart");
     } else if (auto snapshot = state.GetSnapshot()) {
-        if (snapshot->HasConfigurationMetadata()) throw std::invalid_argument("Configuration snapshot recovery is unsupported");
+        if (snapshot->HasConfigurationMetadata())
+            throw std::invalid_argument("Configuration snapshot recovery requires an existing voter binding");
         if (snapshot->Voters != voters) throw std::invalid_argument("Snapshot voter configuration mismatch");
     } else if (state.CurrentTerm != 1 || state.VotedFor || state.LastLogIndex) {
         throw std::invalid_argument("Unbound nonfresh store needs a verified snapshot before enabling learners");
@@ -149,8 +150,9 @@ struct TState: IState {
     }
     std::shared_ptr<const TSnapshot> GetSnapshot() const override { return Snapshot; }
     void InstallSnapshot(const TSnapshot& snapshot) override {
-        if (snapshot.HasConfigurationMetadata()) throw std::invalid_argument("Configuration snapshot installation is unsupported");
         EncodeSnapshot(snapshot); // Validate before changing any state.
+        if (snapshot.HasConfigurationMetadata() && BoundVoters.empty())
+            throw std::invalid_argument("Configuration snapshots require a bound voter set");
         if (!BoundVoters.empty() && snapshot.Voters != BoundVoters)
             throw std::invalid_argument("Snapshot would change bound voters");
         if (snapshot.Index <= SnapshotIndex || snapshot.Term < SnapshotTerm || snapshot.Term > CurrentTerm)

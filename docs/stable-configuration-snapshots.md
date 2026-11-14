@@ -18,11 +18,12 @@ trusted snapshot and commit boundary independently. MRFTS003 cannot assert that
 there was no earlier configuration entry; an explicit trusted baseline remains
 necessary for such histories.
 
-The fixed-membership runtime, storage installation and durable recovery reject
-MRFTS003, and the network receiver rejects it even at an already covered boundary.
-The standalone snapshot store supports offline export. Older binaries may falsely
-acknowledge covered unknown formats; do not send these images to a mixed-version
-cluster. Live configuration activation, rollback, commit rules, joint snapshot
-installation and membership recovery remain open. This experimental format may
-change before those semantics are implemented. Rebuild dependents because the
-in-memory snapshot structure has changed.
+The live runtime rejects MRFTS003, and the network receiver rejects it even at an
+already covered boundary. Bound memory and durable stores can retain and recover
+the image for offline validation only when its voter list matches the persisted
+binding. Storage does not activate a changed voter set from snapshot metadata.
+Older binaries may falsely acknowledge covered unknown formats; do not send these
+images to a mixed-version cluster. Live configuration activation, rollback,
+commit rules, joint snapshot installation and membership recovery remain open.
+This experimental format may change before those semantics are implemented.
+Rebuild dependents because the in-memory snapshot structure has changed.
