@@ -388,6 +388,79 @@ void test_corrupt_snapshot_and_invalid_headers_cannot_mutate_application(void**)
     assert_int_equal(app->LastAppliedIndex, 5); assert_int_equal(app->Loads, 1);
 }
 
+void test_newer_snapshot_cannot_regress_committed_term(void**) {
+    for (bool compacted : {false, true}) {
+        std::vector<TMessageHolder<TInstallSnapshotResponse>> replies;
+        auto peer = std::make_shared<TEndpoint>([&](auto message) {
+            if (message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_RESPONSE))
+                replies.push_back(message.template Cast<TInstallSnapshotResponse>());
+        });
+        auto state = std::make_shared<TState>();
+        auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}});
+        auto app = std::make_shared<TApplication>(); TRequestProcessor processor(raft, app, {});
+        state->CurrentTerm = 2;
+        for (uint64_t index = 1; index <= 3; ++index) {
+            auto entry = app->Prepare(Command("key", std::to_string(index)));
+            entry->Term = index == 1 ? 1 : 2; state->Append(entry);
+        }
+        auto heartbeat = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 2, .Term = 2},
+            TAppendEntriesRequest{.PrevLogIndex = 3, .PrevLogTerm = 2, .LeaderCommit = 3, .LeaderId = 1});
+        raft->Process({}, heartbeat); processor.ProcessCommitted();
+        if (compacted) raft->Compact();
+        assert_int_equal(app->LastAppliedIndex, 3); assert_true(Read(*app, "key") == "3");
+        TKv source; source.Write(source.Prepare(Command("key", "future")), 4);
+        TSnapshot snapshot{4, 1, {1, 2}, source.SaveSnapshot()};
+        auto bytes = EncodeSnapshot(snapshot); auto request = Chunk(snapshot, bytes, 0, bytes.size());
+        request->Term = 9; // An invalid higher-term request must not change hard state.
+        const auto before = static_cast<TStateFields>(*state);
+        raft->Process({}, request);
+        assert_true(static_cast<TStateFields>(*state) == before);
+        assert_true(replies.empty()); assert_int_equal(app->LastAppliedIndex, 3);
+        assert_true(Read(*app, "key") == "3"); assert_int_equal(app->Loads, 0);
+        auto conflicting = snapshot; conflicting.Index = 3;
+        const auto conflictingBytes = EncodeSnapshot(conflicting);
+        auto covered = Chunk(conflicting, conflictingBytes, 0, conflictingBytes.size()); covered->Term = 9;
+        raft->Process({}, covered);
+        assert_true(static_cast<TStateFields>(*state) == before); assert_true(replies.empty());
+        snapshot.Term = 2; bytes = EncodeSnapshot(snapshot);
+        raft->Process({}, Chunk(snapshot, bytes, 0, bytes.size()));
+        assert_true(replies.back()->Installed); assert_int_equal(state->SnapshotIndex, 4);
+        assert_int_equal(app->LastAppliedIndex, 4); assert_true(Read(*app, "key") == "future");
+    }
+}
+
+void test_snapshot_is_rechecked_when_commit_advances_mid_transfer(void**) {
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> replies;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) {
+        if (message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_RESPONSE))
+            replies.push_back(message.template Cast<TInstallSnapshotResponse>());
+    });
+    auto state = std::make_shared<TState>(); auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}});
+    auto app = std::make_shared<TApplication>(); TRequestProcessor processor(raft, app, {});
+    state->CurrentTerm = 2;
+    for (uint64_t index = 1; index <= 3; ++index) {
+        auto entry = app->Prepare(Command("key", std::to_string(index)));
+        entry->Term = index == 1 ? 1 : 2; state->Append(entry);
+    }
+    auto heartbeat = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 2, .Term = 3},
+        TAppendEntriesRequest{.PrevLogIndex = 3, .PrevLogTerm = 2, .LeaderCommit = 1, .LeaderId = 1});
+    raft->Process({}, heartbeat); processor.ProcessCommitted();
+    TKv source; source.Write(source.Prepare(Command("key", "future")), 4);
+    TSnapshot snapshot{4, 1, {1, 2}, source.SaveSnapshot()};
+    const auto bytes = EncodeSnapshot(snapshot);
+    raft->Process({}, Chunk(snapshot, bytes, 0, 8));
+    assert_true(replies.back()->Success); assert_false(replies.back()->Installed);
+    heartbeat.Cast<TAppendEntriesRequest>()->LeaderCommit = 3;
+    raft->Process({}, heartbeat); processor.ProcessCommitted();
+    const auto before = static_cast<TStateFields>(*state); const auto replyCount = replies.size();
+    raft->Process({}, Chunk(snapshot, bytes, 8, bytes.size() - 8));
+    assert_int_equal(replies.size(), replyCount); assert_true(static_cast<TStateFields>(*state) == before);
+    assert_int_equal(app->LastAppliedIndex, 3); assert_true(Read(*app, "key") == "3");
+    snapshot.Term = 2; const auto valid = EncodeSnapshot(snapshot);
+    raft->Process({}, Chunk(snapshot, valid, 0, valid.size()));
+    assert_true(replies.back()->Installed); assert_true(Read(*app, "key") == "future");
+}
+
 void test_remote_snapshot_retains_suffix_without_applying_it_before_commit(void**) {
     auto state = std::make_shared<TState>();
     TKv prefix;
@@ -550,6 +623,8 @@ int main() {
         cmocka_unit_test(test_partial_and_installed_snapshot_acks_do_not_confirm_strong_reads),
         cmocka_unit_test(test_compacted_follower_hint_requires_boundary_probe_before_match),
         cmocka_unit_test(test_corrupt_snapshot_and_invalid_headers_cannot_mutate_application),
+        cmocka_unit_test(test_newer_snapshot_cannot_regress_committed_term),
+        cmocka_unit_test(test_snapshot_is_rechecked_when_commit_advances_mid_transfer),
         cmocka_unit_test(test_joint_snapshot_is_rejected_even_if_boundary_is_already_covered),
         cmocka_unit_test(test_remote_snapshot_retains_suffix_without_applying_it_before_commit),
         cmocka_unit_test(test_snapshot_boundary_index_exhaustion_does_not_append_wrapped_noop),
