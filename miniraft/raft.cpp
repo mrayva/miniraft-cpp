@@ -23,6 +23,51 @@ static uint32_t rand_(uint32_t* seed) {
     return *seed;
 }
 
+struct TCoveredSnapshotProbe {
+    bool Complete = false;
+    bool Supported = false;
+    size_t Need = 8;
+};
+
+bool ReadSnapshotInteger(std::string_view bytes, size_t offset, unsigned width, uint64_t& value) {
+    if (offset > bytes.size() || width > bytes.size() - offset) return false;
+    value = 0;
+    for (unsigned i = 0; i < width; ++i)
+        value |= uint64_t(uint8_t(bytes[offset + i])) << (8 * i);
+    return true;
+}
+
+TCoveredSnapshotProbe ProbeCoveredFixedSnapshot(std::string_view prefix, uint64_t totalBytes,
+        uint64_t index, uint64_t term, const std::vector<uint32_t>& voters) {
+    if (prefix.size() < 8) return {false, false, 8};
+    if (prefix.substr(0, 8) != "MRFTS001") return {true, false, 0};
+
+    // A covered snapshot is not installed, but its identity must still agree
+    // with the RPC and the receiver's fixed membership before it can count as
+    // replication progress. The application payload and CRC are unnecessary
+    // because the receiver already has this committed log prefix.
+    if (prefix.size() < 36) return {false, false, 36};
+    uint64_t embeddedIndex = 0, embeddedTerm = 0, voterCount = 0, dataBytes = 0;
+    if (!ReadSnapshotInteger(prefix, 8, 8, embeddedIndex) ||
+        !ReadSnapshotInteger(prefix, 16, 8, embeddedTerm) ||
+        !ReadSnapshotInteger(prefix, 24, 4, voterCount) ||
+        !ReadSnapshotInteger(prefix, 28, 8, dataBytes) ||
+        embeddedIndex != index || embeddedTerm != term || voterCount != voters.size())
+        return {true, false, 0};
+
+    const uint64_t voterBytes = voterCount * 4;
+    const uint64_t headerBytes = 36 + voterBytes;
+    if (headerBytes + 4 > totalBytes || dataBytes != totalBytes - headerBytes - 4)
+        return {true, false, 0};
+    if (headerBytes > prefix.size()) return {false, false, size_t(headerBytes)};
+    for (size_t i = 0; i < voters.size(); ++i) {
+        uint64_t voter = 0;
+        if (!ReadSnapshotInteger(prefix, 36 + i * 4, 4, voter) || voter != voters[i])
+            return {true, false, 0};
+    }
+    return {true, true, size_t(headerBytes)};
+}
+
 } // namespace
 
 void TDummyRsm::Validate(TMessageHolder<TCommandRequest> message) const {
@@ -874,9 +919,9 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         const auto term = State->LogTerm(request->SnapshotIndex);
         const bool covered = request->SnapshotIndex < State->SnapshotIndex || term == request->SnapshotTerm;
         if (!covered) { reply(false, false, 0); return; }
-        // A covered image needs no application replacement, but must first be
-        // identified as a supported fixed-membership format. Accumulate a short
-        // prefix when a peer splits the magic across multiple valid chunks.
+        // A covered image needs no application replacement, but its snapshot
+        // boundary and fixed voter set must match before it can count as
+        // replicated. Accumulate only the bounded metadata prefix.
         const bool same = IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
             IncomingSnapshot->Leader == request->LeaderId && IncomingSnapshot->Index == request->SnapshotIndex &&
             IncomingSnapshot->BoundaryTerm == request->SnapshotTerm && IncomingSnapshot->Total == request->TotalBytes;
@@ -895,10 +940,11 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
                 IncomingSnapshot.reset(); reply(false, false, 0); return;
             }
         } else prefix.append(request->Data, count);
-        if (prefix.size() < 8) { reply(true, false, prefix.size()); return; }
-        const bool supported = std::string_view(prefix).substr(0, 8) == "MRFTS001";
+        const auto probe = ProbeCoveredFixedSnapshot(prefix, request->TotalBytes,
+            request->SnapshotIndex, request->SnapshotTerm, GetVoterIds());
+        if (!probe.Complete) { reply(true, false, prefix.size()); return; }
         IncomingSnapshot.reset();
-        reply(supported, supported, supported ? request->TotalBytes : 0);
+        reply(probe.Supported, probe.Supported, probe.Supported ? request->TotalBytes : 0);
         return;
     }
     auto application = SnapshotApplication.lock();
