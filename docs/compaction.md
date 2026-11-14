@@ -34,6 +34,14 @@ the persisted current term or vote.
 
 ## Boundaries and atomic persistence
 
+Raft startup validates a recovered snapshot before binding voters: its image,
+index and term must agree with the storage boundary, its voter set must match
+the fixed configuration, and the last term must be consistent with the
+boundary and current term. A nonzero boundary without an image is rejected.
+Custom backends remain responsible for validating the retained entries and
+supplying a consistent, serialized view; these boundary checks are not a
+complete storage audit or proof of snapshot contents.
+
 SnapshotIndex/SnapshotTerm identify the last included entry. Get only returns
 entries after SnapshotIndex, while LogTerm at the boundary returns SnapshotTerm.
 LastLogIndex and all RPC/application indices remain absolute. Appends, truncation,

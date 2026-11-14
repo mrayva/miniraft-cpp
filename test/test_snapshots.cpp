@@ -181,6 +181,41 @@ void test_joint_snapshot_cannot_be_installed_or_restored_by_fixed_runtime(void**
     Reject([&] { TRaft unsupported(recovered, 1, {{2, std::make_shared<TSink>()}, {3, std::make_shared<TSink>()}}); });
     assert_true(recovered->GetBoundVoters().empty());
 }
+void test_startup_rejects_inconsistent_snapshot_boundaries_before_binding(void**) {
+    for (int mode = 0; mode < 11; ++mode) {
+        auto state = std::make_shared<TState>(); state->CurrentTerm = 2;
+        state->SnapshotIndex = state->LastLogIndex = 5;
+        state->SnapshotTerm = state->LastLogTerm = 2;
+        TSnapshot image{5, 2, {1, 2}, "opaque"};
+        if (mode == 1) image.Index = 4;
+        if (mode == 2) image.Term = 1;
+        if (mode == 3) state->LastLogTerm = 1;
+        if (mode == 4) state->CurrentTerm = 1;
+        if (mode == 5) image.Voters = {1, 1};
+        if (mode == 6 || mode == 7) {
+            state->SnapshotIndex = state->LastLogIndex = 0;
+            state->SnapshotTerm = mode == 6 ? 2 : 0; state->LastLogTerm = 0;
+        }
+        if (mode == 8) image.Voters = {1, 3};
+        if (mode != 0 && mode != 6) state->Snapshot = std::make_shared<TSnapshot>(image);
+        if (mode == 9 || mode == 10) {
+            auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = mode == 9 ? 1 : 3; state->Append(entry);
+        }
+        const auto before = static_cast<TStateFields>(*state);
+        Reject([&] { TRaft invalid(state, 1, {{2, std::make_shared<TSink>()}}); });
+        assert_true(static_cast<TStateFields>(*state) == before);
+        assert_true(state->GetBoundVoters().empty());
+    }
+    auto valid = std::make_shared<TState>(); valid->CurrentTerm = 2;
+    valid->SnapshotIndex = valid->LastLogIndex = 5; valid->SnapshotTerm = valid->LastLogTerm = 2;
+    valid->Snapshot = std::make_shared<TSnapshot>(TSnapshot{5, 2, {1, 2}, "opaque"});
+    TRaft raft(valid, 1, {{2, std::make_shared<TSink>()}});
+    assert_int_equal(raft.GetVolatileState()->CommitIndex, 5);
+    assert_true(valid->GetBoundVoters() == std::vector<uint32_t>({1, 2}));
+    auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = 2; valid->Append(entry);
+    TRaft withSuffix(valid, 1, {{2, std::make_shared<TSink>()}});
+    assert_int_equal(withSuffix.GetVolatileState()->CommitIndex, 5);
+}
 void test_snapshot_metadata_and_declared_lengths_are_bounded(void**) {
     auto snapshot = Sample();
     for (uint64_t index : {uint64_t(0), UINT64_MAX}) {
@@ -446,6 +481,7 @@ int main() {
         cmocka_unit_test(test_stable_configuration_snapshot_codec_and_runtime_guards),
         cmocka_unit_test(test_joint_snapshot_metadata_rejects_invalid_boundaries_and_voters),
         cmocka_unit_test(test_joint_snapshot_cannot_be_installed_or_restored_by_fixed_runtime),
+        cmocka_unit_test(test_startup_rejects_inconsistent_snapshot_boundaries_before_binding),
         cmocka_unit_test(test_snapshot_metadata_and_declared_lengths_are_bounded),
         cmocka_unit_test(test_kv_snapshot_is_canonical_and_binary_safe),
         cmocka_unit_test(test_kv_invalid_snapshot_preserves_existing_state_and_progress),
