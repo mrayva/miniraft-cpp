@@ -20,10 +20,12 @@ failure behavior are described in [leadership transfer](leadership-transfer.md).
 Every node must have replication endpoints for all voters before it accepts the
 transition. Endpoint discovery and configuration distribution remain
 responsibilities of the embedding application.
-On restart, construct each Raft object with the persisted original voter set and
-configure later members as learners in that bootstrap view; the retained log
-then recovers their active roles. Supplying the latest voter set as if it were
-the original binding is rejected.
+On restart, the durable original voter binding and retained membership history
+are distinct from the active replication endpoints. When a configuration entry
+or configuration-bearing snapshot proves that membership changed, the binding
+restores the original set while committed history restores active roles; only
+active voters need replication endpoints. Without retained configuration
+history, configured voters must still reproduce the original binding.
 
 These are `TRaft` APIs. `TRaftServer` reconciles outbound client-response readers
 after Raft messages and on its timer loop, so a promoted voter can receive
@@ -71,4 +73,6 @@ and stable histories, including post-restart role recovery after adding and
 removing a voter. Joint snapshot tests cover compaction, exact-history
 installation, higher-term rejection of forged voter metadata, restart recovery,
 finalization from the snapshot baseline, and a dropped/retried all-voter
-compaction barrier that enables follower-local snapshots.
+compaction barrier that enables follower-local snapshots. Restart coverage also
+verifies that a compacted stable membership can recover with the removed voter
+endpoint omitted while preserving the original binding.

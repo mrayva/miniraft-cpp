@@ -1014,6 +1014,50 @@ void test_durable_restart_recovers_stable_membership_roles(void**) {
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 #endif
 }
+void test_restart_after_membership_removal_needs_only_active_endpoints(void**) {
+#ifdef __linux__
+    for (const bool compacted : {false, true}) {
+        auto dir = std::filesystem::temp_directory_path() / ("miniraft-config-removed-endpoint-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+            (compacted ? "-snapshot" : "-log"));
+        assert_true(std::filesystem::create_directory(dir));
+        const auto name = (dir / "raft").string();
+        {
+            auto state = std::make_shared<TDurableState>(name, 1);
+            state->BindVoters({1, 2}); // The durable binding records the original voters.
+            state->CurrentTerm = 3;
+            state->Commit();
+            if (compacted) {
+                TSnapshot snapshot{3, 3, {1, 3}, "stable membership checkpoint"};
+                snapshot.StableConfiguration = true;
+                snapshot.ConfigurationIndex = 2;
+                snapshot.ConfigurationTerm = 2;
+                state->InstallSnapshot(snapshot);
+            } else {
+                TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0, {1, 2}, {1, 3}};
+                state->Append(EncodeConfigurationEntry(joint));
+                auto stable = joint;
+                stable.Phase = EConfigurationPhase::Stable;
+                stable.Term = 3;
+                stable.PreviousIndex = 1;
+                stable.PreviousTerm = 2;
+                state->Append(EncodeConfigurationEntry(stable));
+                state->CommitIndex = 2;
+                state->Commit();
+            }
+        }
+        {
+            auto state = std::make_shared<TDurableState>(name, 1);
+            TRaft raft(state, 1, {{3, std::make_shared<TEndpoint>()}});
+            assert_true(state->GetBoundVoters() == (std::vector<uint32_t>{1, 2}));
+            assert_true(raft.GetVoterIds() == (std::vector<uint32_t>{1, 3}));
+            assert_true(raft.GetLearnerIds().empty());
+            assert_int_equal(raft.GetVolatileState()->CommitIndex, compacted ? 3 : 2);
+        }
+        std::error_code ignored; std::filesystem::remove_all(dir, ignored);
+    }
+#endif
+}
 void test_configuration_application_advances_without_calling_state_machine(void**) {
     auto state = std::make_shared<TState>(); auto record = Joint(); record.Term = 1;
     record.PreviousIndex = record.PreviousTerm = 0;
@@ -1380,6 +1424,7 @@ int main() {
         cmocka_unit_test(test_configuration_application_advances_without_calling_state_machine),
 #ifdef __linux__
         cmocka_unit_test(test_durable_restart_recovers_stable_membership_roles),
+        cmocka_unit_test(test_restart_after_membership_removal_needs_only_active_endpoints),
         cmocka_unit_test(test_durable_restart_rejects_reserved_entry_without_rewriting),
         cmocka_unit_test(test_legacy_restart_uses_safe_flag_lookup_and_preserves_files),
         cmocka_unit_test(test_offline_history_scan_after_durable_snapshot_and_restart),

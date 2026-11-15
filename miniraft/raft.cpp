@@ -329,11 +329,7 @@ TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes, st
     for (const auto& [id, _] : Nodes)
         if (!std::binary_search(Learners.begin(), Learners.end(), id)) InitialVoters.push_back(id);
     std::sort(InitialVoters.begin(), InitialVoters.end());
-    ValidateFixedVoters(InitialVoters);
-    Voters = InitialVoters;
-    VotingQuorum.emplace(Voters);
     if (!State->CurrentTerm) throw std::invalid_argument("Stored Raft term must be positive");
-    Nservers = Voters.size(); MinVotes = Nservers / 2 + 1;
     if (!Learners.empty() && !State->SupportsVoterBinding())
         throw std::invalid_argument("Learners require voter-binding-capable storage");
     const auto bound = State->GetBoundVoters();
@@ -344,6 +340,29 @@ TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes, st
     const auto snapshot = State->GetSnapshot();
     if (snapshot) {
         ValidateSnapshot(*snapshot);
+    }
+    bool hasConfigurationHistory = snapshot && snapshot->HasConfigurationMetadata();
+    const bool durableBinding = State->SupportsVoterBinding() && State->SupportsCommitIndexPersistence();
+    if (durableBinding && !bound.empty() && !hasConfigurationHistory) {
+        for (uint64_t index = State->SnapshotIndex + 1; index <= State->LastLogIndex; ++index) {
+            if (State->RetainedLogFlags(index) & TLogEntry::EConfiguration) {
+                hasConfigurationHistory = true;
+                break;
+            }
+        }
+    }
+    if (durableBinding && !bound.empty() && hasConfigurationHistory) {
+        // The durable binding is the trusted original voter set. After a
+        // committed membership change, removed original voters need not remain
+        // configured as replication endpoints on restart.
+        ValidateFixedVoters(bound);
+        InitialVoters = bound;
+    }
+    ValidateFixedVoters(InitialVoters);
+    Voters = InitialVoters;
+    VotingQuorum.emplace(Voters);
+    Nservers = Voters.size(); MinVotes = Nservers / 2 + 1;
+    if (snapshot) {
         if (snapshot->HasConfigurationMetadata() && bound != InitialVoters)
             throw std::invalid_argument("Configuration snapshot requires the existing voter binding");
         if (snapshot->Index != State->SnapshotIndex || snapshot->Term != State->SnapshotTerm ||
