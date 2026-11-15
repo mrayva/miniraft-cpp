@@ -629,6 +629,7 @@ void test_stable_membership_compaction_recovers_active_voters(void**) {
         ITimeSource::Time now{};
         bool dropConfigurationBarrier = false;
         bool dropConfigurationBarrierResponse = false;
+        bool maskConfigurationBarrierCapability = false;
         unsigned configurationBarrierRequests = 0, droppedConfigurationBarriers = 0;
         unsigned configurationBarrierResponses = 0, acceptedConfigurationBarriers = 0;
         unsigned droppedConfigurationBarrierResponses = 0;
@@ -649,6 +650,11 @@ void test_stable_membership_compaction_recovers_active_voters(void**) {
                     ++droppedConfigurationBarrierResponses;
                     return;
                 }
+            }
+            if (maskConfigurationBarrierCapability &&
+                message->Type == uint32_t(EMessageType::APPEND_ENTRIES_RESPONSE)) {
+                auto response = message.template Cast<TAppendEntriesResponse>();
+                response->Padding &= ~TAppendEntriesResponse::SupportsConfigurationBarrier;
             }
             leader->Process(now, std::move(message));
             leaderProcessor.ProcessCommitted();
@@ -677,9 +683,16 @@ void test_stable_membership_compaction_recovers_active_voters(void**) {
         const auto beforeUngossipedJointCompact = static_cast<TStateFields>(*leaderState);
         Reject([&] { leader->Compact(); });
         assert_true(static_cast<TStateFields>(*leaderState) == beforeUngossipedJointCompact);
-        dropConfigurationBarrier = true;
-        pump(); // Propagate the committed joint boundary to every active voter.
+        maskConfigurationBarrierCapability = true;
+        pump(); // A legacy peer can acknowledge the commit without advertising the new RPC.
         assert_int_equal(addedState->CommitIndex, jointIndex);
+        assert_int_equal(configurationBarrierRequests, 0);
+        assert_int_equal(added->GetVolatileState()->CompactionSafeConfigurationIndex, 0);
+        Reject([&] { added->Compact(); });
+
+        maskConfigurationBarrierCapability = false;
+        dropConfigurationBarrier = true;
+        pump(); // The fresh capability ACK permits the leader to send the barrier.
         assert_int_equal(droppedConfigurationBarriers, 1);
         assert_int_equal(added->GetVolatileState()->CompactionSafeConfigurationIndex, 0);
         Reject([&] { added->Compact(); }); // A local commit alone cannot prove peer ACKs.

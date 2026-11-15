@@ -74,7 +74,10 @@ compaction, recovery and transfer after the receiver commits the exact same
 joint configuration; the configuration-entry protocol remains the only way to
 change membership. The [follower compaction barrier follow-up](docs/follower-compaction-barrier.md)
 retries the all-voter ACK certificate so each replica can checkpoint safely.
-Upgrade all active voters before using this new barrier RPC.
+Leaders learn support from a reserved AppendEntries response bit before sending
+the new RPC, so older peers are not sent an unknown message type. A peer on an
+older version can continue replicating, but cannot compact a membership-bearing
+snapshot locally until upgraded.
 The [snapshot term preflight follow-up](docs/unsupported-snapshot-term-preflight.md)
 rejects unsupported snapshot formats before a higher RPC term changes hard state.
 The [snapshot metadata preflight follow-up](docs/snapshot-metadata-term-preflight.md)

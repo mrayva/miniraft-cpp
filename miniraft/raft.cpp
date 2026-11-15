@@ -514,6 +514,7 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             TAppendEntriesResponse {
                 .MatchIndex = 0,
                 .Success = false,
+                .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier,
             });
         Nodes[reply->Dst]->Send(std::move(reply));
         return;
@@ -554,7 +555,11 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
     if (!success && message->PrevLogIndex < State->SnapshotIndex) matchIndex = State->SnapshotIndex;
     auto reply = NewHoldedMessage(
         TMessageEx {.Src = Id, .Dst = message->Src, .Term = State->CurrentTerm, .Seqno = message->Seqno},
-        TAppendEntriesResponse {.MatchIndex = matchIndex, .Success = success});
+        TAppendEntriesResponse {
+            .MatchIndex = matchIndex,
+            .Success = success,
+            .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier,
+        });
 
     AdvanceCommitIndex(commitIndex);
     if (configurationTouched) RefreshConfiguration(VolatileState->CommitIndex);
@@ -566,7 +571,7 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
     Nodes[reply->Dst]->Send(std::move(reply));
 }
 
-void TRaft::OnAppendEntries(TMessageHolder<TAppendEntriesResponse> message) {
+void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntriesResponse> message) {
     if (message->Term != State->CurrentTerm) {
         return;
     }
@@ -581,6 +586,12 @@ void TRaft::OnAppendEntries(TMessageHolder<TAppendEntriesResponse> message) {
     });
     if (request == requests.end() ||
         (message->Success && message->MatchIndex != request->LastIndex)) return;
+    auto& capabilities = VolatileState->PeerCapabilities[nodeId];
+    if (message->Seqno >= capabilities.AppendAckSeqno) {
+        capabilities.AppendAckSeqno = message->Seqno;
+        capabilities.ConfigurationBarrier =
+            message->Padding & TAppendEntriesResponse::SupportsConfigurationBarrier;
+    }
     const auto acknowledgedLeaderCommit = request->LeaderCommit;
     // A newer response supersedes older RPCs. Reordered/duplicate failures
     // must not undo progress or repeatedly increase backoff.
@@ -617,6 +628,7 @@ void TRaft::OnAppendEntries(TMessageHolder<TAppendEntriesResponse> message) {
             .SetBatchSize(nodeId, 1)
             .SetBackOff(nodeId, std::min(32768, backOff << 1));
     }
+    MaybeDistributeConfigurationBarrier(now);
 }
 
 TMessageHolder<TRequestVoteRequest> TRaft::CreateVote(uint32_t nodeId) {
@@ -704,7 +716,7 @@ void TRaft::Leader(ITimeSource::Time now, TMessageHolder<TMessage> message) {
     if (auto snapshot = message.Maybe<TInstallSnapshotResponse>()) {
         OnInstallSnapshot(snapshot.Cast());
     } else if (auto maybeAppendEntries = message.Maybe<TAppendEntriesResponse>()) {
-        OnAppendEntries(std::move(maybeAppendEntries.Cast()));
+        OnAppendEntries(now, std::move(maybeAppendEntries.Cast()));
     } else if (auto maybeVoteRequest = message.Maybe<TRequestVoteRequest>()) {
         OnRequestVote(now, std::move(maybeVoteRequest.Cast()));
     } else if (auto maybeAppendEntries = message.Maybe<TAppendEntriesRequest>()) {
@@ -1280,6 +1292,12 @@ void TRaft::MaybeDistributeConfigurationBarrier(ITimeSource::Time now) {
         if (voter == Id) continue;
         const auto ack = VolatileState->CommitAckIndex.find(voter);
         if (ack == VolatileState->CommitAckIndex.end() || ack->second < index) return;
+        const auto capability = VolatileState->PeerCapabilities.find(voter);
+        const auto lastSent = VolatileState->LastSentSeqno.find(voter);
+        if (capability == VolatileState->PeerCapabilities.end() ||
+            lastSent == VolatileState->LastSentSeqno.end() ||
+            !capability->second.ConfigurationBarrier ||
+            capability->second.AppendAckSeqno != lastSent->second) return;
     }
 
     VolatileState->CompactionSafeConfigurationIndex = std::max(
@@ -1355,6 +1373,7 @@ std::shared_ptr<INode> TRaft::RemoveLearnerTarget(uint32_t id) {
     VolatileState->ConfigurationBarrierRpcs.erase(id);
     VolatileState->ConfigurationBarrierAckIndex.erase(id);
     VolatileState->ConfigurationBarrierAckDue.erase(id);
+    VolatileState->PeerCapabilities.erase(id);
     VolatileState->HeartbeatDue.erase(id); VolatileState->RpcDue.erase(id);
     VolatileState->BatchSize.erase(id); VolatileState->BackOff.erase(id);
     VolatileState->Votes.erase(id);
@@ -1422,6 +1441,9 @@ TSnapshot TRaft::Compact() {
 }
 
 TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t nodeId) {
+    if (auto capability = VolatileState->PeerCapabilities.find(nodeId);
+        capability != VolatileState->PeerCapabilities.end())
+        capability->second.AppendAckSeqno = 0; // Require a fresh AppendEntries capability ACK afterward.
     auto& rpc = VolatileState->SnapshotRpcs[nodeId];
     if (!rpc.Snapshot) {
         auto snapshot = State->GetSnapshot();

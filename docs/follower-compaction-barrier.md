@@ -21,13 +21,19 @@ compaction after the leader has already observed every active voter commit the
 configuration. Learners cannot lead and may compact their own committed state
 without a voter certificate. The barrier does not persist independently; after
 restart a voter must receive a fresh certificate before compacting further.
-The barrier is a new RPC type. Upgrade all active voters before a leader with a
-committed membership configuration starts this protocol; older binaries reject
-the unknown frame. Bootstrap-only fixed-membership clusters do not send barrier
+The barrier is a new RPC type. Before sending it, a leader waits for a fresh
+AppendEntries response from each active voter that advertises support in a
+reserved response bit. Older binaries leave that bit clear, so they are never
+sent the unknown message type and can continue replicating during a rolling
+upgrade. An older follower cannot compact a membership-bearing snapshot locally
+until it is upgraded. Downgrading a peer while a barrier request is in flight is
+not supported. Bootstrap-only fixed-membership clusters do not send barrier
 messages.
 
-Deterministic durable coverage drops a joint barrier request and verifies that
-the follower refuses to compact until retry succeeds. It also simulates losing
+Deterministic durable coverage masks the capability bit to simulate an older
+peer and verifies that the leader sends no barrier request. After the bit is
+restored, it drops a joint barrier request and verifies that the follower
+refuses to compact until retry succeeds. It also simulates losing
 the follower's volatile certificate, checks periodic re-advertisement, drops a
 stable barrier, and verifies follower compaction after the stable certificate
 arrives. RPC validation confirms that an unproven higher-term request cannot

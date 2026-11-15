@@ -81,6 +81,11 @@ struct TVolatileState {
     std::unordered_map<uint32_t, TConfigurationBarrierRpc> ConfigurationBarrierRpcs;
     std::unordered_map<uint32_t, uint64_t> ConfigurationBarrierAckIndex;
     std::unordered_map<uint32_t, ITimeSource::Time> ConfigurationBarrierAckDue;
+    struct TPeerCapabilities {
+        uint64_t AppendAckSeqno = 0;
+        bool ConfigurationBarrier = false;
+    };
+    std::unordered_map<uint32_t, TPeerCapabilities> PeerCapabilities;
     // A follower may compact a membership-bearing boundary only after the
     // current leader certifies that every active voter acknowledged it.
     uint64_t CompactionSafeConfigurationIndex = 0;
@@ -234,7 +239,7 @@ private:
     void OnRequestVote(ITimeSource::Time now, TMessageHolder<TRequestVoteRequest> message);
     void OnRequestVote(TMessageHolder<TRequestVoteResponse> message);
     void OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntriesRequest> message);
-    void OnAppendEntries(TMessageHolder<TAppendEntriesResponse> message);
+    void OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntriesResponse> message);
 
     void LeaderTimeout(ITimeSource::Time now);
     void CandidateTimeout(ITimeSource::Time now);
