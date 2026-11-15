@@ -235,6 +235,7 @@ void test_learner_snapshot_catchup_status_and_restart_preserve_role(void**) {
     assert_true(snapshot.Voters == (std::vector<uint32_t>{1, 2, 3}));
     assert_false(cluster.Nodes[0]->IsLearnerCaughtUp(4)); cluster.Isolated.clear(); cluster.Pump(1, 100, true);
     assert_int_equal(cluster.Apps[3]->Loads, 1); assert_true(cluster.Nodes[0]->IsLearnerCaughtUp(4));
+    assert_true(cluster.Nodes[0]->IsLearnerCommitAcknowledged(4));
     assert_false(cluster.Nodes[0]->IsLearnerCaughtUp(2)); assert_false(cluster.Nodes[0]->IsLearnerCaughtUp(99));
     assert_true(Read(*cluster.Apps[3], "c") == std::string(60000, 'c'));
     cluster.Nodes[0]->Append(cluster.Apps[0]->Prepare(Command("tail", "later")));
