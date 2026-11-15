@@ -23,9 +23,10 @@ Old binaries cannot read compacted durable images or process InstallSnapshot RPC
 The meaning of `--snapshots` changes from checkpoint-only to actual compaction.
 Mixed-version operation is unsupported. Existing v1 durable files and alpha.15
 checkpoints can be read without destructive migration. The first compaction or
-remote installation writes the current durable format; downgrading that store is unsupported. Fixed voter
-IDs must match the embedded snapshot. Static `--node` edits remain unsafe as a
-membership-change mechanism.
+remote installation writes the current durable format; downgrading that store is
+unsupported. Legacy snapshot voter IDs must match the original binding. Stable
+configuration snapshots can describe a later active set while preserving that
+binding. Static `--node` edits remain unsafe as a membership-change mechanism.
 
 Startup restores an application behind the embedded snapshot before request
 processing, including after a crash between durable publication and application
@@ -38,9 +39,13 @@ the persisted current term or vote.
 ## Boundaries and atomic persistence
 
 Raft startup validates a recovered snapshot before binding voters: its image,
-index and term must agree with the storage boundary, its voter set must match
-the fixed configuration, and the last term must be consistent with the
-boundary and current term. It scans retained terms for nonzero, nondecreasing
+index and term must agree with the storage boundary, its last term must be
+consistent with the boundary and current term, and its active set must be
+supported by configured replication targets. Legacy images must match the
+original voter binding. A stable configuration image may name a later active
+set while the durable store retains that original binding; this path supports
+restart after a committed stable membership transition. It scans retained
+terms for nonzero, nondecreasing
 values no newer than the current term and verifies the recorded last term. A
 nonzero boundary without an image is rejected. Custom backends must report
 accurate entry metadata, validate payloads, and supply a consistent, serialized

@@ -278,7 +278,7 @@ TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes, st
             throw std::invalid_argument("Stable configuration snapshot requires the existing voter binding");
         if (snapshot->Index != State->SnapshotIndex || snapshot->Term != State->SnapshotTerm ||
             snapshot->Term > State->CurrentTerm ||
-            snapshot->Voters != InitialVoters ||
+            (snapshot->Voters != InitialVoters && !snapshot->StableConfiguration) ||
             State->LastLogTerm < State->SnapshotTerm || State->LastLogTerm > State->CurrentTerm ||
             (State->LastLogIndex == State->SnapshotIndex && State->LastLogTerm != State->SnapshotTerm))
             throw std::invalid_argument("Compacted state snapshot boundary mismatch");
@@ -385,16 +385,6 @@ void TRaft::RefreshConfiguration(uint64_t commitIndex) {
             VolatileState->LeaderId = 0;
         }
     }
-}
-
-bool TRaft::HasMembershipHistory() const {
-    if (!ConfigurationBaseline || !Configuration) return false;
-    const auto& baseline = *ConfigurationBaseline;
-    const auto& latest = Configuration->Latest;
-    return baseline.ConfigurationIndex() != latest.ConfigurationIndex() ||
-        baseline.ConfigurationTerm() != latest.ConfigurationTerm() ||
-        baseline.IsJoint() != latest.IsJoint() || baseline.OldVoters() != latest.OldVoters() ||
-        baseline.NewVoters() != latest.NewVoters();
 }
 
 void TRaft::OnRequestVote(ITimeSource::Time now, TMessageHolder<TRequestVoteRequest> message) {
@@ -1136,8 +1126,8 @@ bool TRaft::IsLearnerCommitAcknowledged(uint32_t id) const {
 
 TSnapshot TRaft::Compact() {
     if (!State->SupportsSnapshots()) throw std::logic_error("Storage cannot compact snapshots");
-    if (HasMembershipHistory())
-        throw std::logic_error("Compaction after a log membership change requires runtime configuration snapshots");
+    if (Configuration && (Configuration->Committed.IsJoint() || Configuration->HasUncommittedConfiguration()))
+        throw std::logic_error("Compaction requires a committed stable configuration");
     auto application = SnapshotApplication.lock();
     if (!application) throw std::logic_error("Compaction requires a bound application");
     if (application->LastAppliedIndex == State->SnapshotIndex && State->GetSnapshot()) return *State->GetSnapshot();

@@ -46,12 +46,14 @@ the encoded term and its flags must equal `EConfiguration`. CRC checks accidenta
 corruption; it is not authentication. All voters must run a compatible binary
 before a transition because older versions reject this entry type.
 
-Membership-aware compaction and joint snapshot installation are still open.
-Compaction remains blocked after retained membership history, and a lagging
-peer that requires snapshot transfer across a transition is not yet supported.
-Existing fixed-membership snapshots and legacy stores do not prove the active
-voter set after a transition. Do not remove or edit committed state to bypass
-these limits.
+After the stable successor commits, local compaction records the active voter
+set and stable configuration identity while preserving the original durable
+voter binding ([details](stable-membership-compaction.md)). Compaction remains
+blocked during joint or uncommitted configuration state. Network snapshot
+installation across a membership transition and joint snapshot installation
+remain unsupported; a lagging peer that needs a snapshot across the transition
+must be handled outside this path. Do not remove or edit committed state to
+bypass these limits.
 
 Deterministic durable-store tests cover learner catch-up, voter addition and
 nonleader removal, per-node activation, joint commit propagation, stable
