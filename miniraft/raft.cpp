@@ -540,6 +540,7 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
     }
 
     assert(message->Term == State->CurrentTerm);
+    VolatileState->LeadershipTransfer.reset();
 
     uint64_t matchIndex = 0;
     uint64_t commitIndex = VolatileState->CommitIndex;
@@ -766,6 +767,7 @@ void TRaft::Process(ITimeSource::Time now, TMessageHolder<TMessage> message, con
             State->VotedFor = 0;
             State->Commit();
             StateName = EState::FOLLOWER;
+            VolatileState->LeadershipTransfer.reset();
             IncomingSnapshot.reset();
             VolatileState->SnapshotRpcs.clear();
             EncodedSnapshot.reset();
@@ -1005,6 +1007,20 @@ bool TRaft::ValidateAppendConfiguration(TMessageHolder<TAppendEntriesRequest> me
 }
 
 void TRaft::FollowerTimeout(ITimeSource::Time now) {
+    if (VolatileState->LeadershipTransfer && now >= VolatileState->LeadershipTransfer->RetryDue &&
+        now < VolatileState->ElectionDue) {
+        auto& transfer = *VolatileState->LeadershipTransfer;
+        transfer.RetryDue = now + TTimeout::LeadershipTransferRetry;
+        Nodes.at(transfer.TargetId)->Send(NewHoldedMessage(
+            TMessageEx{.Src = Id, .Dst = transfer.TargetId, .Term = State->CurrentTerm},
+            TTimeoutNowRequest{
+                .LeaderId = Id, .TargetId = transfer.TargetId,
+                .LastLogIndex = transfer.LastLogIndex, .LastLogTerm = transfer.LastLogTerm,
+                .CommitIndex = transfer.CommitIndex, .CommitTerm = transfer.CommitTerm,
+                .ConfigurationIndex = transfer.ConfigurationIndex,
+                .ConfigurationTerm = transfer.ConfigurationTerm,
+            }));
+    }
     if (VolatileState->ElectionDue <= now) {
         Become(EState::CANDIDATE);
     }
@@ -1238,11 +1254,21 @@ void TRaft::TransferLeadership(uint32_t target, ITimeSource::Time now) {
             .ConfigurationIndex = joint.ConfigurationIndex(), .ConfigurationTerm = joint.ConfigurationTerm(),
         });
 
-    // Stop issuing writes before asking the target to campaign. If the request
-    // is lost, the ordinary election timeout lets this node recover leadership.
+    // Stop issuing writes before asking the target to campaign. Retry while
+    // this node remains a follower; the ordinary election timeout is fallback.
     Become(EState::FOLLOWER);
     VolatileState->LeaderId = 0;
     VolatileState->ElectionDue = MakeElection(now);
+    VolatileState->LeadershipTransfer = TVolatileState::TLeadershipTransfer{
+        .TargetId = target,
+        .LastLogIndex = State->LastLogIndex,
+        .LastLogTerm = State->LastLogTerm,
+        .CommitIndex = VolatileState->CommitIndex,
+        .CommitTerm = State->LogTerm(VolatileState->CommitIndex),
+        .ConfigurationIndex = joint.ConfigurationIndex(),
+        .ConfigurationTerm = joint.ConfigurationTerm(),
+        .RetryDue = now + TTimeout::LeadershipTransferRetry,
+    };
     VolatileState->SnapshotRpcs.clear();
     VolatileState->PendingAppendRpcs.clear();
     VolatileState->ConfigurationBarrierRpcs.clear();
@@ -1537,6 +1563,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     // until the complete bounded metadata prefix is supported.
     auto acceptLeaderContact = [&] {
         Become(EState::FOLLOWER);
+        VolatileState->LeadershipTransfer.reset();
         VolatileState->LeaderId = request->LeaderId;
         VolatileState->ElectionDue = MakeElection(now);
     };

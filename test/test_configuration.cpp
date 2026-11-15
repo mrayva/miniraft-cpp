@@ -551,60 +551,85 @@ void test_joint_membership_addition_and_finalization_replicate_deterministically
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 #endif
 }
-void test_dropped_timeout_now_recovers_old_leader_under_joint_quorum(void**) {
+void test_timeout_now_retries_and_falls_back_under_joint_quorum(void**) {
 #ifdef __linux__
-    auto dir = std::filesystem::temp_directory_path() / ("miniraft-transfer-failure-" +
-        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    assert_true(std::filesystem::create_directory(dir));
-    const auto name = (dir / "raft").string();
-    {
-        auto toLearner = std::make_shared<TEndpoint>();
-        auto toLeader = std::make_shared<TEndpoint>();
-        auto leaderState = std::make_shared<TDurableState>(name, 1);
-        auto learnerState = std::make_shared<TDurableState>(name, 2);
-        TRaft leader(leaderState, 1, {{2, toLearner}}, {2});
-        TRaft learner(learnerState, 2, {{1, toLeader}}, {2});
-        const auto start = ITimeSource::Time{};
-        auto rpcNow = start;
-        bool timeoutNowDropped = false;
-        toLearner->Route = [&](auto message) {
-            if (message->Type == uint32_t(EMessageType::TIMEOUT_NOW_REQUEST)) {
-                timeoutNowDropped = true;
-                return;
+    for (const bool deliverRetry : {false, true}) {
+        auto dir = std::filesystem::temp_directory_path() / ("miniraft-transfer-failure-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+            (deliverRetry ? "-retry" : "-fallback"));
+        assert_true(std::filesystem::create_directory(dir));
+        const auto name = (dir / "raft").string();
+        {
+            auto toLearner = std::make_shared<TEndpoint>();
+            auto toLeader = std::make_shared<TEndpoint>();
+            auto leaderState = std::make_shared<TDurableState>(name, 1);
+            auto learnerState = std::make_shared<TDurableState>(name, 2);
+            TRaft leader(leaderState, 1, {{2, toLearner}}, {2});
+            TRaft learner(learnerState, 2, {{1, toLeader}}, {2});
+            const auto start = ITimeSource::Time{};
+            auto rpcNow = start;
+            unsigned timeoutNowRequests = 0;
+            bool timeoutNowDropped = false;
+            toLearner->Route = [&](auto message) {
+                if (message->Type == uint32_t(EMessageType::TIMEOUT_NOW_REQUEST)) {
+                    ++timeoutNowRequests;
+                    if (timeoutNowRequests == 1 || !deliverRetry) {
+                        timeoutNowDropped = true;
+                        return;
+                    }
+                }
+                learner.Process(rpcNow, std::move(message));
+            };
+            toLeader->Route = [&](auto message) { leader.Process(rpcNow, std::move(message)); };
+            auto leaderTimeout = [&](std::chrono::milliseconds offset) {
+                rpcNow = start + offset;
+                leader.ProcessTimeout(rpcNow);
+            };
+            auto learnerTimeout = [&](std::chrono::milliseconds offset) {
+                rpcNow = start + offset;
+                learner.ProcessTimeout(rpcNow);
+            };
+
+            leader.ProcessTimeout(start);
+            leaderTimeout(std::chrono::seconds(10)); // Commit the leader's current-term no-op.
+            assert_true(leader.IsLearnerCommitAcknowledged(2));
+            const auto jointIndex = leader.ProposeJointConfiguration({2});
+            leaderTimeout(std::chrono::seconds(20));
+            leaderTimeout(std::chrono::seconds(30));
+            leaderTimeout(std::chrono::seconds(40)); // Propagate the committed joint watermark.
+            assert_int_equal(learnerState->CommitIndex, jointIndex);
+
+            rpcNow = start + std::chrono::seconds(41);
+            leader.TransferLeadership(2, rpcNow);
+            assert_true(timeoutNowDropped);
+            assert_int_equal(timeoutNowRequests, 1);
+            assert_true(leader.CurrentStateName() == EState::FOLLOWER);
+            assert_true(learner.CurrentStateName() == EState::FOLLOWER);
+
+            if (deliverRetry) {
+                leaderTimeout(std::chrono::seconds(41) + std::chrono::milliseconds(999));
+                assert_int_equal(timeoutNowRequests, 1);
+                leaderTimeout(std::chrono::seconds(42)); // Retry before the election timeout.
+                assert_int_equal(timeoutNowRequests, 2);
+                assert_true(learner.CurrentStateName() == EState::CANDIDATE);
+                assert_int_equal(leader.GetState()->CurrentTerm, learner.GetState()->CurrentTerm);
+                assert_true(leader.CurrentStateName() == EState::FOLLOWER);
+                learnerTimeout(std::chrono::seconds(42) + std::chrono::milliseconds(1));
+                assert_true(learner.CurrentStateName() == EState::LEADER);
+                leaderTimeout(std::chrono::seconds(43));
+                assert_int_equal(timeoutNowRequests, 2); // The higher term cancels transfer retries.
+            } else {
+                // If every request is lost, the old leader's ordinary election
+                // timer still lets it recover under the active joint quorum.
+                leaderTimeout(std::chrono::seconds(55));
+                leaderTimeout(std::chrono::seconds(55) + std::chrono::milliseconds(1));
+                assert_true(leader.CurrentStateName() == EState::LEADER);
+                assert_true(learner.CurrentStateName() == EState::FOLLOWER);
             }
-            learner.Process(rpcNow, std::move(message));
-        };
-        toLeader->Route = [&](auto message) { leader.Process(rpcNow, std::move(message)); };
-        auto leaderTimeout = [&](std::chrono::milliseconds offset) {
-            rpcNow = start + offset;
-            leader.ProcessTimeout(rpcNow);
-        };
-
-        leader.ProcessTimeout(start);
-        leaderTimeout(std::chrono::seconds(10)); // Commit the leader's current-term no-op.
-        assert_true(leader.IsLearnerCommitAcknowledged(2));
-        const auto jointIndex = leader.ProposeJointConfiguration({2});
-        leaderTimeout(std::chrono::seconds(20));
-        leaderTimeout(std::chrono::seconds(30));
-        leaderTimeout(std::chrono::seconds(40)); // Propagate the committed joint watermark.
-        assert_int_equal(learnerState->CommitIndex, jointIndex);
-
-        rpcNow = start + std::chrono::seconds(41);
-        leader.TransferLeadership(2, rpcNow);
-        assert_true(timeoutNowDropped);
-        assert_true(leader.CurrentStateName() == EState::FOLLOWER);
-        assert_true(learner.CurrentStateName() == EState::FOLLOWER);
-
-        // With no transfer message delivered, the old leader's ordinary
-        // election timer fires. The new-set voter grants its vote under the
-        // still-active joint quorum, allowing the old leader to recover.
-        leaderTimeout(std::chrono::seconds(55));
-        leaderTimeout(std::chrono::seconds(55) + std::chrono::milliseconds(1));
-        assert_true(leader.CurrentStateName() == EState::LEADER);
-        assert_true(learner.CurrentStateName() == EState::FOLLOWER);
-        assert_true(leader.GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+            assert_true(leader.GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+        }
+        std::error_code ignored; std::filesystem::remove_all(dir, ignored);
     }
-    std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 #endif
 }
 void test_stable_membership_compaction_recovers_active_voters(void**) {
@@ -1416,7 +1441,7 @@ int main() {
         cmocka_unit_test(test_configuration_rejects_invalid_fields_and_valid_crc_corruption),
         cmocka_unit_test(test_configuration_rpc_and_proposal_are_rejected_before_mutation),
         cmocka_unit_test(test_joint_membership_addition_and_finalization_replicate_deterministically),
-        cmocka_unit_test(test_dropped_timeout_now_recovers_old_leader_under_joint_quorum),
+        cmocka_unit_test(test_timeout_now_retries_and_falls_back_under_joint_quorum),
         cmocka_unit_test(test_stable_membership_compaction_recovers_active_voters),
         cmocka_unit_test(test_snapshot_install_validates_and_advances_committed_membership_history),
         cmocka_unit_test(test_joint_snapshot_install_requires_matching_joint_history_and_recovers),

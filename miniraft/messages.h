@@ -184,6 +184,7 @@ static_assert(sizeof(TCommandResponse) == sizeof(TMessage) + 16);
 struct TTimeout {
     static constexpr std::chrono::milliseconds Election = std::chrono::milliseconds(5000);
     static constexpr std::chrono::milliseconds Heartbeat = std::chrono::milliseconds(1000);
+    static constexpr std::chrono::milliseconds LeadershipTransferRetry = std::chrono::milliseconds(1000);
     static constexpr std::chrono::milliseconds Rpc = std::chrono::milliseconds(10000);
     // Keep partial snapshot transfers across normal RPC retries, but bound how
     // long an idle receiver retains the accumulated image.

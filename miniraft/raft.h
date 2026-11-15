@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <queue>
 #include <deque>
 #include <string>
@@ -86,6 +87,14 @@ struct TVolatileState {
         bool ConfigurationBarrier = false;
     };
     std::unordered_map<uint32_t, TPeerCapabilities> PeerCapabilities;
+    struct TLeadershipTransfer {
+        uint32_t TargetId = 0;
+        uint64_t LastLogIndex = 0, LastLogTerm = 0;
+        uint64_t CommitIndex = 0, CommitTerm = 0;
+        uint64_t ConfigurationIndex = 0, ConfigurationTerm = 0;
+        ITimeSource::Time RetryDue{};
+    };
+    std::optional<TLeadershipTransfer> LeadershipTransfer;
     // A follower may compact a membership-bearing boundary only after the
     // current leader certifies that every active voter acknowledged it.
     uint64_t CompactionSafeConfigurationIndex = 0;

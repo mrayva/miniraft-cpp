@@ -22,10 +22,13 @@ election path. The normal vote rules and both joint majorities still apply. If
 elected, the new leader appends and commits its current-term no-op under the
 joint quorum before it can append the stable successor.
 
-The request has no acknowledgment. If it is lost, the old leader remains a
-follower until its ordinary election timeout, then can campaign again. A
-deterministic durable-store test drops the request and confirms that the old
-leader can win again with a vote from the new-set voter. Another rejects a
+The request has no acknowledgment. The old leader retries it every second while
+it remains a follower and has not reached its election deadline. A higher-term
+message or accepted leader contact cancels retries. If all requests are lost,
+the old leader's ordinary election timeout remains the fallback. Deterministic
+durable-store coverage drops the first request and confirms the retry starts the
+new-set voter before timeout, then drops every request and confirms the old
+leader can still win again with a vote from that voter. Another test rejects a
 malformed higher-term request without changing the receiver's durable state.
 
 `TIMEOUT_NOW_REQUEST` is a new Raft wire message. Upgrade all voters to a
