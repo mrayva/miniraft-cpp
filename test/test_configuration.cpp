@@ -440,6 +440,77 @@ void test_follower_can_register_future_voter_endpoint_before_joint_entry(void**)
     std::filesystem::remove_all(dir, ignored);
 #endif
 }
+void test_runtime_peer_provisioning_commits_joint_membership_across_replicas(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-runtime-joint-provisioning-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    {
+        auto leaderToJoining = std::make_shared<TEndpoint>();
+        auto leaderToFollower = std::make_shared<TEndpoint>();
+        auto followerToLeader = std::make_shared<TEndpoint>();
+        auto followerToJoining = std::make_shared<TEndpoint>();
+        auto joiningToLeader = std::make_shared<TEndpoint>();
+        auto joiningToFollower = std::make_shared<TEndpoint>();
+
+        auto leaderState = std::make_shared<TDurableState>((dir / "raft").string(), 1);
+        auto followerState = std::make_shared<TDurableState>((dir / "raft").string(), 3);
+        auto joiningState = std::make_shared<TDurableState>((dir / "raft").string(), 2);
+        TRaft leader(leaderState, 1, {{2, leaderToJoining}, {3, leaderToFollower}}, {2});
+        TRaft follower(followerState, 3, {{1, followerToLeader}});
+        TRaft joining(joiningState, 2, {{1, joiningToLeader}, {3, joiningToFollower}}, {2});
+
+        ITimeSource::Time rpcNow{};
+        leaderToJoining->Route = [&](auto message) { joining.Process(rpcNow, std::move(message)); };
+        leaderToFollower->Route = [&](auto message) { follower.Process(rpcNow, std::move(message)); };
+        followerToLeader->Route = [&](auto message) { leader.Process(rpcNow, std::move(message)); };
+        followerToJoining->Route = [&](auto message) { joining.Process(rpcNow, std::move(message)); };
+        joiningToLeader->Route = [&](auto message) { leader.Process(rpcNow, std::move(message)); };
+        joiningToFollower->Route = [&](auto message) { follower.Process(rpcNow, std::move(message)); };
+
+        const auto initialVoters = follower.GetVoterIds();
+        follower.RegisterPeerTarget(2, followerToJoining);
+        assert_true(follower.GetVoterIds() == initialVoters);
+        assert_true(follower.GetLearnerIds() == (std::vector<uint32_t>{2}));
+        assert_int_equal(follower.GetNpeers(), 2);
+
+        const auto start = ITimeSource::Time{};
+        auto timeout = [&](std::chrono::seconds offset) {
+            rpcNow = start + offset;
+            leader.ProcessTimeout(rpcNow);
+        };
+        rpcNow = start + std::chrono::seconds(20);
+        leader.ProcessTimeout(rpcNow); // Elect leader 1 with old voters {1, 3}.
+        leader.ProcessTimeout(rpcNow); // Process the synchronous follower vote.
+        assert_true(leader.CurrentStateName() == EState::LEADER);
+        timeout(std::chrono::seconds(30)); // Replicate and commit the current-term leader entry.
+        timeout(std::chrono::seconds(40)); // The joining learner acknowledges the commit boundary.
+        assert_true(leader.IsLearnerCommitAcknowledged(2));
+
+        const auto jointIndex = leader.ProposeJointConfiguration({1, 2, 3});
+        timeout(std::chrono::seconds(50));
+        assert_int_equal(leader.GetVolatileState()->CommitIndex, jointIndex);
+        assert_true(follower.IsVoter(2));
+        assert_true(joining.IsVoter(2));
+        assert_true(follower.GetVoterIds() == (std::vector<uint32_t>{1, 2, 3}));
+        assert_true(joining.GetVoterIds() == (std::vector<uint32_t>{1, 2, 3}));
+
+        timeout(std::chrono::seconds(60)); // Propagate the committed joint watermark.
+        assert_int_equal(followerState->CommitIndex, jointIndex);
+        assert_int_equal(joiningState->CommitIndex, jointIndex);
+        const auto stableIndex = leader.FinalizeConfiguration();
+        timeout(std::chrono::seconds(70));
+        assert_int_equal(leader.GetVolatileState()->CommitIndex, stableIndex);
+        timeout(std::chrono::seconds(80));
+        assert_int_equal(followerState->CommitIndex, stableIndex);
+        assert_int_equal(joiningState->CommitIndex, stableIndex);
+        for (const auto* raft : {&leader, &follower, &joining})
+            assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2, 3}));
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
 void test_joint_membership_addition_and_finalization_replicate_deterministically(void**) {
 #ifdef __linux__
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-live-config-" +
@@ -1859,6 +1930,7 @@ int main() {
         cmocka_unit_test(test_configuration_rejects_invalid_fields_and_valid_crc_corruption),
         cmocka_unit_test(test_configuration_rpc_and_proposal_are_rejected_before_mutation),
         cmocka_unit_test(test_follower_can_register_future_voter_endpoint_before_joint_entry),
+        cmocka_unit_test(test_runtime_peer_provisioning_commits_joint_membership_across_replicas),
         cmocka_unit_test(test_joint_membership_addition_and_finalization_replicate_deterministically),
         cmocka_unit_test(test_live_joint_transition_waits_for_both_nontrivial_majorities),
         cmocka_unit_test(test_timeout_now_retries_and_falls_back_under_joint_quorum),
