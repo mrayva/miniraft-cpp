@@ -540,6 +540,7 @@ void test_joint_membership_addition_and_finalization_replicate_deterministically
         assert_true(leader.CurrentStateName() == EState::LEADER); // Commit watermark has not reached node 2 yet.
         leaderTimeout(std::chrono::seconds(104));
         assert_int_equal(learnerState->CommitIndex, leaderRemovalJoint);
+        Reject([&] { learner.UnregisterPeerTarget(1); }); // Old-set voters remain active throughout joint consensus.
         const auto beforeOldLeaderFinalization = static_cast<TStateFields>(*learnerState);
         const auto jointTerm = leaderState->LogTerm(leaderRemovalJoint);
         auto oldLeaderStable = EncodeConfigurationEntry(TConfigurationRecord{
@@ -585,6 +586,9 @@ void test_joint_membership_addition_and_finalization_replicate_deterministically
         assert_false(leader.IsVoter(1)); assert_true(leader.IsVoter(2));
         assert_true(learner.GetVoterIds() == (std::vector<uint32_t>{2}));
         assert_true(leader.GetVoterIds() == (std::vector<uint32_t>{2}));
+        assert_true(learner.UnregisterPeerTarget(1) == toLeader);
+        assert_int_equal(learner.GetNpeers(), 0);
+        assert_true(learner.GetVoterIds() == (std::vector<uint32_t>{2}));
     }
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 #endif

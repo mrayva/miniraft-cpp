@@ -36,10 +36,11 @@ history, configured voters must still reproduce the original binding.
 
 These are `TRaft` APIs. `TRaftServer` reconciles outbound client-response readers
 after Raft messages and on its timer loop, so a promoted voter can receive
-forwarded command replies without restarting. A reader cannot be safely stopped
-while suspended in socket IO; after a peer has been a voter while the server is
-running, keep its endpoint registered as a learner or restart the server before
-removing that transport target.
+forwarded command replies without restarting. After the stable successor commits
+a demotion, a peer endpoint can be unregistered. `TRaftServer` retires native
+TCP endpoints by shutting down their socket and retaining them until reader and
+writer coroutines unwind. Socket types without a safe shutdown hook, including
+the current coroio TLS wrapper, must remain registered until server shutdown.
 
 Incoming AppendEntries configuration records are decoded and the complete
 candidate suffix is scanned before a higher RPC term is persisted. The scan
