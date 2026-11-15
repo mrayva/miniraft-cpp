@@ -6,12 +6,26 @@
 #include <string_view>
 #include <charconv>
 #include <optional>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <coroio/all.hpp>
 
 #include <miniraft/timesource.h>
 #include <miniraft/messages.h>
 #include <miniraft/raft.h>
+
+namespace NNet::TDetail {
+// Start one response reader the first time a configured peer enters the
+// current voter set. The started set is monotonic because these readers cannot
+// be cancelled safely while blocked on socket IO.
+template<class TPeerMap, class TVoterPredicate, class TStarted, class TStartReader>
+void ReconcilePeerResponseReaders(const TPeerMap& peers, TVoterPredicate isVoter,
+        TStarted& started, TStartReader startReader) {
+    for (const auto& [id, peer] : peers)
+        if (isVoter(id) && started.insert(id).second) startReader(id, peer);
+}
+}
 
 template<typename TSocket>
 class TMessageReader {
@@ -187,6 +201,7 @@ private:
     NNet::TVoidTask InboundConnection(TSocket socket);
     NNet::TVoidTask OutboundServe(std::shared_ptr<TNode<TSocket>>);
     NNet::TVoidTask Idle();
+    void ReconcilePeerReaders();
     void DrainNodes();
     void DebugPrint();
 
@@ -196,6 +211,10 @@ private:
     std::shared_ptr<TRequestProcessor> RequestProcessor;
     std::unordered_set<std::shared_ptr<INode>> Nodes;
     std::unordered_map<uint32_t, std::shared_ptr<TNode<TSocket>>> PeerNodes;
+    // Reader coroutines cannot be cancelled safely while blocked on socket IO.
+    // Keep readers for the server lifetime, and reject endpoint removal once a
+    // reader has started for that peer.
+    std::unordered_set<uint32_t> PeerResponseReaders;
     std::shared_ptr<ITimeSource> TimeSource;
     bool Serving = false;
 

@@ -21,14 +21,19 @@ reentrant calls from transport or application callbacks are unsupported.
 After removal, a write already in progress or data already queued in the
 endpoint may remain. Keep the returned endpoint alive while that I/O can still
 use it, then shut it down according to the embedding application's transport
-lifecycle.
+lifecycle. Once `TRaftServer` starts a response reader for a peer promoted to
+voter, `RemoveLearnerTarget` rejects removal while the server is running because
+that coroutine cannot be cancelled safely during socket IO. Keep the demoted
+peer as a learner target or restart the server before removing it.
 
 The KV CLI still discovers peers at startup. Staging is leader-local and is
 lost on restart or failover; the new leader and the application must reconcile
 it. This adds network transport support for non-voting catch-up. Voter promotion
 and replicated joint consensus are now available through the bounded durable
-transition path in [live membership](configuration-entries.md). Membership-aware
-snapshot installation and leader removal remain unsupported.
+transition path in [live membership](configuration-entries.md). Leader removal
+and membership-aware snapshot installation remain unsupported. The server now
+starts response readers when peers become voters during a live transition,
+without restarting `Serve()`.
 
 The deterministic server test checks target registration, voter/quorum
 invariance, removal and rollback after a nonleader rejection. The existing
