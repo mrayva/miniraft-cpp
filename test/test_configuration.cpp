@@ -1022,8 +1022,10 @@ void test_snapshot_transfer_before_uncommitted_configuration_preserves_suffix(vo
     source->Route = [&](auto message) { replies.push_back(message.template Cast<TInstallSnapshotResponse>()); };
     auto jointOnlySource = std::make_shared<TEndpoint>();
     jointOnlySource->Route = [&](auto message) { replies.push_back(message.template Cast<TInstallSnapshotResponse>()); };
+    auto newOnlySource = std::make_shared<TEndpoint>();
+    newOnlySource->Route = [&](auto message) { replies.push_back(message.template Cast<TInstallSnapshotResponse>()); };
     TNodeDict peers{{1, source}, {3, jointOnlySource},
-        {4, std::make_shared<TEndpoint>()}, {5, std::make_shared<TEndpoint>()},
+        {4, std::make_shared<TEndpoint>()}, {5, newOnlySource},
         {6, std::make_shared<TEndpoint>()}};
     auto raft = std::make_shared<TRaft>(state, 2, peers);
     auto app = std::make_shared<TSnapshotRsm>(); app->LastAppliedIndex = 2;
@@ -1092,7 +1094,9 @@ void test_snapshot_transfer_before_uncommitted_configuration_preserves_suffix(vo
     TSnapshot matchingJoint{4, 3, {1, 2, 3, 4}, "4"};
     matchingJoint.JointVoters = {1, 2, 4, 5};
     matchingJoint.ConfigurationIndex = 4; matchingJoint.ConfigurationTerm = 3;
-    sendSnapshot(matchingJoint, 5);
+    // A newly added voter can lead once the pending joint configuration is
+    // active and both majorities authorize its term.
+    sendSnapshot(matchingJoint, 5, 5);
     assert_int_equal(replies.size(), 2);
     assert_true(replies.back()->Installed); assert_true(replies.back()->Success);
     assert_int_equal(state->CurrentTerm, 5);
