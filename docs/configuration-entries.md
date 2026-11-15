@@ -76,3 +76,6 @@ finalization from the snapshot baseline, and a dropped/retried all-voter
 compaction barrier that enables follower-local snapshots. Restart coverage also
 verifies that a compacted stable membership can recover with the removed voter
 endpoint omitted while preserving the original binding.
+The live transition path also tests both one-sided quorum schedules for the
+overlapping sets `{1, 2, 3}` and `{3, 4, 5}`: neither majority alone commits the
+joint entry, and the entry commits after both majorities acknowledge it.

@@ -551,6 +551,101 @@ void test_joint_membership_addition_and_finalization_replicate_deterministically
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 #endif
 }
+void test_live_joint_transition_waits_for_both_nontrivial_majorities(void**) {
+#ifdef __linux__
+    auto run = [](bool newMajorityFirst) {
+        auto dir = std::filesystem::temp_directory_path() / ("miniraft-live-joint-quorum-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+            (newMajorityFirst ? "-new" : "-old"));
+        assert_true(std::filesystem::create_directory(dir));
+        {
+            auto state = std::make_shared<TDurableState>((dir / "raft").string(), 1);
+            std::unordered_map<uint32_t, std::shared_ptr<TEndpoint>> endpoints;
+            TNodeDict peers;
+            for (uint32_t id : {2, 3, 4, 5}) {
+                auto endpoint = std::make_shared<TEndpoint>();
+                endpoints.emplace(id, endpoint);
+                peers.emplace(id, endpoint);
+            }
+            TRaft leader(state, 1, peers, {4, 5});
+            const auto start = ITimeSource::Time{};
+
+            leader.ProcessTimeout(start);
+            const auto electionTerm = state->CurrentTerm;
+            leader.Process(start + std::chrono::milliseconds(1),
+                NewHoldedMessage(TMessageEx{.Src = 2, .Dst = 1, .Term = electionTerm},
+                    TRequestVoteResponse{.VoteGranted = 1}));
+            leader.ProcessTimeout(start + std::chrono::milliseconds(2));
+            assert_true(leader.CurrentStateName() == EState::LEADER);
+
+            auto ackLatestAppend = [&](uint32_t source, std::chrono::milliseconds offset) {
+                auto& messages = endpoints.at(source)->Messages;
+                const auto request = std::find_if(messages.rbegin(), messages.rend(), [](const auto& message) {
+                    return message->Type == uint32_t(EMessageType::APPEND_ENTRIES_REQUEST);
+                });
+                assert_true(request != messages.rend());
+                auto append = request->Cast<TAppendEntriesRequest>();
+                const auto matchIndex = append->PrevLogIndex + append->Nentries;
+                leader.Process(start + offset,
+                    NewHoldedMessage(TMessageEx{.Src = source, .Dst = 1, .Term = append->Term,
+                        .Seqno = append->Seqno},
+                        TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1}));
+                return matchIndex;
+            };
+            auto latestAppendMatchIndex = [&](uint32_t source) {
+                auto& messages = endpoints.at(source)->Messages;
+                const auto request = std::find_if(messages.rbegin(), messages.rend(), [](const auto& message) {
+                    return message->Type == uint32_t(EMessageType::APPEND_ENTRIES_REQUEST);
+                });
+                assert_true(request != messages.rend());
+                auto append = request->Cast<TAppendEntriesRequest>();
+                return append->PrevLogIndex + append->Nentries;
+            };
+
+            assert_int_equal(ackLatestAppend(2, std::chrono::milliseconds(3)), 1);
+            assert_int_equal(leader.GetVolatileState()->CommitIndex, 1);
+            leader.ApproveRead(); // Send the learners a fresh committed watermark.
+            assert_int_equal(ackLatestAppend(4, std::chrono::milliseconds(4)), 1);
+            assert_int_equal(ackLatestAppend(5, std::chrono::milliseconds(4)), 1);
+            assert_true(leader.IsLearnerCommitAcknowledged(4));
+            assert_true(leader.IsLearnerCommitAcknowledged(5));
+
+            const auto jointIndex = leader.ProposeJointConfiguration({3, 4, 5});
+            assert_int_equal(jointIndex, 2);
+            leader.ProcessTimeout(start + std::chrono::seconds(3));
+            // Shared voter 3 still has to catch up the earlier leader entry. Let
+            // it acknowledge that prefix, then withhold its joint-entry ACK.
+            assert_int_equal(ackLatestAppend(3, std::chrono::seconds(3) + std::chrono::milliseconds(1)), 1);
+            leader.ProcessTimeout(start + std::chrono::seconds(3) + std::chrono::milliseconds(2));
+            assert_int_equal(latestAppendMatchIndex(3), jointIndex);
+            for (uint32_t id : {2, 4, 5})
+                assert_int_equal(latestAppendMatchIndex(id), jointIndex);
+
+            if (newMajorityFirst) {
+                // The new-set majority {4, 5} cannot commit without an old majority.
+                ackLatestAppend(4, std::chrono::seconds(3) + std::chrono::milliseconds(4));
+                ackLatestAppend(5, std::chrono::seconds(3) + std::chrono::milliseconds(4));
+                assert_int_equal(leader.GetVolatileState()->CommitIndex, 1);
+                ackLatestAppend(2, std::chrono::seconds(3) + std::chrono::milliseconds(5));
+            } else {
+                // The old-set majority {1, 2} cannot commit without a new majority.
+                ackLatestAppend(2, std::chrono::seconds(3) + std::chrono::milliseconds(4));
+                assert_int_equal(leader.GetVolatileState()->CommitIndex, 1);
+                ackLatestAppend(4, std::chrono::seconds(3) + std::chrono::milliseconds(4));
+                assert_int_equal(leader.GetVolatileState()->CommitIndex, 1);
+                ackLatestAppend(5, std::chrono::seconds(3) + std::chrono::milliseconds(5));
+            }
+            assert_int_equal(leader.GetVolatileState()->CommitIndex, jointIndex);
+            assert_true(leader.IsVoter(1));
+            assert_true(leader.IsVoter(5));
+            assert_true(leader.GetVoterIds() == (std::vector<uint32_t>{1, 2, 3, 4, 5}));
+        }
+        std::error_code ignored; std::filesystem::remove_all(dir, ignored);
+    };
+    run(false);
+    run(true);
+#endif
+}
 void test_timeout_now_retries_and_falls_back_under_joint_quorum(void**) {
 #ifdef __linux__
     for (const bool deliverRetry : {false, true}) {
@@ -1441,6 +1536,7 @@ int main() {
         cmocka_unit_test(test_configuration_rejects_invalid_fields_and_valid_crc_corruption),
         cmocka_unit_test(test_configuration_rpc_and_proposal_are_rejected_before_mutation),
         cmocka_unit_test(test_joint_membership_addition_and_finalization_replicate_deterministically),
+        cmocka_unit_test(test_live_joint_transition_waits_for_both_nontrivial_majorities),
         cmocka_unit_test(test_timeout_now_retries_and_falls_back_under_joint_quorum),
         cmocka_unit_test(test_stable_membership_compaction_recovers_active_voters),
         cmocka_unit_test(test_snapshot_install_validates_and_advances_committed_membership_history),
