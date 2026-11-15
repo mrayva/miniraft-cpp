@@ -31,6 +31,7 @@ enum class EMessageType : uint32_t {
     INSTALL_SNAPSHOT_RESPONSE = 7,
     COMMAND_REQUEST = 8,
     COMMAND_RESPONSE = 9,
+    TIMEOUT_NOW_REQUEST = 10,
 };
 
 struct TMessage {
@@ -118,6 +119,18 @@ struct TInstallSnapshotResponse: public TMessageEx {
     uint32_t Success = 0, Installed = 0;
 };
 static_assert(sizeof(TInstallSnapshotResponse) == sizeof(TMessageEx) + 24);
+
+// Ask a caught-up voter in the committed new set of a joint configuration to
+// start an election immediately so a leader excluded from that set can step
+// down before the stable successor is proposed.
+struct TTimeoutNowRequest: public TMessageEx {
+    static constexpr EMessageType MessageType = EMessageType::TIMEOUT_NOW_REQUEST;
+    uint32_t LeaderId = 0, TargetId = 0;
+    uint64_t LastLogIndex = 0, LastLogTerm = 0;
+    uint64_t CommitIndex = 0, CommitTerm = 0;
+    uint64_t ConfigurationIndex = 0, ConfigurationTerm = 0;
+};
+static_assert(sizeof(TTimeoutNowRequest) == sizeof(TMessageEx) + 56);
 
 struct TCommandRequest: public TMessage {
     static constexpr EMessageType MessageType = EMessageType::COMMAND_REQUEST;
@@ -221,7 +234,8 @@ struct TMessageHolder {
     }
 
     bool IsEx() const {
-        return HasValidExtent() && Mes->Len >= sizeof(TMessageEx) && (2 <= Mes->Type && Mes->Type <= 7);
+        return HasValidExtent() && Mes->Len >= sizeof(TMessageEx) &&
+            ((2 <= Mes->Type && Mes->Type <= 7) || Mes->Type == uint32_t(EMessageType::TIMEOUT_NOW_REQUEST));
     }
 
     template<typename U>

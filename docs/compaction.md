@@ -155,9 +155,11 @@ Publication-stage process crashes do not replace hardware power-cut testing.
 
 ## Remaining work
 
-Membership remains fixed. Learners, catch-up gates, replicated joint-consensus
-configuration entries, leader removal and corresponding quorum/read changes are
-next. All participating applications/backends must support snapshots before
+Learners, catch-up gates, replicated joint-consensus configuration entries,
+leader removal and corresponding quorum/read changes were added in later
+follow-ups ([live membership](configuration-entries.md) and
+[leadership transfer](leadership-transfer.md)). All participating
+applications/backends must support snapshots before
 compaction is enabled; no capability negotiation is implemented. Asynchronous/COW
 capture, disk-streamed transfer, bounded transport queues, total heap quotas,
 cluster/store authentication and independent review remain open.

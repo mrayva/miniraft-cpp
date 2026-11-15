@@ -40,5 +40,6 @@ rewrite the binding and is absent on restart. A leader-change test verifies
 that an embedding application must re-register the target on the new leader.
 A bounded durable-store promotion/finalization path now uses these catch-up
 acknowledgements; see [live joint membership](configuration-entries.md).
-Persistent endpoint discovery, leader removal and membership-aware snapshot
-installation remain open.
+Leader removal is supported after joint commit through
+[leadership transfer](leadership-transfer.md). Persistent endpoint discovery
+and joint snapshot installation remain open.

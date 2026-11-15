@@ -41,4 +41,5 @@ Callers must serialize Raft access and wait for committed application/client
 completion as appropriate. Directly editing IState or forcing states through the
 test-facing Become API is outside proposal admission. The current bounded
 joint-consensus path is described in [live membership](configuration-entries.md);
-leader removal and membership-aware snapshots remain open.
+leader removal uses [leadership transfer](leadership-transfer.md). Joint
+snapshot installation remains open.

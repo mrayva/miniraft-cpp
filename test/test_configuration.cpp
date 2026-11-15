@@ -416,8 +416,17 @@ void test_joint_membership_addition_and_finalization_replicate_deterministically
         TRaft leader(leaderState, 1, {{2, toLearner}}, {2});
         TRaft learner(learnerState, 2, {{1, toLeader}}, {2});
         const auto now = ITimeSource::Time{};
-        toLearner->Route = [&](auto message) { learner.Process(now, std::move(message)); };
-        toLeader->Route = [&](auto message) { leader.Process(now, std::move(message)); };
+        auto rpcNow = now;
+        toLearner->Route = [&](auto message) { learner.Process(rpcNow, std::move(message)); };
+        toLeader->Route = [&](auto message) { leader.Process(rpcNow, std::move(message)); };
+        auto leaderTimeout = [&](std::chrono::milliseconds offset) {
+            rpcNow = now + offset;
+            leader.ProcessTimeout(rpcNow);
+        };
+        auto learnerTimeout = [&](ITimeSource::Time when) {
+            rpcNow = when;
+            learner.ProcessTimeout(rpcNow);
+        };
 
         // A well-formed but wrong predecessor must not make the higher term
         // durable or earn an AppendEntries response.
@@ -432,30 +441,30 @@ void test_joint_membership_addition_and_finalization_replicate_deterministically
 
         leader.ProcessTimeout(now);
         assert_true(leader.CurrentStateName() == EState::LEADER);
-        leader.ProcessTimeout(now + std::chrono::seconds(10));
+        leaderTimeout(std::chrono::seconds(10));
         assert_true(leader.IsLearnerCommitAcknowledged(2));
 
         const auto beforeRejectedProposal = static_cast<TStateFields>(*leaderState);
-        Reject([&] { leader.ProposeJointConfiguration({2}); }); // Cannot remove the active leader.
+        Reject([&] { leader.ProposeJointConfiguration({1}); }); // A transition must change the voter set.
         assert_true(static_cast<TStateFields>(*leaderState) == beforeRejectedProposal);
         const auto jointIndex = leader.ProposeJointConfiguration({1, 2});
         assert_int_equal(jointIndex, 2);
         assert_true(leader.IsVoter(2));
         assert_true(leader.GetVoterIds() == (std::vector<uint32_t>{1, 2}));
 
-        leader.ProcessTimeout(now + std::chrono::seconds(20));
+        leaderTimeout(std::chrono::seconds(20));
         assert_true(learner.IsVoter(2));
         assert_int_equal(leader.GetVolatileState()->CommitIndex, jointIndex);
         assert_int_equal(learnerState->CommitIndex, 1); // The commit watermark needs another RPC.
-        leader.ProcessTimeout(now + std::chrono::seconds(30));
+        leaderTimeout(std::chrono::seconds(30));
         assert_int_equal(learnerState->CommitIndex, jointIndex);
 
         const auto stableIndex = leader.FinalizeConfiguration();
         assert_int_equal(stableIndex, 3);
-        leader.ProcessTimeout(now + std::chrono::seconds(40));
+        leaderTimeout(std::chrono::seconds(40));
         assert_int_equal(leader.GetVolatileState()->CommitIndex, stableIndex);
         assert_true(leader.GetVoterIds() == (std::vector<uint32_t>{1, 2}));
-        leader.ProcessTimeout(now + std::chrono::seconds(50));
+        leaderTimeout(std::chrono::seconds(50));
         assert_int_equal(learnerState->CommitIndex, stableIndex);
         assert_true(leader.GetLearnerIds().empty());
         assert_true(learner.IsVoter(2));
@@ -466,21 +475,134 @@ void test_joint_membership_addition_and_finalization_replicate_deterministically
         const auto removalJoint = leader.ProposeJointConfiguration({1});
         assert_int_equal(removalJoint, 4);
         assert_true(leader.IsVoter(2));
-        leader.ProcessTimeout(now + std::chrono::seconds(60));
+        leaderTimeout(std::chrono::seconds(60));
         assert_int_equal(leader.GetVolatileState()->CommitIndex, removalJoint);
-        leader.ProcessTimeout(now + std::chrono::seconds(70));
+        leaderTimeout(std::chrono::seconds(70));
         assert_int_equal(learnerState->CommitIndex, removalJoint);
         const auto removalStable = leader.FinalizeConfiguration();
         assert_int_equal(removalStable, 5);
-        leader.ProcessTimeout(now + std::chrono::seconds(80));
+        leaderTimeout(std::chrono::seconds(80));
         assert_int_equal(leader.GetVolatileState()->CommitIndex, removalStable);
         assert_false(leader.IsVoter(2));
-        leader.ProcessTimeout(now + std::chrono::seconds(90));
+        leaderTimeout(std::chrono::seconds(90));
         assert_int_equal(learnerState->CommitIndex, removalStable);
         assert_false(leader.IsVoter(2));
         assert_false(learner.IsVoter(2));
         assert_true(leader.GetVoterIds() == (std::vector<uint32_t>{1}));
         assert_true(learner.GetVoterIds() == (std::vector<uint32_t>{1}));
+
+        // Promote the caught-up learner while jointly retaining the old leader,
+        // then transfer leadership so the stable successor can remove it.
+        const auto leaderRemovalJoint = leader.ProposeJointConfiguration({2});
+        assert_int_equal(leaderRemovalJoint, 6);
+        leaderTimeout(std::chrono::seconds(100));
+        assert_int_equal(leader.GetVolatileState()->CommitIndex, leaderRemovalJoint);
+        rpcNow = now + std::chrono::seconds(100);
+        Reject([&] { leader.TransferLeadership(2, rpcNow); });
+        assert_true(leader.CurrentStateName() == EState::LEADER); // Commit watermark has not reached node 2 yet.
+        leaderTimeout(std::chrono::seconds(104));
+        assert_int_equal(learnerState->CommitIndex, leaderRemovalJoint);
+        const auto beforeOldLeaderFinalization = static_cast<TStateFields>(*learnerState);
+        const auto jointTerm = leaderState->LogTerm(leaderRemovalJoint);
+        auto oldLeaderStable = EncodeConfigurationEntry(TConfigurationRecord{
+            EConfigurationPhase::Stable, leaderState->CurrentTerm, leaderRemovalJoint, jointTerm, {1}, {2}});
+        auto invalidFinalization = NewHoldedMessage(
+            TMessageEx{.Src = 1, .Dst = 2, .Term = leaderState->CurrentTerm, .Seqno = 0},
+            TAppendEntriesRequest{
+                .PrevLogIndex = leaderRemovalJoint, .PrevLogTerm = jointTerm,
+                .LeaderCommit = leaderRemovalJoint, .LeaderId = 1, .Nentries = 1,
+            });
+        invalidFinalization.InitPayload(1);
+        invalidFinalization.Payload[0] = oldLeaderStable;
+        learner.Process(rpcNow, invalidFinalization);
+        assert_true(static_cast<TStateFields>(*learnerState) == beforeOldLeaderFinalization);
+
+        const auto beforeInvalidTransfer = static_cast<TStateFields>(*learnerState);
+        auto invalidTransfer = NewHoldedMessage(
+            TMessageEx{.Src = 1, .Dst = 2, .Term = leaderState->CurrentTerm + 1},
+            TTimeoutNowRequest{
+                .LeaderId = 1, .TargetId = 1, // A transfer to another node cannot trigger this follower.
+                .LastLogIndex = leaderState->LastLogIndex, .LastLogTerm = leaderState->LastLogTerm,
+                .CommitIndex = leaderState->CommitIndex, .CommitTerm = leaderState->LogTerm(leaderState->CommitIndex),
+                .ConfigurationIndex = leaderRemovalJoint, .ConfigurationTerm = leaderState->LogTerm(leaderRemovalJoint),
+            });
+        learner.Process(rpcNow, invalidTransfer);
+        assert_true(static_cast<TStateFields>(*learnerState) == beforeInvalidTransfer);
+        assert_true(learner.CurrentStateName() == EState::FOLLOWER);
+        rpcNow = now + std::chrono::seconds(105);
+        leader.TransferLeadership(2, rpcNow);
+        assert_true(leader.CurrentStateName() == EState::FOLLOWER);
+        assert_true(learner.CurrentStateName() == EState::CANDIDATE);
+
+        learnerTimeout(now + std::chrono::seconds(105) + std::chrono::milliseconds(1));
+        assert_true(learner.CurrentStateName() == EState::LEADER);
+        assert_true(leader.CurrentStateName() == EState::FOLLOWER);
+        learnerTimeout(now + std::chrono::seconds(106)); // Commit the new leader's current-term entry.
+        assert_int_equal(learner.GetVolatileState()->CommitIndex, learnerState->LastLogIndex);
+        const auto leaderRemovalStable = learner.FinalizeConfiguration();
+        assert_int_equal(leaderRemovalStable, 8);
+        learnerTimeout(now + std::chrono::seconds(107));
+        learnerTimeout(now + std::chrono::seconds(110));
+        assert_false(learner.IsVoter(1)); assert_true(learner.IsVoter(2));
+        assert_false(leader.IsVoter(1)); assert_true(leader.IsVoter(2));
+        assert_true(learner.GetVoterIds() == (std::vector<uint32_t>{2}));
+        assert_true(leader.GetVoterIds() == (std::vector<uint32_t>{2}));
+    }
+    std::error_code ignored; std::filesystem::remove_all(dir, ignored);
+#endif
+}
+void test_dropped_timeout_now_recovers_old_leader_under_joint_quorum(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-transfer-failure-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const auto name = (dir / "raft").string();
+    {
+        auto toLearner = std::make_shared<TEndpoint>();
+        auto toLeader = std::make_shared<TEndpoint>();
+        auto leaderState = std::make_shared<TDurableState>(name, 1);
+        auto learnerState = std::make_shared<TDurableState>(name, 2);
+        TRaft leader(leaderState, 1, {{2, toLearner}}, {2});
+        TRaft learner(learnerState, 2, {{1, toLeader}}, {2});
+        const auto start = ITimeSource::Time{};
+        auto rpcNow = start;
+        bool timeoutNowDropped = false;
+        toLearner->Route = [&](auto message) {
+            if (message->Type == uint32_t(EMessageType::TIMEOUT_NOW_REQUEST)) {
+                timeoutNowDropped = true;
+                return;
+            }
+            learner.Process(rpcNow, std::move(message));
+        };
+        toLeader->Route = [&](auto message) { leader.Process(rpcNow, std::move(message)); };
+        auto leaderTimeout = [&](std::chrono::milliseconds offset) {
+            rpcNow = start + offset;
+            leader.ProcessTimeout(rpcNow);
+        };
+
+        leader.ProcessTimeout(start);
+        leaderTimeout(std::chrono::seconds(10)); // Commit the leader's current-term no-op.
+        assert_true(leader.IsLearnerCommitAcknowledged(2));
+        const auto jointIndex = leader.ProposeJointConfiguration({2});
+        leaderTimeout(std::chrono::seconds(20));
+        leaderTimeout(std::chrono::seconds(30));
+        leaderTimeout(std::chrono::seconds(40)); // Propagate the committed joint watermark.
+        assert_int_equal(learnerState->CommitIndex, jointIndex);
+
+        rpcNow = start + std::chrono::seconds(41);
+        leader.TransferLeadership(2, rpcNow);
+        assert_true(timeoutNowDropped);
+        assert_true(leader.CurrentStateName() == EState::FOLLOWER);
+        assert_true(learner.CurrentStateName() == EState::FOLLOWER);
+
+        // With no transfer message delivered, the old leader's ordinary
+        // election timer fires. The new-set voter grants its vote under the
+        // still-active joint quorum, allowing the old leader to recover.
+        leaderTimeout(std::chrono::seconds(55));
+        leaderTimeout(std::chrono::seconds(55) + std::chrono::milliseconds(1));
+        assert_true(leader.CurrentStateName() == EState::LEADER);
+        assert_true(learner.CurrentStateName() == EState::FOLLOWER);
+        assert_true(leader.GetVoterIds() == (std::vector<uint32_t>{1, 2}));
     }
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 #endif
@@ -1083,6 +1205,7 @@ int main() {
         cmocka_unit_test(test_configuration_rejects_invalid_fields_and_valid_crc_corruption),
         cmocka_unit_test(test_configuration_rpc_and_proposal_are_rejected_before_mutation),
         cmocka_unit_test(test_joint_membership_addition_and_finalization_replicate_deterministically),
+        cmocka_unit_test(test_dropped_timeout_now_recovers_old_leader_under_joint_quorum),
         cmocka_unit_test(test_stable_membership_compaction_recovers_active_voters),
         cmocka_unit_test(test_snapshot_install_validates_and_advances_committed_membership_history),
         cmocka_unit_test(test_uncommitted_joint_suffix_replacement_restores_old_voters),

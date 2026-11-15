@@ -132,11 +132,15 @@ public:
     uint64_t Append(TMessageHolder<TLogEntry> entry);
     // Start a joint-consensus transition. Every newly added voter must already
     // be staged as a learner and have acknowledged this leader's committed
-    // boundary. This first runtime path requires the current leader to remain
-    // in the new voter set; leadership transfer must precede leader removal.
+    // boundary. A transition may exclude the leader; transfer leadership to a
+    // caught-up voter in the new set after the joint entry commits.
     uint64_t ProposeJointConfiguration(std::vector<uint32_t> newVoters);
     // Append the stable successor after the joint entry has committed.
     uint64_t FinalizeConfiguration();
+    // Step down and ask a caught-up voter in the committed new set to campaign
+    // immediately. If that election fails, this node can campaign again after
+    // its election timeout.
+    void TransferLeadership(uint32_t target, ITimeSource::Time now);
     uint32_t GetLeaderId() const;
     uint64_t GetLastIndex() const;
     std::vector<uint32_t> GetVoterIds() const;
@@ -205,6 +209,7 @@ private:
     void AdvanceLeaderCommit();
     void OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnapshotRequest> message);
     void OnInstallSnapshot(TMessageHolder<TInstallSnapshotResponse> message);
+    void OnTimeoutNow(ITimeSource::Time now, TMessageHolder<TTimeoutNowRequest> message);
     TMessageHolder<TInstallSnapshotRequest> CreateInstallSnapshot(uint32_t nodeId);
     void Candidate(ITimeSource::Time now, TMessageHolder<TMessage> message);
     void Follower(ITimeSource::Time now, TMessageHolder<TMessage> message);

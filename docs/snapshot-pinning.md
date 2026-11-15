@@ -60,5 +60,6 @@ This guarantees progress of the selected finite image under eventual chunk
 delivery and ACKs. Reaching the live log end still requires enough replication
 capacity relative to writes/compaction and sufficiently stable leadership.
 The bounded promotion and joint-consensus path is described in
-[live membership](configuration-entries.md). Membership-aware snapshots and
-leader removal remain open.
+[live membership](configuration-entries.md). Joint snapshot installation
+remains open. Leader removal is supported by
+[leadership transfer](leadership-transfer.md).

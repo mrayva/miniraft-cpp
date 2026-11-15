@@ -12,11 +12,14 @@ binding. `TDurableState` provides those guarantees. In-memory `TState` and legac
 stores cannot start a live transition. The leader must have a committed entry in
 its current term. Every newly added voter must first be staged as a learner and
 have a correlated replication acknowledgement through the leader's committed
-boundary. The leader must be a member of the new set. The currently supported
-API cannot remove its active leader; this library does not yet provide a
-leadership-transfer API. Every node must have replication endpoints for all
-voters before it accepts the transition. Endpoint discovery and configuration
-distribution remain responsibilities of the embedding application.
+boundary. If the leader remains in the new set, it can finalize the transition
+after the joint entry commits. To remove the active leader, commit the joint
+entry, transfer leadership to a caught-up voter in the new set, then let that
+leader append the stable successor. The bounded transfer protocol and its
+failure behavior are described in [leadership transfer](leadership-transfer.md).
+Every node must have replication endpoints for all voters before it accepts the
+transition. Endpoint discovery and configuration distribution remain
+responsibilities of the embedding application.
 On restart, construct each Raft object with the persisted original voter set and
 configure later members as learners in that bootstrap view; the retained log
 then recovers their active roles. Supplying the latest voter set as if it were
@@ -58,9 +61,9 @@ cannot prove, are rejected. MRFTS002 joint snapshot installation remains
 unsupported. Do not remove or edit committed state to bypass these limits.
 
 Deterministic durable-store tests cover learner catch-up, voter addition and
-nonleader removal, per-node activation, joint commit propagation, stable
-finalization, rejection of a bad predecessor before term mutation, and rollback
-of an uncommitted joint suffix. The test suite also checks recovery of retained
-joint and stable histories, including post-restart role recovery after adding
-and removing a voter. This is a first live transition slice; it does not claim
-joint snapshot installation or explicit leadership transfer.
+removal, leadership transfer and fallback when its request is dropped,
+per-node activation, joint commit propagation, stable finalization, rejection
+of invalid higher-term RPCs before term mutation, and rollback of an
+uncommitted joint suffix. The test suite also checks recovery of retained joint
+and stable histories, including post-restart role recovery after adding and
+removing a voter. Joint snapshot installation remains unsupported.

@@ -42,9 +42,11 @@ The [learner follow-up](docs/learners.md) adds non-voting catch-up and durable
 voter binding. KV uses `--learner id` on every replica's configuration. The
 [live joint-membership step](docs/configuration-entries.md) adds a durable-store
 `TRaft` API for adding and removing nonleader voters through joint consensus;
-local compaction now works after a committed stable transition. Leader removal
-and joint snapshot installation remain unsupported. A stable snapshot can cross
-a committed membership transition when the receiver has the exact committed
+local compaction now works after a committed stable transition. The bounded
+[leadership-transfer follow-up](docs/leadership-transfer.md) enables removing
+the active leader after the joint configuration commits. Joint snapshot
+installation remains unsupported. A stable snapshot can cross a committed
+membership transition when the receiver has the exact committed
 stable identity and voter set. The network server reconciles peer response
 readers as voters change roles.
 The [snapshot retry follow-up](docs/snapshot-retries.md) prevents timeout retries
@@ -162,7 +164,7 @@ log replication, and fault tolerance in a distributed system.
 - **Log Replication** (supported)
 - **Persistence** (supported)
 - **Snapshots** (opt-in KV compaction and InstallSnapshot; Linux durable backend)
-- **Membership Change** (durable joint-consensus add/remove; post-transition local compaction works; leader transfer and cross-transition snapshot install remain open)
+- **Membership Change** (durable joint-consensus add/remove, including leadership transfer for leader removal; joint snapshot installation remains open)
 
 The project focuses on a clear, modular design that leverages C++20 coroutines to simplify asynchronous flows.
 

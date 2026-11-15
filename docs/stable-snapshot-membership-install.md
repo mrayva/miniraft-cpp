@@ -15,11 +15,12 @@ Raft advances the configuration scan baseline to the new snapshot boundary so
 later entries continue from the correct history.
 
 Snapshots remain rejected while the receiver's history is joint or has an
-uncommitted transition. Joint MRFTS002 snapshot installation, transfer to a
-receiver that has not committed the matching stable configuration, and leader
-removal are still unsupported. Snapshot metadata is a consistency assertion,
-not cryptographic proof of cluster identity; this path trusts the receiver's
-previously validated durable configuration history.
+uncommitted transition. Joint MRFTS002 snapshot installation and transfer to a
+receiver that has not committed the matching stable configuration remain
+unsupported. Leader removal was added later through
+[leadership transfer](leadership-transfer.md). Snapshot metadata is a
+consistency assertion, not cryptographic proof of cluster identity; this path
+trusts the receiver's previously validated durable configuration history.
 
 Deterministic coverage includes rejecting a forged identity before accepting a
 higher term, accepting a matching stable snapshot after a committed transition,

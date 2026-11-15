@@ -27,7 +27,9 @@ This caps the number of distinct active transfer generations, not total process
 heap usage. Current application/log state, snapshot capture and installation,
 transport buffers and other allocations remain outside this limit; a global byte
 quota and disk-streamed snapshot transfer remain open. Voter membership changes
-and joint snapshot installation are also still unsupported.
+are available through [live membership](configuration-entries.md), with leader
+removal supported by [leadership transfer](leadership-transfer.md). Joint
+snapshot installation remains unsupported.
 
 Self-review checked the two-generation accounting, exception ordering before
 state mutation, cache ownership and retry path. No independent reviewer approval

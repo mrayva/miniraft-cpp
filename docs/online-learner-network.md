@@ -31,8 +31,9 @@ lost on restart or failover; the new leader and the application must reconcile
 it. This adds network transport support for non-voting catch-up. Voter promotion
 and replicated joint consensus are now available through the bounded durable
 transition path in [live membership](configuration-entries.md). Leader removal
-and joint snapshot installation remain unsupported; stable snapshots require
-the receiver to have the matching committed membership identity. The server now
+is supported after joint commit through [leadership transfer](leadership-transfer.md).
+Joint snapshot installation remains unsupported; stable snapshots require the
+receiver to have the matching committed membership identity. The server now
 starts response readers when peers become voters during a live transition,
 without restarting `Serve()`.
 

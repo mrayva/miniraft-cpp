@@ -139,8 +139,9 @@ proofs, snapshot voter metadata, v1/v2/v3 decoding, publication ordering and the
 distinction between log catch-up and promotion. No independent reviewer approval
 is claimed. Process crashes do not substitute for hardware power-cut testing.
 
-This closes the non-voting catch-up phase, not dynamic voting membership. Next
-are replicated joint configurations, old/new election/commit/read majorities,
-promotion gates, leader removal and configuration history in snapshots. Online
-transport discovery, authenticated bootstrap, SQL snapshots, resource quotas and
-independent review remain open production gates.
+The later [live membership follow-up](configuration-entries.md) adds replicated
+joint configurations, old/new election/commit/read majorities and promotion
+gates. [Leadership transfer](leadership-transfer.md) enables removing the active
+leader. Joint snapshot recovery and installation, online transport discovery,
+authenticated bootstrap, SQL snapshots, resource quotas and independent review
+remain open production gates.

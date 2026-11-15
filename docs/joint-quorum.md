@@ -31,7 +31,11 @@ and live changes require a bound original voter set, a persisted commit index an
 endpoints for every active voter. Joint snapshot recovery and snapshot transfer
 across a membership transition remain unsupported; compaction is rejected while
 the retained log contains a membership change beyond its snapshot baseline.
-Leader removal and explicit leadership transfer are not implemented.
+Leader removal and explicit leadership transfer were not implemented in this
+milestone. Follow-up: [leadership transfer](leadership-transfer.md) adds a
+bounded `TimeoutNow` path for removing the active leader after the joint entry
+commits. Joint snapshot recovery and transition-crossing snapshot transfer
+remain open.
 
 The change adds a public type and changes TRaft's in-memory layout; rebuild the
 library and dependents together. Wire and durable formats are unchanged.

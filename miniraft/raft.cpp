@@ -617,6 +617,8 @@ void TRaft::Follower(ITimeSource::Time now, TMessageHolder<TMessage> message) {
         OnAppendEntries(now, std::move(maybeAppendEntries.Cast()));
     } else if (auto snapshot = message.Maybe<TInstallSnapshotRequest>()) {
         OnInstallSnapshot(now, snapshot.Cast());
+    } else if (auto transfer = message.Maybe<TTimeoutNowRequest>()) {
+        OnTimeoutNow(now, transfer.Cast());
     }
 }
 
@@ -756,6 +758,25 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
             response->NextOffset <= TSnapshot::MaxBytes && response->Success <= 1 && response->Installed <= 1 &&
             (!response->Installed || response->Success) && (response->Success || response->NextOffset == 0);
     }
+    case EMessageType::TIMEOUT_NOW_REQUEST: {
+        auto transfer = message.Cast<TTimeoutNowRequest>();
+        if (StateName != EState::FOLLOWER || header->Term != State->CurrentTerm ||
+            State->CurrentTerm == UINT64_MAX || !Configuration ||
+            Configuration->HasUncommittedConfiguration() || !Configuration->Committed.IsJoint())
+            return false;
+        const auto& joint = Configuration->Committed;
+        return transfer->LeaderId == header->Src && transfer->TargetId == Id &&
+            VolatileState->LeaderId == header->Src &&
+            std::binary_search(joint.OldVoters().begin(), joint.OldVoters().end(), header->Src) &&
+            !std::binary_search(joint.NewVoters().begin(), joint.NewVoters().end(), header->Src) &&
+            std::binary_search(joint.NewVoters().begin(), joint.NewVoters().end(), Id) &&
+            transfer->ConfigurationIndex == joint.ConfigurationIndex() &&
+            transfer->ConfigurationTerm == joint.ConfigurationTerm() &&
+            transfer->LastLogIndex == State->LastLogIndex && transfer->LastLogTerm == State->LastLogTerm &&
+            transfer->CommitIndex >= joint.ConfigurationIndex() &&
+            transfer->CommitIndex <= VolatileState->CommitIndex && transfer->CommitIndex <= State->CommitIndex &&
+            transfer->CommitTerm > 0 && State->LogTerm(transfer->CommitIndex) == transfer->CommitTerm;
+    }
     case EMessageType::APPEND_ENTRIES_REQUEST: {
         auto append = message.Cast<TAppendEntriesRequest>();
         if (append->LeaderId != header->Src || append->PrevLogIndex > maxIndex ||
@@ -784,10 +805,13 @@ bool TRaft::ValidateAppendConfiguration(TMessageHolder<TAppendEntriesRequest> me
         if (!(entry->Flags & TLogEntry::EConfiguration)) continue;
         try {
             const auto record = DecodeConfigurationEntry(entry);
-            // A transition leader must be able to remain a voter through the
-            // stable successor. Leader removal needs an explicit transfer and
-            // commit-propagation protocol, which this runtime does not yet have.
-            if (!std::binary_search(record.NewVoters.begin(), record.NewVoters.end(), message->LeaderId))
+            const bool leaderInOld = std::binary_search(record.OldVoters.begin(), record.OldVoters.end(), message->LeaderId);
+            const bool leaderInNew = std::binary_search(record.NewVoters.begin(), record.NewVoters.end(), message->LeaderId);
+            // Only an old-set leader may propose the joint entry. A stable
+            // successor can be proposed only by a new-set leader, after a
+            // transfer when the active leader is being removed.
+            if ((record.Phase == EConfigurationPhase::Joint && !leaderInOld) ||
+                (record.Phase == EConfigurationPhase::Stable && !leaderInNew))
                 return false;
         } catch (const std::exception&) {
             return false;
@@ -1032,8 +1056,8 @@ uint64_t TRaft::ProposeJointConfiguration(std::vector<uint32_t> newVoters) {
         throw std::logic_error("A current-term entry must be committed before changing membership");
 
     const auto& oldVoters = Configuration->Committed.OldVoters();
-    if (newVoters == oldVoters || !std::binary_search(newVoters.begin(), newVoters.end(), Id))
-        throw std::invalid_argument("The new voter set must change membership and retain the current leader");
+    if (newVoters == oldVoters)
+        throw std::invalid_argument("The new voter set must change membership");
     for (auto id : newVoters) {
         if (id != Id && !Nodes.contains(id))
             throw std::invalid_argument("Every new voter must have a configured replication target");
@@ -1067,6 +1091,56 @@ uint64_t TRaft::FinalizeConfiguration() {
     State->Append(EncodeConfigurationEntry(record));
     RefreshConfiguration(VolatileState->CommitIndex);
     return State->LastLogIndex;
+}
+
+void TRaft::TransferLeadership(uint32_t target, ITimeSource::Time now) {
+    if (StateName != EState::LEADER) throw std::logic_error("Only a leader can transfer leadership");
+    RequireLiveConfigurationStorage();
+    if (State->CurrentTerm == UINT64_MAX) throw std::overflow_error("Raft term exhausted");
+    if (!Configuration || Configuration->HasUncommittedConfiguration() || !Configuration->Committed.IsJoint())
+        throw std::logic_error("Leadership transfer requires a committed joint configuration");
+    const auto& joint = Configuration->Committed;
+    if (std::binary_search(joint.NewVoters().begin(), joint.NewVoters().end(), Id) ||
+        !std::binary_search(joint.NewVoters().begin(), joint.NewVoters().end(), target) ||
+        target == Id || !Nodes.contains(target))
+        throw std::invalid_argument("Transfer target must be a different voter in the joint configuration's new set");
+    if (!VolatileState->CommitIndex || State->LogTerm(VolatileState->CommitIndex) != State->CurrentTerm)
+        throw std::logic_error("A current-term entry must be committed before transferring leadership");
+    const auto match = VolatileState->MatchIndex.find(target);
+    const auto commitAck = VolatileState->CommitAckIndex.find(target);
+    if (match == VolatileState->MatchIndex.end() || match->second < State->LastLogIndex ||
+        commitAck == VolatileState->CommitAckIndex.end() || commitAck->second < VolatileState->CommitIndex)
+        throw std::logic_error("Transfer target must acknowledge the leader's complete committed log");
+
+    auto request = NewHoldedMessage(
+        TMessageEx{.Src = Id, .Dst = target, .Term = State->CurrentTerm},
+        TTimeoutNowRequest{
+            .LeaderId = Id, .TargetId = target,
+            .LastLogIndex = State->LastLogIndex, .LastLogTerm = State->LastLogTerm,
+            .CommitIndex = VolatileState->CommitIndex, .CommitTerm = State->LogTerm(VolatileState->CommitIndex),
+            .ConfigurationIndex = joint.ConfigurationIndex(), .ConfigurationTerm = joint.ConfigurationTerm(),
+        });
+
+    // Stop issuing writes before asking the target to campaign. If the request
+    // is lost, the ordinary election timeout lets this node recover leadership.
+    Become(EState::FOLLOWER);
+    VolatileState->LeaderId = 0;
+    VolatileState->ElectionDue = MakeElection(now);
+    VolatileState->SnapshotRpcs.clear();
+    VolatileState->PendingAppendRpcs.clear();
+    IncomingSnapshot.reset();
+    EncodedSnapshot.reset();
+    EncodedSnapshotIndex = 0;
+    Nodes.at(target)->Send(std::move(request));
+}
+
+void TRaft::OnTimeoutNow(ITimeSource::Time now, TMessageHolder<TTimeoutNowRequest>) {
+    // ValidateRpc has established that the recognized old leader is excluded
+    // from the committed new set and that this node has the exact transfer
+    // boundary. Reuse the normal election path so term persistence, vote
+    // clearing and joint-quorum arithmetic stay identical to timeout elections.
+    VolatileState->ElectionDue = now;
+    ProcessTimeout(now);
 }
 
 uint32_t TRaft::GetLeaderId() const {
