@@ -21,12 +21,14 @@ At alpha.69, snapshots were rejected while the receiver's history was joint or
 had an uncommitted transition. Since alpha.71, MRFTS002 installation is enabled
 when the receiver has committed the same joint configuration, as described in
 [joint snapshot runtime](joint-snapshot-runtime.md). A fresh learner can also
-bootstrap from MRFTS002 when configured with the union of both voter sets. A
-node with existing state still needs matching committed history. Leader removal
-was added later through [leadership transfer](leadership-transfer.md). Snapshot
-metadata is a consistency assertion, not cryptographic proof of cluster
-identity; the learner bootstrap path relies on its configured voter set and a
-sender named in the incoming active set.
+bootstrap from MRFTS002 when configured with the union of both voter sets. An
+existing receiver may now install a matching snapshot before its uncommitted
+configuration entry, retaining that suffix; a snapshot that covers the entry is
+still rejected. A node with existing state still needs matching committed
+history. Leader removal was added later through [leadership transfer](leadership-transfer.md).
+Snapshot metadata is a consistency assertion, not cryptographic proof of
+cluster identity; the learner bootstrap path relies on its configured voter set
+and a sender named in the incoming active set.
 
 Deterministic coverage includes rejecting a forged identity before accepting a
 higher term, accepting a matching stable snapshot after a committed transition,

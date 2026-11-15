@@ -194,8 +194,11 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm) {
     const auto index = rsm.LastAppliedIndex;
     if (!index || index > raft.GetVolatileState()->CommitIndex || index > raft.GetLastIndex())
         throw std::runtime_error("Snapshot requires applied committed progress");
-    if (!raft.Configuration || raft.Configuration->HasUncommittedConfiguration())
-        throw std::logic_error("Snapshot capture requires a committed configuration boundary");
+    if (!raft.Configuration)
+        throw std::logic_error("Snapshot capture requires validated configuration history");
+    if (raft.Configuration->HasUncommittedConfiguration() &&
+        index >= raft.Configuration->Latest.ConfigurationIndex())
+        throw std::logic_error("Snapshot boundary cannot cover an uncommitted configuration");
     const auto& committed = raft.Configuration->Committed;
     if (committed.ConfigurationIndex() > index)
         throw std::logic_error("Application progress precedes the committed configuration");

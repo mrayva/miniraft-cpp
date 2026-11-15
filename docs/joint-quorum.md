@@ -30,12 +30,13 @@ This arithmetic now backs the bounded live transition API described in
 and live changes require a bound original voter set, a persisted commit index and
 endpoints for every active voter. Joint snapshot recovery requires the exact
 committed joint identity; transfer that would introduce an unknown transition
-or cross uncommitted history remains unsupported.
+or include a receiver's uncommitted configuration entry remains unsupported.
 Leader removal and explicit leadership transfer were not implemented in this
 milestone. Follow-up: [leadership transfer](leadership-transfer.md) adds a
 bounded `TimeoutNow` path for removing the active leader after the joint entry
-commits. Joint snapshots require matching committed history; transfer across
-an uncommitted configuration remains open.
+commits. Joint snapshots require matching committed history. A matching snapshot
+may cover committed progress before a pending configuration entry while
+preserving that entry in the retained suffix.
 
 The change adds a public type and changes TRaft's in-memory layout; rebuild the
 library and dependents together. Wire and durable formats are unchanged.

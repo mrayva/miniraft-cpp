@@ -84,12 +84,12 @@ bool SnapshotMetadataContinuesKnown(const TSnapshot* known, bool joint, bool sta
 
 bool CanBootstrapFreshLearnerSnapshot(uint32_t receiverId, const IState& state,
         const std::vector<uint32_t>& localVoters, const IRsm* application,
-        const TConfigurationHistory* committedConfiguration, bool configurationCommitted) {
+        const TConfigurationHistory* committedConfiguration, bool configurationBoundaryKnown) {
     return application && application->LastAppliedIndex == 0 &&
         !std::binary_search(localVoters.begin(), localVoters.end(), receiverId) &&
         state.VotedFor == 0 && state.LastLogIndex == 0 && state.LastLogTerm == 0 &&
         state.CommitIndex == 0 && state.SnapshotIndex == 0 && state.SnapshotTerm == 0 &&
-        !state.GetSnapshot() && configurationCommitted && committedConfiguration &&
+        !state.GetSnapshot() && configurationBoundaryKnown && committedConfiguration &&
         !committedConfiguration->IsJoint() && committedConfiguration->ConfigurationIndex() == 0 &&
         committedConfiguration->ConfigurationTerm() == 0 && committedConfiguration->ThroughIndex() == 0 &&
         committedConfiguration->OldVoters() == localVoters;
@@ -115,10 +115,27 @@ bool SnapshotMatchesFreshLearnerBootstrap(const TSnapshot& snapshot,
         !std::binary_search(activeVoters.begin(), activeVoters.end(), receiverId);
 }
 
+bool SnapshotBoundaryHasKnownConfiguration(const TConfigurationScan* configuration, uint64_t index) {
+    if (!configuration) return false;
+    if (!configuration->HasUncommittedConfiguration()) return true;
+    // The snapshot may replace application/log progress before an uncommitted
+    // configuration entry, but it cannot assert that entry as committed.
+    return configuration->Latest.ConfigurationIndex() > configuration->Committed.ConfigurationIndex() &&
+        index < configuration->Latest.ConfigurationIndex();
+}
+
+std::vector<uint32_t> ConfigurationVoterUnion(const TConfigurationHistory& configuration) {
+    auto voters = configuration.OldVoters();
+    voters.insert(voters.end(), configuration.NewVoters().begin(), configuration.NewVoters().end());
+    std::sort(voters.begin(), voters.end());
+    voters.erase(std::unique(voters.begin(), voters.end()), voters.end());
+    return voters;
+}
+
 TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t totalBytes,
         uint64_t index, uint64_t term, const std::vector<uint32_t>& voters,
         const TSnapshot* knownSnapshot, const TConfigurationHistory* committedConfiguration,
-        bool configurationCommitted, bool allowFreshLearnerBootstrap,
+        bool configurationBoundaryKnown, bool allowFreshLearnerBootstrap,
         uint32_t leaderId, uint32_t receiverId) {
     if (prefix.size() < 8) return {false, false, 8};
     const auto magic = prefix.substr(0, 8);
@@ -128,7 +145,7 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
     const bool freshLearnerBootstrap = allowFreshLearnerBootstrap && (stable || joint);
     // The active configuration phase is already trusted from local committed
     // history, so reject phase mismatches as soon as the format is identified.
-    if (!configurationCommitted || !committedConfiguration ||
+    if (!configurationBoundaryKnown || !committedConfiguration ||
         (joint != committedConfiguration->IsJoint() && !freshLearnerBootstrap))
         return {true, false, 0};
 
@@ -915,12 +932,16 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
             const auto knownSnapshot = State->GetSnapshot();
             const auto* committedConfiguration = Configuration ? &Configuration->Committed : nullptr;
             const auto application = SnapshotApplication.lock();
+            const auto snapshotVoters = committedConfiguration
+                ? ConfigurationVoterUnion(*committedConfiguration) : std::vector<uint32_t>{};
+            const bool configurationBoundaryKnown = SnapshotBoundaryHasKnownConfiguration(
+                Configuration ? &*Configuration : nullptr, request->SnapshotIndex);
             const auto probe = ProbeSnapshotMetadata(std::string_view(request->Data, length),
                 request->TotalBytes, request->SnapshotIndex, request->SnapshotTerm,
-                GetVoterIds(), knownSnapshot.get(), committedConfiguration,
-                Configuration && !Configuration->HasUncommittedConfiguration(),
+                snapshotVoters, knownSnapshot.get(), committedConfiguration,
+                configurationBoundaryKnown,
                 CanBootstrapFreshLearnerSnapshot(Id, *State, GetVoterIds(), application.get(),
-                    committedConfiguration, Configuration && !Configuration->HasUncommittedConfiguration()),
+                    committedConfiguration, configurationBoundaryKnown),
                 request->LeaderId, Id);
             if (!probe.Complete || !probe.Supported) return false;
         }
@@ -1514,8 +1535,6 @@ bool TRaft::IsLearnerCommitAcknowledged(uint32_t id) const {
 
 TSnapshot TRaft::Compact() {
     if (!State->SupportsSnapshots()) throw std::logic_error("Storage cannot compact snapshots");
-    if (Configuration && Configuration->HasUncommittedConfiguration())
-        throw std::logic_error("Compaction requires a committed configuration boundary");
     if (Configuration && Configuration->Committed.ConfigurationIndex()) {
         const auto configurationIndex = Configuration->Committed.ConfigurationIndex();
         if (IsVoter(Id) && StateName == EState::LEADER) {
@@ -1667,9 +1686,13 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         }
         const auto knownSnapshot = State->GetSnapshot();
         const auto* committedConfiguration = Configuration ? &Configuration->Committed : nullptr;
+        const auto snapshotVoters = committedConfiguration
+            ? ConfigurationVoterUnion(*committedConfiguration) : std::vector<uint32_t>{};
+        const bool configurationBoundaryKnown = SnapshotBoundaryHasKnownConfiguration(
+            Configuration ? &*Configuration : nullptr, request->SnapshotIndex);
         const auto probe = ProbeSnapshotMetadata(prefix, request->TotalBytes,
-            request->SnapshotIndex, request->SnapshotTerm, GetVoterIds(), knownSnapshot.get(),
-            committedConfiguration, Configuration && !Configuration->HasUncommittedConfiguration(),
+            request->SnapshotIndex, request->SnapshotTerm, snapshotVoters, knownSnapshot.get(),
+            committedConfiguration, configurationBoundaryKnown,
             false, request->LeaderId, Id);
         if (!probe.Complete) { reply(true, false, prefix.size()); return; }
         IncomingSnapshot.reset();
@@ -1703,12 +1726,15 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     }
     const auto knownSnapshot = State->GetSnapshot();
     const auto* committedConfiguration = Configuration ? &Configuration->Committed : nullptr;
-    const bool configurationCommitted = Configuration && !Configuration->HasUncommittedConfiguration();
+    const auto snapshotVoters = committedConfiguration
+        ? ConfigurationVoterUnion(*committedConfiguration) : std::vector<uint32_t>{};
+    const bool configurationBoundaryKnown = SnapshotBoundaryHasKnownConfiguration(
+        Configuration ? &*Configuration : nullptr, request->SnapshotIndex);
     const auto probe = ProbeSnapshotMetadata(bytes, request->TotalBytes,
-        request->SnapshotIndex, request->SnapshotTerm, GetVoterIds(), knownSnapshot.get(),
-        committedConfiguration, configurationCommitted,
+        request->SnapshotIndex, request->SnapshotTerm, snapshotVoters, knownSnapshot.get(),
+        committedConfiguration, configurationBoundaryKnown,
         CanBootstrapFreshLearnerSnapshot(Id, *State, GetVoterIds(), application.get(),
-            committedConfiguration, configurationCommitted),
+            committedConfiguration, configurationBoundaryKnown),
         request->LeaderId, Id);
     if (!probe.Complete) { reply(true, false, bytes.size()); return; }
     if (!probe.Supported) { IncomingSnapshot.reset(); reply(false, false, 0); return; }
@@ -1719,7 +1745,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         snapshot = DecodeSnapshot(bytes);
         const bool freshLearnerBootstrap = probe.FreshLearnerBootstrap &&
             CanBootstrapFreshLearnerSnapshot(Id, *State, GetVoterIds(), application.get(),
-                committedConfiguration, configurationCommitted);
+                committedConfiguration, configurationBoundaryKnown);
         if (snapshot.Index != request->SnapshotIndex || snapshot.Term != request->SnapshotTerm ||
             (!SnapshotMatchesCommittedConfiguration(snapshot, Configuration->Committed) &&
              (!freshLearnerBootstrap ||

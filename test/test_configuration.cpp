@@ -872,6 +872,25 @@ void test_stable_membership_compaction_recovers_active_voters(void**) {
         assert_true(leaderState->GetBoundVoters() == (std::vector<uint32_t>{1}));
         assert_int_equal(snapshot.ConfigurationIndex, stableIndex);
         assert_int_equal(snapshot.ConfigurationTerm, leaderState->LogTerm(stableIndex));
+
+        // A committed application prefix before a pending transition can be
+        // compacted while retaining the uncommitted configuration entry.
+        const auto appliedIndex = leader->Append(Ordinary(leaderState->CurrentTerm));
+        pump(); pump(); // First commit locally, then propagate the new commit boundary.
+        assert_int_equal(leader->GetVolatileState()->CommitIndex, appliedIndex);
+        assert_int_equal(addedState->CommitIndex, appliedIndex);
+        assert_int_equal(leaderApp->LastAppliedIndex, appliedIndex);
+        const auto pendingJointIndex = leader->ProposeJointConfiguration({1});
+        assert_int_equal(pendingJointIndex, appliedIndex + 1);
+
+        snapshot = leader->Compact();
+        assert_int_equal(snapshot.Index, appliedIndex);
+        assert_true(snapshot.StableConfiguration);
+        assert_int_equal(leaderState->SnapshotIndex, appliedIndex);
+        assert_int_equal(leaderState->LastLogIndex, pendingJointIndex);
+        assert_int_equal(leaderState->RetainedLogFlags(pendingJointIndex), TLogEntry::EConfiguration);
+        assert_int_equal(leaderState->CommitIndex, appliedIndex);
+        assert_true(DecodeConfigurationEntry(leaderState->Get(pendingJointIndex)).Phase == EConfigurationPhase::Joint);
     }
 
     {
@@ -883,9 +902,12 @@ void test_stable_membership_compaction_recovers_active_voters(void**) {
             std::vector<uint32_t>{2}); // Bootstrap from original binding; snapshot restores active voters.
         assert_true(recovered->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
         assert_true(recovered->IsVoter(2));
+        assert_int_equal(recoveredState->CommitIndex, snapshot.Index);
+        assert_int_equal(recoveredState->LastLogIndex, snapshot.Index + 1);
+        assert_true(DecodeConfigurationEntry(recoveredState->Get(snapshot.Index + 1)).Phase == EConfigurationPhase::Joint);
         auto recoveredApp = std::make_shared<TSnapshotRsm>();
         TRequestProcessor recoveredProcessor(recovered, recoveredApp, {{2, peer}});
-        assert_int_equal(recoveredApp->LastAppliedIndex, stableIndex);
+        assert_int_equal(recoveredApp->LastAppliedIndex, snapshot.Index);
     }
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 #endif
@@ -971,6 +993,77 @@ void test_snapshot_install_validates_and_advances_committed_membership_history(v
         assert_int_equal(state->LastLogIndex, 6); assert_int_equal(state->CommitIndex, 6);
         assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
     }
+    std::error_code ignored; std::filesystem::remove_all(dir, ignored);
+#endif
+}
+void test_snapshot_transfer_before_uncommitted_configuration_preserves_suffix(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-pending-config-snapshot-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const auto name = (dir / "raft").string();
+    auto state = std::make_shared<TDurableState>(name, 2);
+    state->BindVoters({1, 2, 3});
+    state->CurrentTerm = 3;
+    auto addJoint = TConfigurationRecord{EConfigurationPhase::Joint, 2, 0, 0,
+        {1, 2, 3}, {1, 2, 3, 4}};
+    state->Append(EncodeConfigurationEntry(addJoint));
+    auto addStable = addJoint; addStable.Phase = EConfigurationPhase::Stable;
+    addStable.PreviousIndex = 1; addStable.PreviousTerm = 2;
+    state->Append(EncodeConfigurationEntry(addStable));
+    state->Append(Ordinary(2)); // The leader's committed snapshot boundary.
+    auto pendingJoint = TConfigurationRecord{EConfigurationPhase::Joint, 3, 2, 2,
+        {1, 2, 3, 4}, {1, 2, 4, 5}};
+    state->Append(EncodeConfigurationEntry(pendingJoint));
+    state->CommitIndex = 2; state->Commit();
+
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> replies;
+    auto source = std::make_shared<TEndpoint>();
+    source->Route = [&](auto message) { replies.push_back(message.template Cast<TInstallSnapshotResponse>()); };
+    TNodeDict peers{{1, source}, {3, std::make_shared<TEndpoint>()},
+        {4, std::make_shared<TEndpoint>()}, {5, std::make_shared<TEndpoint>()}};
+    auto raft = std::make_shared<TRaft>(state, 2, peers);
+    auto app = std::make_shared<TSnapshotRsm>(); app->LastAppliedIndex = 2;
+    TRequestProcessor processor(raft, app, peers);
+    assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2, 3, 4, 5}));
+    assert_int_equal(state->CommitIndex, 2);
+    assert_true(DecodeConfigurationEntry(state->Get(4)) == pendingJoint);
+
+    auto sendSnapshot = [&](const TSnapshot& image, uint64_t rpcTerm) {
+        const auto bytes = EncodeSnapshot(image);
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + bytes.size());
+        request->Src = 1; request->Dst = 2; request->Term = rpcTerm;
+        request->SnapshotIndex = image.Index; request->SnapshotTerm = image.Term;
+        request->Offset = 0; request->TotalBytes = bytes.size(); request->Done = 1; request->LeaderId = 1;
+        memcpy(request->Data, bytes.data(), bytes.size());
+        raft->Process(ITimeSource::Time{}, request);
+    };
+
+    TSnapshot safe{3, 2, {1, 2, 3, 4}, "3"};
+    safe.StableConfiguration = true;
+    safe.ConfigurationIndex = 2; safe.ConfigurationTerm = 2;
+    sendSnapshot(safe, 4);
+    assert_int_equal(replies.size(), 1);
+    assert_true(replies.back()->Installed); assert_true(replies.back()->Success);
+    assert_true(*state->GetSnapshot() == safe);
+    assert_int_equal(state->SnapshotIndex, 3); assert_int_equal(state->CommitIndex, 3);
+    assert_int_equal(state->LastLogIndex, 4);
+    assert_int_equal(state->RetainedLogFlags(4), TLogEntry::EConfiguration);
+    assert_int_equal(app->LastAppliedIndex, 3);
+    assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2, 3, 4, 5}));
+    assert_true(DecodeConfigurationEntry(state->Get(4)) == pendingJoint);
+
+    // A snapshot boundary at the pending entry cannot claim that entry as
+    // committed. Reject its higher term before changing the retained suffix.
+    TSnapshot crosses{4, 3, {1, 2, 3, 4}, "4"};
+    crosses.StableConfiguration = true;
+    crosses.ConfigurationIndex = 2; crosses.ConfigurationTerm = 2;
+    const auto beforeCrossing = static_cast<TStateFields>(*state);
+    sendSnapshot(crosses, 5);
+    assert_true(static_cast<TStateFields>(*state) == beforeCrossing);
+    assert_int_equal(replies.size(), 1);
+    assert_int_equal(state->LastLogIndex, 4);
+    assert_int_equal(state->RetainedLogFlags(4), TLogEntry::EConfiguration);
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 #endif
 }
@@ -1540,6 +1633,7 @@ int main() {
         cmocka_unit_test(test_timeout_now_retries_and_falls_back_under_joint_quorum),
         cmocka_unit_test(test_stable_membership_compaction_recovers_active_voters),
         cmocka_unit_test(test_snapshot_install_validates_and_advances_committed_membership_history),
+        cmocka_unit_test(test_snapshot_transfer_before_uncommitted_configuration_preserves_suffix),
         cmocka_unit_test(test_joint_snapshot_install_requires_matching_joint_history_and_recovers),
         cmocka_unit_test(test_uncommitted_joint_suffix_replacement_restores_old_voters),
         cmocka_unit_test(test_configuration_application_advances_without_calling_state_machine),

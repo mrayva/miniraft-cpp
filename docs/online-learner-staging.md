@@ -42,8 +42,9 @@ A bounded durable-store promotion/finalization path now uses these catch-up
 acknowledgements; see [live joint membership](configuration-entries.md).
 Leader removal is supported after joint commit through
 [leadership transfer](leadership-transfer.md). Persistent endpoint discovery
-is still the embedding application's responsibility. Snapshot transfer across
-an uncommitted configuration change remains unsupported.
+is still the embedding application's responsibility. Snapshot transfer may
+advance through the committed prefix before a pending configuration entry, but
+cannot use the snapshot to commit that pending entry.
 
 A newly staged learner can bootstrap from a configuration-bearing snapshot even
 when its committed log has already been compacted past the membership entry. For

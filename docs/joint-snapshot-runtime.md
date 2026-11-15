@@ -18,16 +18,20 @@ validated before storage or application state changes. A node with existing
 state cannot use snapshot metadata to skip its committed history or cross an
 uncommitted transition.
 
-Compaction remains disabled while a configuration is uncommitted. For a
-configuration-bearing snapshot, every active voter must first acknowledge the
-committed configuration boundary. The leader verifies this from correlated
+Compaction may advance through applied committed progress before an
+uncommitted configuration entry, while retaining that entry in the log suffix.
+For a configuration-bearing snapshot, every active voter must first acknowledge
+the committed configuration boundary. The leader verifies this from correlated
 replication ACKs, then distributes a retryable certificate to followers so each
 replica's local checkpoint loop can compact. A snapshot cannot remove the only
-copy of a transition before every active voter has learned it. A receiver that
-has committed the same joint configuration may install the image and retain its
-committed matching log suffix. A fresh learner uses the validated image as its
-initial configuration baseline and remains a learner. Startup reconstructs the
-joint quorum from the snapshot baseline and can scan a later stable successor.
+copy of a transition before every active voter has learned it. A receiver may
+install a snapshot before its own uncommitted configuration entry only when the
+snapshot matches its committed configuration; a snapshot that covers the entry
+cannot assert it as committed. A receiver that has committed the same joint
+configuration may install the image and retain its committed matching log
+suffix. A fresh learner uses the validated image as its initial configuration
+baseline and remains a learner. Startup reconstructs the joint quorum from the
+snapshot baseline and can scan a later stable successor.
 
 Deterministic durable coverage checks the compaction gate before the joint
 commit watermark reaches a peer, joint capture and compaction after all active
@@ -37,5 +41,5 @@ the snapshot baseline. Release and ASan/UBSan suites are run for this change.
 
 All voters must understand MRFTS002 before using joint snapshot transfer;
 older versions may mishandle a covered unknown image. Snapshot transfer still
-cannot introduce an uncommitted joint configuration or bridge an existing
-receiver whose committed history identifies a different configuration.
+cannot assert an uncommitted joint configuration or bridge an existing receiver
+whose committed history identifies a different configuration.

@@ -42,4 +42,6 @@ completion as appropriate. Directly editing IState or forcing states through the
 test-facing Become API is outside proposal admission. The current bounded
 joint-consensus path is described in [live membership](configuration-entries.md);
 leader removal uses [leadership transfer](leadership-transfer.md). Joint
-snapshot installation remains open.
+snapshot installation requires matching committed history for existing members;
+fresh learners have a bounded bootstrap path, and snapshots may stop before a
+receiver's pending configuration entry while retaining that suffix.

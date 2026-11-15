@@ -53,16 +53,19 @@ before a transition because older versions reject this entry type.
 
 After the stable successor commits, local compaction records the active voter
 set and stable configuration identity while preserving the original durable
-voter binding ([details](stable-membership-compaction.md)). Compaction remains
-blocked during uncommitted configuration state. A receiver can install a stable
-snapshot across a transition only when its committed history has the same stable
-voter set and configuration index/term. MRFTS002 snapshots can be installed
-while the receiver has already committed the exact same joint configuration;
-both voter sets and the configuration index/term must match before a higher
-term is accepted. Joint snapshot compaction waits until every active voter has
-acknowledged that committed joint boundary. Snapshots cannot introduce a
-configuration the receiver has not committed or cross an uncommitted transition.
-Do not remove or edit committed state to bypass these limits.
+voter binding ([details](stable-membership-compaction.md)). During an
+uncommitted transition, compaction may include applied committed progress only
+when its boundary is before the pending configuration entry; the pending entry
+remains in the suffix. A receiver may install a snapshot under the same rule
+when its metadata matches the locally committed configuration and its boundary
+is before the receiver's pending entry. A snapshot that reaches the pending
+entry cannot assert it as committed. Stable snapshots across completed
+transitions still require matching stable voter set and configuration
+index/term. MRFTS002 snapshots for existing members require the exact committed
+joint voter sets and configuration index/term before a higher term is accepted.
+Joint snapshot compaction waits until every active voter has acknowledged that
+committed joint boundary. Do not remove or edit committed state to bypass these
+limits.
 
 Deterministic durable-store tests cover learner catch-up, voter addition and
 removal, leadership transfer and fallback when its request is dropped,

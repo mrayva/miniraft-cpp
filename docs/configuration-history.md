@@ -63,8 +63,11 @@ This validator is one component of live reconfiguration. Joint entry activation,
 rollback and guarded transitions are described in
 [configuration entries](configuration-entries.md); matching-history joint
 snapshot compaction and installation are described in
-[joint snapshot runtime](joint-snapshot-runtime.md). Snapshot transfer still
-does not establish a configuration absent from the receiver's committed history.
+[joint snapshot runtime](joint-snapshot-runtime.md). Existing members still
+cannot use a snapshot to assert a configuration absent from committed history;
+a fresh learner has a narrow committed-snapshot bootstrap path. A snapshot may
+also stop before a receiver's pending configuration entry and preserve it in the
+suffix.
 Self-review checked contiguous scanning, term and predecessor relationships,
 immutable branch results, snapshot boundary consistency and the unknown-v1-
 identity case. No independent reviewer approval is claimed.
