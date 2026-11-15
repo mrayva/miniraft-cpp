@@ -627,11 +627,29 @@ void test_stable_membership_compaction_recovers_active_voters(void**) {
         TRequestProcessor leaderProcessor(leader, leaderApp, {{2, toAdded}});
         TRequestProcessor addedProcessor(added, addedApp, {{1, toLeader}});
         ITimeSource::Time now{};
+        bool dropConfigurationBarrier = false;
+        bool dropConfigurationBarrierResponse = false;
+        unsigned configurationBarrierRequests = 0, droppedConfigurationBarriers = 0;
+        unsigned configurationBarrierResponses = 0, acceptedConfigurationBarriers = 0;
+        unsigned droppedConfigurationBarrierResponses = 0;
         toAdded->Route = [&](auto message) {
+            if (message->Type == uint32_t(EMessageType::CONFIGURATION_BARRIER_REQUEST)) {
+                ++configurationBarrierRequests;
+                if (dropConfigurationBarrier) { ++droppedConfigurationBarriers; return; }
+            }
             added->Process(now, std::move(message));
             addedProcessor.ProcessCommitted();
         };
         toLeader->Route = [&](auto message) {
+            if (message->Type == uint32_t(EMessageType::CONFIGURATION_BARRIER_RESPONSE)) {
+                ++configurationBarrierResponses;
+                if (message.template Cast<TConfigurationBarrierResponse>()->Accepted)
+                    ++acceptedConfigurationBarriers;
+                if (dropConfigurationBarrierResponse) {
+                    ++droppedConfigurationBarrierResponses;
+                    return;
+                }
+            }
             leader->Process(now, std::move(message));
             leaderProcessor.ProcessCommitted();
         };
@@ -659,8 +677,27 @@ void test_stable_membership_compaction_recovers_active_voters(void**) {
         const auto beforeUngossipedJointCompact = static_cast<TStateFields>(*leaderState);
         Reject([&] { leader->Compact(); });
         assert_true(static_cast<TStateFields>(*leaderState) == beforeUngossipedJointCompact);
+        dropConfigurationBarrier = true;
         pump(); // Propagate the committed joint boundary to every active voter.
         assert_int_equal(addedState->CommitIndex, jointIndex);
+        assert_int_equal(droppedConfigurationBarriers, 1);
+        assert_int_equal(added->GetVolatileState()->CompactionSafeConfigurationIndex, 0);
+        Reject([&] { added->Compact(); }); // A local commit alone cannot prove peer ACKs.
+        dropConfigurationBarrier = false;
+        pump(); // Retry the dropped leader certificate and acknowledge it.
+        assert_int_equal(configurationBarrierRequests, 2);
+        assert_int_equal(configurationBarrierResponses, 1);
+        assert_int_equal(acceptedConfigurationBarriers, 1);
+        assert_int_equal(added->GetVolatileState()->CompactionSafeConfigurationIndex, jointIndex);
+        // The receiver's certificate is volatile; periodic re-advertisement
+        // reconstructs it after a process restart without a new election.
+        const auto requestsBeforeRefresh = configurationBarrierRequests;
+        const_cast<TVolatileState*>(added->GetVolatileState())->CompactionSafeConfigurationIndex = 0;
+        pump(); pump();
+        assert_int_equal(added->GetVolatileState()->CompactionSafeConfigurationIndex, 0);
+        pump();
+        assert_int_equal(configurationBarrierRequests, requestsBeforeRefresh + 1);
+        assert_int_equal(added->GetVolatileState()->CompactionSafeConfigurationIndex, jointIndex);
         assert_true(leader->IsVoter(1)); assert_true(leader->IsVoter(2));
         const auto jointImage = CaptureSnapshot(*leader, *leaderApp);
         assert_true(jointImage.IsJoint());
@@ -670,13 +707,31 @@ void test_stable_membership_compaction_recovers_active_voters(void**) {
         snapshot = leader->Compact();
         assert_true(snapshot == jointImage);
         assert_int_equal(leaderState->SnapshotIndex, jointIndex);
+        const auto addedJointImage = added->Compact();
+        assert_true(addedJointImage.IsJoint());
+        assert_int_equal(addedState->SnapshotIndex, jointIndex);
 
         stableIndex = leader->FinalizeConfiguration();
+        dropConfigurationBarrier = true;
         pump(); pump();
         assert_int_equal(leader->GetVolatileState()->CommitIndex, stableIndex);
         assert_true(leader->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
         assert_int_equal(leaderApp->LastAppliedIndex, stableIndex);
         assert_int_equal(addedApp->LastAppliedIndex, stableIndex);
+
+        assert_true(added->GetVolatileState()->CompactionSafeConfigurationIndex < stableIndex);
+        dropConfigurationBarrier = false;
+        dropConfigurationBarrierResponse = true;
+        pump(); // Retry the stable barrier, then lose its acknowledgement.
+        assert_int_equal(added->GetVolatileState()->CompactionSafeConfigurationIndex, stableIndex);
+        assert_true(leader->GetVolatileState()->ConfigurationBarrierAckIndex.at(2) < stableIndex);
+        assert_int_equal(droppedConfigurationBarrierResponses, 1);
+        dropConfigurationBarrierResponse = false;
+        pump(); // Retry after the lost response and record follower acceptance.
+        assert_int_equal(leader->GetVolatileState()->ConfigurationBarrierAckIndex.at(2), stableIndex);
+        const auto addedStableImage = added->Compact();
+        assert_true(addedStableImage.StableConfiguration);
+        assert_int_equal(addedStableImage.ConfigurationIndex, stableIndex);
 
         snapshot = leader->Compact();
         assert_true(snapshot.StableConfiguration);

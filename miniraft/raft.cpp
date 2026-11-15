@@ -681,6 +681,8 @@ void TRaft::Follower(ITimeSource::Time now, TMessageHolder<TMessage> message) {
         OnInstallSnapshot(now, snapshot.Cast());
     } else if (auto transfer = message.Maybe<TTimeoutNowRequest>()) {
         OnTimeoutNow(now, transfer.Cast());
+    } else if (auto barrier = message.Maybe<TConfigurationBarrierRequest>()) {
+        OnConfigurationBarrier(barrier.Cast());
     }
 }
 
@@ -693,6 +695,8 @@ void TRaft::Candidate(ITimeSource::Time now, TMessageHolder<TMessage> message) {
         OnAppendEntries(now, std::move(maybeAppendEntries.Cast()));
     } else if (auto snapshot = message.Maybe<TInstallSnapshotRequest>()) {
         OnInstallSnapshot(now, snapshot.Cast());
+    } else if (auto barrier = message.Maybe<TConfigurationBarrierRequest>()) {
+        OnConfigurationBarrier(barrier.Cast());
     }
 }
 
@@ -707,6 +711,10 @@ void TRaft::Leader(ITimeSource::Time now, TMessageHolder<TMessage> message) {
         OnAppendEntries(now, std::move(maybeAppendEntries.Cast()));
     } else if (auto snapshot = message.Maybe<TInstallSnapshotRequest>()) {
         OnInstallSnapshot(now, snapshot.Cast());
+    } else if (auto barrier = message.Maybe<TConfigurationBarrierRequest>()) {
+        OnConfigurationBarrier(barrier.Cast());
+    } else if (auto barrier = message.Maybe<TConfigurationBarrierResponse>()) {
+        OnConfigurationBarrier(now, barrier.Cast());
     }
 }
 
@@ -760,7 +768,9 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
     if (header->Dst != Id || !Nodes.contains(header->Src)) return false;
     if (!IsVoter(header->Src)) {
         if ((header->Type != uint32_t(EMessageType::APPEND_ENTRIES_RESPONSE) &&
-             header->Type != uint32_t(EMessageType::INSTALL_SNAPSHOT_RESPONSE)) || header->Term != State->CurrentTerm)
+             header->Type != uint32_t(EMessageType::INSTALL_SNAPSHOT_RESPONSE) &&
+             header->Type != uint32_t(EMessageType::CONFIGURATION_BARRIER_RESPONSE)) ||
+            header->Term != State->CurrentTerm)
             return false; // Nonvoters cannot campaign, lead or force a term change.
     }
     constexpr uint64_t maxIndex = INT64_MAX;
@@ -838,6 +848,19 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
             transfer->CommitIndex >= joint.ConfigurationIndex() &&
             transfer->CommitIndex <= VolatileState->CommitIndex && transfer->CommitIndex <= State->CommitIndex &&
             transfer->CommitTerm > 0 && State->LogTerm(transfer->CommitIndex) == transfer->CommitTerm;
+    }
+    case EMessageType::CONFIGURATION_BARRIER_REQUEST: {
+        auto request = message.Cast<TConfigurationBarrierRequest>();
+        return header->Term == State->CurrentTerm && request->LeaderId == header->Src &&
+            request->Padding == 0 &&
+            request->ConfigurationIndex > 0 && request->ConfigurationIndex <= maxIndex &&
+            request->ConfigurationTerm > 0 && request->ConfigurationTerm <= header->Term;
+    }
+    case EMessageType::CONFIGURATION_BARRIER_RESPONSE: {
+        auto response = message.Cast<TConfigurationBarrierResponse>();
+        return response->ConfigurationIndex > 0 && response->ConfigurationIndex <= maxIndex &&
+            response->ConfigurationTerm > 0 && response->ConfigurationTerm <= header->Term &&
+            response->Accepted <= 1 && response->Padding == 0;
     }
     case EMessageType::APPEND_ENTRIES_REQUEST: {
         auto append = message.Cast<TAppendEntriesRequest>();
@@ -982,6 +1005,7 @@ void TRaft::LeaderTimeout(ITimeSource::Time now) {
     if (Nservers == 1) {
         AdvanceLeaderCommit();
     }
+    MaybeDistributeConfigurationBarrier(now);
 }
 
 uint64_t TRaft::ApproveRead() {
@@ -1190,6 +1214,7 @@ void TRaft::TransferLeadership(uint32_t target, ITimeSource::Time now) {
     VolatileState->ElectionDue = MakeElection(now);
     VolatileState->SnapshotRpcs.clear();
     VolatileState->PendingAppendRpcs.clear();
+    VolatileState->ConfigurationBarrierRpcs.clear();
     IncomingSnapshot.reset();
     EncodedSnapshot.reset();
     EncodedSnapshotIndex = 0;
@@ -1203,6 +1228,85 @@ void TRaft::OnTimeoutNow(ITimeSource::Time now, TMessageHolder<TTimeoutNowReques
     // clearing and joint-quorum arithmetic stay identical to timeout elections.
     VolatileState->ElectionDue = now;
     ProcessTimeout(now);
+}
+
+void TRaft::OnConfigurationBarrier(TMessageHolder<TConfigurationBarrierRequest> request) {
+    const bool accepted = StateName == EState::FOLLOWER && IsVoter(request->LeaderId) &&
+        VolatileState->LeaderId == request->LeaderId && Configuration &&
+        !Configuration->HasUncommittedConfiguration() &&
+        Configuration->Committed.ConfigurationIndex() == request->ConfigurationIndex &&
+        Configuration->Committed.ConfigurationTerm() == request->ConfigurationTerm;
+    if (accepted) {
+        VolatileState->CompactionSafeConfigurationIndex = std::max(
+            VolatileState->CompactionSafeConfigurationIndex, request->ConfigurationIndex);
+    }
+    auto reply = NewHoldedMessage(
+        TMessageEx{.Src = Id, .Dst = request->Src, .Term = State->CurrentTerm, .Seqno = request->Seqno},
+        TConfigurationBarrierResponse{
+            .ConfigurationIndex = request->ConfigurationIndex,
+            .ConfigurationTerm = request->ConfigurationTerm,
+            .Accepted = uint32_t(accepted),
+        });
+    Nodes.at(reply->Dst)->Send(std::move(reply));
+}
+
+void TRaft::OnConfigurationBarrier(ITimeSource::Time now,
+        TMessageHolder<TConfigurationBarrierResponse> response) {
+    auto found = VolatileState->ConfigurationBarrierRpcs.find(response->Src);
+    if (found == VolatileState->ConfigurationBarrierRpcs.end()) return;
+    const auto pending = found->second;
+    if (pending.Seqno != response->Seqno ||
+        pending.ConfigurationIndex != response->ConfigurationIndex ||
+        pending.ConfigurationTerm != response->ConfigurationTerm) return;
+    VolatileState->ConfigurationBarrierRpcs.erase(found);
+    if (response->Accepted) {
+        VolatileState->ConfigurationBarrierAckIndex[response->Src] = std::max(
+            VolatileState->ConfigurationBarrierAckIndex[response->Src], response->ConfigurationIndex);
+        VolatileState->ConfigurationBarrierAckDue[response->Src] =
+            now + TTimeout::ConfigurationBarrierRefresh;
+    } else {
+        VolatileState->ConfigurationBarrierAckIndex.erase(response->Src);
+        VolatileState->ConfigurationBarrierAckDue.erase(response->Src);
+    }
+}
+
+void TRaft::MaybeDistributeConfigurationBarrier(ITimeSource::Time now) {
+    if (StateName != EState::LEADER || !Configuration ||
+        Configuration->HasUncommittedConfiguration()) return;
+    const auto index = Configuration->Committed.ConfigurationIndex();
+    const auto term = Configuration->Committed.ConfigurationTerm();
+    if (!index || !term) return;
+    for (auto voter : Voters) {
+        if (voter == Id) continue;
+        const auto ack = VolatileState->CommitAckIndex.find(voter);
+        if (ack == VolatileState->CommitAckIndex.end() || ack->second < index) return;
+    }
+
+    VolatileState->CompactionSafeConfigurationIndex = std::max(
+        VolatileState->CompactionSafeConfigurationIndex, index);
+    for (auto voter : Voters) {
+        if (voter == Id || !Nodes.contains(voter)) continue;
+        const auto acked = VolatileState->ConfigurationBarrierAckIndex.find(voter);
+        const auto ackDue = VolatileState->ConfigurationBarrierAckDue.find(voter);
+        if (acked != VolatileState->ConfigurationBarrierAckIndex.end() && acked->second >= index &&
+            ackDue != VolatileState->ConfigurationBarrierAckDue.end() && now < ackDue->second) continue;
+        const auto pending = VolatileState->ConfigurationBarrierRpcs.find(voter);
+        if (pending != VolatileState->ConfigurationBarrierRpcs.end() &&
+            pending->second.ConfigurationIndex == index && pending->second.ConfigurationTerm == term &&
+            now < pending->second.Due) continue;
+
+        const auto seqno = NextSeqno();
+        auto request = NewHoldedMessage(
+            TMessageEx{.Src = Id, .Dst = voter, .Term = State->CurrentTerm, .Seqno = seqno},
+            TConfigurationBarrierRequest{
+                .LeaderId = Id,
+                .ConfigurationIndex = index,
+                .ConfigurationTerm = term,
+            });
+        VolatileState->ConfigurationBarrierRpcs[voter] = {
+            seqno, index, term, now + TTimeout::Rpc};
+        Nodes.at(voter)->Send(std::move(request));
+    }
 }
 
 uint32_t TRaft::GetLeaderId() const {
@@ -1248,6 +1352,9 @@ std::shared_ptr<INode> TRaft::RemoveLearnerTarget(uint32_t id) {
     VolatileState->CommitAckIndex.erase(id);
     VolatileState->ReadAckSeqno.erase(id); VolatileState->LastSentSeqno.erase(id);
     VolatileState->PendingAppendRpcs.erase(id); VolatileState->SnapshotRpcs.erase(id);
+    VolatileState->ConfigurationBarrierRpcs.erase(id);
+    VolatileState->ConfigurationBarrierAckIndex.erase(id);
+    VolatileState->ConfigurationBarrierAckDue.erase(id);
     VolatileState->HeartbeatDue.erase(id); VolatileState->RpcDue.erase(id);
     VolatileState->BatchSize.erase(id); VolatileState->BackOff.erase(id);
     VolatileState->Votes.erase(id);
@@ -1277,12 +1384,16 @@ TSnapshot TRaft::Compact() {
     if (Configuration && Configuration->HasUncommittedConfiguration())
         throw std::logic_error("Compaction requires a committed configuration boundary");
     if (Configuration && Configuration->Committed.ConfigurationIndex()) {
-        for (auto voter : Voters) {
-            if (voter == Id) continue;
-            const auto ack = VolatileState->CommitAckIndex.find(voter);
-            if (ack == VolatileState->CommitAckIndex.end() ||
-                ack->second < Configuration->Committed.ConfigurationIndex())
-                throw std::logic_error("Compaction requires every active voter to acknowledge the committed configuration");
+        const auto configurationIndex = Configuration->Committed.ConfigurationIndex();
+        if (IsVoter(Id) && StateName == EState::LEADER) {
+            for (auto voter : Voters) {
+                if (voter == Id) continue;
+                const auto ack = VolatileState->CommitAckIndex.find(voter);
+                if (ack == VolatileState->CommitAckIndex.end() || ack->second < configurationIndex)
+                    throw std::logic_error("Compaction requires every active voter to acknowledge the committed configuration");
+            }
+        } else if (IsVoter(Id) && VolatileState->CompactionSafeConfigurationIndex < configurationIndex) {
+            throw std::logic_error("Compaction requires the leader's all-voter configuration acknowledgement barrier");
         }
     }
     auto application = SnapshotApplication.lock();

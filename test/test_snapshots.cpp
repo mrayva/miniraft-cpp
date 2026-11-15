@@ -556,10 +556,9 @@ void test_stable_configuration_snapshot_durable_runtime_recovery_and_compaction(
         state->Append(entry); app->Write(entry, 3);
         auto* volatileState = const_cast<TVolatileState*>(raft->GetVolatileState());
         volatileState->CommitIndex = 3;
-        // This fixture represents a stable configuration already acknowledged
-        // by every active voter; only the new application tail is local.
-        volatileState->CommitAckIndex[2] = snapshot.ConfigurationIndex;
-        volatileState->CommitAckIndex[3] = snapshot.ConfigurationIndex;
+        // Model a follower that received the all-voter configuration barrier;
+        // only the new application tail is local.
+        volatileState->CompactionSafeConfigurationIndex = snapshot.ConfigurationIndex;
         compacted = raft->Compact();
         assert_true(compacted.StableConfiguration);
         assert_int_equal(compacted.ConfigurationIndex, snapshot.ConfigurationIndex);

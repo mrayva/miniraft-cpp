@@ -15,12 +15,13 @@ configuration or cross an uncommitted transition.
 
 Compaction remains disabled while a configuration is uncommitted. For a
 configuration-bearing snapshot, every active voter must first acknowledge the
-committed configuration boundary. This preserves a copy of the transition for
-any active voter that has not learned it. The snapshot can then advance beyond
-that boundary; a receiver that has committed the same joint configuration may
-install it and retain its committed matching log suffix. Startup reconstructs
-the joint quorum from the snapshot baseline and can scan a later stable
-successor.
+committed configuration boundary. The leader verifies this from correlated
+replication ACKs, then distributes a retryable certificate to followers so each
+replica's local checkpoint loop can compact. A snapshot cannot remove the only
+copy of a transition before every active voter has learned it. A receiver that
+has committed the same joint configuration may install the image and retain its
+committed matching log suffix. Startup reconstructs the joint quorum from the
+snapshot baseline and can scan a later stable successor.
 
 Deterministic durable coverage checks the compaction gate before the joint
 commit watermark reaches a peer, joint capture and compaction after all active

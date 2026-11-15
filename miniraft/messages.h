@@ -32,6 +32,8 @@ enum class EMessageType : uint32_t {
     COMMAND_REQUEST = 8,
     COMMAND_RESPONSE = 9,
     TIMEOUT_NOW_REQUEST = 10,
+    CONFIGURATION_BARRIER_REQUEST = 11,
+    CONFIGURATION_BARRIER_RESPONSE = 12,
 };
 
 struct TMessage {
@@ -132,6 +134,23 @@ struct TTimeoutNowRequest: public TMessageEx {
 };
 static_assert(sizeof(TTimeoutNowRequest) == sizeof(TMessageEx) + 56);
 
+// Leader certificate that every active voter acknowledged a committed
+// configuration boundary. Followers use it to compact safely without
+// inferring peer progress from their own local commit index.
+struct TConfigurationBarrierRequest: public TMessageEx {
+    static constexpr EMessageType MessageType = EMessageType::CONFIGURATION_BARRIER_REQUEST;
+    uint32_t LeaderId = 0, Padding = 0;
+    uint64_t ConfigurationIndex = 0, ConfigurationTerm = 0;
+};
+static_assert(sizeof(TConfigurationBarrierRequest) == sizeof(TMessageEx) + 24);
+
+struct TConfigurationBarrierResponse: public TMessageEx {
+    static constexpr EMessageType MessageType = EMessageType::CONFIGURATION_BARRIER_RESPONSE;
+    uint64_t ConfigurationIndex = 0, ConfigurationTerm = 0;
+    uint32_t Accepted = 0, Padding = 0;
+};
+static_assert(sizeof(TConfigurationBarrierResponse) == sizeof(TMessageEx) + 24);
+
 struct TCommandRequest: public TMessage {
     static constexpr EMessageType MessageType = EMessageType::COMMAND_REQUEST;
     enum EFlags {
@@ -167,6 +186,9 @@ struct TTimeout {
     // Keep partial snapshot transfers across normal RPC retries, but bound how
     // long an idle receiver retains the accumulated image.
     static constexpr std::chrono::milliseconds SnapshotTransferIdle = std::chrono::seconds(30);
+    // Re-advertise configuration-compaction certificates so a restarted
+    // follower can reconstruct its volatile certificate without a new term.
+    static constexpr std::chrono::milliseconds ConfigurationBarrierRefresh = std::chrono::seconds(30);
 };
 
 template<typename T>
@@ -235,7 +257,8 @@ struct TMessageHolder {
 
     bool IsEx() const {
         return HasValidExtent() && Mes->Len >= sizeof(TMessageEx) &&
-            ((2 <= Mes->Type && Mes->Type <= 7) || Mes->Type == uint32_t(EMessageType::TIMEOUT_NOW_REQUEST));
+            ((2 <= Mes->Type && Mes->Type <= 7) ||
+             (10 <= Mes->Type && Mes->Type <= 12));
     }
 
     template<typename U>

@@ -74,6 +74,16 @@ struct TVolatileState {
         uint64_t Offset = 0, Seqno = 0, SentEnd = 0;
     };
     std::unordered_map<uint32_t, TSnapshotRpc> SnapshotRpcs;
+    struct TConfigurationBarrierRpc {
+        uint64_t Seqno = 0, ConfigurationIndex = 0, ConfigurationTerm = 0;
+        ITimeSource::Time Due{};
+    };
+    std::unordered_map<uint32_t, TConfigurationBarrierRpc> ConfigurationBarrierRpcs;
+    std::unordered_map<uint32_t, uint64_t> ConfigurationBarrierAckIndex;
+    std::unordered_map<uint32_t, ITimeSource::Time> ConfigurationBarrierAckDue;
+    // A follower may compact a membership-bearing boundary only after the
+    // current leader certifies that every active voter acknowledged it.
+    uint64_t CompactionSafeConfigurationIndex = 0;
     uint32_t LeaderId = 0;
     std::unordered_map<uint32_t, uint64_t> NextIndex;
     std::unordered_map<uint32_t, uint64_t> MatchIndex;
@@ -158,6 +168,8 @@ public:
     void AddLearnerTarget(uint32_t id, std::shared_ptr<INode> node);
     std::shared_ptr<INode> RemoveLearnerTarget(uint32_t id);
     // Capture applied state and atomically replace its prefix with a snapshot.
+    // Membership-bearing voter snapshots require an all-voter commit ACK
+    // proof: leaders derive it locally, followers receive a retryable barrier.
     // Throws without mutation while two distinct generations remain pinned by
     // outgoing peer transfers; callers may retry after a transfer completes.
     TSnapshot Compact();
@@ -211,6 +223,9 @@ private:
     void OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnapshotRequest> message);
     void OnInstallSnapshot(TMessageHolder<TInstallSnapshotResponse> message);
     void OnTimeoutNow(ITimeSource::Time now, TMessageHolder<TTimeoutNowRequest> message);
+    void OnConfigurationBarrier(TMessageHolder<TConfigurationBarrierRequest> message);
+    void OnConfigurationBarrier(ITimeSource::Time now, TMessageHolder<TConfigurationBarrierResponse> message);
+    void MaybeDistributeConfigurationBarrier(ITimeSource::Time now);
     TMessageHolder<TInstallSnapshotRequest> CreateInstallSnapshot(uint32_t nodeId);
     void Candidate(ITimeSource::Time now, TMessageHolder<TMessage> message);
     void Follower(ITimeSource::Time now, TMessageHolder<TMessage> message);

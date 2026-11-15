@@ -70,4 +70,5 @@ uncommitted joint suffix. The test suite also checks recovery of retained joint
 and stable histories, including post-restart role recovery after adding and
 removing a voter. Joint snapshot tests cover compaction, exact-history
 installation, higher-term rejection of forged voter metadata, restart recovery,
-and finalization from the snapshot baseline.
+finalization from the snapshot baseline, and a dropped/retried all-voter
+compaction barrier that enables follower-local snapshots.

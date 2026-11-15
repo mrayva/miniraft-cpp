@@ -241,6 +241,29 @@ void test_fragmented_snapshot_request_and_response_roundtrip(void**) {
     auto ack = Read(stream).Cast<TInstallSnapshotResponse>(); assert_true(ack->Installed);
     assert_int_equal(ack->NextOffset, 1024); assert_int_equal(stream.Position, stream.Bytes.size());
 }
+void test_configuration_barrier_rpc_roundtrip(void**) {
+    auto request = NewHoldedMessage(
+        TMessageEx{.Src = 1, .Dst = 2, .Term = 3, .Seqno = 9},
+        TConfigurationBarrierRequest{.LeaderId = 1, .ConfigurationIndex = 12, .ConfigurationTerm = 2});
+    auto response = NewHoldedMessage(
+        TMessageEx{.Src = 2, .Dst = 1, .Term = 3, .Seqno = 9},
+        TConfigurationBarrierResponse{.ConfigurationIndex = 12, .ConfigurationTerm = 2, .Accepted = 1});
+    TStream stream; stream.Chunk = 1;
+    TMessageWriter(stream).Write(request).await_resume();
+    TMessageWriter(stream).Write(response).await_resume();
+    stream.Bytes = stream.Output;
+    auto receivedRequest = Read(stream);
+    assert_true(receivedRequest.IsEx());
+    auto barrier = receivedRequest.Cast<TConfigurationBarrierRequest>();
+    assert_int_equal(barrier->LeaderId, 1);
+    assert_int_equal(barrier->ConfigurationIndex, 12);
+    auto receivedResponse = Read(stream);
+    assert_true(receivedResponse.IsEx());
+    auto ack = receivedResponse.Cast<TConfigurationBarrierResponse>();
+    assert_true(ack->Accepted);
+    assert_int_equal(ack->ConfigurationTerm, 2);
+    assert_int_equal(stream.Position, stream.Bytes.size());
+}
 }
 
 int main() {
@@ -260,6 +283,7 @@ int main() {
         cmocka_unit_test(test_writer_validates_entire_batch_before_first_byte),
         cmocka_unit_test(test_fragmented_roundtrip_keeps_consecutive_frame_boundaries),
         cmocka_unit_test(test_fragmented_snapshot_request_and_response_roundtrip),
+        cmocka_unit_test(test_configuration_barrier_rpc_roundtrip),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }

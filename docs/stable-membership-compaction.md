@@ -21,9 +21,12 @@ This milestone initially rejected compaction during joint consensus. Since
 alpha.71, local compaction can create MRFTS002 while a joint configuration is
 committed, and a receiver can install it after committing the same joint voter
 sets and configuration index/term. Compaction waits for every active voter to
-acknowledge the committed configuration, preventing a snapshot from removing
-the only copy of a transition that an active voter has not learned. Uncommitted
-configuration changes remain ineligible for compaction. A lagging receiver can
+acknowledge the committed configuration. The leader retries a configuration
+barrier to each active voter; followers compact only after validating that
+barrier against their committed history. This lets each local checkpoint loop
+compact without removing the only copy of a transition before an active voter
+has learned it. Uncommitted configuration changes remain ineligible for
+compaction. A lagging receiver can
 also install MRFTS003 across a stable transition after it has committed the
 matching stable voter set and identity.
 

@@ -73,6 +73,25 @@ void test_candidate_identity_must_match_sender(void**) {
     assert_int_equal(fixture.State->VotedFor, 1);
     assert_true(fixture.Peer->Sent.empty());
 }
+void test_configuration_barrier_requires_current_term_and_committed_leader_contact(void**) {
+    TFixture fixture;
+    auto higherTerm = NewHoldedMessage(
+        TMessageEx{.Src = 2, .Dst = 1, .Term = 4, .Seqno = 10},
+        TConfigurationBarrierRequest{.LeaderId = 2, .ConfigurationIndex = 1, .ConfigurationTerm = 1});
+    fixture.Raft.Process(fixture.Now, higherTerm);
+    assert_int_equal(fixture.State->CurrentTerm, 3);
+    assert_true(fixture.Peer->Sent.empty());
+
+    auto unproven = NewHoldedMessage(
+        TMessageEx{.Src = 2, .Dst = 1, .Term = 3, .Seqno = 11},
+        TConfigurationBarrierRequest{.LeaderId = 2, .ConfigurationIndex = 1, .ConfigurationTerm = 1});
+    fixture.Raft.Process(fixture.Now, unproven);
+    assert_int_equal(fixture.State->CurrentTerm, 3);
+    assert_int_equal(fixture.Peer->Sent.size(), 1);
+    auto reply = fixture.Peer->Sent.back().Cast<TConfigurationBarrierResponse>();
+    assert_int_equal(reply->ConfigurationIndex, 1);
+    assert_false(reply->Accepted);
+}
 void test_out_of_range_ack_cannot_wrap_next_index(void**) {
     TFixture fixture;
     fixture.Append(3);
@@ -212,6 +231,13 @@ void test_invalid_requests_and_boolean_fields_are_ignored(void**) {
     append->Success = 2;
     fixture.Raft.Process(fixture.Now, append);
     assert_int_equal(fixture.State->CurrentTerm, 3);
+
+    auto barrierResponse = NewHoldedMessage(
+        TMessageEx{.Src = 2, .Dst = 1, .Term = 100, .Seqno = 1},
+        TConfigurationBarrierResponse{
+            .ConfigurationIndex = 1, .ConfigurationTerm = 1, .Accepted = 2});
+    fixture.Raft.Process(fixture.Now, barrierResponse);
+    assert_int_equal(fixture.State->CurrentTerm, 3);
 }
 void test_old_evicted_response_is_ignored_and_latest_progresses(void**) {
     TFixture fixture;
@@ -263,6 +289,7 @@ int main() {
         cmocka_unit_test(test_unknown_sender_cannot_change_term),
         cmocka_unit_test(test_wrong_destination_cannot_change_term),
         cmocka_unit_test(test_candidate_identity_must_match_sender),
+        cmocka_unit_test(test_configuration_barrier_requires_current_term_and_committed_leader_contact),
         cmocka_unit_test(test_out_of_range_ack_cannot_wrap_next_index),
         cmocka_unit_test(test_unknown_sequence_cannot_commit),
         cmocka_unit_test(test_ack_cannot_confirm_an_entry_not_in_its_rpc),

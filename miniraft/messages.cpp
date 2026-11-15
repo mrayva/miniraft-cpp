@@ -21,6 +21,8 @@ void ValidateMessageHeader(uint32_t type, uint32_t length, const TMessageLimits&
         fixed = false; break;
     case EMessageType::INSTALL_SNAPSHOT_RESPONSE: minimum = sizeof(TInstallSnapshotResponse); break;
     case EMessageType::TIMEOUT_NOW_REQUEST: minimum = sizeof(TTimeoutNowRequest); break;
+    case EMessageType::CONFIGURATION_BARRIER_REQUEST: minimum = sizeof(TConfigurationBarrierRequest); break;
+    case EMessageType::CONFIGURATION_BARRIER_RESPONSE: minimum = sizeof(TConfigurationBarrierResponse); break;
     case EMessageType::COMMAND_REQUEST: minimum = sizeof(TCommandRequest); fixed = false; break;
     case EMessageType::COMMAND_RESPONSE: minimum = sizeof(TCommandResponse); fixed = false; break;
     default: throw TMessageError("Unknown or unsupported message type");
