@@ -1,9 +1,17 @@
 # Network server learner staging: v0.1.0-alpha.40
 
-`TRaftServer<TSocket>` now exposes `AddLearnerTarget(id, endpoint)` and
-`RemoveLearnerTarget(id)`, using a `shared_ptr<TNode<TSocket>>` endpoint. Adding
-a learner registers it with Raft and the server's drain set, so the normal
-server loop can send its replication and snapshot traffic without restarting.
+`TRaftServer<TSocket>` exposes `RegisterPeerTarget(id, endpoint)` and
+`UnregisterPeerTarget(id)` on any Raft role, using a
+`shared_ptr<TNode<TSocket>>` endpoint. Register the endpoint on every existing
+replica before a joint configuration introduces that voter. Each local
+registration makes the endpoint available to configuration validation and the
+request-routing layer without changing voters or quorums. Registering it on the
+leader also starts ordinary learner replication, so the leader can check
+`IsLearnerCommitAcknowledged` before proposing promotion. The leader-only
+`AddLearnerTarget(id, endpoint)` API remains a convenience for adding and
+staging an endpoint only on the leader; do not call it for an ID already
+registered there. Both paths add the endpoint to the server's drain set, so the
+normal server loop can send replication and snapshot traffic without restarting.
 The request processor's peer map is updated at the same time, so an endpoint
 added after server construction can receive forwarded commands if it later
 becomes leader. Removal drops that forwarding route along with the Raft progress
@@ -13,6 +21,10 @@ calculations remain unchanged.
 
 Construct the remote node with the right address and socket factory, and make
 sure its local Raft instance is configured as a learner with the same voter set.
+If only the leader has registered the endpoint, use `AddLearnerTarget` there to
+start replication; if every replica already has it registered, replication
+starts on the leader as part of that registration. In either case, wait for
+`IsLearnerCommitAcknowledged` before promotion.
 The storage on the current leader must have a bound voter list. The learner
 still must have a configured return path to the voters. The server does not
 discover, authenticate or configure the remote process.
@@ -25,16 +37,19 @@ After removal, a write already in progress or data already queued in the
 endpoint may remain. Keep the returned endpoint alive while that I/O can still
 use it, then shut it down according to the embedding application's transport
 lifecycle. Once `TRaftServer` starts a response reader for a peer promoted to
-voter, `RemoveLearnerTarget` can remove it after a stable configuration demotes
-it. The server shuts down the socket and retains the endpoint until its reader
-and writer coroutines unwind. The returned node is retired; use a fresh endpoint
-if that ID is registered again. The current coroio TLS wrapper does not expose
-the shutdown hook needed for live removal after a response reader starts, so
-keep TLS peer endpoints until server shutdown.
+voter, `UnregisterPeerTarget` (or leader-only `RemoveLearnerTarget`) can remove
+it after a stable configuration demotes it. The server shuts down the socket
+and retains the endpoint until its reader and writer coroutines unwind. The
+returned node is retired; use a fresh endpoint if that ID is registered again.
+The current coroio TLS wrapper does not expose the shutdown hook needed for live
+removal after a response reader starts, so keep TLS peer endpoints until server
+shutdown.
 
-The KV CLI still discovers peers at startup. Staging is leader-local and is
-lost on restart or failover; the new leader and the application must reconcile
-it. This adds network transport support for non-voting catch-up. Voter promotion
+The KV CLI still discovers peers at startup. Endpoint registrations are
+instance-local and are lost on restart; the application must provision them on
+each replica before proposing a configuration change. Replication progress is
+leader-local and must be checked again after failover. This adds network
+transport support for non-voting catch-up. Voter promotion
 and replicated joint consensus are now available through the bounded durable
 transition path in [live membership](configuration-entries.md). Leader removal
 is supported after joint commit through [leadership transfer](leadership-transfer.md).

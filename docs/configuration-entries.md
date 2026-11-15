@@ -22,7 +22,10 @@ target still campaigns under both joint majorities and commits the successor
 with a current-term entry. The bounded transfer protocol and its failure
 behavior are described in [leadership transfer](leadership-transfer.md).
 Every node must have replication endpoints for all voters before it accepts the
-transition. Endpoint discovery and configuration distribution remain
+transition. The embedding application can provision them locally with
+`RegisterPeerTarget` on each existing replica before the leader proposes the
+joint entry; this endpoint registration does not itself change quorum
+membership. Endpoint discovery and configuration distribution remain
 responsibilities of the embedding application.
 On restart, the durable original voter binding and retained membership history
 are distinct from the active replication endpoints. When a configuration entry

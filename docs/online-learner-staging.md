@@ -12,21 +12,32 @@ replication reply confirms the leader's current Raft commit boundary while the
 learner also matches the leader's log. It does not report application-applied
 progress and does not authorize promotion.
 
+`TRaft::RegisterPeerTarget` and `TRaft::UnregisterPeerTarget` provide local
+endpoint provisioning on any role. They add or remove this instance's transport
+target and derived learner role, but do not change or persist the voter set.
+Provision new voter endpoints on every existing replica before proposing the
+joint entry. Registration on the leader also starts learner replication; use
+`IsLearnerCommitAcknowledged` to check the current leader's catch-up proof.
+Unregistration rejects active voters, including voters in a pending joint
+configuration.
+
 These are serialized embedding APIs, not a replicated cluster configuration or a
 promotion API. The caller must ensure the destination is configured as a learner
 with the same voter set, arrange and authenticate its transport, and keep its
 endpoint alive while asynchronous operations may still use it. After removal,
 use the returned endpoint to coordinate safe transport shutdown; queued traffic
-can still exist. The caller must serialize add/remove with Raft processing and
-must not re-enter them from transport callbacks. Duplicate IDs, voters, the local
-ID, null endpoints and calls on nonleaders are rejected. Staging requires storage
-with an already-bound matching voter set; unbound and legacy stores cannot stage.
+can still exist. The caller must serialize registration/removal with Raft
+processing and must not re-enter them from transport callbacks. Duplicate IDs,
+voters, the local ID and null endpoints are rejected. The leader-only
+`AddLearnerTarget` staging API also rejects nonleaders and requires storage with
+an already-bound matching voter set; unbound and legacy stores cannot stage.
 
 Registration is local to this Raft object and is not persisted or propagated to
-other voters. The embedding application must reconcile targets on a new leader
-and after restart; a previous leader retains its local list if it becomes a
-follower. Removing a target drops replication progress and pending RPCs, and a
-subsequent add starts a fresh probe. Delayed responses cannot satisfy new RPCs.
+other voters. The embedding application must re-register endpoints after
+restart and make sure each new leader has the endpoint. Replication progress is
+leader-local and catch-up must be checked again after leadership changes.
+Removing a target drops replication progress and pending RPCs, and a subsequent
+registration starts a fresh probe. Delayed responses cannot satisfy new RPCs.
 The KV CLI still uses static transport setup. `TRaftServer` runtime integration
 is described in [network learner staging](online-learner-network.md). Older
 binaries must not be mixed with learner configurations because they treat
@@ -41,8 +52,10 @@ that an embedding application must re-register the target on the new leader.
 A bounded durable-store promotion/finalization path now uses these catch-up
 acknowledgements; see [live joint membership](configuration-entries.md).
 Leader removal is supported after joint commit through
-[leadership transfer](leadership-transfer.md). Persistent endpoint discovery
-is still the embedding application's responsibility. Snapshot transfer may
+[leadership transfer](leadership-transfer.md). The leader-change test verifies
+that a node without a local endpoint registration must register it before it
+can replicate to that peer. Persistent endpoint discovery is still the embedding
+application's responsibility. Snapshot transfer may
 advance through the committed prefix before a pending configuration entry, but
 may cover the entry only when its configuration identity exactly matches the
 receiver's pending transition and its sender belongs to the governing quorum.

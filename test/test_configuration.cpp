@@ -402,6 +402,44 @@ void test_configuration_rpc_and_proposal_are_rejected_before_mutation(void**) {
     Reject([&] { leader.ProposeJointConfiguration({1, 2}); }); // Volatile stores cannot authorize a live change.
     assert_true(static_cast<TStateFields>(*leaderState) == leaderBefore);
 }
+void test_follower_can_register_future_voter_endpoint_before_joint_entry(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-peer-provisioning-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    {
+        auto leaderEndpoint = std::make_shared<TEndpoint>();
+        auto state = std::make_shared<TDurableState>((dir / "raft").string(), 2);
+        TRaft follower(state, 2, {{1, leaderEndpoint}});
+        TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0, {1, 2}, {1, 2, 3}};
+        auto makeRequest = [&] {
+            auto request = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 2, .Term = 2},
+                TAppendEntriesRequest{.LeaderId = 1, .Nentries = 1});
+            request.InitPayload(1);
+            request.Payload[0] = EncodeConfigurationEntry(joint);
+            return request;
+        };
+
+        const auto beforeMissingEndpoint = static_cast<TStateFields>(*state);
+        follower.Process({}, makeRequest());
+        assert_true(static_cast<TStateFields>(*state) == beforeMissingEndpoint);
+        assert_int_equal(leaderEndpoint->Sent, 0);
+        assert_true(follower.GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+
+        follower.RegisterPeerTarget(3, std::make_shared<TEndpoint>());
+        assert_true(follower.GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+        assert_true(follower.GetLearnerIds() == (std::vector<uint32_t>{3}));
+        follower.Process({}, makeRequest());
+        assert_int_equal(state->CurrentTerm, 2);
+        assert_int_equal(state->LastLogIndex, 1);
+        assert_true(follower.IsVoter(3)); // The received joint entry activates both sets.
+        assert_true(follower.GetVoterIds() == (std::vector<uint32_t>{1, 2, 3}));
+        Reject([&] { follower.UnregisterPeerTarget(3); }); // Active joint voters cannot be detached.
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
 void test_joint_membership_addition_and_finalization_replicate_deterministically(void**) {
 #ifdef __linux__
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-live-config-" +
@@ -1816,6 +1854,7 @@ int main() {
         cmocka_unit_test(test_configuration_roundtrips_both_phases_and_bounded_maximum),
         cmocka_unit_test(test_configuration_rejects_invalid_fields_and_valid_crc_corruption),
         cmocka_unit_test(test_configuration_rpc_and_proposal_are_rejected_before_mutation),
+        cmocka_unit_test(test_follower_can_register_future_voter_endpoint_before_joint_entry),
         cmocka_unit_test(test_joint_membership_addition_and_finalization_replicate_deterministically),
         cmocka_unit_test(test_live_joint_transition_waits_for_both_nontrivial_majorities),
         cmocka_unit_test(test_timeout_now_retries_and_falls_back_under_joint_quorum),

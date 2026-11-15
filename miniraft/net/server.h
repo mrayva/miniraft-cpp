@@ -203,8 +203,12 @@ public:
 
     void Serve();
 
-    // Runtime learner targets update Raft replication and command-routing
-    // endpoints. Calls must be serialized with the poller loop and Raft work.
+    // Register local endpoints on any role so every replica can validate and
+    // communicate with future voters. This does not change quorum membership.
+    // Calls must be serialized with the poller loop and Raft work.
+    void RegisterPeerTarget(uint32_t id, std::shared_ptr<TNode<TSocket>> node);
+    std::shared_ptr<TNode<TSocket>> UnregisterPeerTarget(uint32_t id);
+    // Leader-only catch-up staging and endpoint removal wrappers.
     void AddLearnerTarget(uint32_t id, std::shared_ptr<TNode<TSocket>> node);
     std::shared_ptr<TNode<TSocket>> RemoveLearnerTarget(uint32_t id);
 
@@ -216,6 +220,8 @@ private:
     void ReconcilePeerReaders();
     void DrainNodes();
     void DebugPrint();
+    void RegisterPeerTargetImpl(uint32_t id, std::shared_ptr<TNode<TSocket>> node, bool stageLearner);
+    std::shared_ptr<TNode<TSocket>> UnregisterPeerTargetImpl(uint32_t id, bool requireLeader);
 
     typename TSocket::TPoller& Poller;
     TSocket Socket;

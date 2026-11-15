@@ -176,9 +176,14 @@ public:
     // through this leader's current commit index, and its log matches the leader.
     // This does not attest to application progress or authorize promotion.
     bool IsLearnerCommitAcknowledged(uint32_t id) const;
-    // Leader-local replication staging; not a membership change. Caller owns
-    // endpoint lifecycle, reconciles targets after failover/restart, and must
-    // serialize these calls with all Raft processing.
+    // Register or remove a local peer endpoint on any Raft role. This changes
+    // only this instance's transport targets; it does not change voter
+    // membership or persist/distribute the endpoint. A registered nonvoter
+    // is treated as a learner locally. Calls must be serialized with Raft work.
+    void RegisterPeerTarget(uint32_t id, std::shared_ptr<INode> node);
+    std::shared_ptr<INode> UnregisterPeerTarget(uint32_t id);
+    // Leader-local replication staging; requires bound voter storage. Caller
+    // owns endpoint lifecycle and reconciles targets after failover/restart.
     void AddLearnerTarget(uint32_t id, std::shared_ptr<INode> node);
     std::shared_ptr<INode> RemoveLearnerTarget(uint32_t id);
     // Capture applied state and atomically replace its prefix with a snapshot.

@@ -53,8 +53,9 @@ void TRaftServer<TSocket>::Serve() {
 }
 
 template<typename TSocket>
-void TRaftServer<TSocket>::AddLearnerTarget(uint32_t id, std::shared_ptr<TNode<TSocket>> node) {
-    if (!node || node->IsRetired()) throw std::invalid_argument("Invalid learner target endpoint");
+void TRaftServer<TSocket>::RegisterPeerTargetImpl(
+        uint32_t id, std::shared_ptr<TNode<TSocket>> node, bool stageLearner) {
+    if (!node || node->IsRetired()) throw std::invalid_argument("Invalid peer target endpoint");
     auto [peer, insertedPeer] = PeerNodes.emplace(id, node);
     if (!insertedPeer) throw std::invalid_argument("Duplicate network peer ID");
 
@@ -62,10 +63,11 @@ void TRaftServer<TSocket>::AddLearnerTarget(uint32_t id, std::shared_ptr<TNode<T
     bool insertedRequestPeer = false;
     try {
         insertedNode = Nodes.insert(node).second;
-        if (!insertedNode) throw std::invalid_argument("Learner endpoint is already registered");
+        if (!insertedNode) throw std::invalid_argument("Peer endpoint is already registered");
         RequestProcessor->AddPeerEndpoint(id, node);
         insertedRequestPeer = true;
-        Raft->AddLearnerTarget(id, node);
+        if (stageLearner) Raft->AddLearnerTarget(id, node);
+        else Raft->RegisterPeerTarget(id, node);
     } catch (...) {
         if (insertedRequestPeer) RequestProcessor->RemovePeerEndpoint(id, node);
         if (insertedNode) Nodes.erase(node);
@@ -76,9 +78,20 @@ void TRaftServer<TSocket>::AddLearnerTarget(uint32_t id, std::shared_ptr<TNode<T
 }
 
 template<typename TSocket>
-std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::RemoveLearnerTarget(uint32_t id) {
+void TRaftServer<TSocket>::RegisterPeerTarget(uint32_t id, std::shared_ptr<TNode<TSocket>> node) {
+    RegisterPeerTargetImpl(id, std::move(node), false);
+}
+
+template<typename TSocket>
+void TRaftServer<TSocket>::AddLearnerTarget(uint32_t id, std::shared_ptr<TNode<TSocket>> node) {
+    RegisterPeerTargetImpl(id, std::move(node), true);
+}
+
+template<typename TSocket>
+std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::UnregisterPeerTargetImpl(
+        uint32_t id, bool requireLeader) {
     auto peer = PeerNodes.find(id);
-    if (peer == PeerNodes.end()) throw std::invalid_argument("Unknown network learner target");
+    if (peer == PeerNodes.end()) throw std::invalid_argument("Unknown network peer target");
     auto endpoint = peer->second;
     const bool readerStarted = PeerResponseReaders.contains(id);
     if (readerStarted && !endpoint->SupportsRetirement())
@@ -86,7 +99,8 @@ std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::RemoveLearnerTarget(uint32
     bool trackedForRetirement = false;
     if (readerStarted) trackedForRetirement = RetiredPeerNodes.insert(endpoint).second;
     try {
-        Raft->RemoveLearnerTarget(id); // Rejects voters and nonleaders before server state changes.
+        if (requireLeader) Raft->RemoveLearnerTarget(id);
+        else Raft->UnregisterPeerTarget(id);
     } catch (...) {
         if (trackedForRetirement) RetiredPeerNodes.erase(endpoint);
         throw;
@@ -98,6 +112,16 @@ std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::RemoveLearnerTarget(uint32
     if (readerStarted) endpoint->Retire();
     RequestProcessor->OnPeerDisconnected(endpoint);
     return endpoint;
+}
+
+template<typename TSocket>
+std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::UnregisterPeerTarget(uint32_t id) {
+    return UnregisterPeerTargetImpl(id, false);
+}
+
+template<typename TSocket>
+std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::RemoveLearnerTarget(uint32_t id) {
+    return UnregisterPeerTargetImpl(id, true);
 }
 
 template<typename TSocket>

@@ -502,6 +502,29 @@ void test_online_learner_staging_rejects_invalid_calls(void**) {
     Reject([&] { oldStore.AddLearnerTarget(2, endpoint); });
     assert_true(oldStore.GetLearnerIds().empty()); assert_int_equal(oldStore.GetNpeers(), 0);
 }
+void test_local_peer_endpoint_registration_does_not_change_voter_membership(void**) {
+    auto raft = std::make_shared<TRaft>(std::make_shared<TState>(), 1, Peers(1, 3));
+    auto endpoint = std::make_shared<TEndpoint>();
+    const auto voters = raft->GetVoterIds();
+    const auto term = raft->GetState()->CurrentTerm;
+    raft->RegisterPeerTarget(4, endpoint);
+    assert_true(raft->GetVoterIds() == voters);
+    assert_true(raft->GetLearnerIds() == (std::vector<uint32_t>{4}));
+    assert_int_equal(raft->GetNservers(), 3);
+    assert_int_equal(raft->GetNpeers(), 3);
+
+    // A locally registered endpoint is still a nonvoter and cannot raise the
+    // term or act as leader before a replicated joint configuration promotes it.
+    raft->Process({}, NewHoldedMessage(TMessageEx{.Src = 4, .Dst = 1, .Term = term + 10},
+        TAppendEntriesRequest{.LeaderId = 4}));
+    assert_int_equal(raft->GetState()->CurrentTerm, term);
+    assert_true(raft->GetVoterIds() == voters);
+    Reject([&] { raft->UnregisterPeerTarget(2); });
+    assert_true(raft->UnregisterPeerTarget(4) == endpoint);
+    assert_true(raft->GetVoterIds() == voters);
+    assert_true(raft->GetLearnerIds().empty());
+    assert_int_equal(raft->GetNpeers(), 2);
+}
 void test_recovered_hard_state_must_match_fixed_voters(void**) {
     for (int mode = 0; mode < 2; ++mode) {
         auto state = std::make_shared<TState>();
@@ -865,6 +888,7 @@ int main() {
         cmocka_unit_test(test_online_learner_removal_during_snapshot_and_delayed_ack),
         cmocka_unit_test(test_online_learner_requires_reconciliation_after_leader_change),
         cmocka_unit_test(test_online_learner_staging_rejects_invalid_calls),
+        cmocka_unit_test(test_local_peer_endpoint_registration_does_not_change_voter_membership),
         cmocka_unit_test(test_recovered_hard_state_must_match_fixed_voters),
 #ifdef __linux__
         cmocka_unit_test(test_legacy_recovered_vote_outside_voters_preserves_storage),

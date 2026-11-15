@@ -200,6 +200,15 @@ void test_server_stages_and_removes_runtime_learner(void**) {
     assert_true(raft->GetLearnerIds().empty());
     assert_int_equal(raft->GetNpeers(), 0);
 
+    auto followerEndpoint = makeEndpoint();
+    server.RegisterPeerTarget(3, followerEndpoint);
+    assert_true(raft->GetLearnerIds() == std::vector<uint32_t>({3}));
+    assert_int_equal(raft->GetNservers(), 1);
+    assert_int_equal(raft->GetNpeers(), 1);
+    assert_true(server.UnregisterPeerTarget(3) == followerEndpoint);
+    assert_true(raft->GetLearnerIds().empty());
+    assert_int_equal(raft->GetNpeers(), 0);
+
     raft->Become(EState::LEADER);
     auto retryEndpoint = makeEndpoint();
     server.AddLearnerTarget(3, retryEndpoint);

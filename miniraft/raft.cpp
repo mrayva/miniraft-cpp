@@ -1536,11 +1536,15 @@ bool TRaft::IsVoter(uint32_t id) const { return std::binary_search(Voters.begin(
 
 void TRaft::AddLearnerTarget(uint32_t id, std::shared_ptr<INode> node) {
     if (StateName != EState::LEADER) throw std::logic_error("Only a leader can stage a learner");
-    if (!id || id == Id || !node || Nodes.contains(id) || IsVoter(id) ||
-        std::binary_search(Learners.begin(), Learners.end(), id))
-        throw std::invalid_argument("Invalid or duplicate learner target");
     if (!State->SupportsVoterBinding() || State->GetBoundVoters() != InitialVoters)
         throw std::logic_error("Learner staging requires a bound voter configuration");
+    RegisterPeerTarget(id, std::move(node));
+}
+
+void TRaft::RegisterPeerTarget(uint32_t id, std::shared_ptr<INode> node) {
+    if (!id || id == Id || !node || Nodes.contains(id) || IsVoter(id) ||
+        std::binary_search(Learners.begin(), Learners.end(), id))
+        throw std::invalid_argument("Invalid or duplicate peer target");
     if (Nodes.size() >= size_t(INT_MAX)) throw std::overflow_error("Too many replication targets");
     // Build all allocating changes before publishing any part of the target.
     auto nodes = Nodes;
@@ -1555,10 +1559,14 @@ void TRaft::AddLearnerTarget(uint32_t id, std::shared_ptr<INode> node) {
 
 std::shared_ptr<INode> TRaft::RemoveLearnerTarget(uint32_t id) {
     if (StateName != EState::LEADER) throw std::logic_error("Only a leader can remove a learner target");
+    return UnregisterPeerTarget(id);
+}
+
+std::shared_ptr<INode> TRaft::UnregisterPeerTarget(uint32_t id) {
     auto learner = std::lower_bound(Learners.begin(), Learners.end(), id);
     auto peer = Nodes.find(id);
     if (id == Id || learner == Learners.end() || *learner != id || peer == Nodes.end() || IsVoter(id))
-        throw std::invalid_argument("Unknown learner target");
+        throw std::invalid_argument("Unknown or active-voter peer target");
     auto node = peer->second;
     Nodes.erase(peer); Learners.erase(learner);
     VolatileState->NextIndex.erase(id); VolatileState->MatchIndex.erase(id);
