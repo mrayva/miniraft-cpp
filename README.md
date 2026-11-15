@@ -35,14 +35,16 @@ stored term sequences before they influence elections or log matching.
 The [snapshot foundation](docs/snapshots.md) adds opt-in durable KV checkpoints
 and tail-only application recovery with `--durable --snapshots N`. Logs remain
 fully retained in that baseline. The [compaction follow-up](docs/compaction.md)
-enables prefix deletion and chunked InstallSnapshot catch-up; fixed membership
-remains required. Upgrade all voters before enabling the new compaction behavior.
+enables prefix deletion and chunked InstallSnapshot catch-up; a persisted
+original voter binding remains required. Upgrade all voters
+before enabling the new compaction behavior.
 The [learner follow-up](docs/learners.md) adds non-voting catch-up and durable
 voter binding. KV uses `--learner id` on every replica's configuration. The
 [live joint-membership step](docs/configuration-entries.md) adds a durable-store
 `TRaft` API for adding and removing nonleader voters through joint consensus;
-leader removal and membership-aware snapshot transfer remain unsupported. The
-network server now reconciles peer response readers as voters change roles.
+local compaction now works after a committed stable transition. Leader removal
+and snapshot transfer across membership transitions remain unsupported. The
+network server reconciles peer response readers as voters change roles.
 The [snapshot retry follow-up](docs/snapshot-retries.md) prevents timeout retries
 and strong-read traffic from starving delayed snapshot acknowledgements, and
 prevents stale reader failures from destroying newer reconnect attempts.
@@ -91,8 +93,9 @@ The [snapshot pin budget follow-up](docs/snapshot-pin-budget.md) bounds outgoing
 transfer retention to two image generations and defers local compaction at the cap.
 The [stable configuration snapshot foundation](docs/stable-configuration-snapshots.md)
 preserves configuration identity. Raft can recover and install stable metadata
-snapshots when their voter list matches the node's existing fixed membership;
-joint snapshots and membership-aware snapshot transfer remain disabled.
+snapshots after local compaction across a stable membership change. Network
+installation still requires the receiver's active voter set to match; joint
+snapshots and transition-crossing transfers remain disabled.
 The [durable configuration snapshot follow-up](docs/durable-configuration-snapshots.md)
 documents its voter-binding requirement and recovery boundary.
 The [trusted legacy voter binding follow-up](docs/trusted-legacy-voter-binding.md)
@@ -103,6 +106,9 @@ The [legacy voter startup proof follow-up](docs/legacy-voter-proof-startup.md)
 requires recovered durable stores to provide voter proof before Raft can start.
 The [stable snapshot runtime follow-up](docs/stable-configuration-snapshot-runtime.md)
 carries that identity through restore, InstallSnapshot, and later compaction.
+The [stable membership compaction follow-up](docs/stable-membership-compaction.md)
+preserves the active voter set when compacting after a completed transition and
+recovers it from the snapshot while retaining the original storage binding.
 The [metadata continuity follow-up](docs/stable-snapshot-metadata-continuity.md)
 preserves the known identity across legacy-format refreshes and rejects conflicts.
 The [storage continuity follow-up](docs/stable-snapshot-storage-continuity.md)
@@ -149,7 +155,7 @@ log replication, and fault tolerance in a distributed system.
 - **Log Replication** (supported)
 - **Persistence** (supported)
 - **Snapshots** (opt-in KV compaction and InstallSnapshot; Linux durable backend)
-- **Membership Change** (durable joint-consensus add/remove; leader transfer and snapshot continuity remain open)
+- **Membership Change** (durable joint-consensus add/remove; post-transition local compaction works; leader transfer and cross-transition snapshot install remain open)
 
 The project focuses on a clear, modular design that leverages C++20 coroutines to simplify asynchronous flows.
 

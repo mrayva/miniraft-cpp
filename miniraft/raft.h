@@ -199,6 +199,7 @@ public:
 
 private:
     friend class TRequestProcessor;
+    friend TSnapshot CaptureSnapshot(const TRaft&, const IRsm&);
     void RestoreAppliedIndex(uint64_t index);
     void AdvanceCommitIndex(uint64_t index);
     void AdvanceLeaderCommit();
@@ -226,7 +227,6 @@ private:
     bool ValidateAppendConfiguration(TMessageHolder<TAppendEntriesRequest> message) const;
     void RequireLiveConfigurationStorage() const;
     void RefreshConfiguration(uint64_t commitIndex);
-    bool HasMembershipHistory() const;
 
     uint32_t Id;
     TNodeDict Nodes;

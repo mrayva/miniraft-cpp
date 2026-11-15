@@ -34,14 +34,18 @@ joint snapshot installation remains unsupported.
 
 In alpha.45 these images were persistence for offline validation only. The
 alpha.46 follow-up enables runtime recovery and transfer of MRFTS003 stable
-snapshots when the voter list equals the node's existing fixed membership.
-Compaction carries forward that stable configuration identity. MRFTS002 joint
-snapshots remain disabled in the live runtime; configuration log entries are
-now accepted through the guarded joint-consensus path.
+snapshots for the configured active voter set. Compaction carries forward the
+stable configuration identity. The stable membership compaction follow-up
+extends local compaction and restart recovery after a finalized voter change,
+while preserving the original binding. Network installation still requires
+the receiver's active set to match. MRFTS002 joint snapshots remain disabled in
+the live runtime; configuration log entries are accepted through the guarded
+joint-consensus path.
 Since alpha.58, bound storage can preserve its original voter binding while
 installing configuration-bearing snapshots whose active set changed. Raft
-startup and network snapshot handling still reject those transition snapshots;
-the storage support is only for offline history validation and trusted inputs.
+startup uses stable metadata to recover a changed active set after local
+compaction. Network snapshot handling still rejects transition snapshots; the
+storage support also serves offline history validation and trusted inputs.
 The [alpha.59 follow-up](configuration-snapshot-continuity.md) checks that a
 replacement configuration snapshot extends the previously stored phase,
 identity, and active voter sets.

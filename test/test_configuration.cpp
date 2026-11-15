@@ -8,6 +8,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <string>
 #include <stdarg.h>
 #include <stddef.h>
 #include <setjmp.h>
@@ -48,6 +49,16 @@ struct TCountingRsm : TDummyRsm {
     TMessageHolder<TMessage> Write(TMessageHolder<TLogEntry> entry, uint64_t index) override {
         ++Writes;
         return TDummyRsm::Write(std::move(entry), index);
+    }
+};
+struct TSnapshotRsm : TCountingRsm {
+    std::string SaveSnapshot() const override { return std::to_string(LastAppliedIndex); }
+    void ValidateSnapshot(std::string_view data, uint64_t index) const override {
+        if (data != std::to_string(index)) throw std::runtime_error("Snapshot index mismatch");
+    }
+    void LoadSnapshot(std::string_view data, uint64_t index) override {
+        ValidateSnapshot(data, index);
+        LastAppliedIndex = index;
     }
 };
 TMessageHolder<TLogEntry> Ordinary(uint64_t term) {
@@ -474,6 +485,92 @@ void test_joint_membership_addition_and_finalization_replicate_deterministically
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 #endif
 }
+void test_stable_membership_compaction_recovers_active_voters(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-membership-snapshot-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const auto name = (dir / "raft").string();
+    TSnapshot snapshot;
+    uint64_t stableIndex = 0;
+    {
+        auto leaderState = std::make_shared<TDurableState>(name, 1);
+        auto addedState = std::make_shared<TDurableState>(name, 2);
+        auto toAdded = std::make_shared<TEndpoint>();
+        auto toLeader = std::make_shared<TEndpoint>();
+        auto leader = std::make_shared<TRaft>(leaderState, 1, TNodeDict{{2, toAdded}}, std::vector<uint32_t>{2});
+        auto added = std::make_shared<TRaft>(addedState, 2, TNodeDict{{1, toLeader}}, std::vector<uint32_t>{2});
+        auto leaderApp = std::make_shared<TSnapshotRsm>();
+        auto addedApp = std::make_shared<TSnapshotRsm>();
+        TRequestProcessor leaderProcessor(leader, leaderApp, {{2, toAdded}});
+        TRequestProcessor addedProcessor(added, addedApp, {{1, toLeader}});
+        ITimeSource::Time now{};
+        toAdded->Route = [&](auto message) {
+            added->Process(now, std::move(message));
+            addedProcessor.ProcessCommitted();
+        };
+        toLeader->Route = [&](auto message) {
+            leader->Process(now, std::move(message));
+            leaderProcessor.ProcessCommitted();
+        };
+        auto pump = [&] {
+            now += std::chrono::seconds(10);
+            leader->ProcessTimeout(now);
+            leaderProcessor.ProcessCommitted();
+            addedProcessor.ProcessCommitted();
+        };
+
+        leader->ProcessTimeout(now);
+        assert_int_equal(leader->CurrentStateName(), EState::LEADER);
+        leaderProcessor.ProcessCommitted();
+        pump(); // Learner acknowledges the leader's committed bootstrap boundary.
+        assert_true(leader->GetVolatileState()->MatchIndex.contains(2));
+        assert_int_equal(leader->GetVolatileState()->MatchIndex.at(2), leaderState->LastLogIndex);
+        assert_int_equal(leader->GetVolatileState()->CommitAckIndex.at(2),
+            leader->GetVolatileState()->CommitIndex);
+        assert_true(leader->IsLearnerCommitAcknowledged(2));
+
+        const auto jointIndex = leader->ProposeJointConfiguration({1, 2});
+        pump(); pump(); // Replicate and commit the joint entry, then its watermark.
+        assert_int_equal(leader->GetVolatileState()->CommitIndex, jointIndex);
+        assert_true(leader->IsVoter(1)); assert_true(leader->IsVoter(2));
+        const auto beforeJointCompact = static_cast<TStateFields>(*leaderState);
+        Reject([&] { leader->Compact(); });
+        Reject([&] { CaptureSnapshot(*leader, *leaderApp); });
+        assert_true(static_cast<TStateFields>(*leaderState) == beforeJointCompact);
+        assert_int_equal(leaderState->SnapshotIndex, 0);
+
+        stableIndex = leader->FinalizeConfiguration();
+        pump(); pump();
+        assert_int_equal(leader->GetVolatileState()->CommitIndex, stableIndex);
+        assert_true(leader->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+        assert_int_equal(leaderApp->LastAppliedIndex, stableIndex);
+        assert_int_equal(addedApp->LastAppliedIndex, stableIndex);
+
+        snapshot = leader->Compact();
+        assert_true(snapshot.StableConfiguration);
+        assert_true(snapshot.Voters == (std::vector<uint32_t>{1, 2}));
+        assert_true(leaderState->GetBoundVoters() == (std::vector<uint32_t>{1}));
+        assert_int_equal(snapshot.ConfigurationIndex, stableIndex);
+        assert_int_equal(snapshot.ConfigurationTerm, leaderState->LogTerm(stableIndex));
+    }
+
+    {
+        auto recoveredState = std::make_shared<TDurableState>(name, 1);
+        assert_true(recoveredState->GetBoundVoters() == (std::vector<uint32_t>{1}));
+        assert_true(*recoveredState->GetSnapshot() == snapshot);
+        auto peer = std::make_shared<TEndpoint>();
+        auto recovered = std::make_shared<TRaft>(recoveredState, 1, TNodeDict{{2, peer}},
+            std::vector<uint32_t>{2}); // Bootstrap from original binding; snapshot restores active voters.
+        assert_true(recovered->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+        assert_true(recovered->IsVoter(2));
+        auto recoveredApp = std::make_shared<TSnapshotRsm>();
+        TRequestProcessor recoveredProcessor(recovered, recoveredApp, {{2, peer}});
+        assert_int_equal(recoveredApp->LastAppliedIndex, stableIndex);
+    }
+    std::error_code ignored; std::filesystem::remove_all(dir, ignored);
+#endif
+}
 void test_uncommitted_joint_suffix_replacement_restores_old_voters(void**) {
 #ifdef __linux__
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-config-rollback-" +
@@ -758,7 +855,7 @@ void test_raft_keeps_joint_quorum_until_stable_successor_commits(void**) {
     state.reset();
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 }
-void test_raft_rejects_stable_snapshot_that_changes_active_voters(void**) {
+void test_raft_rejects_snapshot_when_configured_bootstrap_binding_mismatches(void**) {
     auto state = std::make_shared<TState>();
     state->BindVoters({1, 2, 3});
     state->CurrentTerm = 5;
@@ -902,6 +999,7 @@ int main() {
         cmocka_unit_test(test_configuration_rejects_invalid_fields_and_valid_crc_corruption),
         cmocka_unit_test(test_configuration_rpc_and_proposal_are_rejected_before_mutation),
         cmocka_unit_test(test_joint_membership_addition_and_finalization_replicate_deterministically),
+        cmocka_unit_test(test_stable_membership_compaction_recovers_active_voters),
         cmocka_unit_test(test_uncommitted_joint_suffix_replacement_restores_old_voters),
         cmocka_unit_test(test_configuration_application_advances_without_calling_state_machine),
 #ifdef __linux__
@@ -911,7 +1009,7 @@ int main() {
         cmocka_unit_test(test_offline_history_scan_after_durable_snapshot_and_restart),
         cmocka_unit_test(test_raft_recovers_joint_quorum_for_candidate_election),
         cmocka_unit_test(test_raft_keeps_joint_quorum_until_stable_successor_commits),
-        cmocka_unit_test(test_raft_rejects_stable_snapshot_that_changes_active_voters),
+        cmocka_unit_test(test_raft_rejects_snapshot_when_configured_bootstrap_binding_mismatches),
         cmocka_unit_test(test_persisted_commit_boundary_drives_committed_configuration_scan),
         cmocka_unit_test(test_configuration_snapshots_preserve_original_binding_across_transitions),
 #endif

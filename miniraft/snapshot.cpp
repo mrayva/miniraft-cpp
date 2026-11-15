@@ -179,10 +179,26 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm) {
     if (!index || index > raft.GetVolatileState()->CommitIndex || index > raft.GetLastIndex())
         throw std::runtime_error("Snapshot requires applied committed progress");
     TSnapshot snapshot{index, raft.GetState()->LogTerm(index), raft.GetVoterIds(), {}};
-    if (const auto previous = raft.GetState()->GetSnapshot(); previous && previous->StableConfiguration) {
-        snapshot.StableConfiguration = true;
-        snapshot.ConfigurationIndex = previous->ConfigurationIndex;
-        snapshot.ConfigurationTerm = previous->ConfigurationTerm;
+    if (raft.Configuration) {
+        if (raft.Configuration->HasUncommittedConfiguration())
+            throw std::logic_error("Snapshot capture requires a committed configuration boundary");
+        const auto& committed = raft.Configuration->Committed;
+        if (committed.IsJoint()) throw std::logic_error("Joint configuration snapshots are unsupported");
+        if (committed.ConfigurationIndex() > index)
+            throw std::logic_error("Application progress precedes the committed configuration");
+        if (committed.ConfigurationIndex()) {
+            snapshot.StableConfiguration = true;
+            snapshot.ConfigurationIndex = committed.ConfigurationIndex();
+            snapshot.ConfigurationTerm = committed.ConfigurationTerm();
+        }
+    }
+    if (!snapshot.StableConfiguration) {
+        const auto previous = raft.GetState()->GetSnapshot();
+        if (previous && previous->StableConfiguration) {
+            snapshot.StableConfiguration = true;
+            snapshot.ConfigurationIndex = previous->ConfigurationIndex;
+            snapshot.ConfigurationTerm = previous->ConfigurationTerm;
+        }
     }
     CheckLocalLog(snapshot, raft);
     snapshot.Data = rsm.SaveSnapshot();
