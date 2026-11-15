@@ -54,7 +54,7 @@ void TRaftServer<TSocket>::Serve() {
 
 template<typename TSocket>
 void TRaftServer<TSocket>::AddLearnerTarget(uint32_t id, std::shared_ptr<TNode<TSocket>> node) {
-    if (!node) throw std::invalid_argument("Learner target endpoint is null");
+    if (!node || node->IsRetired()) throw std::invalid_argument("Invalid learner target endpoint");
     auto [peer, insertedPeer] = PeerNodes.emplace(id, node);
     if (!insertedPeer) throw std::invalid_argument("Duplicate network peer ID");
 
@@ -79,14 +79,24 @@ template<typename TSocket>
 std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::RemoveLearnerTarget(uint32_t id) {
     auto peer = PeerNodes.find(id);
     if (peer == PeerNodes.end()) throw std::invalid_argument("Unknown network learner target");
-    if (PeerResponseReaders.contains(id))
-        throw std::logic_error("Cannot remove a peer with an active response reader before server shutdown");
     auto endpoint = peer->second;
-    Raft->RemoveLearnerTarget(id); // Rejects voters and nonleaders before server state changes.
-    RequestProcessor->OnPeerDisconnected(endpoint);
+    const bool readerStarted = PeerResponseReaders.contains(id);
+    if (readerStarted && !endpoint->SupportsRetirement())
+        throw std::logic_error("Socket type does not support safe response-reader retirement");
+    bool trackedForRetirement = false;
+    if (readerStarted) trackedForRetirement = RetiredPeerNodes.insert(endpoint).second;
+    try {
+        Raft->RemoveLearnerTarget(id); // Rejects voters and nonleaders before server state changes.
+    } catch (...) {
+        if (trackedForRetirement) RetiredPeerNodes.erase(endpoint);
+        throw;
+    }
+    PeerResponseReaders.erase(id);
     RequestProcessor->RemovePeerEndpoint(id, endpoint);
     Nodes.erase(endpoint);
     PeerNodes.erase(peer);
+    if (readerStarted) endpoint->Retire();
+    RequestProcessor->OnPeerDisconnected(endpoint);
     return endpoint;
 }
 
@@ -97,6 +107,7 @@ void TRaftServer<TSocket>::ReconcilePeerReaders() {
         [this](uint32_t id) { return Raft->IsVoter(id); }, PeerResponseReaders,
         [this](uint32_t, const auto& node) {
             // Run readers for newly promoted voters without restarting Serve.
+            node->MarkResponseReaderStarted();
             OutboundServe(node);
         });
 }
@@ -106,12 +117,21 @@ void TRaftServer<TSocket>::DrainNodes() {
     for (const auto& node : Nodes) {
         node->Drain();
     }
+    for (auto it = RetiredPeerNodes.begin(); it != RetiredPeerNodes.end();) {
+        (*it)->Drain();
+        if ((*it)->RetirementComplete()) it = RetiredPeerNodes.erase(it);
+        else ++it;
+    }
 }
 
 template<typename TSocket>
 NNet::TVoidTask TRaftServer<TSocket>::OutboundServe(std::shared_ptr<TNode<TSocket>> node) {
+    struct TReaderGuard {
+        std::shared_ptr<TNode<TSocket>> Node;
+        ~TReaderGuard() { Node->MarkResponseReaderStopped(); }
+    } readerGuard{node};
     // read forwarded replies
-    while (true) {
+    while (!node->IsRetired()) {
         bool error = false;
         const bool wasConnected = node->IsConnected();
         const auto generation = node->GetConnectionGeneration();
@@ -132,11 +152,16 @@ NNet::TVoidTask TRaftServer<TSocket>::OutboundServe(std::shared_ptr<TNode<TSocke
             error = true;
         }
         if (error) {
+            if (node->IsRetired()) break;
             RequestProcessor->OnPeerDisconnected(node);
             if (wasConnected) node->Disconnect(generation);
             DrainNodes();
             co_await Poller.Sleep(std::chrono::milliseconds(1000));
         }
+    }
+    if (node->IsRetired()) {
+        RequestProcessor->OnPeerDisconnected(node);
+        DrainNodes();
     }
     co_return;
 }

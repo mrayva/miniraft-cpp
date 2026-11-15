@@ -11,17 +11,21 @@ response reader. It also handles learners staged through `AddLearnerTarget`
 after `Serve()` has begun. Runtime add and remove operations also update the
 request processor's forwarding routes. This lets a node that later becomes
 leader receive forwarded client commands through an endpoint added after server
-construction. Reader IDs are monotonic: joint promotion starts the reader once,
-and a later stable removal leaves the endpoint usable as a learner target
-without restarting or duplicating the reader.
+construction. Reader tracking follows each registered endpoint: joint promotion
+starts one reader, stable demotion keeps it available for learner traffic, and
+re-promotion does not start a duplicate. Removing the endpoint retires that
+reader and releases its ID for a fresh endpoint.
 
-The coroutine can be suspended inside a socket read, and the networking layer
-does not provide safe cancellation for that operation. Therefore
-`RemoveLearnerTarget` rejects removal of a peer whose response reader has
-started. After removing that peer from the voter set, keep it as a learner
-replication target until server shutdown; restart the server before removing the
-transport endpoint. Staged learners that have never been voters can still be
-removed live.
+When a peer with a response reader is removed after voter demotion,
+`RemoveLearnerTarget` shuts down its socket to wake pending reads and writes.
+The server retains the node until the reader and writer coroutines unwind, then
+closes it. A reader in its reconnect delay exits on its next wakeup. The returned
+node is retired and must not be re-added; register a fresh endpoint if the ID is
+used again. Learner targets that never became voters can still be removed live,
+with the embedding application responsible for any write already in progress.
+The built-in TCP socket supports this shutdown path. Socket wrappers that do
+not expose a nonthrowing shutdown or native descriptor, including the current
+coroio TLS wrapper, still reject live removal after a response reader starts.
 
 This closes the server-side role-change gap for forwarded client responses.
 Leadership transfer for removing the active leader is described in

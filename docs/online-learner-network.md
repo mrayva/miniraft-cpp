@@ -25,9 +25,12 @@ After removal, a write already in progress or data already queued in the
 endpoint may remain. Keep the returned endpoint alive while that I/O can still
 use it, then shut it down according to the embedding application's transport
 lifecycle. Once `TRaftServer` starts a response reader for a peer promoted to
-voter, `RemoveLearnerTarget` rejects removal while the server is running because
-that coroutine cannot be cancelled safely during socket IO. Keep the demoted
-peer as a learner target or restart the server before removing it.
+voter, `RemoveLearnerTarget` can remove it after a stable configuration demotes
+it. The server shuts down the socket and retains the endpoint until its reader
+and writer coroutines unwind. The returned node is retired; use a fresh endpoint
+if that ID is registered again. The current coroio TLS wrapper does not expose
+the shutdown hook needed for live removal after a response reader starts, so
+keep TLS peer endpoints until server shutdown.
 
 The KV CLI still discovers peers at startup. Staging is leader-local and is
 lost on restart or failover; the new leader and the application must reconcile

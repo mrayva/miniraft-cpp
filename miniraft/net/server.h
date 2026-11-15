@@ -16,9 +16,8 @@
 #include <miniraft/raft.h>
 
 namespace NNet::TDetail {
-// Start one response reader the first time a configured peer enters the
-// current voter set. The started set is monotonic because these readers cannot
-// be cancelled safely while blocked on socket IO.
+// Start one response reader the first time a registered peer enters the voter
+// set. The started set prevents duplicates until that endpoint is removed.
 template<class TPeerMap, class TVoterPredicate, class TStarted, class TStartReader>
 void ReconcilePeerResponseReaders(const TPeerMap& peers, TVoterPredicate isVoter,
         TStarted& started, TStartReader startReader) {
@@ -139,6 +138,15 @@ public:
     // reader cannot disconnect a newer connection or its pending connector.
     void Disconnect() { Disconnect(ConnectionGeneration); }
     void Disconnect(uint64_t generation);
+    void Retire();
+    bool SupportsRetirement() const {
+        return requires(TSocket& socket) { { socket.Shutdown() } noexcept; } ||
+            requires(TSocket& socket) { socket.Fd(); };
+    }
+    bool IsRetired() const { return Retired; }
+    void MarkResponseReaderStarted() { ResponseReaderActive = true; }
+    void MarkResponseReaderStopped() { ResponseReaderActive = false; }
+    bool RetirementComplete() const { return Retired && RetiredCleaned; }
     uint64_t GetConnectionGeneration() const { return ConnectionGeneration; }
     bool IsConnected() { return Connected; }
     TSocket& Sock() {
@@ -147,6 +155,7 @@ public:
 
 private:
     void Connect();
+    void ShutdownSocket() noexcept;
 
     NNet::TVoidSuspendedTask DoDrain();
     NNet::TVoidSuspendedTask DoConnect();
@@ -157,6 +166,9 @@ private:
     std::function<TSocket(const NNet::TAddress&)> SocketFactory;
     TSocket Socket;
     bool Connected = false;
+    bool Retired = false;
+    bool ResponseReaderActive = false;
+    bool RetiredCleaned = false;
     uint64_t ConnectionGeneration = 0;
 
     std::coroutine_handle<> Drainer;
@@ -211,10 +223,10 @@ private:
     std::shared_ptr<TRequestProcessor> RequestProcessor;
     std::unordered_set<std::shared_ptr<INode>> Nodes;
     std::unordered_map<uint32_t, std::shared_ptr<TNode<TSocket>>> PeerNodes;
-    // Reader coroutines cannot be cancelled safely while blocked on socket IO.
-    // Keep readers for the server lifetime, and reject endpoint removal once a
-    // reader has started for that peer.
+    // Tracks readers for registered endpoint IDs. Removal retires the socket,
+    // then retains the node until its read and write coroutines unwind.
     std::unordered_set<uint32_t> PeerResponseReaders;
+    std::unordered_set<std::shared_ptr<TNode<TSocket>>> RetiredPeerNodes;
     std::shared_ptr<ITimeSource> TimeSource;
     bool Serving = false;
 

@@ -3,11 +3,21 @@
 // Template definitions kept visible for alternative socket implementations.
 template<typename TSocket>
 void TNode<TSocket>::Send(TMessageHolder<TMessage> message) {
+    if (Retired) return;
     Messages.emplace_back(std::move(message));
 }
 
 template<typename TSocket>
 void TNode<TSocket>::Drain() {
+    if (Retired) {
+        if (Drainer && Drainer.done()) { Drainer.destroy(); Drainer = {}; }
+        if (Connector && Connector.done()) { Connector.destroy(); Connector = {}; }
+        if (!ResponseReaderActive && !Drainer && !Connector && !RetiredCleaned) {
+            Disconnect(ConnectionGeneration);
+            RetiredCleaned = true;
+        }
+        return;
+    }
     if (!Connected) {
         Connect();
         return;
@@ -17,6 +27,32 @@ void TNode<TSocket>::Drain() {
             Drainer.destroy();
         }
         Drainer = DoDrain();
+    }
+}
+
+template<typename TSocket>
+void TNode<TSocket>::Retire() {
+    if (Retired) return;
+    if (!SupportsRetirement())
+        throw std::logic_error("Socket type does not support safe peer retirement");
+    Retired = true;
+    Messages.clear();
+    ShutdownSocket();
+}
+
+template<typename TSocket>
+void TNode<TSocket>::ShutdownSocket() noexcept {
+    if constexpr (requires(TSocket& socket) { { socket.Shutdown() } noexcept; }) {
+        Socket.Shutdown();
+    } else if constexpr (requires(TSocket& socket) { socket.Fd(); }) {
+        const auto fd = Socket.Fd();
+        if (fd >= 0) {
+#ifdef _WIN32
+            ::shutdown(static_cast<SOCKET>(fd), SD_BOTH);
+#else
+            ::shutdown(fd, SHUT_RDWR);
+#endif
+        }
     }
 }
 
@@ -31,7 +67,7 @@ NNet::TVoidSuspendedTask TNode<TSocket>::DoDrain() {
         }
     } catch (const std::exception& ex) {
         std::cout << "Error on write: " << ex.what() << "\n";
-        Connect();
+        if (!Retired) Connect();
     }
     co_return;
 }
@@ -51,7 +87,7 @@ void TNode<TSocket>::Disconnect(uint64_t generation) {
 
 template<typename TSocket>
 void TNode<TSocket>::Connect() {
-    if (Address && (!Connector || Connector.done())) {
+    if (!Retired && Address && (!Connector || Connector.done())) {
         if (ConnectionGeneration == UINT64_MAX) throw std::overflow_error("Connection generation exhausted");
         if (Connector && Connector.done()) {
             Connector.destroy();
@@ -65,7 +101,7 @@ template<typename TSocket>
 NNet::TVoidSuspendedTask TNode<TSocket>::DoConnect() {
     std::cout << "Connecting " << Name << "\n";
     Connected = false;
-    while (!Connected) {
+    while (!Connected && !Retired) {
         try {
             Socket = SocketFactory(*Address);
             // The dependency's finite deadline can leave I/O and timer wakeups
@@ -73,12 +109,16 @@ NNet::TVoidSuspendedTask TNode<TSocket>::DoConnect() {
             // I/O-only connect until cancellation of both sources is supported.
             // TCP connect failure timing is therefore controlled by the OS.
             co_await Socket.Connect();
+            if (Retired) {
+                ShutdownSocket();
+                break;
+            }
             std::cout << "Connected " << Name << "\n";
             Connected = true;
         } catch (const std::exception& ex) {
             std::cout << "Error on connect: " << Name << " " << ex.what() << "\n";
         }
-        if (!Connected) {
+        if (!Connected && !Retired) {
             co_await Socket.Poller()->Sleep(std::chrono::milliseconds(1000));
         }
     }
