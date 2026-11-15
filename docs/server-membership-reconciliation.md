@@ -25,4 +25,5 @@ Leadership transfer for removing the active leader is described in
 [leadership transfer](leadership-transfer.md). Membership-aware compaction is
 available after the active voters acknowledge the committed configuration.
 Matching committed joint snapshots can also be compacted and installed; a
-snapshot cannot introduce an uncommitted voter configuration.
+snapshot cannot introduce an unknown voter configuration. An exact match for a
+receiver's validated pending transition can confirm it at the snapshot boundary.

@@ -36,4 +36,6 @@ compatible build before using a transition that removes its leader; older
 builds reject the message. Joint snapshots require the receiver to have already
 committed the exact same joint voter sets and configuration identity; see
 [configuration entries](configuration-entries.md). Snapshots still cannot
-introduce an uncommitted transition or cross an unknown configuration boundary.
+introduce an unknown transition or cross an unknown configuration boundary. A
+snapshot matching a receiver's exact validated pending transition can now
+confirm that transition at the snapshot boundary.

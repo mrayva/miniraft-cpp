@@ -24,7 +24,9 @@ when the receiver has committed the same joint configuration, as described in
 bootstrap from MRFTS002 when configured with the union of both voter sets. An
 existing receiver may now install a matching snapshot before its uncommitted
 configuration entry, retaining that suffix; a snapshot that covers the entry is
-still rejected. A node with existing state still needs matching committed
+now accepted only when it exactly matches the locally validated pending
+configuration and its sender belongs to the quorum governing that transition.
+A node with existing state still needs matching committed or validated pending
 history. Leader removal was added later through [leadership transfer](leadership-transfer.md).
 Snapshot metadata is a consistency assertion, not cryptographic proof of
 cluster identity; the learner bootstrap path relies on its configured voter set

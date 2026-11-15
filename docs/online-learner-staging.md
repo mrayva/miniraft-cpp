@@ -44,7 +44,8 @@ Leader removal is supported after joint commit through
 [leadership transfer](leadership-transfer.md). Persistent endpoint discovery
 is still the embedding application's responsibility. Snapshot transfer may
 advance through the committed prefix before a pending configuration entry, but
-cannot use the snapshot to commit that pending entry.
+may cover the entry only when its configuration identity exactly matches the
+receiver's pending transition and its sender belongs to the governing quorum.
 
 A newly staged learner can bootstrap from a configuration-bearing snapshot even
 when its committed log has already been compacted past the membership entry. For

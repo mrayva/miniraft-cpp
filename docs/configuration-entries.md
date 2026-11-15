@@ -58,11 +58,17 @@ uncommitted transition, compaction may include applied committed progress only
 when its boundary is before the pending configuration entry; the pending entry
 remains in the suffix. A receiver may install a snapshot under the same rule
 when its metadata matches the locally committed configuration and its boundary
-is before the receiver's pending entry. A snapshot that reaches the pending
-entry cannot assert it as committed. Stable snapshots across completed
-transitions still require matching stable voter set and configuration
-index/term. MRFTS002 snapshots for existing members require the exact committed
-joint voter sets and configuration index/term before a higher term is accepted.
+is before the receiver's pending entry. If it reaches or passes that entry, the
+receiver accepts it only when the snapshot's phase, voter sets, and
+configuration index/term exactly match the locally validated pending entry.
+This lets a leader snapshot confirm the entry's commitment without allowing it
+to invent a transition; a mismatch is rejected before a higher term is
+persisted. The sender must be a voter in the quorum configuration that governs
+the pending transition, including the committed joint quorum while a stable
+successor is pending. Stable snapshots across completed transitions still
+require matching stable voter set and configuration index/term. MRFTS002
+snapshots for existing members require exact joint metadata before a higher
+term is accepted.
 Joint snapshot compaction waits until every active voter has acknowledged that
 committed joint boundary. Do not remove or edit committed state to bypass these
 limits.

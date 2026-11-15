@@ -35,7 +35,9 @@ provide a trusted history baseline.
 Older binaries may falsely acknowledge covered unknown formats; do not send these
 images to a mixed-version cluster. Later follow-ups added live configuration
 activation and matching-history joint snapshots. Snapshot metadata still cannot
-assert an uncommitted configuration. A matching snapshot can cover committed
+invent an uncommitted configuration. A matching snapshot can cover committed
 progress before a pending configuration entry while preserving that entry in
-the suffix; a snapshot that includes it remains rejected. Rebuild dependents
-because the in-memory snapshot structure has changed.
+the suffix. A snapshot at or beyond the entry is accepted only when its phase,
+voter sets and configuration index/term match the receiver's validated pending
+transition and its sender belongs to the quorum governing that transition.
+Rebuild dependents because the in-memory snapshot structure has changed.

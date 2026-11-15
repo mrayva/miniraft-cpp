@@ -1020,8 +1020,11 @@ void test_snapshot_transfer_before_uncommitted_configuration_preserves_suffix(vo
     std::vector<TMessageHolder<TInstallSnapshotResponse>> replies;
     auto source = std::make_shared<TEndpoint>();
     source->Route = [&](auto message) { replies.push_back(message.template Cast<TInstallSnapshotResponse>()); };
-    TNodeDict peers{{1, source}, {3, std::make_shared<TEndpoint>()},
-        {4, std::make_shared<TEndpoint>()}, {5, std::make_shared<TEndpoint>()}};
+    auto jointOnlySource = std::make_shared<TEndpoint>();
+    jointOnlySource->Route = [&](auto message) { replies.push_back(message.template Cast<TInstallSnapshotResponse>()); };
+    TNodeDict peers{{1, source}, {3, jointOnlySource},
+        {4, std::make_shared<TEndpoint>()}, {5, std::make_shared<TEndpoint>()},
+        {6, std::make_shared<TEndpoint>()}};
     auto raft = std::make_shared<TRaft>(state, 2, peers);
     auto app = std::make_shared<TSnapshotRsm>(); app->LastAppliedIndex = 2;
     TRequestProcessor processor(raft, app, peers);
@@ -1029,12 +1032,12 @@ void test_snapshot_transfer_before_uncommitted_configuration_preserves_suffix(vo
     assert_int_equal(state->CommitIndex, 2);
     assert_true(DecodeConfigurationEntry(state->Get(4)) == pendingJoint);
 
-    auto sendSnapshot = [&](const TSnapshot& image, uint64_t rpcTerm) {
+    auto sendSnapshot = [&](const TSnapshot& image, uint64_t rpcTerm, uint32_t leaderId = 1) {
         const auto bytes = EncodeSnapshot(image);
         auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + bytes.size());
-        request->Src = 1; request->Dst = 2; request->Term = rpcTerm;
+        request->Src = leaderId; request->Dst = 2; request->Term = rpcTerm;
         request->SnapshotIndex = image.Index; request->SnapshotTerm = image.Term;
-        request->Offset = 0; request->TotalBytes = bytes.size(); request->Done = 1; request->LeaderId = 1;
+        request->Offset = 0; request->TotalBytes = bytes.size(); request->Done = 1; request->LeaderId = leaderId;
         memcpy(request->Data, bytes.data(), bytes.size());
         raft->Process(ITimeSource::Time{}, request);
     };
@@ -1053,8 +1056,26 @@ void test_snapshot_transfer_before_uncommitted_configuration_preserves_suffix(vo
     assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2, 3, 4, 5}));
     assert_true(DecodeConfigurationEntry(state->Get(4)) == pendingJoint);
 
-    // A snapshot boundary at the pending entry cannot claim that entry as
-    // committed. Reject its higher term before changing the retained suffix.
+    // A snapshot that reaches the pending entry must identify the exact
+    // transition already validated in the receiver's log. Reject a different
+    // joint voter set, and reject the former stable configuration phase, before
+    // either higher term can change the state.
+    TSnapshot mismatchedJoint{4, 3, {1, 2, 3, 4}, "4"};
+    mismatchedJoint.JointVoters = {1, 2, 4, 6};
+    mismatchedJoint.ConfigurationIndex = 4; mismatchedJoint.ConfigurationTerm = 3;
+    const auto beforeMismatchedJoint = static_cast<TStateFields>(*state);
+    sendSnapshot(mismatchedJoint, 5);
+    assert_true(static_cast<TStateFields>(*state) == beforeMismatchedJoint);
+    assert_int_equal(replies.size(), 1);
+
+    TSnapshot mismatchedIdentity{5, 4, {1, 2, 3, 4}, "5"};
+    mismatchedIdentity.JointVoters = {1, 2, 4, 5};
+    mismatchedIdentity.ConfigurationIndex = 4; mismatchedIdentity.ConfigurationTerm = 2;
+    const auto beforeMismatchedIdentity = static_cast<TStateFields>(*state);
+    sendSnapshot(mismatchedIdentity, 5);
+    assert_true(static_cast<TStateFields>(*state) == beforeMismatchedIdentity);
+    assert_int_equal(replies.size(), 1);
+
     TSnapshot crosses{4, 3, {1, 2, 3, 4}, "4"};
     crosses.StableConfiguration = true;
     crosses.ConfigurationIndex = 2; crosses.ConfigurationTerm = 2;
@@ -1064,6 +1085,60 @@ void test_snapshot_transfer_before_uncommitted_configuration_preserves_suffix(vo
     assert_int_equal(replies.size(), 1);
     assert_int_equal(state->LastLogIndex, 4);
     assert_int_equal(state->RetainedLogFlags(4), TLogEntry::EConfiguration);
+
+    // The same leader term can now install the exact pending transition as a
+    // committed snapshot boundary. This consumes the matching log entry and
+    // recovers the joint quorum from snapshot metadata.
+    TSnapshot matchingJoint{4, 3, {1, 2, 3, 4}, "4"};
+    matchingJoint.JointVoters = {1, 2, 4, 5};
+    matchingJoint.ConfigurationIndex = 4; matchingJoint.ConfigurationTerm = 3;
+    sendSnapshot(matchingJoint, 5);
+    assert_int_equal(replies.size(), 2);
+    assert_true(replies.back()->Installed); assert_true(replies.back()->Success);
+    assert_int_equal(state->CurrentTerm, 5);
+    assert_int_equal(state->SnapshotIndex, 4); assert_int_equal(state->CommitIndex, 4);
+    assert_int_equal(state->LastLogIndex, 4);
+    assert_true(*state->GetSnapshot() == matchingJoint);
+    assert_int_equal(app->LastAppliedIndex, 4);
+    assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2, 3, 4, 5}));
+
+    // Stable finalization is also safe to install when it exactly matches the
+    // pending successor. The committed joint quorum still authorizes an old-
+    // only leader while the stable entry is uncommitted.
+    auto pendingStable = TConfigurationRecord{EConfigurationPhase::Stable, 5, 4, 3,
+        {1, 2, 3, 4}, {1, 2, 4, 5}};
+    state->Append(EncodeConfigurationEntry(pendingStable));
+    state->Commit();
+    auto finalizedRaft = std::make_shared<TRaft>(state, 2, peers);
+    auto finalizedApp = std::make_shared<TSnapshotRsm>(); finalizedApp->LastAppliedIndex = 4;
+    TRequestProcessor finalizedProcessor(finalizedRaft, finalizedApp, peers);
+    raft = std::move(finalizedRaft);
+    app = std::move(finalizedApp);
+
+    TSnapshot mismatchedStable{5, 5, {1, 2, 3, 4, 5}, "5"};
+    mismatchedStable.StableConfiguration = true;
+    mismatchedStable.ConfigurationIndex = 5; mismatchedStable.ConfigurationTerm = 5;
+    const auto beforeMismatchedStable = static_cast<TStateFields>(*state);
+    sendSnapshot(mismatchedStable, 6, 3);
+    assert_true(static_cast<TStateFields>(*state) == beforeMismatchedStable);
+    assert_int_equal(replies.size(), 2);
+
+    TSnapshot matchingStable{5, 5, {1, 2, 4, 5}, "5"};
+    matchingStable.StableConfiguration = true;
+    matchingStable.ConfigurationIndex = 5; matchingStable.ConfigurationTerm = 5;
+    const auto beforeUnauthorizedSender = static_cast<TStateFields>(*state);
+    sendSnapshot(matchingStable, 6, 6);
+    assert_true(static_cast<TStateFields>(*state) == beforeUnauthorizedSender);
+    assert_int_equal(replies.size(), 2);
+
+    sendSnapshot(matchingStable, 6, 3);
+    assert_int_equal(replies.size(), 3);
+    assert_true(replies.back()->Installed); assert_true(replies.back()->Success);
+    assert_int_equal(state->CurrentTerm, 6);
+    assert_int_equal(state->SnapshotIndex, 5); assert_int_equal(state->CommitIndex, 5);
+    assert_true(*state->GetSnapshot() == matchingStable);
+    assert_int_equal(app->LastAppliedIndex, 5);
+    assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2, 4, 5}));
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 #endif
 }

@@ -26,20 +26,27 @@ replication ACKs, then distributes a retryable certificate to followers so each
 replica's local checkpoint loop can compact. A snapshot cannot remove the only
 copy of a transition before every active voter has learned it. A receiver may
 install a snapshot before its own uncommitted configuration entry only when the
-snapshot matches its committed configuration; a snapshot that covers the entry
-cannot assert it as committed. A receiver that has committed the same joint
-configuration may install the image and retain its committed matching log
-suffix. A fresh learner uses the validated image as its initial configuration
-baseline and remains a learner. Startup reconstructs the joint quorum from the
-snapshot baseline and can scan a later stable successor.
+snapshot matches its committed configuration. If the boundary reaches a
+pending entry, the receiver requires exact phase, voter-set and configuration
+identity matches with that validated entry before accepting a higher term. The
+sender must belong to the quorum that governs the transition: the pending joint
+quorum for an uncommitted joint entry, or the committed joint quorum while a
+stable successor is pending. This lets a valid leader snapshot confirm
+commitment without introducing unknown membership. A receiver that has already
+committed the same joint configuration may install the image and retain its
+committed matching log suffix. A fresh learner uses the validated image as its
+initial configuration baseline and remains a learner. Startup reconstructs the
+joint quorum from the snapshot baseline and can scan a later stable successor.
 
 Deterministic durable coverage checks the compaction gate before the joint
 commit watermark reaches a peer, joint capture and compaction after all active
 voters acknowledge it, rejection of forged joint voter metadata before a higher
 term, successful installation, restart recovery, and stable finalization from
-the snapshot baseline. Release and ASan/UBSan suites are run for this change.
+the snapshot baseline. Pending-transition transfer rejects mismatched joint and
+stable metadata before term mutation, then installs exact matching joint and
+stable snapshots. Release and ASan/UBSan suites are run for this change.
 
 All voters must understand MRFTS002 before using joint snapshot transfer;
-older versions may mishandle a covered unknown image. Snapshot transfer still
-cannot assert an uncommitted joint configuration or bridge an existing receiver
-whose committed history identifies a different configuration.
+older versions may mishandle a covered unknown image. Snapshot transfer cannot
+introduce an unknown joint configuration or bridge an existing receiver whose
+committed and pending history identify a different configuration.

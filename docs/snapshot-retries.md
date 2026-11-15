@@ -62,6 +62,7 @@ Snapshot catch-up is a prerequisite for promotion, not authorization by itself.
 The bounded durable joint-consensus API is described in
 [live membership](configuration-entries.md); leader removal is supported by
 [leadership transfer](leadership-transfer.md). Joint snapshot installation
-requires matching committed history. A snapshot may cover a committed prefix
-before a receiver's uncommitted configuration entry while preserving that entry
-in the suffix; it cannot cover the pending entry.
+requires matching configuration history. A snapshot may cover a committed
+prefix before a receiver's pending configuration entry while preserving that
+entry in the suffix. At or beyond the pending entry, transfer requires exact
+metadata for that local transition and a sender authorized by its active quorum.
