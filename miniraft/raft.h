@@ -304,6 +304,9 @@ public:
     // Unattributed responses are ignored; pass the configured outbound peer.
     void OnCommandResponse(TMessageHolder<TCommandResponse> message, const std::shared_ptr<INode>& peer = {});
     void OnPeerDisconnected(const std::shared_ptr<INode>& peer);
+    // Keep command forwarding aligned with runtime peer endpoint changes.
+    void AddPeerEndpoint(uint32_t id, std::shared_ptr<INode> peer);
+    void RemovePeerEndpoint(uint32_t id, const std::shared_ptr<INode>& peer) noexcept;
     void ProcessCommitted();
     void ProcessWaiting();
     void CleanUp(const std::shared_ptr<INode>& replyTo);

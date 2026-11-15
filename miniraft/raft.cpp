@@ -2078,6 +2078,18 @@ void TRequestProcessor::OnPeerDisconnected(const std::shared_ptr<INode>& peer) {
     if (peer) CancelForwarded(peer, true);
 }
 
+void TRequestProcessor::AddPeerEndpoint(uint32_t id, std::shared_ptr<INode> peer) {
+    if (!id || id == Raft->GetId() || !peer)
+        throw std::invalid_argument("Invalid request-routing peer endpoint");
+    if (!Nodes.emplace(id, std::move(peer)).second)
+        throw std::invalid_argument("Duplicate request-routing peer ID");
+}
+
+void TRequestProcessor::RemovePeerEndpoint(uint32_t id, const std::shared_ptr<INode>& peer) noexcept {
+    auto it = Nodes.find(id);
+    if (it != Nodes.end() && it->second == peer) Nodes.erase(it);
+}
+
 void TRequestProcessor::CleanUp(const std::shared_ptr<INode>& replyTo) {
     if (!replyTo) return;
     PruneRequests(replyTo);

@@ -191,8 +191,8 @@ public:
 
     void Serve();
 
-    // Runtime learner targets are replication-only endpoints. Calls must be
-    // serialized with the poller loop and other Raft processing.
+    // Runtime learner targets update Raft replication and command-routing
+    // endpoints. Calls must be serialized with the poller loop and Raft work.
     void AddLearnerTarget(uint32_t id, std::shared_ptr<TNode<TSocket>> node);
     std::shared_ptr<TNode<TSocket>> RemoveLearnerTarget(uint32_t id);
 

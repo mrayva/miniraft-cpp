@@ -4,9 +4,12 @@
 `RemoveLearnerTarget(id)`, using a `shared_ptr<TNode<TSocket>>` endpoint. Adding
 a learner registers it with Raft and the server's drain set, so the normal
 server loop can send its replication and snapshot traffic without restarting.
-Removing it drops its Raft progress and removes it from future server drains;
-the method returns the endpoint so the embedding application can manage its
-transport lifetime. The voter list and quorum calculations remain unchanged.
+The request processor's peer map is updated at the same time, so an endpoint
+added after server construction can receive forwarded commands if it later
+becomes leader. Removal drops that forwarding route along with the Raft progress
+and future server drains; the method returns the endpoint so the embedding
+application can manage its transport lifetime. The voter list and quorum
+calculations remain unchanged.
 
 Construct the remote node with the right address and socket factory, and make
 sure its local Raft instance is configured as a learner with the same voter set.

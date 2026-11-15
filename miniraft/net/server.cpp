@@ -59,11 +59,15 @@ void TRaftServer<TSocket>::AddLearnerTarget(uint32_t id, std::shared_ptr<TNode<T
     if (!insertedPeer) throw std::invalid_argument("Duplicate network peer ID");
 
     bool insertedNode = false;
+    bool insertedRequestPeer = false;
     try {
         insertedNode = Nodes.insert(node).second;
         if (!insertedNode) throw std::invalid_argument("Learner endpoint is already registered");
+        RequestProcessor->AddPeerEndpoint(id, node);
+        insertedRequestPeer = true;
         Raft->AddLearnerTarget(id, node);
     } catch (...) {
+        if (insertedRequestPeer) RequestProcessor->RemovePeerEndpoint(id, node);
         if (insertedNode) Nodes.erase(node);
         PeerNodes.erase(peer);
         throw;
@@ -79,6 +83,8 @@ std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::RemoveLearnerTarget(uint32
         throw std::logic_error("Cannot remove a peer with an active response reader before server shutdown");
     auto endpoint = peer->second;
     Raft->RemoveLearnerTarget(id); // Rejects voters and nonleaders before server state changes.
+    RequestProcessor->OnPeerDisconnected(endpoint);
+    RequestProcessor->RemovePeerEndpoint(id, endpoint);
     Nodes.erase(endpoint);
     PeerNodes.erase(peer);
     return endpoint;

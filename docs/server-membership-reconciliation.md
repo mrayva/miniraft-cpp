@@ -8,9 +8,12 @@ forwarded client responses from that peer without restarting the server.
 The server now reconciles peer readers after processing Raft messages and from
 its timer loop. When a peer first becomes an active voter, the server starts its
 response reader. It also handles learners staged through `AddLearnerTarget`
-after `Serve()` has begun. Reader IDs are monotonic: joint promotion starts the
-reader once, and a later stable removal leaves the endpoint usable as a learner
-target without restarting or duplicating the reader.
+after `Serve()` has begun. Runtime add and remove operations also update the
+request processor's forwarding routes. This lets a node that later becomes
+leader receive forwarded client commands through an endpoint added after server
+construction. Reader IDs are monotonic: joint promotion starts the reader once,
+and a later stable removal leaves the endpoint usable as a learner target
+without restarting or duplicating the reader.
 
 The coroutine can be suspended inside a socket read, and the networking layer
 does not provide safe cancellation for that operation. Therefore

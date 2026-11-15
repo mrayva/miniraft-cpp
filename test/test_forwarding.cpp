@@ -242,6 +242,45 @@ void test_peer_disconnect_cancels_once_and_does_not_reuse_cookies(void**) {
     assert_int_equal(afterReconnect.Replies[0].Cookie, 44);
     assert_int_equal(afterReconnect.Replies[0].Error, 0);
 }
+void test_runtime_peer_endpoint_updates_forwarding_routes(void**) {
+    auto originalPeer = std::make_shared<TEndpoint>([](auto) {});
+    std::vector<TMessageHolder<TCommandRequest>> sent;
+    auto addedPeer = std::make_shared<TEndpoint>([&](auto message) {
+        if (message->Type == uint32_t(EMessageType::COMMAND_REQUEST))
+            sent.push_back(message.template Cast<TCommandRequest>());
+    });
+    auto raft = std::make_shared<TRaft>(std::make_shared<TState>(), 2,
+        TNodeDict{{1, originalPeer}, {3, addedPeer}});
+    // Model a transport target added after the request processor was created.
+    TRequestProcessor processor{raft, std::make_shared<TDummyRsm>(), TNodeDict{{1, originalPeer}}};
+    auto contact = NewHoldedMessage(TMessageEx{.Src = 3, .Dst = 2, .Term = 2},
+        TAppendEntriesRequest{.LeaderId = 3});
+    raft->Process(ITimeSource::Time{}, contact);
+    assert_int_equal(raft->GetLeaderId(), 3);
+
+    TClient client;
+    auto request = NewHoldedMessage<TCommandRequest>(sizeof(TCommandRequest) + 5);
+    request->Cookie = 17;
+    request->Flags = TCommandRequest::EWrite;
+    memcpy(request->Data, "value", 5);
+    processor.OnCommandRequest(request, client.Endpoint);
+    assert_true(sent.empty()); // The new leader is not in the startup route map yet.
+
+    processor.AddPeerEndpoint(3, addedPeer);
+    processor.CheckStateChange();
+    assert_int_equal(sent.size(), 1);
+    assert_true(sent[0]->Flags & TCommandRequest::EForwarded);
+    processor.OnCommandResponse(NewHoldedMessage(TCommandResponse{.Cookie = sent[0]->Cookie}), addedPeer);
+    assert_int_equal(client.Replies.size(), 1);
+    assert_int_equal(client.Replies[0].Cookie, 17);
+    assert_int_equal(client.Replies[0].Error, 0);
+
+    processor.RemovePeerEndpoint(3, addedPeer);
+    TClient afterRemoval;
+    request->Cookie = 18;
+    processor.OnCommandRequest(request, afterRemoval.Endpoint);
+    assert_int_equal(sent.size(), 1); // A removed endpoint is no longer a forwarding route.
+}
 }
 
 int main() {
@@ -259,6 +298,7 @@ int main() {
         cmocka_unit_test(test_nonzero_cookie_waits_for_leader_discovery),
         cmocka_unit_test(test_response_requires_original_peer_and_preserves_wire_message),
         cmocka_unit_test(test_peer_disconnect_cancels_once_and_does_not_reuse_cookies),
+        cmocka_unit_test(test_runtime_peer_endpoint_updates_forwarding_routes),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }
