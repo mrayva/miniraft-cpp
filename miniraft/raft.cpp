@@ -81,6 +81,12 @@ const TConfigurationHistory& SnapshotLeaderConfiguration(
     return committed;
 }
 
+bool HasPendingStableSuccessor(const TConfigurationScan& configuration) {
+    return configuration.HasUncommittedConfiguration() && configuration.Committed.IsJoint() &&
+        !configuration.Latest.IsJoint() &&
+        configuration.Latest.ConfigurationIndex() > configuration.Committed.ConfigurationIndex();
+}
+
 bool SnapshotMatchesPendingConfiguration(const TSnapshot& snapshot,
         const TConfigurationHistory& committed, const TConfigurationHistory& pending,
         uint32_t leaderId) {
@@ -1004,9 +1010,11 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
     }
     case EMessageType::TIMEOUT_NOW_REQUEST: {
         auto transfer = message.Cast<TTimeoutNowRequest>();
+        const bool pendingStableSuccessor = Configuration && HasPendingStableSuccessor(*Configuration);
         if (StateName != EState::FOLLOWER || header->Term != State->CurrentTerm ||
             State->CurrentTerm == UINT64_MAX || !Configuration ||
-            Configuration->HasUncommittedConfiguration() || !Configuration->Committed.IsJoint())
+            (Configuration->HasUncommittedConfiguration() && !pendingStableSuccessor) ||
+            !Configuration->Committed.IsJoint())
             return false;
         const auto& joint = Configuration->Committed;
         return transfer->LeaderId == header->Src && transfer->TargetId == Id &&
@@ -1369,14 +1377,17 @@ void TRaft::TransferLeadership(uint32_t target, ITimeSource::Time now) {
     if (StateName != EState::LEADER) throw std::logic_error("Only a leader can transfer leadership");
     RequireLiveConfigurationStorage();
     if (State->CurrentTerm == UINT64_MAX) throw std::overflow_error("Raft term exhausted");
-    if (!Configuration || Configuration->HasUncommittedConfiguration() || !Configuration->Committed.IsJoint())
+    const bool pendingStableSuccessor = Configuration && HasPendingStableSuccessor(*Configuration);
+    if (!Configuration || (Configuration->HasUncommittedConfiguration() && !pendingStableSuccessor) ||
+        !Configuration->Committed.IsJoint())
         throw std::logic_error("Leadership transfer requires a committed joint configuration");
     const auto& joint = Configuration->Committed;
     if (std::binary_search(joint.NewVoters().begin(), joint.NewVoters().end(), Id) ||
         !std::binary_search(joint.NewVoters().begin(), joint.NewVoters().end(), target) ||
         target == Id || !Nodes.contains(target))
         throw std::invalid_argument("Transfer target must be a different voter in the joint configuration's new set");
-    if (!VolatileState->CommitIndex || State->LogTerm(VolatileState->CommitIndex) != State->CurrentTerm)
+    if (!VolatileState->CommitIndex || (!pendingStableSuccessor &&
+        State->LogTerm(VolatileState->CommitIndex) != State->CurrentTerm))
         throw std::logic_error("A current-term entry must be committed before transferring leadership");
     const auto match = VolatileState->MatchIndex.find(target);
     const auto commitAck = VolatileState->CommitAckIndex.find(target);

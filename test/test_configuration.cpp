@@ -727,6 +727,115 @@ void test_timeout_now_retries_and_falls_back_under_joint_quorum(void**) {
     }
 #endif
 }
+void test_old_side_leader_can_transfer_with_pending_stable_successor(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-pending-stable-transfer-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const auto name = (dir / "raft").string();
+    const std::vector<uint32_t> originalVoters{1, 2, 3, 4};
+    const TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0,
+        {1, 2, 3, 4}, {1, 2, 4, 5}};
+    const TConfigurationRecord stable{EConfigurationPhase::Stable, 3, 1, 2,
+        joint.OldVoters, joint.NewVoters};
+    auto makeState = [&](uint32_t id) {
+        auto state = std::make_shared<TDurableState>(name, id);
+        state->BindVoters(originalVoters);
+        state->CurrentTerm = 4;
+        state->Append(EncodeConfigurationEntry(joint));
+        state->Append(EncodeConfigurationEntry(stable)); // Same pending successor on both nodes.
+        state->CommitIndex = 1; // The joint entry committed; stable finalization has not.
+        state->Commit();
+        return state;
+    };
+    auto leaderState = makeState(3);
+    auto targetState = makeState(5);
+
+    auto toOne = std::make_shared<TEndpoint>();
+    auto toTwo = std::make_shared<TEndpoint>();
+    auto toFour = std::make_shared<TEndpoint>();
+    auto toTarget = std::make_shared<TEndpoint>();
+    TNodeDict leaderPeers{{1, toOne}, {2, toTwo}, {4, toFour}, {5, toTarget}};
+    auto leader = std::make_shared<TRaft>(leaderState, 3, leaderPeers);
+
+    auto targetToOne = std::make_shared<TEndpoint>();
+    auto targetToTwo = std::make_shared<TEndpoint>();
+    auto targetToLeader = std::make_shared<TEndpoint>();
+    auto targetToFour = std::make_shared<TEndpoint>();
+    TNodeDict targetPeers{{1, targetToOne}, {2, targetToTwo}, {3, targetToLeader}, {4, targetToFour}};
+    auto target = std::make_shared<TRaft>(targetState, 5, targetPeers);
+
+    const ITimeSource::Time start{};
+    leader->ProcessTimeout(start);
+    assert_true(leader->CurrentStateName() == EState::CANDIDATE);
+    auto grantVote = [&](uint32_t voter, const std::shared_ptr<TEndpoint>& endpoint) {
+        const auto request = std::find_if(endpoint->Messages.rbegin(), endpoint->Messages.rend(), [](const auto& item) {
+            return item->Type == uint32_t(EMessageType::REQUEST_VOTE_REQUEST);
+        });
+        assert_true(request != endpoint->Messages.rend());
+        const auto vote = request->Cast<TRequestVoteRequest>();
+        leader->Process(start + std::chrono::milliseconds(1),
+            NewHoldedMessage(TMessageEx{.Src = voter, .Dst = 3, .Term = vote->Term,
+                .Seqno = request->Cast<TMessageEx>()->Seqno},
+                TRequestVoteResponse{.VoteGranted = 1}));
+        assert_true(leader->GetVolatileState()->Votes.contains(voter));
+    };
+    grantVote(1, toOne);
+    grantVote(2, toTwo);
+    grantVote(4, toFour); // Old-side 3 leads with votes from both joint majorities.
+    leader->ProcessTimeout(start + std::chrono::milliseconds(2));
+    assert_true(leader->CurrentStateName() == EState::LEADER);
+    assert_true(leaderState->CurrentTerm == 5);
+    assert_int_equal(leaderState->CommitIndex, 1); // Current-term no-op remains uncommitted.
+
+    auto replicateLatestTargetAppend = [&](ITimeSource::Time now) {
+        const auto append = std::find_if(toTarget->Messages.rbegin(), toTarget->Messages.rend(), [](const auto& item) {
+            return item->Type == uint32_t(EMessageType::APPEND_ENTRIES_REQUEST);
+        });
+        assert_true(append != toTarget->Messages.rend());
+        target->Process(now, *append);
+        const auto appendReply = std::find_if(targetToLeader->Messages.rbegin(), targetToLeader->Messages.rend(),
+            [](const auto& item) { return item->Type == uint32_t(EMessageType::APPEND_ENTRIES_RESPONSE); });
+        assert_true(appendReply != targetToLeader->Messages.rend());
+        leader->Process(now, *appendReply);
+    };
+    replicateLatestTargetAppend(start + std::chrono::milliseconds(3));
+    leader->ProcessTimeout(start + std::chrono::seconds(1));
+    replicateLatestTargetAppend(start + std::chrono::seconds(1) + std::chrono::milliseconds(1));
+    assert_int_equal(leader->GetVolatileState()->MatchIndex.at(5), leaderState->LastLogIndex);
+    assert_int_equal(leader->GetVolatileState()->CommitAckIndex.at(5), 1);
+
+    // The target has the exact full suffix and committed joint boundary, so
+    // the old-side leader can transfer before the stable successor commits.
+    leader->TransferLeadership(5, start + std::chrono::seconds(1) + std::chrono::milliseconds(2));
+    assert_true(leader->CurrentStateName() == EState::FOLLOWER);
+    const auto timeoutNow = std::find_if(toTarget->Messages.rbegin(), toTarget->Messages.rend(), [](const auto& item) {
+        return item->Type == uint32_t(EMessageType::TIMEOUT_NOW_REQUEST);
+    });
+    assert_true(timeoutNow != toTarget->Messages.rend());
+    target->Process(start + std::chrono::seconds(1) + std::chrono::milliseconds(2), *timeoutNow);
+    assert_true(target->CurrentStateName() == EState::CANDIDATE);
+    assert_int_equal(targetState->CurrentTerm, 6);
+
+    auto grantTargetVote = [&](uint32_t voter, const std::shared_ptr<TEndpoint>& endpoint) {
+        const auto request = std::find_if(endpoint->Messages.rbegin(), endpoint->Messages.rend(), [](const auto& item) {
+            return item->Type == uint32_t(EMessageType::REQUEST_VOTE_REQUEST);
+        });
+        assert_true(request != endpoint->Messages.rend());
+        const auto vote = request->Cast<TRequestVoteRequest>();
+        target->Process(start + std::chrono::seconds(1) + std::chrono::milliseconds(3),
+            NewHoldedMessage(TMessageEx{.Src = voter, .Dst = 5, .Term = vote->Term,
+                .Seqno = request->Cast<TMessageEx>()->Seqno}, TRequestVoteResponse{.VoteGranted = 1}));
+    };
+    grantTargetVote(1, targetToOne);
+    grantTargetVote(2, targetToTwo);
+    grantTargetVote(4, targetToFour);
+    target->ProcessTimeout(start + std::chrono::seconds(1) + std::chrono::milliseconds(4));
+    assert_true(target->CurrentStateName() == EState::LEADER);
+    assert_int_equal(targetState->CommitIndex, 1); // The stable successor still needs joint replication.
+    std::error_code ignored; std::filesystem::remove_all(dir, ignored);
+#endif
+}
 void test_stable_membership_compaction_recovers_active_voters(void**) {
 #ifdef __linux__
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-membership-snapshot-" +
@@ -1710,6 +1819,7 @@ int main() {
         cmocka_unit_test(test_joint_membership_addition_and_finalization_replicate_deterministically),
         cmocka_unit_test(test_live_joint_transition_waits_for_both_nontrivial_majorities),
         cmocka_unit_test(test_timeout_now_retries_and_falls_back_under_joint_quorum),
+        cmocka_unit_test(test_old_side_leader_can_transfer_with_pending_stable_successor),
         cmocka_unit_test(test_stable_membership_compaction_recovers_active_voters),
         cmocka_unit_test(test_snapshot_install_validates_and_advances_committed_membership_history),
         cmocka_unit_test(test_snapshot_transfer_before_uncommitted_configuration_preserves_suffix),

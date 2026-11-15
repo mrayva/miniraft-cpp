@@ -15,8 +15,12 @@ have a correlated replication acknowledgement through the leader's committed
 boundary. If the leader remains in the new set, it can finalize the transition
 after the joint entry commits. To remove the active leader, commit the joint
 entry, transfer leadership to a caught-up voter in the new set, then let that
-leader append the stable successor. The bounded transfer protocol and its
-failure behavior are described in [leadership transfer](leadership-transfer.md).
+leader append the stable successor. If an old-set-only voter later becomes
+leader while that stable successor is already present but uncommitted, it can
+transfer to a caught-up new-set voter using the same bounded protocol; the
+target still campaigns under both joint majorities and commits the successor
+with a current-term entry. The bounded transfer protocol and its failure
+behavior are described in [leadership transfer](leadership-transfer.md).
 Every node must have replication endpoints for all voters before it accepts the
 transition. Endpoint discovery and configuration distribution remain
 responsibilities of the embedding application.

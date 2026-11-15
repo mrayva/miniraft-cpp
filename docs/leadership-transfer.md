@@ -8,19 +8,25 @@ the elected leader call `FinalizeConfiguration()`.
 
 Transfer is intentionally limited to this membership-change case. It requires
 a durable store with persisted commit and original-voter metadata, a committed
-joint configuration, a current-term committed entry, and a target whose
-correlated replication ACK covers the complete leader log and commit index. The
-target must be a different configured voter in the joint configuration's new
-set. This prevents a voter with a stale log or commit watermark from starting
-the handoff election.
+joint configuration, and a target whose correlated replication ACK covers the
+complete leader log and commit index. Normally, the leader must also have a
+current-term committed entry. There is one exception: an old-set-only leader
+may transfer while the stable successor to that committed joint entry is
+pending. Committing a current-term entry after that successor would also commit
+the successor and remove the old leader, so the transfer uses the already
+committed joint boundary instead. No other uncommitted configuration is
+allowed. The target must be a different configured voter in the joint
+configuration's new set. These checks prevent a voter with a stale log or
+commit watermark from starting the handoff election.
 
 The old leader steps down before sending a `TIMEOUT_NOW_REQUEST`. The target
 accepts it only from its recognized current leader, in the same term, while its
 committed joint configuration excludes that leader and matches the request's
-configuration, log, and commit boundaries. It then starts the ordinary
-election path. The normal vote rules and both joint majorities still apply. If
-elected, the new leader appends and commits its current-term no-op under the
-joint quorum before it can append the stable successor.
+configuration, log, and commit boundaries. For the pending-successor case, it
+must also have that stable successor in its log. It then starts the ordinary
+election path. The normal vote rules and both joint majorities still apply. The
+new leader commits a current-term entry under the joint quorum; that advances
+commit through the pending stable successor and completes the change.
 
 The request has no acknowledgment. The old leader retries it every second while
 it remains a follower and has not reached its election deadline. A higher-term
