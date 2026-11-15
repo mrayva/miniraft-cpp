@@ -5,13 +5,18 @@ application restore and InstallSnapshot. The snapshot records the old and new
 voter sets plus the joint configuration entry's index and term. The persisted
 voter binding remains the original bootstrap set.
 
-The runtime accepts a joint image only when the receiver has already committed
-that exact joint configuration. The snapshot's old and new voter sets and
-configuration index/term must all match local committed history. These checks
-run on the bounded metadata prefix before a higher RPC term is persisted, and
-the full image, checksum and application payload are validated before storage
-or application state changes. Snapshot metadata cannot establish a new voter
-configuration or cross an uncommitted transition.
+For an existing member, the runtime accepts a joint image only when the receiver
+has already committed that exact joint configuration. The snapshot's old and
+new voter sets and configuration index/term must all match local committed
+history. A completely fresh learner can also bootstrap from a joint image when
+its configured voter set is exactly the union of the snapshot's old and new
+sets, the receiver is in neither set, and the sender belongs to the active set.
+The learner must have no log, commit, snapshot, vote, or applied application
+progress. These checks run on the bounded metadata prefix before a higher RPC
+term is persisted, and the full image, checksum and application payload are
+validated before storage or application state changes. A node with existing
+state cannot use snapshot metadata to skip its committed history or cross an
+uncommitted transition.
 
 Compaction remains disabled while a configuration is uncommitted. For a
 configuration-bearing snapshot, every active voter must first acknowledge the
@@ -20,8 +25,9 @@ replication ACKs, then distributes a retryable certificate to followers so each
 replica's local checkpoint loop can compact. A snapshot cannot remove the only
 copy of a transition before every active voter has learned it. A receiver that
 has committed the same joint configuration may install the image and retain its
-committed matching log suffix. Startup reconstructs the joint quorum from the
-snapshot baseline and can scan a later stable successor.
+committed matching log suffix. A fresh learner uses the validated image as its
+initial configuration baseline and remains a learner. Startup reconstructs the
+joint quorum from the snapshot baseline and can scan a later stable successor.
 
 Deterministic durable coverage checks the compaction gate before the joint
 commit watermark reaches a peer, joint capture and compaction after all active
@@ -31,5 +37,5 @@ the snapshot baseline. Release and ASan/UBSan suites are run for this change.
 
 All voters must understand MRFTS002 before using joint snapshot transfer;
 older versions may mishandle a covered unknown image. Snapshot transfer still
-cannot introduce an uncommitted joint configuration or bridge a receiver whose
-committed history identifies a different configuration.
+cannot introduce an uncommitted joint configuration or bridge an existing
+receiver whose committed history identifies a different configuration.

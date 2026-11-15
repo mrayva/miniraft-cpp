@@ -247,6 +247,82 @@ void test_learner_snapshot_catchup_status_and_restart_preserve_role(void**) {
     assert_false(cluster.Nodes[3]->IsVoter(4)); assert_int_equal(state->VotedFor, 0);
     assert_int_equal(cluster.Nodes[3]->CurrentStateName(), EState::FOLLOWER);
 }
+void test_fresh_learner_bootstraps_stable_and_joint_membership_snapshots(void**) {
+    TKv image;
+    const auto data = image.SaveSnapshot();
+    auto deliver = [&](TSnapshot snapshot, const std::vector<uint32_t>& bootstrapVoters,
+            bool expectedInstall, bool priorLog = false) {
+        constexpr uint32_t learnerId = 10;
+        std::vector<TMessageHolder<TMessage>> replies;
+        TNodeDict peers;
+        for (auto id : bootstrapVoters) {
+            peers[id] = std::make_shared<TEndpoint>([&](auto message) { replies.push_back(std::move(message)); });
+        }
+        auto state = std::make_shared<TState>();
+        if (priorLog) {
+            state->BindVoters(bootstrapVoters);
+            auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = 1;
+            state->Append(entry);
+        }
+        auto raft = std::make_shared<TRaft>(state, learnerId, peers, std::vector<uint32_t>{learnerId});
+        auto application = std::make_shared<TApp>();
+        TRequestProcessor processor(raft, application, peers);
+        const auto encoded = EncodeSnapshot(snapshot);
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + encoded.size());
+        request->Src = bootstrapVoters.front(); request->Dst = learnerId; request->Term = 3;
+        request->SnapshotIndex = snapshot.Index; request->SnapshotTerm = snapshot.Term;
+        request->Offset = 0; request->TotalBytes = encoded.size(); request->Done = 1;
+        request->LeaderId = bootstrapVoters.front();
+        memcpy(request->Data, encoded.data(), encoded.size());
+        raft->Process({}, request);
+
+        assert_true(raft->GetLearnerIds() == (std::vector<uint32_t>{learnerId}));
+        assert_false(raft->IsVoter(learnerId));
+        if (expectedInstall) {
+            assert_int_equal(replies.size(), 1);
+            auto response = replies.back().Cast<TInstallSnapshotResponse>();
+            assert_true(response->Installed); assert_true(response->Success);
+            assert_true(*state->GetSnapshot() == snapshot);
+            assert_int_equal(state->SnapshotIndex, snapshot.Index);
+            assert_int_equal(state->CommitIndex, snapshot.Index);
+            assert_int_equal(application->LastAppliedIndex, snapshot.Index);
+            auto expectedActive = snapshot.Voters;
+            expectedActive.insert(expectedActive.end(), snapshot.JointVoters.begin(), snapshot.JointVoters.end());
+            std::sort(expectedActive.begin(), expectedActive.end());
+            expectedActive.erase(std::unique(expectedActive.begin(), expectedActive.end()), expectedActive.end());
+            assert_true(raft->GetVoterIds() == expectedActive);
+            assert_true(state->GetBoundVoters() == bootstrapVoters);
+        } else {
+            // Bad voter metadata must be rejected by the higher-term preflight,
+            // before it can change the learner's durable term or membership.
+            assert_true(replies.empty());
+            assert_int_equal(state->CurrentTerm, 1);
+            assert_int_equal(state->SnapshotIndex, 0);
+            assert_int_equal(state->CommitIndex, 0);
+            assert_int_equal(state->LastLogIndex, priorLog ? 1 : 0);
+            assert_int_equal(application->LastAppliedIndex, 0);
+        }
+    };
+
+    TSnapshot stable{5, 2, {1, 2, 3}, data};
+    stable.StableConfiguration = true;
+    stable.ConfigurationIndex = 2; stable.ConfigurationTerm = 2;
+    deliver(stable, {1, 2, 3}, true);
+
+    TSnapshot joint{5, 2, {1, 2, 3}, data};
+    joint.JointVoters = {3, 4, 5};
+    joint.ConfigurationIndex = 3; joint.ConfigurationTerm = 2;
+    deliver(joint, {1, 2, 3, 4, 5}, true);
+
+    TSnapshot wrongSet{5, 2, {1, 2, 4}, data};
+    wrongSet.StableConfiguration = true;
+    wrongSet.ConfigurationIndex = 2; wrongSet.ConfigurationTerm = 2;
+    deliver(wrongSet, {1, 2, 3}, false);
+
+    // Metadata may bootstrap only an empty learner. Prior log history keeps
+    // the ordinary exact-configuration validation in force.
+    deliver(stable, {1, 2, 3}, false, true);
+}
 void test_restart_cannot_promote_learner_or_change_voters_but_can_add_transport(void**) {
     auto state = std::make_shared<TState>(); TRaft learner(state, 4, Peers(4), {4});
     const auto fields = static_cast<TStateFields>(*state);
@@ -781,6 +857,7 @@ int main() {
         cmocka_unit_test(test_learner_replication_cannot_commit_or_satisfy_strong_read),
         cmocka_unit_test(test_learner_commit_ack_waits_for_commit_propagation),
         cmocka_unit_test(test_learner_snapshot_catchup_status_and_restart_preserve_role),
+        cmocka_unit_test(test_fresh_learner_bootstraps_stable_and_joint_membership_snapshots),
         cmocka_unit_test(test_restart_cannot_promote_learner_or_change_voters_but_can_add_transport),
         cmocka_unit_test(test_nonfresh_unbound_store_requires_snapshot_proof_for_learners),
         cmocka_unit_test(test_online_learner_staging_snapshot_catchup_and_quorum_isolation),

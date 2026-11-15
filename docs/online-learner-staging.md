@@ -42,4 +42,18 @@ A bounded durable-store promotion/finalization path now uses these catch-up
 acknowledgements; see [live joint membership](configuration-entries.md).
 Leader removal is supported after joint commit through
 [leadership transfer](leadership-transfer.md). Persistent endpoint discovery
-and snapshot transfer across an uncommitted configuration change remain open.
+is still the embedding application's responsibility. Snapshot transfer across
+an uncommitted configuration change remains unsupported.
+
+A newly staged learner can bootstrap from a configuration-bearing snapshot even
+when its committed log has already been compacted past the membership entry. For
+a stable snapshot, configure the empty learner with the exact active voter set.
+For a joint snapshot, configure it with the union of the old and new voter sets.
+The learner must have no log, commit, snapshot, vote, or applied application
+progress, and the snapshot sender must be named in the snapshot's active voter
+set. Installation advances the learner's configuration baseline from the
+validated snapshot; it does not make the learner a voter. A voter or a node with
+prior state still needs matching committed configuration history. Deterministic
+coverage checks stable and joint bootstrap, rejects mismatched voter metadata
+and nonempty learner state before accepting a higher term, and verifies the
+learner role and voter binding after installation.
