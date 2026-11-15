@@ -22,12 +22,12 @@ configure later members as learners in that bootstrap view; the retained log
 then recovers their active roles. Supplying the latest voter set as if it were
 the original binding is rejected.
 
-These are `TRaft` APIs. `TRaftServer` currently starts outbound client-response
-readers from the roles present when `Serve()` starts and does not reconcile that
-reader set after a live promotion. Raft replication and quorum processing are
-updated live, but a promoted follower that forwards client requests may need a
-server restart before its forwarded responses are handled. Hot server role
-reconciliation remains a follow-up.
+These are `TRaft` APIs. `TRaftServer` reconciles outbound client-response readers
+after Raft messages and on its timer loop, so a promoted voter can receive
+forwarded command replies without restarting. A reader cannot be safely stopped
+while suspended in socket IO; after a peer has been a voter while the server is
+running, keep its endpoint registered as a learner or restart the server before
+removing that transport target.
 
 Incoming AppendEntries configuration records are decoded and the complete
 candidate suffix is scanned before a higher RPC term is persisted. The scan

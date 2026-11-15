@@ -1,4 +1,8 @@
 #include <miniraft/net/server.h>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 #include <stdarg.h>
 #include <stddef.h>
 #include <setjmp.h>
@@ -80,12 +84,40 @@ void test_connect_cannot_leave_a_second_deadline_wakeup_after_completion(void**)
     poller.Tick(); // A leftover deadline must not resume the destroyed connector.
     assert_false(node.IsConnected());
 }
+void test_peer_response_readers_start_once_when_voters_are_added(void**) {
+    const std::unordered_map<uint32_t, std::string> peers{{1, "old voter"}, {2, "staged learner"}, {3, "other"}};
+    std::unordered_set<uint32_t> voters{1};
+    std::unordered_set<uint32_t> started;
+    std::vector<uint32_t> calls;
+    const auto reconcile = [&] {
+        NNet::TDetail::ReconcilePeerResponseReaders(peers,
+            [&](uint32_t id) { return voters.contains(id); }, started,
+            [&](uint32_t id, const std::string&) { calls.push_back(id); });
+    };
+
+    reconcile();
+    assert_true(started == std::unordered_set<uint32_t>{1});
+    assert_true(calls == std::vector<uint32_t>{1});
+
+    voters.insert(2); // Joint configuration activates the staged peer.
+    reconcile();
+    assert_true(started == std::unordered_set<uint32_t>({1, 2}));
+    assert_true(calls == std::vector<uint32_t>({1, 2}));
+
+    reconcile(); // Repeated processing must not launch a duplicate reader.
+    assert_true(calls == std::vector<uint32_t>({1, 2}));
+    voters.erase(1); // A demoted peer's in-flight reader remains tracked.
+    reconcile();
+    assert_true(started == std::unordered_set<uint32_t>({1, 2}));
+    assert_true(calls == std::vector<uint32_t>({1, 2}));
+}
 }
 int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_disconnect_during_pending_connect_does_not_destroy_timer_target),
         cmocka_unit_test(test_old_reader_failure_cannot_disconnect_writer_reconnect),
         cmocka_unit_test(test_connect_cannot_leave_a_second_deadline_wakeup_after_completion),
+        cmocka_unit_test(test_peer_response_readers_start_once_when_voters_are_added),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }

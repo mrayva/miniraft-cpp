@@ -26,8 +26,10 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(TSocket socket) {
                 RequestProcessor->OnCommandResponse(std::move(maybeCommandResponse.Cast()), client);
             } else {
                 Raft->Process(TimeSource->Now(), std::move(mes), client);
+                ReconcilePeerReaders();
             }
             Raft->ProcessTimeout(TimeSource->Now());
+            ReconcilePeerReaders();
             RequestProcessor->CheckStateChange();
             RequestProcessor->ProcessCommitted();
             RequestProcessor->ProcessWaiting();
@@ -45,15 +47,9 @@ template<typename TSocket>
 void TRaftServer<TSocket>::Serve() {
     if (Serving) throw std::logic_error("Raft server is already serving");
     Serving = true;
+    ReconcilePeerReaders();
     Idle();
     InboundServe();
-    std::vector<NNet::TVoidTask> tasks;
-    for (auto& [id, node] : PeerNodes) {
-        // Learners only receive replication and reply through their own
-        // configured voter connections. They cannot receive forwarded client
-        // commands, so no outbound response reader is needed for them.
-        if (Raft->IsVoter(id)) tasks.emplace_back(OutboundServe(node));
-    }
 }
 
 template<typename TSocket>
@@ -72,17 +68,31 @@ void TRaftServer<TSocket>::AddLearnerTarget(uint32_t id, std::shared_ptr<TNode<T
         PeerNodes.erase(peer);
         throw;
     }
+    ReconcilePeerReaders();
 }
 
 template<typename TSocket>
 std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::RemoveLearnerTarget(uint32_t id) {
     auto peer = PeerNodes.find(id);
     if (peer == PeerNodes.end()) throw std::invalid_argument("Unknown network learner target");
+    if (PeerResponseReaders.contains(id))
+        throw std::logic_error("Cannot remove a peer with an active response reader before server shutdown");
     auto endpoint = peer->second;
     Raft->RemoveLearnerTarget(id); // Rejects voters and nonleaders before server state changes.
     Nodes.erase(endpoint);
     PeerNodes.erase(peer);
     return endpoint;
+}
+
+template<typename TSocket>
+void TRaftServer<TSocket>::ReconcilePeerReaders() {
+    if (!Serving) return;
+    NNet::TDetail::ReconcilePeerResponseReaders(PeerNodes,
+        [this](uint32_t id) { return Raft->IsVoter(id); }, PeerResponseReaders,
+        [this](uint32_t, const auto& node) {
+            // Run readers for newly promoted voters without restarting Serve.
+            OutboundServe(node);
+        });
 }
 
 template<typename TSocket>
@@ -184,6 +194,7 @@ NNet::TVoidTask TRaftServer<TSocket>::Idle() {
     auto sleep = std::chrono::milliseconds(100);
     while (true) {
         Raft->ProcessTimeout(TimeSource->Now());
+        ReconcilePeerReaders();
         RequestProcessor->CheckStateChange();
         RequestProcessor->ProcessCommitted();
         RequestProcessor->ProcessWaiting();

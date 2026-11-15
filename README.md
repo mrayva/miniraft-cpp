@@ -41,8 +41,8 @@ The [learner follow-up](docs/learners.md) adds non-voting catch-up and durable
 voter binding. KV uses `--learner id` on every replica's configuration. The
 [live joint-membership step](docs/configuration-entries.md) adds a durable-store
 `TRaft` API for adding and removing nonleader voters through joint consensus;
-leader removal, hot server role reconciliation and membership-aware snapshot
-transfer remain unsupported.
+leader removal and membership-aware snapshot transfer remain unsupported. The
+network server now reconciles peer response readers as voters change roles.
 The [snapshot retry follow-up](docs/snapshot-retries.md) prevents timeout retries
 and strong-read traffic from starving delayed snapshot acknowledgements, and
 prevents stale reader failures from destroying newer reconnect attempts.
@@ -78,6 +78,8 @@ The [online learner staging API](docs/online-learner-staging.md) lets embedders
 add and remove leader-local, non-voting replication targets.
 The [network learner follow-up](docs/online-learner-network.md) connects that
 API to the built-in server's runtime drain loop.
+The [server membership reconciliation follow-up](docs/server-membership-reconciliation.md)
+starts peer response readers as staged learners become voters.
 The [covered-snapshot follow-up](docs/covered-snapshot-identity.md) validates
 snapshot boundary and voter metadata before acknowledging an already-covered image.
 The [snapshot contact follow-up](docs/snapshot-contact-validation.md) waits for
@@ -147,7 +149,7 @@ log replication, and fault tolerance in a distributed system.
 - **Log Replication** (supported)
 - **Persistence** (supported)
 - **Snapshots** (opt-in KV compaction and InstallSnapshot; Linux durable backend)
-- **Membership Change** (non-voting learners; voting changes not supported yet)
+- **Membership Change** (durable joint-consensus add/remove; leader transfer and snapshot continuity remain open)
 
 The project focuses on a clear, modular design that leverages C++20 coroutines to simplify asynchronous flows.
 
