@@ -42,4 +42,4 @@ A bounded durable-store promotion/finalization path now uses these catch-up
 acknowledgements; see [live joint membership](configuration-entries.md).
 Leader removal is supported after joint commit through
 [leadership transfer](leadership-transfer.md). Persistent endpoint discovery
-and joint snapshot installation remain open.
+and snapshot transfer across an uncommitted configuration change remain open.

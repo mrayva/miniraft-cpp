@@ -14,9 +14,9 @@ and monotonic commit index. Validated retained configuration history now selects
 the runtime quorum used by elections, commit advancement and strong-read
 confirmation. An uncommitted joint entry uses both voter sets; after that entry
 commits, the joint quorum remains active until its stable successor commits.
-The fixed-membership snapshot runtime still requires stable snapshot voters to
-match the node's configured and bound set; joint snapshot recovery remains
-disabled.
+The later [joint snapshot follow-up](configuration-entries.md) allows snapshots
+at a committed joint boundary when both voter sets and configuration identity
+match the receiver's history.
 
 Tests exhaust every pair of nonempty old/new subsets of five IDs and every vote
 subset, including disjoint and overlapping sets, even-sized groups, absent self
@@ -28,14 +28,14 @@ partition, learner, snapshot and read tests exercise the fixed-membership paths.
 This arithmetic now backs the bounded live transition API described in
 [configuration entries](configuration-entries.md). Recovered suffix transitions
 and live changes require a bound original voter set, a persisted commit index and
-endpoints for every active voter. Joint snapshot recovery and snapshot transfer
-across a membership transition remain unsupported; compaction is rejected while
-the retained log contains a membership change beyond its snapshot baseline.
+endpoints for every active voter. Joint snapshot recovery requires the exact
+committed joint identity; transfer that would introduce an unknown transition
+or cross uncommitted history remains unsupported.
 Leader removal and explicit leadership transfer were not implemented in this
 milestone. Follow-up: [leadership transfer](leadership-transfer.md) adds a
 bounded `TimeoutNow` path for removing the active leader after the joint entry
-commits. Joint snapshot recovery and transition-crossing snapshot transfer
-remain open.
+commits. Joint snapshots require matching committed history; transfer across
+an uncommitted configuration remains open.
 
 The change adds a public type and changes TRaft's in-memory layout; rebuild the
 library and dependents together. Wire and durable formats are unchanged.

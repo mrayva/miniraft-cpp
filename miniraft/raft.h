@@ -204,6 +204,7 @@ public:
 private:
     friend class TRequestProcessor;
     friend TSnapshot CaptureSnapshot(const TRaft&, const IRsm&);
+    friend void RestoreSnapshot(const TSnapshot&, const TRaft&, IRsm&);
     void RestoreAppliedIndex(uint64_t index);
     void AdvanceCommitIndex(uint64_t index);
     void AdvanceLeaderCommit();

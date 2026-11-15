@@ -13,10 +13,10 @@ rejected before the in-memory state or durable file changes. The receiver and
 both backends share one helper, so future callers cannot bypass the rule by
 installing snapshots below Raft.
 
-This preserves only the fixed-membership identity already trusted by storage. It
-does not enable joint snapshot recovery, live membership changes, or membership
-activation from an untrusted snapshot. Joint images remain explicit metadata and
-are still available to the existing offline durable format tests.
+This preserves the membership identity already trusted by storage. The later
+joint snapshot runtime still requires the bound original voters and exact
+committed joint history; snapshots cannot activate membership from metadata
+alone.
 
 The [alpha.59 follow-up](configuration-snapshot-continuity.md) extends this
 continuity check to active voter sets, stable-to-joint transitions and joint

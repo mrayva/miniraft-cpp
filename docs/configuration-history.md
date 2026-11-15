@@ -9,12 +9,11 @@ The caller must independently establish that the history boundary is committed
 and that the supplied application image corresponds exactly to that boundary.
 The method validates snapshot metadata and size; it does not capture application
 state, compact or mutate storage, establish commitment, or activate voters.
-Joint configuration snapshots remain rejected by the live runtime. Stable
-metadata snapshots are runtime-compatible only when they match the node's
-existing fixed voter set. Bound storage can retain stable or joint metadata
-snapshots for offline validation while preserving the original voter binding,
-even when the active set in the snapshot differs. This does not enable voter
-changes.
+At this alpha.27 milestone joint snapshots were rejected by the live runtime.
+Since alpha.71, MRFTS002 participates in runtime compaction and InstallSnapshot
+when the receiver has committed the exact same joint voter sets and identity.
+Bound storage preserves the original voter binding while the snapshot records
+the active joint sets; that metadata alone does not prove commitment.
 
 TConfigurationHistory checks a sequence of retained log entries against a trusted
 configuration baseline. It joins the experimental configuration-entry codec with
@@ -60,10 +59,12 @@ restart, confirms the fixture's known bootstrap baseline, and verifies that Raft
 still rejects the unsupported entries without rewriting storage. Full tests also
 cover existing snapshot installation and learner catch-up.
 
-This is configuration history validation for fixed membership, not live
-reconfiguration. Joint entry activation and rollback, snapshot installation
-across membership transitions, promotion gates and transport discovery remain
-open. Self-review
-checked contiguous scanning, term and predecessor relationships, immutable branch
-results, snapshot boundary consistency and the unknown-v1-identity case. No
-independent reviewer approval is claimed.
+This validator is one component of live reconfiguration. Joint entry activation,
+rollback and guarded transitions are described in
+[configuration entries](configuration-entries.md); matching-history joint
+snapshot compaction and installation are described in
+[joint snapshot runtime](joint-snapshot-runtime.md). Snapshot transfer still
+does not establish a configuration absent from the receiver's committed history.
+Self-review checked contiguous scanning, term and predecessor relationships,
+immutable branch results, snapshot boundary consistency and the unknown-v1-
+identity case. No independent reviewer approval is claimed.

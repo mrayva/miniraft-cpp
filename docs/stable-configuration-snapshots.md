@@ -33,7 +33,8 @@ image acceptable to live Raft or authenticate its membership claim; callers must
 provide a trusted history baseline.
 
 Older binaries may falsely acknowledge covered unknown formats; do not send these
-images to a mixed-version cluster. Joint snapshot installation, live
-configuration activation, rollback, commit rules and membership recovery remain
-open. This experimental format may change before those semantics are implemented.
-Rebuild dependents because the in-memory snapshot structure has changed.
+images to a mixed-version cluster. Later follow-ups added live configuration
+activation and matching-history joint snapshots. Snapshot metadata still cannot
+establish commitment, and transition rollback and transfer across an uncommitted
+configuration remain restricted. Rebuild dependents because the in-memory
+snapshot structure has changed.

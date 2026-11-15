@@ -36,5 +36,6 @@ recompute roles after commit or suffix replacement. Live changes additionally
 require durable commit-index persistence, the original voter binding and local
 endpoints for every active voter. Stable snapshots can cross a committed
 transition only when the receiver's committed history proves the same active
-voter set and configuration identity. Joint snapshot installation remains
-unsupported. Snapshot metadata alone does not authenticate a transition.
+voter set and configuration identity. Joint snapshots require the receiver to
+have committed the exact same joint voter sets and configuration index/term.
+Snapshot metadata alone does not authenticate a transition.

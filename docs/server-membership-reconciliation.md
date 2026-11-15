@@ -23,5 +23,6 @@ removed live.
 This closes the server-side role-change gap for forwarded client responses.
 Leadership transfer for removing the active leader is described in
 [leadership transfer](leadership-transfer.md). Membership-aware compaction is
-available after a committed stable transition; joint snapshot installation
-remains unsupported.
+available after the active voters acknowledge the committed configuration.
+Matching committed joint snapshots can also be compacted and installed; a
+snapshot cannot introduce an uncommitted voter configuration.

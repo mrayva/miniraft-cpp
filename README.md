@@ -45,8 +45,10 @@ voter binding. KV uses `--learner id` on every replica's configuration. The
 local compaction now works after a committed stable transition. The bounded
 [leadership-transfer follow-up](docs/leadership-transfer.md) enables removing
 the active leader after the joint configuration commits. Joint snapshot
-installation remains unsupported. A stable snapshot can cross a committed
-membership transition when the receiver has the exact committed
+installation requires matching committed history and the
+[joint snapshot runtime follow-up](docs/joint-snapshot-runtime.md) documents its
+compaction barrier. A stable snapshot can cross a committed membership
+transition when the receiver has the exact committed
 stable identity and voter set. The network server reconciles peer response
 readers as voters change roles.
 The [snapshot retry follow-up](docs/snapshot-retries.md) prevents timeout retries
@@ -66,16 +68,19 @@ when Raft needs only a retained entry's term.
 The [joint quorum foundation](docs/joint-quorum.md) adds and tests dual-majority
 arithmetic used by the live membership transition path.
 The [joint snapshot metadata foundation](docs/joint-snapshots.md) adds a versioned
-representation for a joint configuration at a snapshot boundary. Runtime joint
-snapshot adoption remains disabled; live membership is handled through the
-configuration-entry protocol.
+representation for a joint configuration at a snapshot boundary. The
+[joint snapshot runtime follow-up](docs/joint-snapshot-runtime.md) enables local
+compaction, recovery and transfer after the receiver commits the exact same
+joint configuration; the configuration-entry protocol remains the only way to
+change membership.
 The [snapshot term preflight follow-up](docs/unsupported-snapshot-term-preflight.md)
 rejects unsupported snapshot formats before a higher RPC term changes hard state.
 The [snapshot metadata preflight follow-up](docs/snapshot-metadata-term-preflight.md)
 checks the boundary, fixed voters, and stable identity before that term update.
 The [configuration entry support](docs/configuration-entries.md) describes the
-live joint-to-stable transition API, stable snapshot catch-up across committed
-transitions, and the remaining joint-snapshot limits.
+live joint-to-stable transition API and snapshot catch-up across committed
+transitions. Joint snapshot transfer requires matching committed history and
+all voters must understand MRFTS002.
 The [stable snapshot membership follow-up](docs/stable-snapshot-membership-install.md)
 documents the committed-history checks for snapshot transfer after a voter
 change.
@@ -164,7 +169,7 @@ log replication, and fault tolerance in a distributed system.
 - **Log Replication** (supported)
 - **Persistence** (supported)
 - **Snapshots** (opt-in KV compaction and InstallSnapshot; Linux durable backend)
-- **Membership Change** (durable joint-consensus add/remove, including leadership transfer for leader removal; joint snapshot installation remains open)
+- **Membership Change** (durable joint-consensus add/remove, leadership transfer for leader removal, and snapshots for an already committed matching joint configuration)
 
 The project focuses on a clear, modular design that leverages C++20 coroutines to simplify asynchronous flows.
 

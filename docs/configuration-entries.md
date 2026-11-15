@@ -52,13 +52,15 @@ before a transition because older versions reject this entry type.
 After the stable successor commits, local compaction records the active voter
 set and stable configuration identity while preserving the original durable
 voter binding ([details](stable-membership-compaction.md)). Compaction remains
-blocked during joint or uncommitted configuration state. A receiver can install
-a stable snapshot across a transition only when its committed history has the
-same stable voter set and configuration index/term; installation advances the
-history baseline before later configuration entries are scanned. Snapshots
-that cross a joint or uncommitted transition, or whose identity the receiver
-cannot prove, are rejected. MRFTS002 joint snapshot installation remains
-unsupported. Do not remove or edit committed state to bypass these limits.
+blocked during uncommitted configuration state. A receiver can install a stable
+snapshot across a transition only when its committed history has the same stable
+voter set and configuration index/term. MRFTS002 snapshots can be installed
+while the receiver has already committed the exact same joint configuration;
+both voter sets and the configuration index/term must match before a higher
+term is accepted. Joint snapshot compaction waits until every active voter has
+acknowledged that committed joint boundary. Snapshots cannot introduce a
+configuration the receiver has not committed or cross an uncommitted transition.
+Do not remove or edit committed state to bypass these limits.
 
 Deterministic durable-store tests cover learner catch-up, voter addition and
 removal, leadership transfer and fallback when its request is dropped,
@@ -66,4 +68,6 @@ per-node activation, joint commit propagation, stable finalization, rejection
 of invalid higher-term RPCs before term mutation, and rollback of an
 uncommitted joint suffix. The test suite also checks recovery of retained joint
 and stable histories, including post-restart role recovery after adding and
-removing a voter. Joint snapshot installation remains unsupported.
+removing a voter. Joint snapshot tests cover compaction, exact-history
+installation, higher-term rejection of forged voter metadata, restart recovery,
+and finalization from the snapshot baseline.

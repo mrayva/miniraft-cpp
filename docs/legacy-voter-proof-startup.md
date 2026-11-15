@@ -17,7 +17,9 @@ startup.
 The rejection does not rewrite the durable file. The alpha.51 startup marker
 also keeps the explicit migration API startup-only. `TDiskState` and in-memory
 state behavior are unchanged. This closes unbound durable startup; it does not
-implement live membership changes or joint snapshot recovery.
+implement live membership changes or joint snapshot recovery at this milestone.
+Later follow-ups add guarded live membership and joint snapshot recovery when
+the original voter binding and matching committed configuration history exist.
 
 Tests cover recovered log-only and idle stores failing without file changes,
 successful startup after explicit trusted migration, ordinary-snapshot adoption,

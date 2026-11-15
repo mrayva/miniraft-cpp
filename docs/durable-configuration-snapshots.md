@@ -29,26 +29,28 @@ history baseline through the snapshot boundary; the scanner verifies it against
 the snapshot metadata. Legacy snapshots still require the baseline voters to
 match the original binding. This scanner is an offline validation API; snapshot
 metadata is not proof of commitment or cluster identity. The separate live log
-transition API uses the durable commit boundary and original binding, while
-joint snapshot installation remains unsupported.
+transition API uses the durable commit boundary and original binding. Since
+alpha.71, the live runtime also recovers and installs MRFTS002 when the receiver
+has committed the exact same joint voter sets and configuration identity.
 
 In alpha.45 these images were persistence for offline validation only. The
 alpha.46 follow-up enables runtime recovery and transfer of MRFTS003 stable
 snapshots for the configured active voter set. Compaction carries forward the
 stable configuration identity. The stable membership compaction follow-up
 extends local compaction and restart recovery after a finalized voter change,
-while preserving the original binding. Network installation still requires
-the receiver's active set to match. MRFTS002 joint snapshots remain disabled in
-the live runtime; configuration log entries are accepted through the guarded
-joint-consensus path.
+while preserving the original binding. Network installation requires the
+receiver's committed configuration and both joint voter sets to match before
+accepting a higher term. Configuration log entries are accepted through the
+guarded joint-consensus path.
 Since alpha.58, bound storage can preserve its original voter binding while
 installing configuration-bearing snapshots whose active set changed. Raft
 startup uses stable metadata to recover a changed active set after local
 compaction. Since alpha.69, network installation also accepts stable snapshots
 across a committed transition when the receiver's committed history proves the
-same active set and configuration identity. Joint and uncommitted transitions
-remain unsupported by snapshot installation; the storage support also serves
-offline history validation and trusted inputs.
+same active set and configuration identity. Since alpha.71, joint snapshot
+installation also works when the receiver has committed the same joint
+configuration. Uncommitted transitions remain unsupported; the storage API
+also serves offline history validation and trusted inputs.
 The [alpha.59 follow-up](configuration-snapshot-continuity.md) checks that a
 replacement configuration snapshot extends the previously stored phase,
 identity, and active voter sets.
@@ -56,5 +58,5 @@ identity, and active voter sets.
 Tests cover in-memory installation, durable joint and stable round-trips,
 rejection of unbound configuration snapshots and mismatched legacy snapshots,
 offline scan baselines across multiple committed transitions, stable runtime
-restore/transfer/compaction, and continued joint snapshot rejection.
+restore/transfer/compaction, and matching-history joint runtime recovery.
 No independent reviewer approval is claimed.

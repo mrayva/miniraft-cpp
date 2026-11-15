@@ -14,11 +14,12 @@ receiver's trusted identity into the stored image. After durable installation,
 Raft advances the configuration scan baseline to the new snapshot boundary so
 later entries continue from the correct history.
 
-Snapshots remain rejected while the receiver's history is joint or has an
-uncommitted transition. Joint MRFTS002 snapshot installation and transfer to a
-receiver that has not committed the matching stable configuration remain
-unsupported. Leader removal was added later through
-[leadership transfer](leadership-transfer.md). Snapshot metadata is a
+At alpha.69, snapshots were rejected while the receiver's history was joint or
+had an uncommitted transition. Since alpha.71, MRFTS002 installation is enabled
+when the receiver has committed the same joint configuration, as described in
+[joint snapshot runtime](joint-snapshot-runtime.md). Transfer still cannot
+establish a configuration the receiver has not committed. Leader removal was
+added later through [leadership transfer](leadership-transfer.md). Snapshot metadata is a
 consistency assertion, not cryptographic proof of cluster identity; this path
 trusts the receiver's previously validated durable configuration history.
 

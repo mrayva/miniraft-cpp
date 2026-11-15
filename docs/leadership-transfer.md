@@ -30,5 +30,7 @@ malformed higher-term request without changing the receiver's durable state.
 
 `TIMEOUT_NOW_REQUEST` is a new Raft wire message. Upgrade all voters to a
 compatible build before using a transition that removes its leader; older
-builds reject the message. Joint snapshot installation and snapshot transfer
-across an in-progress transition remain unsupported.
+builds reject the message. Joint snapshots require the receiver to have already
+committed the exact same joint voter sets and configuration identity; see
+[configuration entries](configuration-entries.md). Snapshots still cannot
+introduce an uncommitted transition or cross an unknown configuration boundary.

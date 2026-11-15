@@ -28,34 +28,22 @@ that a stored stable configuration advances to a joint image using the same old
 voters, and that a joint image can only continue with the same joint identity or
 move to a stable successor selecting its new voters.
 
-This is a format and offline persistence foundation, not live joint consensus or
-complete configuration history. A bound memory or durable store can install and
-recover a joint snapshot for offline validation while preserving its original
-voter binding, which may differ from the snapshot's active old voter set after
-earlier transitions. The caller must supply a trusted history baseline; the
-snapshot codec and store do not prove that the transition was committed. Raft
-startup and RPC paths still reject joint snapshots, and compaction only creates
-fixed-voter snapshots. A covered
-snapshot is acknowledged only after its prefix identifies supported fixed v1 or
-stable v3 metadata, including when the prefix arrives in several chunks.
-Unsupported joint images are rejected without replacing application data or
-publishing a joint snapshot. Since alpha.48, a higher-term InstallSnapshot can
-advance hard state only after its initial chunk identifies a supported MRFTS001
-or MRFTS003 format. Since alpha.49, that chunk must also contain the complete
-bounded metadata prefix and match the RPC boundary, fixed voter set, and any
-known stable configuration identity. Short, unknown, joint-format, mismatched,
-or continuation chunks cannot change the term before rejection. These rules
-avoid falsely acknowledging a joint image merely because its index is already
-committed locally.
+This began as a format and offline persistence foundation. Since alpha.71, Raft
+startup, local compaction, and InstallSnapshot support joint images when the
+persisted original voter binding is present and the receiver's committed joint
+history matches both voter sets and the configuration identity. The metadata
+does not prove commitment or authenticate a sender; the runtime relies on the
+receiver's previously validated history. Compaction waits for every active
+voter to acknowledge the committed joint boundary. A covered
+snapshot is acknowledged only after its prefix identifies a supported format,
+including when the prefix arrives in several chunks. A higher-term install must
+include the complete bounded metadata prefix and match the RPC boundary and
+known configuration history before hard state advances.
 
 Older binaries do not understand MRFTS002 and may acknowledge an already-covered
-image without checking its version. Do not send or activate joint snapshots in a
-mixed-version cluster. Future live use requires an upgrade of every voter, a
-defined compatibility protocol, replicated configuration entries, durable and
-snapshot recovery of configuration history, transition rollback rules and dual
-quorum handling throughout the protocol. This experimental v2 format may change
-before those semantics are implemented. A standalone export is not proof that a
-configuration is committed and is not an authoritative Raft checkpoint.
+image without checking its version. Upgrade every voter before using joint
+snapshot transfer. A standalone export is not proof that a configuration is
+committed and is not an authoritative Raft checkpoint.
 
 Tests cover a golden v1 image, joint round-trip, every-byte corruption and
 truncation, semantic corruption with valid CRC, bounds and ordering, standalone

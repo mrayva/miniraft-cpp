@@ -32,9 +32,11 @@ struct TSnapshotMetadataProbe {
 
 bool IsSupportedSnapshotMagicPrefix(std::string_view prefix) {
     constexpr std::string_view legacy = "MRFTS001";
+    constexpr std::string_view joint = "MRFTS002";
     constexpr std::string_view stable = "MRFTS003";
     const auto bytes = prefix.substr(0, std::min(prefix.size(), legacy.size()));
-    return legacy.substr(0, bytes.size()) == bytes || stable.substr(0, bytes.size()) == bytes;
+    return legacy.substr(0, bytes.size()) == bytes || joint.substr(0, bytes.size()) == bytes ||
+        stable.substr(0, bytes.size()) == bytes;
 }
 
 bool ReadSnapshotInteger(std::string_view bytes, size_t offset, unsigned width, uint64_t& value) {
@@ -45,58 +47,118 @@ bool ReadSnapshotInteger(std::string_view bytes, size_t offset, unsigned width, 
     return true;
 }
 
+bool SnapshotMatchesCommittedConfiguration(const TSnapshot& snapshot,
+        const TConfigurationHistory& committed) {
+    if (committed.IsJoint()) {
+        return snapshot.IsJoint() && !snapshot.StableConfiguration &&
+            snapshot.Voters == committed.OldVoters() && snapshot.JointVoters == committed.NewVoters() &&
+            snapshot.ConfigurationIndex == committed.ConfigurationIndex() &&
+            snapshot.ConfigurationTerm == committed.ConfigurationTerm();
+    }
+    if (snapshot.IsJoint() || snapshot.Voters != committed.OldVoters()) return false;
+    if (snapshot.StableConfiguration)
+        return snapshot.ConfigurationIndex == committed.ConfigurationIndex() &&
+            snapshot.ConfigurationTerm == committed.ConfigurationTerm();
+    return snapshot.Index >= committed.ConfigurationIndex();
+}
+
+bool SnapshotMetadataContinuesKnown(const TSnapshot* known, bool joint, bool stable,
+        const std::vector<uint32_t>& oldVoters,
+        const std::vector<uint32_t>& newVoters, uint64_t configurationIndex,
+        uint64_t configurationTerm) {
+    if (!known || !known->HasConfigurationMetadata()) return true;
+    if (known->StableConfiguration) {
+        if (joint) return oldVoters == known->Voters && configurationIndex > known->Index &&
+            configurationTerm >= known->Term;
+        if (stable) return oldVoters == known->Voters &&
+            configurationIndex == known->ConfigurationIndex && configurationTerm == known->ConfigurationTerm;
+        return oldVoters == known->Voters;
+    }
+    if (joint) return oldVoters == known->Voters && newVoters == known->JointVoters &&
+        configurationIndex == known->ConfigurationIndex && configurationTerm == known->ConfigurationTerm;
+    if (stable) return oldVoters == known->JointVoters && configurationIndex > known->Index &&
+        configurationTerm >= known->Term;
+    return false;
+}
+
 TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t totalBytes,
         uint64_t index, uint64_t term, const std::vector<uint32_t>& voters,
         const TSnapshot* knownSnapshot, const TConfigurationHistory* committedConfiguration,
-        bool configurationStable) {
+        bool configurationCommitted) {
     if (prefix.size() < 8) return {false, false, 8};
     const auto magic = prefix.substr(0, 8);
     const bool stable = magic == "MRFTS003";
-    if (!stable && magic != "MRFTS001") return {true, false, 0};
+    const bool joint = magic == "MRFTS002";
+    if (!stable && !joint && magic != "MRFTS001") return {true, false, 0};
+    // The active configuration phase is already trusted from local committed
+    // history, so reject phase mismatches as soon as the format is identified.
+    if (!configurationCommitted || !committedConfiguration ||
+        joint != committedConfiguration->IsJoint())
+        return {true, false, 0};
 
     // Inspect only the bounded format header and voter list. Callers use this
     // before granting replication progress or accepting a higher term; payload
     // bytes and CRC are validated by the full install path when needed.
-    const size_t fixedHeaderBytes = stable ? 52 : 36;
+    const size_t fixedHeaderBytes = stable ? 52 : joint ? 56 : 36;
     if (prefix.size() < fixedHeaderBytes) return {false, false, fixedHeaderBytes};
     uint64_t embeddedIndex = 0, embeddedTerm = 0, voterCount = 0, dataBytes = 0;
     if (!ReadSnapshotInteger(prefix, 8, 8, embeddedIndex) ||
         !ReadSnapshotInteger(prefix, 16, 8, embeddedTerm) ||
         !ReadSnapshotInteger(prefix, 24, 4, voterCount) ||
         !ReadSnapshotInteger(prefix, 28, 8, dataBytes) ||
-        embeddedIndex != index || embeddedTerm != term || voterCount != voters.size())
+        embeddedIndex != index || embeddedTerm != term || voterCount > TSnapshot::MaxVoters)
         return {true, false, 0};
-    // Snapshot voter metadata is only meaningful relative to the receiver's
-    // already committed configuration. An image cannot invent a membership
-    // identity or cross a joint/uncommitted transition by naming a voter list.
-    if (!configurationStable || !committedConfiguration || committedConfiguration->IsJoint() ||
-        voters != committedConfiguration->OldVoters() ||
-        embeddedIndex < committedConfiguration->ConfigurationIndex())
+    uint64_t configurationIndex = 0, configurationTerm = 0, newCount = 0;
+    if ((stable || joint) && (!ReadSnapshotInteger(prefix, 36, 8, configurationIndex) ||
+        !ReadSnapshotInteger(prefix, 44, 8, configurationTerm) || !configurationIndex ||
+        configurationIndex > embeddedIndex || !configurationTerm || configurationTerm > embeddedTerm ||
+        (configurationIndex == embeddedIndex && configurationTerm != embeddedTerm)))
         return {true, false, 0};
-    if (stable) {
-        uint64_t configurationIndex = 0, configurationTerm = 0;
-        if (!ReadSnapshotInteger(prefix, 36, 8, configurationIndex) ||
-            !ReadSnapshotInteger(prefix, 44, 8, configurationTerm) || !configurationIndex ||
-            configurationIndex > embeddedIndex || !configurationTerm || configurationTerm > embeddedTerm ||
-            (configurationIndex == embeddedIndex && configurationTerm != embeddedTerm) ||
+    if (joint && (!ReadSnapshotInteger(prefix, 52, 4, newCount) || newCount > TSnapshot::MaxVoters))
+        return {true, false, 0};
+    std::vector<uint32_t> activeVoters = committedConfiguration->OldVoters();
+    if (committedConfiguration->IsJoint()) {
+        activeVoters.insert(activeVoters.end(), committedConfiguration->NewVoters().begin(),
+            committedConfiguration->NewVoters().end());
+        std::sort(activeVoters.begin(), activeVoters.end());
+        activeVoters.erase(std::unique(activeVoters.begin(), activeVoters.end()), activeVoters.end());
+    }
+    if (voters != activeVoters || voterCount != committedConfiguration->OldVoters().size() ||
+        newCount != (joint ? committedConfiguration->NewVoters().size() : 0))
+        return {true, false, 0};
+    if (joint) {
+        if (!committedConfiguration->IsJoint() ||
             configurationIndex != committedConfiguration->ConfigurationIndex() ||
-            configurationTerm != committedConfiguration->ConfigurationTerm() ||
-            (knownSnapshot && knownSnapshot->StableConfiguration &&
-                (configurationIndex != knownSnapshot->ConfigurationIndex ||
-                 configurationTerm != knownSnapshot->ConfigurationTerm)))
+            configurationTerm != committedConfiguration->ConfigurationTerm())
+            return {true, false, 0};
+    } else {
+        if (committedConfiguration->IsJoint() || embeddedIndex < committedConfiguration->ConfigurationIndex())
+            return {true, false, 0};
+        if (stable && (configurationIndex != committedConfiguration->ConfigurationIndex() ||
+            configurationTerm != committedConfiguration->ConfigurationTerm()))
             return {true, false, 0};
     }
 
     const uint64_t voterBytes = voterCount * 4;
-    const uint64_t headerBytes = fixedHeaderBytes + voterBytes;
+    const uint64_t headerBytes = fixedHeaderBytes + voterBytes + newCount * 4;
     if (headerBytes + 4 > totalBytes || dataBytes != totalBytes - headerBytes - 4)
         return {true, false, 0};
     if (headerBytes > prefix.size()) return {false, false, size_t(headerBytes)};
-    for (size_t i = 0; i < voters.size(); ++i) {
+    const auto& expectedOld = committedConfiguration->OldVoters();
+    for (size_t i = 0; i < expectedOld.size(); ++i) {
         uint64_t voter = 0;
-        if (!ReadSnapshotInteger(prefix, fixedHeaderBytes + i * 4, 4, voter) || voter != voters[i])
+        if (!ReadSnapshotInteger(prefix, fixedHeaderBytes + i * 4, 4, voter) || voter != expectedOld[i])
             return {true, false, 0};
     }
+    const auto& expectedNew = committedConfiguration->NewVoters();
+    for (size_t i = 0; i < expectedNew.size(); ++i) {
+        uint64_t voter = 0;
+        if (!ReadSnapshotInteger(prefix, fixedHeaderBytes + voterBytes + i * 4, 4, voter) || voter != expectedNew[i])
+            return {true, false, 0};
+    }
+    if (!SnapshotMetadataContinuesKnown(knownSnapshot, joint, stable,
+        expectedOld, expectedNew, configurationIndex, configurationTerm))
+        return {true, false, 0};
     return {true, true, size_t(headerBytes)};
 }
 
@@ -282,13 +344,11 @@ TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes, st
     const auto snapshot = State->GetSnapshot();
     if (snapshot) {
         ValidateSnapshot(*snapshot);
-        if (snapshot->IsJoint())
-            throw std::invalid_argument("Joint snapshot recovery is unsupported");
-        if (snapshot->StableConfiguration && bound != InitialVoters)
-            throw std::invalid_argument("Stable configuration snapshot requires the existing voter binding");
+        if (snapshot->HasConfigurationMetadata() && bound != InitialVoters)
+            throw std::invalid_argument("Configuration snapshot requires the existing voter binding");
         if (snapshot->Index != State->SnapshotIndex || snapshot->Term != State->SnapshotTerm ||
             snapshot->Term > State->CurrentTerm ||
-            (snapshot->Voters != InitialVoters && !snapshot->StableConfiguration) ||
+            (snapshot->Voters != InitialVoters && !snapshot->HasConfigurationMetadata()) ||
             State->LastLogTerm < State->SnapshotTerm || State->LastLogTerm > State->CurrentTerm ||
             (State->LastLogIndex == State->SnapshotIndex && State->LastLogTerm != State->SnapshotTerm))
             throw std::invalid_argument("Compacted state snapshot boundary mismatch");
@@ -317,7 +377,9 @@ TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes, st
         (fresh || snapshot || !Learners.empty());
     const auto baseline = snapshot && snapshot->StableConfiguration
         ? TConfigurationHistory::FromStableSnapshot(*snapshot)
-        : TConfigurationHistory::Stable(InitialVoters, 0, 0, State->SnapshotIndex, State->SnapshotTerm);
+        : snapshot && snapshot->IsJoint()
+            ? TConfigurationHistory::FromJointSnapshot(*snapshot)
+            : TConfigurationHistory::Stable(InitialVoters, 0, 0, State->SnapshotIndex, State->SnapshotTerm);
     ConfigurationBaseline = baseline;
     RefreshConfiguration(std::max(State->CommitIndex, State->SnapshotIndex));
     const bool hasRetainedConfiguration = Configuration->Latest.ConfigurationIndex() > baseline.ConfigurationIndex();
@@ -1212,8 +1274,17 @@ bool TRaft::IsLearnerCommitAcknowledged(uint32_t id) const {
 
 TSnapshot TRaft::Compact() {
     if (!State->SupportsSnapshots()) throw std::logic_error("Storage cannot compact snapshots");
-    if (Configuration && (Configuration->Committed.IsJoint() || Configuration->HasUncommittedConfiguration()))
-        throw std::logic_error("Compaction requires a committed stable configuration");
+    if (Configuration && Configuration->HasUncommittedConfiguration())
+        throw std::logic_error("Compaction requires a committed configuration boundary");
+    if (Configuration && Configuration->Committed.ConfigurationIndex()) {
+        for (auto voter : Voters) {
+            if (voter == Id) continue;
+            const auto ack = VolatileState->CommitAckIndex.find(voter);
+            if (ack == VolatileState->CommitAckIndex.end() ||
+                ack->second < Configuration->Committed.ConfigurationIndex())
+                throw std::logic_error("Compaction requires every active voter to acknowledge the committed configuration");
+        }
+    }
     auto application = SnapshotApplication.lock();
     if (!application) throw std::logic_error("Compaction requires a bound application");
     if (application->LastAppliedIndex == State->SnapshotIndex && State->GetSnapshot()) return *State->GetSnapshot();
@@ -1228,7 +1299,9 @@ TSnapshot TRaft::Compact() {
     State->InstallSnapshot(snapshot);
     ConfigurationBaseline = snapshot.StableConfiguration
         ? TConfigurationHistory::FromStableSnapshot(snapshot)
-        : TConfigurationHistory::Stable(Voters, 0, 0, snapshot.Index, snapshot.Term);
+        : snapshot.IsJoint()
+            ? TConfigurationHistory::FromJointSnapshot(snapshot)
+            : TConfigurationHistory::Stable(Voters, 0, 0, snapshot.Index, snapshot.Term);
     RefreshConfiguration(VolatileState->CommitIndex);
     // Outstanding transfers own their immutable encoded bytes; discard any
     // otherwise-retained encoding of the old local snapshot.
@@ -1391,7 +1464,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     TSnapshot snapshot;
     try {
         snapshot = DecodeSnapshot(bytes);
-        if (snapshot.IsJoint() || snapshot.Index != request->SnapshotIndex || snapshot.Term != request->SnapshotTerm || snapshot.Voters != GetVoterIds())
+        if (snapshot.Index != request->SnapshotIndex || snapshot.Term != request->SnapshotTerm ||
+            !SnapshotMatchesCommittedConfiguration(snapshot, Configuration->Committed))
             throw TMessageError("Snapshot metadata mismatch");
         if (!snapshot.HasConfigurationMetadata() && Configuration->Committed.ConfigurationIndex()) {
             // Legacy snapshots have no configuration identity. The bounded
@@ -1415,7 +1489,9 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     VolatileState->CommitIndex = State->CommitIndex;
     ConfigurationBaseline = snapshot.StableConfiguration
         ? TConfigurationHistory::FromStableSnapshot(snapshot)
-        : TConfigurationHistory::Stable(snapshot.Voters, 0, 0, snapshot.Index, snapshot.Term);
+        : snapshot.IsJoint()
+            ? TConfigurationHistory::FromJointSnapshot(snapshot)
+            : TConfigurationHistory::Stable(snapshot.Voters, 0, 0, snapshot.Index, snapshot.Term);
     RefreshConfiguration(VolatileState->CommitIndex);
     IncomingSnapshot.reset();
     reply(true, true, request->TotalBytes);

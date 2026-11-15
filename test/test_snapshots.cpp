@@ -178,7 +178,7 @@ void test_joint_snapshot_metadata_rejects_invalid_boundaries_and_voters(void**) 
     mismatch[36] = 2; // configuration index equals the snapshot index
     FixChecksum(mismatch); Reject([&] { DecodeSnapshot(mismatch); });
 }
-void test_joint_snapshot_cannot_be_installed_or_restored_by_fixed_runtime(void**) {
+void test_joint_snapshot_requires_matching_runtime_history_and_binding(void**) {
     auto snapshot = JointSample();
     auto state = std::make_shared<TState>();
     state->Append(NewHoldedMessage<TLogEntry>()); state->Append(NewHoldedMessage<TLogEntry>());
@@ -554,7 +554,12 @@ void test_stable_configuration_snapshot_durable_runtime_recovery_and_compaction(
 
         auto entry = app->Prepare(Command("tail", "after recovery")); entry->Term = 1;
         state->Append(entry); app->Write(entry, 3);
-        const_cast<TVolatileState*>(raft->GetVolatileState())->CommitIndex = 3;
+        auto* volatileState = const_cast<TVolatileState*>(raft->GetVolatileState());
+        volatileState->CommitIndex = 3;
+        // This fixture represents a stable configuration already acknowledged
+        // by every active voter; only the new application tail is local.
+        volatileState->CommitAckIndex[2] = snapshot.ConfigurationIndex;
+        volatileState->CommitAckIndex[3] = snapshot.ConfigurationIndex;
         compacted = raft->Compact();
         assert_true(compacted.StableConfiguration);
         assert_int_equal(compacted.ConfigurationIndex, snapshot.ConfigurationIndex);
@@ -743,7 +748,7 @@ int main() {
         cmocka_unit_test(test_joint_snapshot_codec_roundtrip_and_corruption),
         cmocka_unit_test(test_stable_configuration_snapshot_codec_and_runtime_guards),
         cmocka_unit_test(test_joint_snapshot_metadata_rejects_invalid_boundaries_and_voters),
-        cmocka_unit_test(test_joint_snapshot_cannot_be_installed_or_restored_by_fixed_runtime),
+        cmocka_unit_test(test_joint_snapshot_requires_matching_runtime_history_and_binding),
         cmocka_unit_test(test_startup_rejects_inconsistent_snapshot_boundaries_before_binding),
         cmocka_unit_test(test_startup_rejects_invalid_compacted_suffix_terms),
         cmocka_unit_test(test_snapshot_metadata_and_declared_lengths_are_bounded),

@@ -1,8 +1,9 @@
 # Stable configuration snapshot runtime support: v0.1.0-alpha.46
 
-The runtime now accepts MRFTS003 snapshots for the node's already configured
-fixed voter set. Startup requires the snapshot voter list, supplied Raft peers,
-and persisted voter binding to agree. Joint MRFTS002 snapshots remain rejected.
+This alpha.46 milestone accepted MRFTS003 snapshots for the node's configured
+stable voter set. A later [joint snapshot follow-up](configuration-entries.md)
+also accepts MRFTS002 when the receiver has committed the exact same joint
+configuration.
 
 With that same-set check, the existing snapshot lifecycle can restore a durable
 snapshot into the application, receive and persist it over InstallSnapshot, and
@@ -24,14 +25,16 @@ binding. After a stable successor commits, local compaction records the new
 active set and startup recovers it from the stable snapshot while the configured
 bootstrap view still matches the original binding. Network snapshot handling
 now allows transfer across a committed stable transition when the receiver has
-the exact same stable identity and voter set. It rejects snapshots that cross
-joint or uncommitted history, or claim an identity not established by the
-receiver's committed configuration. Joint snapshot installation remains open.
-Upgrade all voters before sending MRFTS003 images because older binaries may
-acknowledge an already-covered unknown snapshot format.
+the exact same stable identity and voter set. Joint installation requires the
+receiver's committed joint history to match both voter sets and the
+configuration index/term. Snapshot metadata cannot introduce an uncommitted
+transition or establish membership on its own. Upgrade all voters before
+sending configuration-bearing images because older binaries may acknowledge
+an already-covered unknown snapshot format.
 
 Tests cover durable application restore, identity preservation through
 compaction, restart, and legacy-format refresh, chunked InstallSnapshot,
 covered-prefix validation of stable metadata, and rejection of conflicting
-identities and joint snapshots. Self-review completed; no independent reviewer
-approval is claimed.
+identities. Joint snapshot runtime coverage is maintained with the live
+membership tests. Self-review completed; no independent reviewer approval is
+claimed.

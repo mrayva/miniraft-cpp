@@ -19,12 +19,10 @@ struct TSnapshot {
     std::vector<uint32_t> Voters;
     std::string Data;
     // Optional joint configuration effective at this snapshot boundary.
-    // Runtime installation is disabled until membership recovery is implemented.
     std::vector<uint32_t> JointVoters;
     uint64_t ConfigurationIndex = 0, ConfigurationTerm = 0;
-    // Experimental stable-configuration identity. Offline storage may retain
-    // an active voter set that differs from its original persisted binding;
-    // live Raft still rejects that configuration until transitions are enabled.
+    // Stable-configuration identity. Offline storage retains the original
+    // persisted voter binding while this field records the active voter set.
     bool StableConfiguration = false;
     bool IsJoint() const { return !JointVoters.empty() || (!StableConfiguration && (ConfigurationIndex || ConfigurationTerm)); }
     bool HasConfigurationMetadata() const { return StableConfiguration || IsJoint(); }

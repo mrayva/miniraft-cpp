@@ -18,7 +18,7 @@ application payload before replacing state.
 Deterministic regression cases cover mismatched embedded voters, a snapshot
 boundary that disagrees with the request, invalid stable metadata, and valid
 metadata prefixes split across chunks. Rejected images do not change durable Raft
-or application state. Joint snapshots remain unsupported; live voter changes use
-the configuration log protocol described in
-[live membership](configuration-entries.md).
+or application state. Joint snapshots use committed history as their gate: the
+receiver must already have committed the same old and new voter sets and
+configuration identity. They cannot introduce a voter change.
 Self-review completed; no independent reviewer approval is claimed.

@@ -142,6 +142,7 @@ is claimed. Process crashes do not substitute for hardware power-cut testing.
 The later [live membership follow-up](configuration-entries.md) adds replicated
 joint configurations, old/new election/commit/read majorities and promotion
 gates. [Leadership transfer](leadership-transfer.md) enables removing the active
-leader. Joint snapshot recovery and installation, online transport discovery,
-authenticated bootstrap, SQL snapshots, resource quotas and independent review
-remain open production gates.
+leader. Joint snapshot recovery and installation require matching committed
+history, and snapshots cannot introduce an uncommitted transition. Online
+transport discovery, authenticated bootstrap, SQL snapshots, resource quotas
+and independent review remain open production gates.

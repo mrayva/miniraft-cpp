@@ -9,9 +9,9 @@ the baseline needed by recovery and later compaction.
 Incoming MRFTS003 snapshots must retain the known configuration index and term.
 The receiver rejects conflicting identities both when installing a newer image
 and when acknowledging an image whose boundary is already covered. These checks
-do not enable membership changes through snapshots: the node still requires the
-same configured voters, and joint snapshots remain unsupported. Membership now
-changes through the separate configuration log protocol.
+do not enable membership changes through snapshots: membership changes still
+use the separate configuration log protocol. Since alpha.71, an MRFTS002 image
+can be installed only after the receiver commits the same joint configuration.
 
 The focused compaction test covers a covered-boundary conflict, a legacy-format
 refresh followed by restart, and a conflicting newer stable snapshot. The change

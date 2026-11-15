@@ -10,15 +10,16 @@ advance the follower's durable term before the handler rejected it.
 
 For a higher-term InstallSnapshot request, the RPC validator now requires an
 initial chunk with at least the eight-byte magic and accepts the term only when
-that magic identifies a supported MRFTS001 or MRFTS003 image. Higher-term
+that magic identifies a supported snapshot image. Higher-term
 continuation chunks are rejected because a term change discards partial
 transfers. Current-term malformed or joint images continue through the ordinary
 fail-closed rejection path. The outbound sender already places the complete
 magic in its initial chunk.
 
-This closes the hard-state mutation gap for snapshots that can be recognized as
-unsupported from their first chunk. It does not enable joint snapshot transfer,
-joint snapshot recovery, or live membership changes.
+This closed the hard-state mutation gap for then-supported snapshot formats.
+Since alpha.71, matching committed joint snapshots are supported; their complete
+metadata prefix must prove the same committed old/new voter sets before the
+receiver accepts a higher term.
 
 The compaction regression test sends a full joint image, a short first chunk,
 and a continuation chunk at a higher term, then verifies that term, vote, log,

@@ -80,9 +80,25 @@ void CheckSnapshotConfigurationContinuity(const TSnapshot* current, const TSnaps
     }
     throw std::invalid_argument("Legacy snapshot cannot discard joint configuration metadata");
 }
-void CheckLocalLog(const TSnapshot& snapshot, const TRaft& raft) {
+bool MatchesConfiguration(const TSnapshot& snapshot, const TConfigurationHistory& committed) {
+    if (committed.IsJoint()) {
+        return snapshot.IsJoint() && !snapshot.StableConfiguration &&
+            snapshot.Voters == committed.OldVoters() && snapshot.JointVoters == committed.NewVoters() &&
+            snapshot.ConfigurationIndex == committed.ConfigurationIndex() &&
+            snapshot.ConfigurationTerm == committed.ConfigurationTerm();
+    }
+    if (snapshot.IsJoint() || snapshot.Voters != committed.OldVoters()) return false;
+    if (snapshot.StableConfiguration)
+        return snapshot.ConfigurationIndex == committed.ConfigurationIndex() &&
+            snapshot.ConfigurationTerm == committed.ConfigurationTerm();
+    return snapshot.Index >= committed.ConfigurationIndex();
+}
+
+void CheckLocalLog(const TSnapshot& snapshot, const TRaft& raft,
+        const TConfigurationHistory& configurationAtBoundary) {
     Validate(snapshot);
-    if (snapshot.IsJoint() || snapshot.Voters != raft.GetVoterIds() || snapshot.Index > raft.GetLastIndex() ||
+    if (!MatchesConfiguration(snapshot, configurationAtBoundary) ||
+        snapshot.Index > raft.GetLastIndex() ||
         snapshot.Term > raft.GetState()->CurrentTerm ||
         raft.GetState()->LogTerm(snapshot.Index) != snapshot.Term)
         throw std::runtime_error("Snapshot does not match retained log and active configuration");
@@ -178,19 +194,20 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm) {
     const auto index = rsm.LastAppliedIndex;
     if (!index || index > raft.GetVolatileState()->CommitIndex || index > raft.GetLastIndex())
         throw std::runtime_error("Snapshot requires applied committed progress");
-    TSnapshot snapshot{index, raft.GetState()->LogTerm(index), raft.GetVoterIds(), {}};
-    if (raft.Configuration) {
-        if (raft.Configuration->HasUncommittedConfiguration())
-            throw std::logic_error("Snapshot capture requires a committed configuration boundary");
-        const auto& committed = raft.Configuration->Committed;
-        if (committed.IsJoint()) throw std::logic_error("Joint configuration snapshots are unsupported");
-        if (committed.ConfigurationIndex() > index)
-            throw std::logic_error("Application progress precedes the committed configuration");
-        if (committed.ConfigurationIndex()) {
-            snapshot.StableConfiguration = true;
-            snapshot.ConfigurationIndex = committed.ConfigurationIndex();
-            snapshot.ConfigurationTerm = committed.ConfigurationTerm();
-        }
+    if (!raft.Configuration || raft.Configuration->HasUncommittedConfiguration())
+        throw std::logic_error("Snapshot capture requires a committed configuration boundary");
+    const auto& committed = raft.Configuration->Committed;
+    if (committed.ConfigurationIndex() > index)
+        throw std::logic_error("Application progress precedes the committed configuration");
+    TSnapshot snapshot{index, raft.GetState()->LogTerm(index), committed.OldVoters(), {}};
+    if (committed.IsJoint()) {
+        snapshot.JointVoters = committed.NewVoters();
+        snapshot.ConfigurationIndex = committed.ConfigurationIndex();
+        snapshot.ConfigurationTerm = committed.ConfigurationTerm();
+    } else if (committed.ConfigurationIndex()) {
+        snapshot.StableConfiguration = true;
+        snapshot.ConfigurationIndex = committed.ConfigurationIndex();
+        snapshot.ConfigurationTerm = committed.ConfigurationTerm();
     }
     if (!snapshot.StableConfiguration) {
         const auto previous = raft.GetState()->GetSnapshot();
@@ -200,7 +217,7 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm) {
             snapshot.ConfigurationTerm = previous->ConfigurationTerm;
         }
     }
-    CheckLocalLog(snapshot, raft);
+    CheckLocalLog(snapshot, raft, raft.Configuration->Committed);
     snapshot.Data = rsm.SaveSnapshot();
     Validate(snapshot);
     return snapshot;
@@ -210,7 +227,12 @@ void RestoreSnapshot(const TSnapshot& snapshot, const TRaft& raft, IRsm& rsm) {
     const auto knownSnapshot = raft.GetState()->GetSnapshot();
     ValidateSnapshot(snapshot);
     CheckSnapshotConfigurationContinuity(knownSnapshot.get(), snapshot);
-    CheckLocalLog(snapshot, raft);
+    if (snapshot.Index < raft.GetState()->SnapshotIndex ||
+        snapshot.Index > raft.GetVolatileState()->CommitIndex || !raft.ConfigurationBaseline)
+        throw std::runtime_error("Snapshot is outside the committed retained configuration history");
+    const auto configurationAtBoundary = ScanConfigurationHistory(*raft.GetState(),
+        *raft.ConfigurationBaseline, snapshot.Index).Committed;
+    CheckLocalLog(snapshot, raft, configurationAtBoundary);
     if (rsm.LastAppliedIndex >= snapshot.Index)
         throw std::runtime_error("Application is not behind the snapshot");
     rsm.ValidateSnapshot(snapshot.Data, snapshot.Index);

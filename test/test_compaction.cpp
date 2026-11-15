@@ -376,7 +376,7 @@ TMessageHolder<TInstallSnapshotRequest> Chunk(const TSnapshot& snapshot, std::st
     message->Offset = offset; message->TotalBytes = bytes.size(); message->Done = offset + count == bytes.size();
     message->LeaderId = 1; memcpy(message->Data, bytes.data() + offset, count); return message;
 }
-void test_joint_snapshot_is_rejected_even_if_boundary_is_already_covered(void**) {
+void test_joint_snapshot_is_rejected_without_matching_history_even_if_boundary_is_covered(void**) {
     TKv source; source.Write(source.Prepare(Command("a", "old")), 5);
     TSnapshot fixed{5, 1, {1, 2}, source.SaveSnapshot()};
     std::vector<TMessageHolder<TInstallSnapshotResponse>> replies;
@@ -496,7 +496,7 @@ void test_joint_snapshot_is_rejected_even_if_boundary_is_already_covered(void**)
     assert_true(static_cast<TStateFields>(*state) == before); assert_int_equal(app->Loads, 1);
     assert_true(Read(*app, "a") == "old");
 }
-void test_unsupported_new_snapshot_does_not_accept_leader_contact(void**) {
+void test_unmatched_joint_snapshot_does_not_accept_leader_contact(void**) {
     TKv source; source.Write(source.Prepare(Command("a", "joint")), 5);
     TSnapshot joint{5, 2, {1, 2}, source.SaveSnapshot()};
     joint.JointVoters = {2, 3}; joint.ConfigurationIndex = 4; joint.ConfigurationTerm = 2;
@@ -1042,8 +1042,8 @@ int main() {
         cmocka_unit_test(test_snapshot_is_rechecked_when_commit_advances_mid_transfer),
         cmocka_unit_test(test_memory_snapshot_storage_rejects_term_regression),
         cmocka_unit_test(test_memory_snapshot_cannot_replace_committed_index_with_conflicting_term),
-        cmocka_unit_test(test_joint_snapshot_is_rejected_even_if_boundary_is_already_covered),
-        cmocka_unit_test(test_unsupported_new_snapshot_does_not_accept_leader_contact),
+        cmocka_unit_test(test_joint_snapshot_is_rejected_without_matching_history_even_if_boundary_is_covered),
+        cmocka_unit_test(test_unmatched_joint_snapshot_does_not_accept_leader_contact),
         cmocka_unit_test(test_unproven_stable_configuration_snapshot_is_rejected_for_fixed_membership),
         cmocka_unit_test(test_idle_partial_snapshot_expires_on_learner_despite_heartbeats),
         cmocka_unit_test(test_remote_snapshot_retains_suffix_without_applying_it_before_commit),
