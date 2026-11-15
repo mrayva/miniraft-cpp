@@ -49,17 +49,18 @@ before a transition because older versions reject this entry type.
 After the stable successor commits, local compaction records the active voter
 set and stable configuration identity while preserving the original durable
 voter binding ([details](stable-membership-compaction.md)). Compaction remains
-blocked during joint or uncommitted configuration state. Network snapshot
-installation across a membership transition and joint snapshot installation
-remain unsupported; a lagging peer that needs a snapshot across the transition
-must be handled outside this path. Do not remove or edit committed state to
-bypass these limits.
+blocked during joint or uncommitted configuration state. A receiver can install
+a stable snapshot across a transition only when its committed history has the
+same stable voter set and configuration index/term; installation advances the
+history baseline before later configuration entries are scanned. Snapshots
+that cross a joint or uncommitted transition, or whose identity the receiver
+cannot prove, are rejected. MRFTS002 joint snapshot installation remains
+unsupported. Do not remove or edit committed state to bypass these limits.
 
 Deterministic durable-store tests cover learner catch-up, voter addition and
 nonleader removal, per-node activation, joint commit propagation, stable
 finalization, rejection of a bad predecessor before term mutation, and rollback
 of an uncommitted joint suffix. The test suite also checks recovery of retained
 joint and stable histories, including post-restart role recovery after adding
-and removing a voter. This is a first live transition slice; it does not
-claim snapshot continuity across membership changes or explicit leadership
-transfer.
+and removing a voter. This is a first live transition slice; it does not claim
+joint snapshot installation or explicit leadership transfer.

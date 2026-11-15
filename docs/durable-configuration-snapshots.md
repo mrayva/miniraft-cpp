@@ -44,8 +44,11 @@ joint-consensus path.
 Since alpha.58, bound storage can preserve its original voter binding while
 installing configuration-bearing snapshots whose active set changed. Raft
 startup uses stable metadata to recover a changed active set after local
-compaction. Network snapshot handling still rejects transition snapshots; the
-storage support also serves offline history validation and trusted inputs.
+compaction. Since alpha.69, network installation also accepts stable snapshots
+across a committed transition when the receiver's committed history proves the
+same active set and configuration identity. Joint and uncommitted transitions
+remain unsupported by snapshot installation; the storage support also serves
+offline history validation and trusted inputs.
 The [alpha.59 follow-up](configuration-snapshot-continuity.md) checks that a
 replacement configuration snapshot extends the previously stored phase,
 identity, and active voter sets.

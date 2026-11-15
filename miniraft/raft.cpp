@@ -47,7 +47,8 @@ bool ReadSnapshotInteger(std::string_view bytes, size_t offset, unsigned width, 
 
 TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t totalBytes,
         uint64_t index, uint64_t term, const std::vector<uint32_t>& voters,
-        const TSnapshot* knownSnapshot) {
+        const TSnapshot* knownSnapshot, const TConfigurationHistory* committedConfiguration,
+        bool configurationStable) {
     if (prefix.size() < 8) return {false, false, 8};
     const auto magic = prefix.substr(0, 8);
     const bool stable = magic == "MRFTS003";
@@ -65,12 +66,21 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
         !ReadSnapshotInteger(prefix, 28, 8, dataBytes) ||
         embeddedIndex != index || embeddedTerm != term || voterCount != voters.size())
         return {true, false, 0};
+    // Snapshot voter metadata is only meaningful relative to the receiver's
+    // already committed configuration. An image cannot invent a membership
+    // identity or cross a joint/uncommitted transition by naming a voter list.
+    if (!configurationStable || !committedConfiguration || committedConfiguration->IsJoint() ||
+        voters != committedConfiguration->OldVoters() ||
+        embeddedIndex < committedConfiguration->ConfigurationIndex())
+        return {true, false, 0};
     if (stable) {
         uint64_t configurationIndex = 0, configurationTerm = 0;
         if (!ReadSnapshotInteger(prefix, 36, 8, configurationIndex) ||
             !ReadSnapshotInteger(prefix, 44, 8, configurationTerm) || !configurationIndex ||
             configurationIndex > embeddedIndex || !configurationTerm || configurationTerm > embeddedTerm ||
             (configurationIndex == embeddedIndex && configurationTerm != embeddedTerm) ||
+            configurationIndex != committedConfiguration->ConfigurationIndex() ||
+            configurationTerm != committedConfiguration->ConfigurationTerm() ||
             (knownSnapshot && knownSnapshot->StableConfiguration &&
                 (configurationIndex != knownSnapshot->ConfigurationIndex ||
                  configurationTerm != knownSnapshot->ConfigurationTerm)))
@@ -731,9 +741,11 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
             // establish leader contact.
             if (request->Offset != 0) return false;
             const auto knownSnapshot = State->GetSnapshot();
+            const auto* committedConfiguration = Configuration ? &Configuration->Committed : nullptr;
             const auto probe = ProbeSnapshotMetadata(std::string_view(request->Data, length),
                 request->TotalBytes, request->SnapshotIndex, request->SnapshotTerm,
-                GetVoterIds(), knownSnapshot.get());
+                GetVoterIds(), knownSnapshot.get(), committedConfiguration,
+                Configuration && !Configuration->HasUncommittedConfiguration());
             if (!probe.Complete || !probe.Supported) return false;
         }
         return true;
@@ -1259,8 +1271,10 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             IncomingSnapshot.reset(); reply(false, false, 0); return;
         }
         const auto knownSnapshot = State->GetSnapshot();
+        const auto* committedConfiguration = Configuration ? &Configuration->Committed : nullptr;
         const auto probe = ProbeSnapshotMetadata(prefix, request->TotalBytes,
-            request->SnapshotIndex, request->SnapshotTerm, GetVoterIds(), knownSnapshot.get());
+            request->SnapshotIndex, request->SnapshotTerm, GetVoterIds(), knownSnapshot.get(),
+            committedConfiguration, Configuration && !Configuration->HasUncommittedConfiguration());
         if (!probe.Complete) { reply(true, false, prefix.size()); return; }
         IncomingSnapshot.reset();
         if (probe.Supported) acceptLeaderContact();
@@ -1292,8 +1306,10 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         IncomingSnapshot.reset(); reply(false, false, 0); return;
     }
     const auto knownSnapshot = State->GetSnapshot();
+    const auto* committedConfiguration = Configuration ? &Configuration->Committed : nullptr;
     const auto probe = ProbeSnapshotMetadata(bytes, request->TotalBytes,
-        request->SnapshotIndex, request->SnapshotTerm, GetVoterIds(), knownSnapshot.get());
+        request->SnapshotIndex, request->SnapshotTerm, GetVoterIds(), knownSnapshot.get(),
+        committedConfiguration, Configuration && !Configuration->HasUncommittedConfiguration());
     if (!probe.Complete) { reply(true, false, bytes.size()); return; }
     if (!probe.Supported) { IncomingSnapshot.reset(); reply(false, false, 0); return; }
     acceptLeaderContact();
@@ -1303,6 +1319,14 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         snapshot = DecodeSnapshot(bytes);
         if (snapshot.IsJoint() || snapshot.Index != request->SnapshotIndex || snapshot.Term != request->SnapshotTerm || snapshot.Voters != GetVoterIds())
             throw TMessageError("Snapshot metadata mismatch");
+        if (!snapshot.HasConfigurationMetadata() && Configuration->Committed.ConfigurationIndex()) {
+            // Legacy snapshots have no configuration identity. The bounded
+            // probe established that this image is at or beyond the receiver's
+            // committed stable configuration and names its exact voter set.
+            snapshot.StableConfiguration = true;
+            snapshot.ConfigurationIndex = Configuration->Committed.ConfigurationIndex();
+            snapshot.ConfigurationTerm = Configuration->Committed.ConfigurationTerm();
+        }
         PreserveStableSnapshotIdentity(knownSnapshot.get(), snapshot);
         ValidateSnapshot(snapshot);
         application->ValidateSnapshot(snapshot.Data, snapshot.Index);
@@ -1315,6 +1339,10 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         if (application->LastAppliedIndex != snapshot.Index) std::terminate();
     } catch (...) { std::terminate(); }
     VolatileState->CommitIndex = State->CommitIndex;
+    ConfigurationBaseline = snapshot.StableConfiguration
+        ? TConfigurationHistory::FromStableSnapshot(snapshot)
+        : TConfigurationHistory::Stable(snapshot.Voters, 0, 0, snapshot.Index, snapshot.Term);
+    RefreshConfiguration(VolatileState->CommitIndex);
     IncomingSnapshot.reset();
     reply(true, true, request->TotalBytes);
 }

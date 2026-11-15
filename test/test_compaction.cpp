@@ -473,24 +473,13 @@ void test_joint_snapshot_is_rejected_even_if_boundary_is_already_covered(void**)
     assert_true(replies.back()->Success); assert_false(replies.back()->Installed);
     raft->Process({}, Chunk(joint, bytes, 4, 4));
     assert_false(replies.back()->Success); assert_false(replies.back()->Installed);
+    // A stable format cannot invent a configuration identity when the
+    // receiver has no committed membership record to substantiate it.
     auto stable = fixed; stable.StableConfiguration = true; stable.ConfigurationIndex = 4; stable.ConfigurationTerm = 1;
     auto stableBytes = EncodeSnapshot(stable);
     raft->Process({}, Chunk(stable, stableBytes, 0, stableBytes.size()));
-    assert_true(replies.back()->Success); assert_true(replies.back()->Installed);
+    assert_false(replies.back()->Success); assert_false(replies.back()->Installed);
     assert_true(static_cast<TStateFields>(*state) == before); assert_int_equal(app->Loads, 1);
-
-    // The stable-format covered probe validates the config identity and voter
-    // set from a split metadata prefix before crediting the already-held index.
-    const size_t stableMetadataBytes = 52 + 4 * stable.Voters.size();
-    for (size_t offset = 0; offset < stableMetadataBytes; offset += 4) {
-        const auto count = std::min<size_t>(4, stableMetadataBytes - offset);
-        raft->Process({}, Chunk(stable, stableBytes, offset, static_cast<uint32_t>(count)));
-        if (offset + count < stableMetadataBytes) {
-            assert_true(replies.back()->Success); assert_false(replies.back()->Installed);
-            assert_int_equal(replies.back()->NextOffset, offset + count);
-        }
-    }
-    assert_true(replies.back()->Success); assert_true(replies.back()->Installed);
 
     auto stableWrongVoters = stable; stableWrongVoters.Voters = {1, 3};
     auto stableWrongVotersBytes = EncodeSnapshot(stableWrongVoters);
@@ -539,7 +528,7 @@ void test_unsupported_new_snapshot_does_not_accept_leader_contact(void**) {
     assert_true(static_cast<TStateFields>(*state) == before);
     assert_int_equal(app->Loads, 0); assert_int_equal(app->LastAppliedIndex, 0);
 }
-void test_stable_configuration_snapshot_installs_and_recovers_with_fixed_membership(void**) {
+void test_unproven_stable_configuration_snapshot_is_rejected_for_fixed_membership(void**) {
     TKv source; source.Write(source.Prepare(Command("a", "stable snapshot")), 5);
     TSnapshot snapshot{5, 1, {1, 2}, source.SaveSnapshot()};
     snapshot.StableConfiguration = true;
@@ -551,15 +540,19 @@ void test_stable_configuration_snapshot_installs_and_recovers_with_fixed_members
     {
         auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}});
         auto app = std::make_shared<TApplication>(); TRequestProcessor processor(raft, app, {});
-        const size_t metadataBytes = 52 + 4 * snapshot.Voters.size();
-        raft->Process({}, Chunk(snapshot, bytes, 0, metadataBytes));
-        assert_true(replies.back()->Success); assert_false(replies.back()->Installed);
-        assert_int_equal(replies.back()->NextOffset, metadataBytes); assert_int_equal(app->Loads, 0);
-        raft->Process({}, Chunk(snapshot, bytes, metadataBytes,
-            static_cast<uint32_t>(bytes.size() - metadataBytes)));
+        state->CurrentTerm = 3; // Exercise a same-term rejection with a normal RPC response.
+        raft->Process({}, Chunk(snapshot, bytes, 0, static_cast<uint32_t>(bytes.size())));
+        assert_false(replies.back()->Success); assert_false(replies.back()->Installed);
+        assert_true(!state->GetSnapshot()); assert_int_equal(app->Loads, 0);
+
+        // A legacy snapshot remains valid when the receiver has no membership
+        // transition history and its voter list matches the fixed set.
+        TSnapshot legacy{5, 1, {1, 2}, source.SaveSnapshot()};
+        const auto legacyInitialBytes = EncodeSnapshot(legacy);
+        raft->Process({}, Chunk(legacy, legacyInitialBytes, 0,
+            static_cast<uint32_t>(legacyInitialBytes.size())));
         assert_true(replies.back()->Success); assert_true(replies.back()->Installed);
-        assert_int_equal(replies.back()->NextOffset, bytes.size());
-        assert_true(*state->GetSnapshot() == snapshot);
+        assert_true(*state->GetSnapshot() == legacy);
         assert_int_equal(app->Loads, 1); assert_true(Read(*app, "a") == "stable snapshot");
 
         // A covered stable image with a different configuration identity must
@@ -575,25 +568,20 @@ void test_stable_configuration_snapshot_installs_and_recovers_with_fixed_members
         raft->Process({}, higherTermConflictingCovered);
         assert_true(static_cast<TStateFields>(*state) == beforeConflictingCovered);
         assert_int_equal(replies.size(), repliesBeforeConflictingCovered);
-        assert_true(*state->GetSnapshot() == snapshot); assert_int_equal(app->Loads, 1);
+        assert_true(*state->GetSnapshot() == legacy); assert_int_equal(app->Loads, 1);
 
         raft->Process({}, Chunk(conflictingCovered, conflictingCoveredBytes, 0,
             static_cast<uint32_t>(conflictingCoveredBytes.size())));
         assert_false(replies.back()->Success); assert_false(replies.back()->Installed);
-        assert_true(*state->GetSnapshot() == snapshot); assert_int_equal(app->Loads, 1);
+        assert_true(*state->GetSnapshot() == legacy); assert_int_equal(app->Loads, 1);
 
-        // A newer legacy image can be installed, but it must retain the
-        // receiver's already trusted stable configuration identity.
+        // A newer legacy image remains compatible with the same fixed set.
         source.Write(source.Prepare(Command("a", "legacy refresh")), 6);
-        TSnapshot legacy{6, 1, {1, 2}, source.SaveSnapshot()};
+        legacy = {6, 1, {1, 2}, source.SaveSnapshot()};
         const auto legacyBytes = EncodeSnapshot(legacy);
         raft->Process({}, Chunk(legacy, legacyBytes, 0, static_cast<uint32_t>(legacyBytes.size())));
         assert_true(replies.back()->Success); assert_true(replies.back()->Installed);
-        auto preserved = legacy;
-        preserved.StableConfiguration = true;
-        preserved.ConfigurationIndex = snapshot.ConfigurationIndex;
-        preserved.ConfigurationTerm = snapshot.ConfigurationTerm;
-        assert_true(*state->GetSnapshot() == preserved);
+        assert_true(*state->GetSnapshot() == legacy);
         assert_int_equal(app->Loads, 2); assert_true(Read(*app, "a") == "legacy refresh");
 
         // Conflicting metadata at a newer boundary is rejected before either
@@ -606,7 +594,7 @@ void test_stable_configuration_snapshot_installs_and_recovers_with_fixed_members
         raft->Process({}, Chunk(conflicting, conflictingBytes, 0,
             static_cast<uint32_t>(conflictingBytes.size())));
         assert_false(replies.back()->Success); assert_false(replies.back()->Installed);
-        assert_true(*state->GetSnapshot() == preserved);
+        assert_true(*state->GetSnapshot() == legacy);
         assert_int_equal(app->Loads, 2); assert_int_equal(app->LastAppliedIndex, 6);
         assert_true(Read(*app, "a") == "legacy refresh");
     }
@@ -615,9 +603,7 @@ void test_stable_configuration_snapshot_installs_and_recovers_with_fixed_members
     assert_int_equal(recovered->LastAppliedIndex, 6);
     assert_true(Read(*recovered, "a") == "legacy refresh");
     const auto recoveredSnapshot = restarted->GetState()->GetSnapshot();
-    assert_true(recoveredSnapshot->StableConfiguration);
-    assert_int_equal(recoveredSnapshot->ConfigurationIndex, 4);
-    assert_int_equal(recoveredSnapshot->ConfigurationTerm, 1);
+    assert_false(recoveredSnapshot->HasConfigurationMetadata());
 }
 void test_idle_partial_snapshot_expires_on_learner_despite_heartbeats(void**) {
     auto state = std::make_shared<TState>();
@@ -1058,7 +1044,7 @@ int main() {
         cmocka_unit_test(test_memory_snapshot_cannot_replace_committed_index_with_conflicting_term),
         cmocka_unit_test(test_joint_snapshot_is_rejected_even_if_boundary_is_already_covered),
         cmocka_unit_test(test_unsupported_new_snapshot_does_not_accept_leader_contact),
-        cmocka_unit_test(test_stable_configuration_snapshot_installs_and_recovers_with_fixed_membership),
+        cmocka_unit_test(test_unproven_stable_configuration_snapshot_is_rejected_for_fixed_membership),
         cmocka_unit_test(test_idle_partial_snapshot_expires_on_learner_despite_heartbeats),
         cmocka_unit_test(test_remote_snapshot_retains_suffix_without_applying_it_before_commit),
         cmocka_unit_test(test_snapshot_boundary_index_exhaustion_does_not_append_wrapped_noop),

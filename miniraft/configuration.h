@@ -6,7 +6,9 @@
 #include <vector>
 
 // Configuration record encoding for the live joint-consensus log protocol.
-// Snapshot installation across membership transitions remains unsupported.
+// Stable snapshots can cross a committed transition when the receiver's
+// committed history proves the same stable configuration. Joint snapshots are
+// still not accepted by the runtime.
 enum class EConfigurationPhase : uint32_t { Joint = 1, Stable = 2 };
 struct TConfigurationRecord {
     EConfigurationPhase Phase = EConfigurationPhase::Joint;

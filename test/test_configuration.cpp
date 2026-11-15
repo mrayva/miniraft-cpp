@@ -571,6 +571,90 @@ void test_stable_membership_compaction_recovers_active_voters(void**) {
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 #endif
 }
+void test_snapshot_install_validates_and_advances_committed_membership_history(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-config-snapshot-install-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const auto name = (dir / "raft").string();
+    {
+        auto state = std::make_shared<TDurableState>(name, 2);
+        state->BindVoters({1}); // The durable binding is the original set.
+        state->CurrentTerm = 3;
+        state->Append(Ordinary(1));
+        auto joint = TConfigurationRecord{EConfigurationPhase::Joint, 2, 0, 0, {1}, {1, 2}};
+        state->Append(EncodeConfigurationEntry(joint));
+        auto stable = joint; stable.Phase = EConfigurationPhase::Stable;
+        stable.PreviousIndex = 2; stable.PreviousTerm = 2;
+        state->Append(EncodeConfigurationEntry(stable));
+        state->CommitIndex = 3; state->Commit();
+
+        std::vector<TMessageHolder<TMessage>> replies;
+        auto peer = std::make_shared<TEndpoint>();
+        peer->Route = [&](auto message) { replies.push_back(std::move(message)); };
+        auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}}, std::vector<uint32_t>{2});
+        auto app = std::make_shared<TSnapshotRsm>(); TRequestProcessor processor(raft, app, {{1, peer}});
+        assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+
+        auto sendSnapshot = [&](const TSnapshot& snapshot, uint64_t rpcTerm) {
+            const auto bytes = EncodeSnapshot(snapshot);
+            auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + bytes.size());
+            request->Src = 1; request->Dst = 2; request->Term = rpcTerm; request->Seqno = replies.size() + 1;
+            request->SnapshotIndex = snapshot.Index; request->SnapshotTerm = snapshot.Term;
+            request->Offset = 0; request->TotalBytes = bytes.size(); request->Done = 1; request->LeaderId = 1;
+            memcpy(request->Data, bytes.data(), bytes.size());
+            raft->Process(ITimeSource::Time{}, request);
+        };
+
+        // The joint entry's identity is not the committed stable identity.
+        // Reject this claim before accepting even a higher leader term.
+        TSnapshot wrongIdentity{4, 3, {1, 2}, "4"};
+        wrongIdentity.StableConfiguration = true;
+        wrongIdentity.ConfigurationIndex = 2; wrongIdentity.ConfigurationTerm = 2;
+        const auto before = static_cast<TStateFields>(*state);
+        sendSnapshot(wrongIdentity, 4);
+        assert_true(static_cast<TStateFields>(*state) == before);
+        assert_true(replies.empty());
+        sendSnapshot(wrongIdentity, 3);
+        assert_false(replies.back().Cast<TInstallSnapshotResponse>()->Success);
+        assert_int_equal(state->SnapshotIndex, 0); assert_int_equal(app->LastAppliedIndex, 0);
+
+        // A stable snapshot that matches the committed successor may cross the
+        // membership boundary. The receiver advances its baseline to index 4.
+        TSnapshot valid{4, 3, {1, 2}, "4"};
+        valid.StableConfiguration = true;
+        valid.ConfigurationIndex = 3; valid.ConfigurationTerm = 2;
+        sendSnapshot(valid, 3);
+        assert_true(replies.back().Cast<TInstallSnapshotResponse>()->Installed);
+        assert_int_equal(state->SnapshotIndex, 4); assert_int_equal(state->CommitIndex, 4);
+        assert_true(*state->GetSnapshot() == valid);
+        assert_int_equal(app->LastAppliedIndex, 4);
+
+        // A legacy image beyond this committed transition inherits its identity
+        // from the receiver's proven stable history.
+        TSnapshot legacy{5, 3, {1, 2}, "5"};
+        sendSnapshot(legacy, 3);
+        assert_true(replies.back().Cast<TInstallSnapshotResponse>()->Installed);
+        assert_true(state->GetSnapshot()->StableConfiguration);
+        assert_int_equal(state->GetSnapshot()->ConfigurationIndex, 3);
+        assert_int_equal(state->GetSnapshot()->ConfigurationTerm, 2);
+        assert_int_equal(app->LastAppliedIndex, 5);
+
+        // A subsequent transition extends the committed identity. This append
+        // is rejected if snapshot installation left the old baseline at index 0.
+        auto next = TConfigurationRecord{EConfigurationPhase::Joint, 3, 3, 2, {1, 2}, {1}};
+        auto append = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 2, .Term = 3, .Seqno = 20},
+            TAppendEntriesRequest{.PrevLogIndex = 5, .PrevLogTerm = 3, .LeaderCommit = 6,
+                .LeaderId = 1, .Nentries = 1});
+        append.InitPayload(1); append.Payload[0] = EncodeConfigurationEntry(next);
+        raft->Process(ITimeSource::Time{}, append);
+        assert_true(replies.back().Cast<TAppendEntriesResponse>()->Success);
+        assert_int_equal(state->LastLogIndex, 6); assert_int_equal(state->CommitIndex, 6);
+        assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+    }
+    std::error_code ignored; std::filesystem::remove_all(dir, ignored);
+#endif
+}
 void test_uncommitted_joint_suffix_replacement_restores_old_voters(void**) {
 #ifdef __linux__
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-config-rollback-" +
@@ -1000,6 +1084,7 @@ int main() {
         cmocka_unit_test(test_configuration_rpc_and_proposal_are_rejected_before_mutation),
         cmocka_unit_test(test_joint_membership_addition_and_finalization_replicate_deterministically),
         cmocka_unit_test(test_stable_membership_compaction_recovers_active_voters),
+        cmocka_unit_test(test_snapshot_install_validates_and_advances_committed_membership_history),
         cmocka_unit_test(test_uncommitted_joint_suffix_replacement_restores_old_voters),
         cmocka_unit_test(test_configuration_application_advances_without_calling_state_machine),
 #ifdef __linux__

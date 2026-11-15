@@ -43,8 +43,10 @@ voter binding. KV uses `--learner id` on every replica's configuration. The
 [live joint-membership step](docs/configuration-entries.md) adds a durable-store
 `TRaft` API for adding and removing nonleader voters through joint consensus;
 local compaction now works after a committed stable transition. Leader removal
-and snapshot transfer across membership transitions remain unsupported. The
-network server reconciles peer response readers as voters change roles.
+and joint snapshot installation remain unsupported. A stable snapshot can cross
+a committed membership transition when the receiver has the exact committed
+stable identity and voter set. The network server reconciles peer response
+readers as voters change roles.
 The [snapshot retry follow-up](docs/snapshot-retries.md) prevents timeout retries
 and strong-read traffic from starving delayed snapshot acknowledgements, and
 prevents stale reader failures from destroying newer reconnect attempts.
@@ -62,14 +64,19 @@ when Raft needs only a retained entry's term.
 The [joint quorum foundation](docs/joint-quorum.md) adds and tests dual-majority
 arithmetic used by the live membership transition path.
 The [joint snapshot metadata foundation](docs/joint-snapshots.md) adds a versioned
-representation for a joint configuration at a snapshot boundary; runtime adoption
-and membership changes remain disabled.
+representation for a joint configuration at a snapshot boundary. Runtime joint
+snapshot adoption remains disabled; live membership is handled through the
+configuration-entry protocol.
 The [snapshot term preflight follow-up](docs/unsupported-snapshot-term-preflight.md)
 rejects unsupported snapshot formats before a higher RPC term changes hard state.
 The [snapshot metadata preflight follow-up](docs/snapshot-metadata-term-preflight.md)
 checks the boundary, fixed voters, and stable identity before that term update.
 The [configuration entry support](docs/configuration-entries.md) describes the
-live joint-to-stable transition API and its durable-storage and snapshot limits.
+live joint-to-stable transition API, stable snapshot catch-up across committed
+transitions, and the remaining joint-snapshot limits.
+The [stable snapshot membership follow-up](docs/stable-snapshot-membership-install.md)
+documents the committed-history checks for snapshot transfer after a voter
+change.
 The [configuration history validator](docs/configuration-history.md) checks an
 offline retained-log sequence against a trusted baseline or joint snapshot.
 The [configuration log scanner](docs/configuration-scan.md) validates a retained

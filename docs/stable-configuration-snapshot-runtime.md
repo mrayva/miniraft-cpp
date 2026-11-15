@@ -23,10 +23,12 @@ joint-consensus log protocol can move the active set without rewriting that
 binding. After a stable successor commits, local compaction records the new
 active set and startup recovers it from the stable snapshot while the configured
 bootstrap view still matches the original binding. Network snapshot handling
-continues to require the receiver's active set to match; joint snapshot
-installation and snapshot transfer across a membership transition remain
-open. Upgrade all voters before sending MRFTS003 images because older binaries
-may acknowledge an already-covered unknown snapshot format.
+now allows transfer across a committed stable transition when the receiver has
+the exact same stable identity and voter set. It rejects snapshots that cross
+joint or uncommitted history, or claim an identity not established by the
+receiver's committed configuration. Joint snapshot installation remains open.
+Upgrade all voters before sending MRFTS003 images because older binaries may
+acknowledge an already-covered unknown snapshot format.
 
 Tests cover durable application restore, identity preservation through
 compaction, restart, and legacy-format refresh, chunked InstallSnapshot,

@@ -47,7 +47,7 @@ struct TLogEntry: public TMessage {
     enum EFlags : uint64_t {
         ENone = 0,
         EStub = 1,
-        // Reserved for configuration entries; live use remains disabled.
+        // Marks entries consumed by the guarded live membership protocol.
         EConfiguration = uint64_t(1) << 63,
     };
     uint64_t Term = 1;

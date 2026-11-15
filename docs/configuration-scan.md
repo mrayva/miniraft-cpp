@@ -34,6 +34,7 @@ The standalone scanner remains read-only. The Raft runtime uses it to validate
 a simulated AppendEntries suffix before accepting configuration entries and to
 recompute roles after commit or suffix replacement. Live changes additionally
 require durable commit-index persistence, the original voter binding and local
-endpoints for every active voter. Joint snapshot installation and snapshot
-transfer across a transition remain unsupported. Snapshot metadata alone does
-not authenticate a transition.
+endpoints for every active voter. Stable snapshots can cross a committed
+transition only when the receiver's committed history proves the same active
+voter set and configuration identity. Joint snapshot installation remains
+unsupported. Snapshot metadata alone does not authenticate a transition.

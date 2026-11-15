@@ -20,11 +20,16 @@ joint-consensus APIs, or independently verify a checkpoint before loading it.
 Compaction rejects a committed joint configuration and any uncommitted
 configuration change. Application progress must include the committed stable
 configuration entry so the snapshot cannot claim a voter set newer than its
-included log boundary. Joint snapshot creation and network snapshot transfer
-across membership transitions remain unsupported. A lagging peer still needs a
-separately reconciled active configuration before it can accept a snapshot.
+included log boundary. A lagging receiver can install an MRFTS003 image across
+that transition after it has committed the same stable voter set and
+configuration identity. The receiver rejects mismatched identities, images
+that precede its committed transition, and snapshots while local history is
+joint or uncommitted. MRFTS002 joint snapshot creation and installation remain
+unsupported.
 
-The deterministic durable test commits an add transition, rejects compaction
-while joint, commits the stable successor, compacts, and restarts from the
-original binding while recovering the active voter set from MRFTS003 metadata.
-It also checks that the original binding remains unchanged.
+The deterministic durable tests commit an add transition, reject compaction
+while joint, compact after the stable successor, and restart from the original
+binding while recovering the active voter set. They also install a matching
+stable snapshot at a lagging receiver, reject an unproven configuration
+identity before a higher term is accepted, and append a later transition to
+verify that snapshot installation advanced the receiver's history baseline.
