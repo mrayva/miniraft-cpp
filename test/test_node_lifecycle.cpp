@@ -6,6 +6,8 @@
 #ifdef __linux__
 #include <sys/socket.h>
 #include <unistd.h>
+#include "../coroio/tests/server.crt"
+#include "../coroio/tests/server.key"
 #endif
 #include <stdarg.h>
 #include <stddef.h>
@@ -222,6 +224,62 @@ void test_socket_shutdown_wakes_a_real_pending_read(void**) {
         "tls-peer", NNet::TSslSocket<NNet::TSocket>{}, std::make_shared<TTimeSource>());
     assert_false(tlsNode.SupportsRetirement());
 }
+
+using TRetirableTlsSocket = NNet::TRetirableSslSocket<NNet::TSocket>;
+struct TTlsAcceptState {
+    std::unique_ptr<TRetirableTlsSocket> Connection;
+    bool HandshakeComplete = false;
+};
+NNet::TVoidTask AcceptTlsPeer(TRetirableTlsSocket& listener, NNet::TSslContext& context, TTlsAcceptState& state) {
+    auto socket = co_await listener.Accept();
+    state.Connection = std::make_unique<TRetirableTlsSocket>(std::move(socket));
+    co_await state.Connection->AcceptHandshake();
+    state.HandshakeComplete = true;
+}
+NNet::TVoidTask ReadTlsUntilShutdown(std::shared_ptr<TNode<TRetirableTlsSocket>> node, bool& stopped) {
+    char byte = 0;
+    try {
+        co_await node->Sock().ReadSome(&byte, 1);
+    } catch (const std::exception&) {
+    }
+    node->MarkResponseReaderStopped();
+    stopped = true;
+}
+void test_tls_shutdown_wakes_retired_peer_reader(void**) {
+    NNet::TLoop<NNet::TPoll> loop;
+    NNet::TSocket rawListener(NNet::TAddress{"127.0.0.1", 0}, loop.Poller());
+    rawListener.Bind(); rawListener.Listen();
+    sockaddr_in bound{};
+    socklen_t boundSize = sizeof(bound);
+    assert_int_equal(::getsockname(rawListener.Fd(), reinterpret_cast<sockaddr*>(&bound), &boundSize), 0);
+    const NNet::TAddress peerAddress(reinterpret_cast<sockaddr*>(&bound), boundSize);
+
+    auto clientContext = NNet::TSslContext::Client();
+    auto serverContext = NNet::TSslContext::ServerFromMem(testMemCert, testMemKey);
+    TRetirableTlsSocket listener(std::move(rawListener), serverContext);
+    TTlsAcceptState accepted;
+    AcceptTlsPeer(listener, serverContext, accepted);
+    auto node = std::make_shared<TNode<TRetirableTlsSocket>>(
+        [&](const NNet::TAddress& address) {
+            return TRetirableTlsSocket(NNet::TSocket(address, loop.Poller()), clientContext);
+        }, "tls-peer", peerAddress, std::make_shared<TTimeSource>());
+    node->Drain();
+    for (size_t step = 0; step < 10000 && (!node->IsConnected() || !accepted.HandshakeComplete); ++step)
+        loop.Step();
+    assert_true(node->IsConnected());
+    assert_true(accepted.HandshakeComplete);
+    assert_true(node->SupportsRetirement());
+
+    node->MarkResponseReaderStarted();
+    bool readerStopped = false;
+    ReadTlsUntilShutdown(node, readerStopped);
+    assert_false(readerStopped);
+    node->Retire();
+    for (size_t step = 0; step < 100 && !readerStopped; ++step) loop.Step();
+    assert_true(readerStopped);
+    node->Drain();
+    assert_true(node->RetirementComplete());
+}
 #endif
 }
 int main() {
@@ -233,6 +291,7 @@ int main() {
         cmocka_unit_test(test_retirement_wakes_reader_and_writer_before_socket_cleanup),
 #ifdef __linux__
         cmocka_unit_test(test_socket_shutdown_wakes_a_real_pending_read),
+        cmocka_unit_test(test_tls_shutdown_wakes_retired_peer_reader),
 #endif
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);

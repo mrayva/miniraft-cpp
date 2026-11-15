@@ -10,6 +10,7 @@
 #include <unordered_set>
 
 #include <coroio/all.hpp>
+#include <miniraft/net/retirable_ssl_socket.h>
 
 #include <miniraft/timesource.h>
 #include <miniraft/messages.h>
@@ -140,8 +141,17 @@ public:
     void Disconnect(uint64_t generation);
     void Retire();
     bool SupportsRetirement() const {
-        return requires(TSocket& socket) { { socket.Shutdown() } noexcept; } ||
-            requires(TSocket& socket) { socket.Fd(); };
+        if constexpr (requires(TSocket& socket) { socket.SupportsRetirement(); }) {
+            if (Socket.SupportsRetirement()) return true;
+        } else if constexpr (requires(TSocket& socket) { { socket.Shutdown() } noexcept; }) {
+            return true;
+        } else if constexpr (requires(TSocket& socket) { socket.Fd(); }) {
+            if (Socket.Fd() >= 0) return true;
+        }
+        // A disconnected endpoint with no live writer or connector has no
+        // socket operation to interrupt; an idle response reader will exit
+        // when its retry timer observes Retired.
+        return !Connected && (!Drainer || Drainer.done()) && (!Connector || Connector.done());
     }
     bool IsRetired() const { return Retired; }
     void MarkResponseReaderStarted() { ResponseReaderActive = true; }

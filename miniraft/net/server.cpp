@@ -267,3 +267,4 @@ NNet::TVoidTask TRaftServer<TSocket>::Idle() {
 // TODO: Use TPoller::TSocket
 template class TRaftServer<NNet::TSocket>;
 template class TRaftServer<NNet::TSslSocket<NNet::TSocket>>;
+template class TRaftServer<NNet::TRetirableSslSocket<NNet::TSocket>>;

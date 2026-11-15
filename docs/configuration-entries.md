@@ -40,7 +40,10 @@ forwarded command replies without restarting. After the stable successor commits
 a demotion, a peer endpoint can be unregistered. `TRaftServer` retires native
 TCP endpoints by shutting down their socket and retaining them until reader and
 writer coroutines unwind. Socket types without a safe shutdown hook, including
-the current coroio TLS wrapper, must remain registered until server shutdown.
+the raw coroio TLS wrapper, must remain registered until server shutdown. For
+TLS servers, use `NNet::TRetirableSslSocket<THandle>` from
+`miniraft/net/retirable_ssl_socket.h`; it exposes the native shutdown hook used
+to wake pending TLS I/O during peer retirement.
 
 Incoming AppendEntries configuration records are decoded and the complete
 candidate suffix is scanned before a higher RPC term is persisted. The scan

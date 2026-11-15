@@ -50,9 +50,10 @@ int main(int argc, char** argv) {
             myHost = host;
         } else {
             if (ssl) {
-                nodes[host.Id] = std::make_shared<TNode<NNet::TSslSocket<TPoller::TSocket>>>(
+                using TPeerSocket = NNet::TRetirableSslSocket<TPoller::TSocket>;
+                nodes[host.Id] = std::make_shared<TNode<TPeerSocket>>(
                     [&](const NNet::TAddress& addr) {
-                        return std::move(NNet::TSslSocket(std::move(TPoller::TSocket(addr, loop.Poller())), *clientContext.get()));
+                        return TPeerSocket(TPoller::TSocket(addr, loop.Poller()), *clientContext.get());
                     },
                     std::to_string(host.Id),
                     NNet::TAddress{host.Address, host.Port},
@@ -77,7 +78,7 @@ int main(int argc, char** argv) {
     socket.Bind();
     socket.Listen();
     if (ssl) {
-        auto sslSocket = NNet::TSslSocket(std::move(socket), *serverContext.get());
+        auto sslSocket = NNet::TRetirableSslSocket<TPoller::TSocket>(std::move(socket), *serverContext.get());
         TRaftServer server(loop.Poller(), std::move(sslSocket), raft, rsm, nodes, timeSource);
         server.Serve();
         loop.Loop();
