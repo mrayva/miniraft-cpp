@@ -38,6 +38,25 @@ public:
         return New.empty() ? old : std::min(old, majority(New));
     }
 
+    // Return the value at the strict-majority boundary for each voter set.
+    // This also works for timestamps: the result is the latest instant at
+    // which a quorum could have been assembled. Missing voters should return
+    // a value ordered below every real acknowledgement.
+    template<class F> auto Threshold(F value) const {
+        using TValue = decltype(value(uint32_t{}));
+        std::vector<TValue> values;
+        const auto majority = [&](const auto& voters) {
+            values.clear();
+            values.reserve(voters.size());
+            for (auto id : voters) values.push_back(value(id));
+            auto middle = values.begin() + (values.size() - 1) / 2;
+            std::nth_element(values.begin(), middle, values.end());
+            return *middle;
+        };
+        const auto old = majority(Old);
+        return New.empty() ? old : std::min(old, majority(New));
+    }
+
     bool HasQuorum(const std::unordered_set<uint32_t>& votes, uint32_t self = 0) const {
         return Value([&](uint32_t id) -> uint64_t {
             return (self != 0 && id == self) || votes.contains(id);

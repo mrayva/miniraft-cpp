@@ -199,7 +199,7 @@ void test_learner_replication_cannot_commit_or_satisfy_strong_read(void**) {
     });
     auto read = NewHoldedMessage<TReadKv>(sizeof(TReadKv) + 1);
     read->Flags = TCommandRequest::EConsistent; read->Cookie = 77; read->KeySize = 1; read->Data[0] = 'x';
-    cluster.Processors[0]->OnCommandRequest(read, client); cluster.Pump(); assert_int_equal(replies, 0);
+    cluster.Processors[0]->OnCommandRequest(read, client); cluster.Pump(1, 10); assert_int_equal(replies, 0);
     cluster.Isolated = {3}; cluster.Pump(1, 80);
     assert_int_equal(replies, 1); assert_true(Read(*cluster.Apps[3], "x") == "new");
 }
@@ -373,7 +373,7 @@ void test_online_learner_staging_snapshot_catchup_and_quorum_isolation(void**) {
     });
     auto read = NewHoldedMessage<TReadKv>(sizeof(TReadKv) + 1);
     read->Flags = TCommandRequest::EConsistent; read->KeySize = 1; read->Data[0] = 'a';
-    cluster.Processors[0]->OnCommandRequest(read, client); cluster.Pump();
+    cluster.Processors[0]->OnCommandRequest(read, client); cluster.Pump(1, 10);
     assert_int_equal(replies, 0);
     cluster.Isolated = {3}; cluster.Pump(1, 80);
     assert_int_equal(replies, 1);

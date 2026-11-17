@@ -196,6 +196,20 @@ void test_snapshot_partial_ack_cannot_skip_unsent_bytes(void**) {
 void ExerciseDelayedSnapshotAcks(bool readTraffic) {
     for (auto learners : {std::vector<uint32_t>{}, std::vector<uint32_t>{3}}) {
         TCluster cluster(learners); cluster.Prepare();
+        auto acknowledgeVoter2Heartbeat = [&] {
+            for (auto it = cluster.Packets.begin(); it != cluster.Packets.end(); ++it) {
+                const auto header = it->Cast<TMessageEx>();
+                if (header->Src != 1 || header->Dst != 2 ||
+                    header->Type != uint32_t(EMessageType::APPEND_ENTRIES_REQUEST)) continue;
+                auto heartbeat = *it;
+                cluster.Packets.erase(it);
+                cluster.Deliver(heartbeat);
+                auto response = cluster.Take(2, 1, EMessageType::APPEND_ENTRIES_RESPONSE);
+                cluster.Deliver(response);
+                return;
+            }
+            fail_msg("Missing heartbeat 1 -> 2 while snapshot ACK is delayed");
+        };
         const auto boundary = cluster.Nodes[0]->GetState()->SnapshotIndex;
         auto chunk = cluster.SendChunk();
         size_t chunks = 0;
@@ -210,6 +224,7 @@ void ExerciseDelayedSnapshotAcks(bool readTraffic) {
                 else { cluster.Now += std::chrono::seconds(3); cluster.Nodes[0]->ProcessTimeout(cluster.Now); }
                 auto retransmit = cluster.Take(1, 3, EMessageType::INSTALL_SNAPSHOT_REQUEST).Cast<TInstallSnapshotRequest>();
                 assert_int_equal(retransmit->Offset, chunk->Offset);
+                acknowledgeVoter2Heartbeat();
                 cluster.Packets.clear();
             }
             cluster.Deliver(ack);

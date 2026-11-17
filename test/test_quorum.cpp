@@ -1,6 +1,7 @@
 #include <miniraft/quorum.h>
 #include <miniraft/raft.h>
 #include <bit>
+#include <optional>
 #include <stdarg.h>
 #include <stddef.h>
 #include <setjmp.h>
@@ -61,6 +62,29 @@ void test_joint_commit_and_read_watermarks_need_both_majorities(void**) {
         }
     }
 }
+void test_joint_timestamp_threshold_requires_recent_responses_from_both_sets(void**) {
+    TQuorum quorum({1, 2, 3}, {3, 4, 5});
+    std::unordered_map<uint32_t, std::optional<int>> timestamps{
+        {1, 100}, {2, 80}, {3, 110}, {4, 90},
+    };
+    auto threshold = [&] {
+        return quorum.Threshold([&](uint32_t id) -> std::optional<int> {
+            auto it = timestamps.find(id);
+            return it == timestamps.end() ? std::nullopt : it->second;
+        });
+    };
+    auto latestQuorumTime = threshold();
+    assert_true(latestQuorumTime.has_value());
+    assert_int_equal(*latestQuorumTime, 90); // Old majority 100, new majority 90.
+
+    timestamps.erase(4);
+    assert_false(threshold().has_value()); // The new set has only one response.
+
+    timestamps[5] = 95;
+    latestQuorumTime = threshold();
+    assert_true(latestQuorumTime.has_value());
+    assert_int_equal(*latestQuorumTime, 95); // Old majority 100, new majority 95.
+}
 void test_invalid_configurations_are_rejected(void**) {
     for (auto bad : {std::vector<uint32_t>{}, std::vector<uint32_t>{0},
                      std::vector<uint32_t>{1, 1}, std::vector<uint32_t>{2, 1}}) {
@@ -94,6 +118,7 @@ int main() {
         cmocka_unit_test(test_stable_quorum_matches_strict_majority_order_statistic),
         cmocka_unit_test(test_all_small_joint_election_quorums),
         cmocka_unit_test(test_joint_commit_and_read_watermarks_need_both_majorities),
+        cmocka_unit_test(test_joint_timestamp_threshold_requires_recent_responses_from_both_sets),
         cmocka_unit_test(test_invalid_configurations_are_rejected),
         cmocka_unit_test(test_joint_commit_respects_both_majorities_and_current_term),
     };

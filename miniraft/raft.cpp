@@ -1046,6 +1046,12 @@ void TRaft::RefreshConfiguration(uint64_t commitIndex) {
     VotingQuorum.swap(quorum);
     MinVotes = minVotes;
     Nservers = int(Voters.size());
+    for (auto it = VolatileState->QuorumResponseTime.begin(); it != VolatileState->QuorumResponseTime.end();) {
+        if (!std::binary_search(Voters.begin(), Voters.end(), it->first))
+            it = VolatileState->QuorumResponseTime.erase(it);
+        else
+            ++it;
+    }
     Configuration = std::move(scan);
     const auto& baseline = *ConfigurationBaseline;
     const auto& latest = Configuration->Latest;
@@ -1238,6 +1244,7 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
     });
     if (request == requests.end() ||
         (message->Success && message->MatchIndex != request->LastIndex)) return;
+    RecordLeadershipResponse(now, nodeId);
     auto& capabilities = VolatileState->PeerCapabilities[nodeId];
     if (message->Seqno >= capabilities.AppendAckSeqno) {
         capabilities.AppendAckSeqno = message->Seqno;
@@ -1366,7 +1373,7 @@ void TRaft::Candidate(ITimeSource::Time now, TMessageHolder<TMessage> message) {
 
 void TRaft::Leader(ITimeSource::Time now, TMessageHolder<TMessage> message) {
     if (auto snapshot = message.Maybe<TInstallSnapshotResponse>()) {
-        OnInstallSnapshot(snapshot.Cast());
+        OnInstallSnapshot(now, snapshot.Cast());
     } else if (auto maybeAppendEntries = message.Maybe<TAppendEntriesResponse>()) {
         OnAppendEntries(now, std::move(maybeAppendEntries.Cast()));
     } else if (auto maybeVoteRequest = message.Maybe<TRequestVoteRequest>()) {
@@ -1723,6 +1730,54 @@ void TRaft::LeaderTimeout(ITimeSource::Time now) {
         AdvanceLeaderCommit();
     }
     MaybeDistributeConfigurationBarrier(now);
+    // Do this after due replication work. A response delivered synchronously
+    // by an in-memory transport at this tick is valid fresh quorum activity.
+    ExpireLeadership(now);
+}
+
+bool TRaft::HasRecentLeadershipQuorum(ITimeSource::Time now) const {
+    const auto latestQuorumResponse = LatestLeadershipQuorumResponse(now);
+    return latestQuorumResponse && now >= *latestQuorumResponse &&
+        now - *latestQuorumResponse < TTimeout::LeadershipExpiration;
+}
+
+std::optional<ITimeSource::Time> TRaft::LatestLeadershipQuorumResponse(ITimeSource::Time now) const {
+    return VotingQuorum->Threshold([&](uint32_t id) -> std::optional<ITimeSource::Time> {
+        if (id == Id) return now;
+        const auto it = VolatileState->QuorumResponseTime.find(id);
+        if (it == VolatileState->QuorumResponseTime.end() || now < it->second) return std::nullopt;
+        return it->second;
+    });
+}
+
+void TRaft::RecordLeadershipResponse(ITimeSource::Time now, uint32_t nodeId) {
+    if (StateName != EState::LEADER || nodeId == Id || !IsVoter(nodeId)) return;
+    VolatileState->QuorumResponseTime[nodeId] = now;
+    if (const auto latest = LatestLeadershipQuorumResponse(now))
+        VolatileState->LeadershipExpiryDue = *latest + TTimeout::LeadershipExpiration;
+}
+
+void TRaft::ExpireLeadership(ITimeSource::Time now) {
+    if (StateName != EState::LEADER || now < VolatileState->LeadershipExpiryDue) return;
+    if (HasRecentLeadershipQuorum(now)) {
+        if (const auto latest = LatestLeadershipQuorumResponse(now))
+            VolatileState->LeadershipExpiryDue = *latest + TTimeout::LeadershipExpiration;
+        return;
+    }
+
+    // Leadership expiry only changes volatile role state; the next ordinary
+    // election timeout starts a new term if this replica can reach a quorum.
+    Become(EState::FOLLOWER);
+    VolatileState->LeaderId = 0;
+    VolatileState->ElectionDue = MakeElection(now);
+    VolatileState->LeadershipExpiryDue = ITimeSource::Max;
+    VolatileState->QuorumResponseTime.clear();
+    VolatileState->LeadershipTransfer.reset();
+    VolatileState->SnapshotRpcs.clear();
+    VolatileState->PendingAppendRpcs.clear();
+    VolatileState->ConfigurationBarrierRpcs.clear();
+    EncodedSnapshot.reset();
+    EncodedSnapshotIndex = 0;
 }
 
 uint64_t TRaft::ApproveRead() {
@@ -1815,6 +1870,7 @@ void TRaft::ProcessTimeout(ITimeSource::Time now) {
                 .NextIndex = nextIndex,
                 .RpcDue = rpcDue,
                 .ElectionDue = ITimeSource::Max,
+                .LeadershipExpiryDue = now + TTimeout::LeadershipExpiration,
             });
 
             VolatileState = std::move(nextVolatileState);
@@ -2068,6 +2124,7 @@ void TRaft::OnConfigurationBarrier(ITimeSource::Time now,
     if (pending.Seqno != response->Seqno ||
         pending.ConfigurationIndex != response->ConfigurationIndex ||
         pending.ConfigurationTerm != response->ConfigurationTerm) return;
+    RecordLeadershipResponse(now, response->Src);
     VolatileState->ConfigurationBarrierRpcs.erase(found);
     if (response->Accepted) {
         VolatileState->ConfigurationBarrierAckIndex[response->Src] = std::max(
@@ -2180,6 +2237,7 @@ std::shared_ptr<INode> TRaft::UnregisterPeerTarget(uint32_t id) {
     VolatileState->NextIndex.erase(id); VolatileState->MatchIndex.erase(id);
     VolatileState->CommitAckIndex.erase(id);
     VolatileState->ReadAckSeqno.erase(id); VolatileState->LastSentSeqno.erase(id);
+    VolatileState->QuorumResponseTime.erase(id);
     VolatileState->PendingAppendRpcs.erase(id); VolatileState->SnapshotRpcs.erase(id);
     VolatileState->ConfigurationBarrierRpcs.erase(id);
     VolatileState->ConfigurationBarrierAckIndex.erase(id);
@@ -2286,17 +2344,20 @@ TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t no
     return request;
 }
 
-void TRaft::OnInstallSnapshot(TMessageHolder<TInstallSnapshotResponse> response) {
+void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnapshotResponse> response) {
     if (response->Term != State->CurrentTerm) return;
     auto found = VolatileState->SnapshotRpcs.find(response->Src);
     if (found == VolatileState->SnapshotRpcs.end()) return;
     auto& rpc = found->second;
     if (!rpc.Seqno || response->Seqno != rpc.Seqno || response->SnapshotIndex != rpc.Snapshot->Index) return;
+    if (response->Success && ((response->Installed && response->NextOffset != rpc.Bytes->size()) ||
+        (!response->Installed && (response->NextOffset != rpc.SentEnd || response->NextOffset >= rpc.Bytes->size()))))
+        return;
+    RecordLeadershipResponse(now, response->Src);
     if (!response->Success) {
         rpc.Offset = 0;
         rpc.Seqno = 0;
     } else if (response->Installed) {
-        if (response->NextOffset != rpc.Bytes->size()) return;
         const auto index = std::max(VolatileState->MatchIndex[response->Src], response->SnapshotIndex);
         (*VolatileState).SetMatchIndex(response->Src, index).SetNextIndex(response->Src, index + 1)
             .SetBatchSize(response->Src, 1024).SetBackOff(response->Src, 1);
@@ -2308,7 +2369,6 @@ void TRaft::OnInstallSnapshot(TMessageHolder<TInstallSnapshotResponse> response)
         // Snapshot completion is not a fresh-read acknowledgement. AppendEntries
         // must still establish the next read barrier and replicate the suffix.
     } else {
-        if (response->NextOffset != rpc.SentEnd || response->NextOffset >= rpc.Bytes->size()) return;
         rpc.Offset = response->NextOffset;
         rpc.Seqno = 0; // Next chunk gets a new identity; old replies stay stale.
     }

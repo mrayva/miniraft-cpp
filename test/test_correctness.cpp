@@ -619,6 +619,30 @@ void test_deadlines_cover_slow_validation_preparation_and_read_callbacks(void**)
     assert_int_equal(replies[2].second, TCommandResponse::TimedOut);
 }
 
+void test_leader_expires_after_losing_fresh_voter_quorum(void**) {
+    TCluster cluster(3);
+    cluster.Elect(1);
+    cluster.Replicate(1);
+    cluster.Replicate(1);
+    cluster.Replicate(1);
+    cluster.Replicate(1); // Fresh quorum responses keep leadership alive beyond one expiry window.
+    auto& leader = cluster.Nodes[0];
+    assert_int_equal(leader->CurrentStateName(), EState::LEADER);
+
+    cluster.Now += std::chrono::seconds(3);
+    leader->ProcessTimeout(cluster.Now);
+    cluster.Drain(); // Establish a known fresh quorum response at this timestamp.
+    cluster.Isolated.insert(1);
+    cluster.Now += TTimeout::LeadershipExpiration - std::chrono::milliseconds(1);
+    leader->ProcessTimeout(cluster.Now);
+    assert_int_equal(leader->CurrentStateName(), EState::LEADER);
+
+    cluster.Now += std::chrono::milliseconds(1);
+    leader->ProcessTimeout(cluster.Now);
+    assert_int_equal(leader->CurrentStateName(), EState::FOLLOWER);
+    assert_int_equal(leader->GetLeaderId(), 0);
+}
+
 void test_uncommitted_log_budget_survives_disconnect_and_releases_after_commit(void**) {
     auto state = std::make_shared<TState>();
     auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{}, std::vector<uint32_t>{},
@@ -1357,6 +1381,7 @@ int main() {
         cmocka_unit_test(test_deadlines_expire_local_reads_and_leader_waiters),
         cmocka_unit_test(test_deadline_expires_strong_read_waiting_for_quorum),
         cmocka_unit_test(test_deadlines_cover_slow_validation_preparation_and_read_callbacks),
+        cmocka_unit_test(test_leader_expires_after_losing_fresh_voter_quorum),
         cmocka_unit_test(test_uncommitted_log_budget_survives_disconnect_and_releases_after_commit),
         cmocka_unit_test(test_follower_rejects_append_batch_that_exceeds_uncommitted_log_budget),
         cmocka_unit_test(test_follower_log_budget_is_reclaimed_when_leader_replaces_uncommitted_suffix),

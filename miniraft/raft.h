@@ -138,6 +138,8 @@ struct TVolatileState {
     std::unordered_map<uint32_t, int> BatchSize;
     std::unordered_map<uint32_t, int> BackOff;
     ITimeSource::Time ElectionDue;
+    ITimeSource::Time LeadershipExpiryDue = ITimeSource::Max;
+    std::unordered_map<uint32_t, ITimeSource::Time> QuorumResponseTime;
 
     std::vector<uint64_t> Indices;
 
@@ -295,7 +297,7 @@ private:
     void AdvanceCommitIndex(uint64_t index);
     void AdvanceLeaderCommit();
     void OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnapshotRequest> message);
-    void OnInstallSnapshot(TMessageHolder<TInstallSnapshotResponse> message);
+    void OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnapshotResponse> message);
     void OnTimeoutNow(ITimeSource::Time now, TMessageHolder<TTimeoutNowRequest> message);
     void OnConfigurationBarrier(TMessageHolder<TConfigurationBarrierRequest> message);
     void OnConfigurationBarrier(ITimeSource::Time now, TMessageHolder<TConfigurationBarrierResponse> message);
@@ -313,6 +315,10 @@ private:
     void LeaderTimeout(ITimeSource::Time now);
     void CandidateTimeout(ITimeSource::Time now);
     void FollowerTimeout(ITimeSource::Time now);
+    std::optional<ITimeSource::Time> LatestLeadershipQuorumResponse(ITimeSource::Time now) const;
+    bool HasRecentLeadershipQuorum(ITimeSource::Time now) const;
+    void RecordLeadershipResponse(ITimeSource::Time now, uint32_t nodeId);
+    void ExpireLeadership(ITimeSource::Time now);
 
     TMessageHolder<TRequestVoteRequest> CreateVote(uint32_t nodeId);
     TMessageHolder<TAppendEntriesRequest> CreateAppendEntries(uint32_t nodeId);
