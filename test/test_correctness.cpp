@@ -379,6 +379,89 @@ void test_pending_write_admission_is_bounded_and_released_on_completion_or_disco
     assert_int_equal(cluster.Nodes[0]->GetLastIndex(), before + 3);
 }
 
+void test_uncommitted_log_budget_survives_disconnect_and_releases_after_commit(void**) {
+    auto state = std::make_shared<TState>();
+    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{}, std::vector<uint32_t>{},
+        TRaft::TLogLimits{.MaxUncommittedBytes = 1024, .MaxUncommittedEntries = 2});
+    raft->ProcessTimeout({});
+    assert_int_equal(raft->CurrentStateName(), EState::LEADER);
+
+    TWriteClient client(raft);
+    client.Write(31, "survives disconnect");
+    const auto acceptedIndex = raft->GetLastIndex();
+    client.Processor.CleanUp(client.Endpoint);
+    client.Write(32, "over capacity");
+    assert_int_equal(raft->GetLastIndex(), acceptedIndex);
+    assert_int_equal(client.Replies.size(), 1);
+    assert_int_equal(client.Replies[0].Cookie, 32);
+    assert_int_equal(client.Replies[0].Error, TCommandResponse::Overloaded);
+
+    raft->ProcessTimeout({});
+    assert_true(state->CommitIndex >= acceptedIndex);
+    client.Write(33, "capacity released");
+    assert_int_equal(raft->GetLastIndex(), acceptedIndex + 1);
+}
+
+void test_follower_rejects_append_batch_that_exceeds_uncommitted_log_budget(void**) {
+    TMessageHolder<TAppendEntriesResponse> response;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) {
+        response = message.template Cast<TAppendEntriesResponse>();
+    });
+    auto state = std::make_shared<TState>();
+    TRaft raft(state, 1, TNodeDict{{2, peer}}, std::vector<uint32_t>{},
+        TRaft::TLogLimits{.MaxUncommittedBytes = 1024, .MaxUncommittedEntries = 1});
+
+    auto first = NewHoldedMessage<TLogEntry>();
+    auto second = NewHoldedMessage<TLogEntry>();
+    first->Term = second->Term = 1;
+    auto request = NewHoldedMessage(
+        TMessageEx{.Src = 2, .Dst = 1, .Term = 1, .Seqno = 1},
+        TAppendEntriesRequest{
+            .PrevLogIndex = 0, .PrevLogTerm = 0, .LeaderCommit = 0,
+            .LeaderId = 2, .Nentries = 2,
+        });
+    request.InitPayload(2);
+    request.Payload[0] = first;
+    request.Payload[1] = second;
+    raft.Process({}, request);
+
+    assert_int_equal(state->LastLogIndex, 0);
+    assert_non_null(response);
+    assert_false(response->Success);
+}
+
+void test_follower_log_budget_is_reclaimed_when_leader_replaces_uncommitted_suffix(void**) {
+    TMessageHolder<TAppendEntriesResponse> response;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) {
+        response = message.template Cast<TAppendEntriesResponse>();
+    });
+    auto state = std::make_shared<TState>();
+    TRaft raft(state, 1, TNodeDict{{2, peer}}, std::vector<uint32_t>{},
+        TRaft::TLogLimits{.MaxUncommittedBytes = 1024, .MaxUncommittedEntries = 1});
+    auto append = [&](uint64_t term, uint64_t seqno) {
+        auto entry = NewHoldedMessage<TLogEntry>();
+        entry->Term = term;
+        auto request = NewHoldedMessage(
+            TMessageEx{.Src = 2, .Dst = 1, .Term = term, .Seqno = seqno},
+            TAppendEntriesRequest{
+                .PrevLogIndex = 0, .PrevLogTerm = 0, .LeaderCommit = 0,
+                .LeaderId = 2, .Nentries = 1,
+            });
+        request.InitPayload(1);
+        request.Payload[0] = entry;
+        raft.Process({}, request);
+        return response;
+    };
+
+    auto first = append(1, 1);
+    assert_true(first && first->Success);
+    assert_int_equal(state->LastLogTerm, 1);
+    auto replacement = append(2, 2);
+    assert_true(replacement && replacement->Success);
+    assert_int_equal(state->LastLogIndex, 1);
+    assert_int_equal(state->LastLogTerm, 2);
+}
+
 void test_pending_request_byte_admission_covers_leader_wait_queue(void**) {
     TCluster cluster(3);
     std::vector<uint32_t> replies;
@@ -1029,6 +1112,9 @@ int main() {
         cmocka_unit_test(test_replaced_write_never_receives_another_commands_reply),
         cmocka_unit_test(test_stepdown_rejects_write_without_waiting_for_application),
         cmocka_unit_test(test_pending_write_admission_is_bounded_and_released_on_completion_or_disconnect),
+        cmocka_unit_test(test_uncommitted_log_budget_survives_disconnect_and_releases_after_commit),
+        cmocka_unit_test(test_follower_rejects_append_batch_that_exceeds_uncommitted_log_budget),
+        cmocka_unit_test(test_follower_log_budget_is_reclaimed_when_leader_replaces_uncommitted_suffix),
         cmocka_unit_test(test_pending_request_byte_admission_covers_leader_wait_queue),
         cmocka_unit_test(test_cached_write_reply_budget_returns_unknown_outcome),
         cmocka_unit_test(test_committed_but_unanswered_write_has_unknown_outcome_on_stepdown),

@@ -6,6 +6,7 @@
 #include <deque>
 #include <string>
 #include <string_view>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -75,6 +76,11 @@ struct TJointConfigurationReadiness {
             HasCommittedCurrentTermEntry && ChangesVoterSet && MissingPeerTargets.empty() &&
             AddedVotersWithoutCommitAck.empty();
     }
+};
+
+class TRaftLogCapacityExceeded : public std::runtime_error {
+public:
+    TRaftLogCapacityExceeded() : std::runtime_error("Uncommitted Raft log capacity exceeded") {}
 };
 
 struct TVolatileState {
@@ -165,13 +171,29 @@ enum class EState: int {
 
 class TRaft {
 public:
+    // Hard per-node bound for the suffix above the commit index. Reserve room
+    // for one current-term leader no-op; repeated uncommitted terms may consume
+    // the finite reserve and require operator recovery to restore progress.
+    struct TLogLimits {
+        uint64_t MaxUncommittedBytes = 256ull * 1024 * 1024;
+        size_t MaxUncommittedEntries = 65536;
+        // Keep one entry's worth of room for a leader's current-term no-op.
+        // Repeated failed terms can still consume this finite reserve.
+        uint64_t ReservedControlBytes = sizeof(TLogEntry);
+        size_t ReservedControlEntries = 1;
+    };
+
     // Nodes contains every configured replication peer; learners may include
     // the local ID. Retained validated configuration history determines active
     // voter roles and joint quorum arithmetic.
     TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes, std::vector<uint32_t> learners = {});
+    TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes,
+          std::vector<uint32_t> learners, TLogLimits logLimits);
     // Node IDs are uint32_t on the wire and in membership records. Keep the int
     // overload for source compatibility while allowing the full voter ID range.
     TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& nodes, std::vector<uint32_t> learners = {});
+    TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& nodes,
+          std::vector<uint32_t> learners, TLogLimits logLimits);
 
     void Process(ITimeSource::Time now, TMessageHolder<TMessage> message, const std::shared_ptr<INode>& replyTo = {});
     void ProcessTimeout(ITimeSource::Time now);
@@ -299,6 +321,12 @@ private:
     bool ValidateAppendConfiguration(TMessageHolder<TAppendEntriesRequest> message) const;
     void RequireLiveConfigurationStorage() const;
     void RefreshConfiguration(uint64_t commitIndex);
+    void RebuildUncommittedLogUsage();
+    void PruneCommittedLogUsage(uint64_t commitIndex);
+    void RemoveUncommittedLogSuffix(uint64_t firstIndex);
+    void RecordUncommittedLogEntry(uint64_t index, uint32_t bytes);
+    bool FitsUncommittedLog(uint64_t bytes, size_t entries) const;
+    void EnsureProposalLogCapacity(uint64_t bytes, size_t entries) const;
 
     uint32_t Id;
     TNodeDict Nodes;
@@ -314,6 +342,10 @@ private:
     int Npeers;
     int Nservers;
     std::shared_ptr<IState> State;
+    TLogLimits LogLimits;
+    struct TUncommittedLogEntry { uint64_t Index; uint32_t Bytes; };
+    std::deque<TUncommittedLogEntry> UncommittedLog;
+    uint64_t UncommittedLogBytes = 0;
     std::unique_ptr<TVolatileState> VolatileState;
     uint64_t Seqno = 1; // zero is reserved for an unconfirmed read
     std::weak_ptr<IRsm> SnapshotApplication;

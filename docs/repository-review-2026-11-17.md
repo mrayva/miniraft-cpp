@@ -6,7 +6,8 @@ build setup, tests and documentation, with targeted reproduction. It is not an
 exhaustive proof of consensus safety or a review of every dependency. CodeGraph
 failed twice with an internal module error; direct source inspection was used.
 The full build and all 21 CTest targets passed at this same commit in the
-preceding validation. This review did not rerun that suite or change runtime code.
+preceding validation. Follow-up fixes below are recorded separately from that
+baseline.
 
 ## Findings
 
@@ -39,7 +40,7 @@ Deterministic regressions cover disconnected queue count and byte caps, retry
 coalescing, and rejected forwarded work. These are per-peer bounds; aggregate
 memory still scales with the number of peers.
 
-### P1: pending client work has no admission or deadline budget — partially fixed
+### P1: pending client work has no deadline budget — partially fixed
 
 `miniraft/raft.h:334-418` and `miniraft/raft.cpp:2540-2940`: waiting reads,
 writes, requests awaiting a leader and forwarded requests now share default
@@ -51,10 +52,16 @@ write, leader-wait and forwarded paths.
 
 Requests still have no deadline and can remain pending while their role or peer
 state does not change, though their count and memory are bounded. A disconnected
-client's already-appended write remains in the durable log; the log itself has
-no uncommitted-entry budget. Those two controls remain open. ErrorCode=1 still
-means the outcome may be unknown after an admitted write is cancelled or its
-reply cannot be retained.
+client's already-appended write remains in the durable log. Follow-up work now
+bounds each node's uncommitted suffix to 256 MiB / 65,536 entries by default,
+reserves one no-op entry for control progress, rejects over-budget local writes
+as Overloaded, and makes followers reject oversized AppendEntries batches before
+mutation. Repeated uncommitted terms can consume the finite control reserve;
+recovered suffixes above the configured cap are retained and prevent further
+proposals. This bounds storage but does not provide a recovery protocol for a
+saturated log. Request deadlines remain open. ErrorCode=1 still means the
+outcome may be unknown after an admitted write is cancelled or its reply cannot
+be retained.
 
 ### P2: readiness omits exhausted log capacity
 
@@ -150,9 +157,10 @@ Sources consulted:
 - https://github.com/eBay/NuRaft/blob/master/docs/snapshot_transmission.md
 - https://github.com/eBay/NuRaft/blob/master/docs/streaming_mode.md
 
-Recommended order: fix endpoint parsing; bound transport and client admission;
-add deadlines and leadership expiration; implement pre-vote; then address WAL
-performance, large snapshots, membership administration and generated failure
-testing. Authentication and shutdown are necessary before exposing this as a
-general production service. No new consensus safety violation was established
-in this review; no independent reviewer approval is claimed.
+Recommended order: fix endpoint parsing; bound transport, client admission and
+the uncommitted log; add deadlines and leadership expiration; implement
+pre-vote; then address WAL performance, large snapshots, membership
+administration and generated failure testing. Authentication and shutdown are
+necessary before exposing this as a general production service. No new
+consensus safety violation was established in this review; no independent
+reviewer approval is claimed.

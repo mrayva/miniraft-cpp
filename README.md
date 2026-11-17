@@ -14,7 +14,8 @@ The [strong-read follow-up](docs/strong-reads.md) requires a fresh majority for
 `--consistent` reads and rejects pending reads when their leadership term ends.
 The [pending request follow-up](docs/pending-requests.md) prevents replacement
 write acknowledgements, cleans up obsolete or disconnected requests, and bounds
-pending request admission and cached write replies.
+pending request admission, cached write replies and uncommitted Raft log
+growth.
 The [forwarding follow-up](docs/forwarding.md) preserves client cookies and binds
 forwarded replies to their original leader, term and outbound peer.
 The [network framing follow-up](docs/network-frames.md) handles fragmented input

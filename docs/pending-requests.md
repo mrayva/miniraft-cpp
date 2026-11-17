@@ -48,8 +48,24 @@ and disconnect cleanup.
 
 These limits bound request-processor memory. They do not bound the persistent
 uncommitted Raft log: a write already appended remains in the log after its
-client disconnects. A separate uncommitted-log budget is still needed to bound
-storage growth during quorum loss.
+client disconnects. Raft now also bounds that suffix independently: by default,
+each node accepts at most 256 MiB and 65,536 uncommitted entries, counting full
+serialized log-entry frames. One entry and its frame size are reserved from
+application proposals for a leader's current-term no-op. The limits are
+configurable through `TRaft::TLogLimits`; committed entries do not consume the
+budget, and a recovered suffix already above the configured limit is retained
+but blocks further local proposals.
+
+A local proposal that would cross its budget is rejected before storage append
+with ErrorCode=3 (`Overloaded`). A follower preflights the complete incoming
+AppendEntries suffix and rejects the RPC without partial mutation if it would
+cross its hard log limit. Replication then retries through the normal Raft
+backoff path. The finite control reserve protects a current-term no-op when
+application entries fill their quota, but repeated uncommitted leadership terms
+can consume it. If a node reaches the hard limit before a current-term entry can
+commit, Raft cannot promise progress until a conflicting leader suffix replaces
+entries or the cluster is otherwise recovered. This is the storage bound's
+explicit availability tradeoff.
 
 Cancellation concerns the response, not the replicated command. Committed
 commands still apply even if their client disconnected or their leader changed.
@@ -107,8 +123,9 @@ processor. No independent reviewer approval is claimed.
 ## Remaining gaps
 
 Exactly-once retries, durable request IDs, forwarded-request lifecycle across
-leader failures, request deadlines, an uncommitted-log budget, transport
-validation and broader generated history/linearizability testing remain open.
+leader failures, request deadlines, transport validation and broader generated
+history/linearizability testing remain open. The log budget bounds resource
+growth but can stop progress at exhaustion, as described above.
 This change does not promise successful completion during quorum loss or
 establish library-wide linearizability. Unanswered writes after process crashes
 also have unknown outcomes.

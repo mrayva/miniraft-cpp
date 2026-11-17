@@ -856,22 +856,38 @@ TVolatileState& TVolatileState::SetCommitIndex(uint64_t index)
 
 TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes,
         std::vector<uint32_t> learners)
+    : TRaft(std::move(state), node, nodes, std::move(learners), TLogLimits{})
+{}
+
+TRaft::TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes,
+        std::vector<uint32_t> learners, TLogLimits logLimits)
     : TRaft(std::move(state), node > 0 ? static_cast<uint32_t>(node) : uint32_t{0},
-        nodes, std::move(learners))
+        nodes, std::move(learners), logLimits)
 {}
 
 TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& nodes,
         std::vector<uint32_t> learners)
+    : TRaft(std::move(state), node, nodes, std::move(learners), TLogLimits{})
+{}
+
+TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& nodes,
+        std::vector<uint32_t> learners, TLogLimits logLimits)
     : Id(node)
     , Nodes(nodes)
     , MinVotes(0) // derived from voting IDs after role validation
     , Npeers(nodes.size())
     , Nservers(0)
     , State(std::move(state))
+    , LogLimits(logLimits)
     , VolatileState(std::make_unique<TVolatileState>())
     , StateName(EState::FOLLOWER)
 {
     if (!node || !State) throw std::invalid_argument("Raft requires a positive ID and state");
+    if (!LogLimits.MaxUncommittedBytes || !LogLimits.MaxUncommittedEntries ||
+        LogLimits.ReservedControlBytes < sizeof(TLogEntry) || !LogLimits.ReservedControlEntries ||
+        LogLimits.ReservedControlBytes > LogLimits.MaxUncommittedBytes ||
+        LogLimits.ReservedControlEntries > LogLimits.MaxUncommittedEntries)
+        throw std::invalid_argument("Raft uncommitted-log limits must be positive");
     // Equal seeds make simultaneously started voters campaign in lockstep.
     // An odd multiplier gives every nonzero node ID a distinct stream.
     Seed = Id * 0x9e3779b9u;
@@ -982,6 +998,7 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
         State->Commit();
     }
     VolatileState->CommitIndex = State->CommitIndex;
+    RebuildUncommittedLogUsage();
     State->MarkRaftStarted();
 }
 
@@ -1117,26 +1134,74 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
         (message->PrevLogIndex <= State->LastLogIndex
             && State->LogTerm(message->PrevLogIndex) == message->PrevLogTerm)))
     {
-        success = true;
+        uint64_t conflictIndex = 0;
+        uint32_t conflictOffset = 0;
         auto index = message->PrevLogIndex;
-        for (uint32_t i = 0 ; i < message.PayloadSize; i++) {
-            auto& data = message.Payload[i];
-            auto entry = data.Cast<TLogEntry>();
-            index++;
-            // replace or append log entries
+        for (uint32_t i = 0; i < message.PayloadSize; ++i) {
+            ++index;
+            const auto entry = message.Payload[i].Cast<TLogEntry>();
             if (State->LogTerm(index) != entry->Term) {
-                if (Configuration && index <= Configuration->Latest.ConfigurationIndex())
-                    configurationTouched = true;
-                while (State->LastLogIndex > index-1) {
-                    State->RemoveLast();
-                }
-                State->Append(entry);
-                if (entry->Flags & TLogEntry::EConfiguration) configurationTouched = true;
+                conflictIndex = index;
+                conflictOffset = i;
+                break;
             }
         }
 
-        matchIndex = index;
-        commitIndex = std::max(commitIndex, std::min(message->LeaderCommit, matchIndex));
+        bool fits = true;
+        if (conflictIndex) {
+            // Refuse a conflicting leader suffix at or below a commit boundary
+            // before touching storage. Storage removal methods also guard this,
+            // but a protocol rejection is the correct response to stale input.
+            const auto commitFloor = std::max(State->CommitIndex, VolatileState->CommitIndex);
+            if (conflictIndex <= commitFloor) {
+                fits = false;
+            } else {
+                uint64_t replacedBytes = 0;
+                size_t replacedEntries = 0;
+                for (auto it = UncommittedLog.rbegin(); it != UncommittedLog.rend() &&
+                        it->Index >= conflictIndex; ++it) {
+                    replacedBytes += it->Bytes;
+                    ++replacedEntries;
+                }
+                uint64_t incomingBytes = 0;
+                for (uint32_t i = conflictOffset; i < message.PayloadSize; ++i)
+                    incomingBytes += message.Payload[i].Cast<TLogEntry>()->Len;
+                const auto retainedBytes = UncommittedLogBytes - replacedBytes;
+                const auto retainedEntries = UncommittedLog.size() - replacedEntries;
+                const auto incomingEntries = size_t(message.PayloadSize - conflictOffset);
+                fits = retainedBytes <= LogLimits.MaxUncommittedBytes &&
+                    incomingBytes <= LogLimits.MaxUncommittedBytes - retainedBytes &&
+                    retainedEntries <= LogLimits.MaxUncommittedEntries &&
+                    incomingEntries <= LogLimits.MaxUncommittedEntries - retainedEntries;
+            }
+        }
+
+        if (fits) {
+            success = true;
+            index = message->PrevLogIndex;
+            for (uint32_t i = 0; i < message.PayloadSize; ++i) {
+                auto& data = message.Payload[i];
+                auto entry = data.Cast<TLogEntry>();
+                ++index;
+                // replace or append log entries
+                if (State->LogTerm(index) != entry->Term) {
+                    if (Configuration && index <= Configuration->Latest.ConfigurationIndex())
+                        configurationTouched = true;
+                    while (State->LastLogIndex > index - 1) {
+                        const auto removedIndex = State->LastLogIndex;
+                        State->RemoveLast();
+                        RemoveUncommittedLogSuffix(removedIndex);
+                    }
+                    const auto bytes = entry->Len;
+                    State->Append(entry);
+                    RecordUncommittedLogEntry(index, bytes);
+                    if (entry->Flags & TLogEntry::EConfiguration) configurationTouched = true;
+                }
+            }
+
+            matchIndex = index;
+            commitIndex = std::max(commitIndex, std::min(message->LeaderCommit, matchIndex));
+        }
     }
 
     if (!success && message->PrevLogIndex < State->SnapshotIndex) matchIndex = State->SnapshotIndex;
@@ -1761,7 +1826,15 @@ void TRaft::ProcessTimeout(ITimeSource::Time now) {
                 auto empty = NewHoldedMessage<TLogEntry>();
                 empty->Term = State->CurrentTerm;
                 empty->Flags = TLogEntry::EStub;
-                State->Append(std::move(empty));
+                // A full log must not prevent election itself. The hard cap
+                // may prevent this current-term entry; in that case proposals
+                // also fail until a conflicting leader suffix replaces entries
+                // or the cluster is otherwise recovered.
+                if (FitsUncommittedLog(empty->Len, 1)) {
+                    const auto bytes = empty->Len;
+                    State->Append(std::move(empty));
+                    RecordUncommittedLogEntry(State->LastLogIndex, bytes);
+                }
             }
         }
     }
@@ -1792,8 +1865,11 @@ uint64_t TRaft::Append(TMessageHolder<TLogEntry> entry) {
     ValidateMessageTree(entry);
     if (entry->Flags & TLogEntry::EConfiguration)
         throw TMessageError("Configuration proposals are unsupported");
+    EnsureProposalLogCapacity(entry->Len, 1);
     entry->Term = State->CurrentTerm;
+    const auto bytes = entry->Len;
     State->Append(std::move(entry));
+    RecordUncommittedLogEntry(State->LastLogIndex, bytes);
     return State->LastLogIndex;
 }
 
@@ -1860,7 +1936,11 @@ uint64_t TRaft::ProposeJointConfiguration(std::vector<uint32_t> newVoters) {
     const auto& latest = Configuration->Latest;
     TConfigurationRecord record{EConfigurationPhase::Joint, State->CurrentTerm,
         latest.ConfigurationIndex(), latest.ConfigurationTerm(), oldVoters, std::move(newVoters)};
-    State->Append(EncodeConfigurationEntry(record));
+    auto entry = EncodeConfigurationEntry(record);
+    EnsureProposalLogCapacity(entry->Len, 1);
+    const auto bytes = entry->Len;
+    State->Append(std::move(entry));
+    RecordUncommittedLogEntry(State->LastLogIndex, bytes);
     RefreshConfiguration(VolatileState->CommitIndex);
     return State->LastLogIndex;
 }
@@ -1879,7 +1959,11 @@ uint64_t TRaft::FinalizeConfiguration() {
         throw std::logic_error("Leadership must transfer to a voter in the new set before finalization");
     TConfigurationRecord record{EConfigurationPhase::Stable, State->CurrentTerm,
         joint.ConfigurationIndex(), joint.ConfigurationTerm(), joint.OldVoters(), joint.NewVoters()};
-    State->Append(EncodeConfigurationEntry(record));
+    auto entry = EncodeConfigurationEntry(record);
+    EnsureProposalLogCapacity(entry->Len, 1);
+    const auto bytes = entry->Len;
+    State->Append(std::move(entry));
+    RecordUncommittedLogEntry(State->LastLogIndex, bytes);
     RefreshConfiguration(VolatileState->CommitIndex);
     return State->LastLogIndex;
 }
@@ -2144,6 +2228,7 @@ TSnapshot TRaft::Compact() {
     application->ValidateSnapshot(snapshot.Data, snapshot.Index);
     AdvanceCommitIndex(VolatileState->CommitIndex);
     State->InstallSnapshot(snapshot);
+    RebuildUncommittedLogUsage();
     ConfigurationBaseline = snapshot.StableConfiguration
         ? TConfigurationHistory::FromStableSnapshot(snapshot)
         : snapshot.IsJoint()
@@ -2491,6 +2576,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         if (application->LastAppliedIndex != snapshot.Index) std::terminate();
     } catch (...) { std::terminate(); }
     VolatileState->CommitIndex = State->CommitIndex;
+    RebuildUncommittedLogUsage();
     ConfigurationBaseline = snapshot.StableConfiguration
         ? TConfigurationHistory::FromStableSnapshot(snapshot)
         : snapshot.IsJoint()
@@ -2509,6 +2595,57 @@ void TRaft::RestoreAppliedIndex(uint64_t index) {
     AdvanceCommitIndex(std::max(VolatileState->CommitIndex, index));
 }
 
+void TRaft::RebuildUncommittedLogUsage() {
+    UncommittedLog.clear();
+    UncommittedLogBytes = 0;
+    const auto committed = std::max({State->CommitIndex, State->SnapshotIndex,
+        VolatileState ? VolatileState->CommitIndex : uint64_t(0)});
+    for (uint64_t index = committed + 1; index <= State->LastLogIndex; ++index) {
+        auto entry = State->Get(static_cast<int64_t>(index));
+        if (!entry) throw std::logic_error("Missing uncommitted Raft log entry");
+        RecordUncommittedLogEntry(index, entry->Len);
+    }
+}
+
+void TRaft::PruneCommittedLogUsage(uint64_t commitIndex) {
+    while (!UncommittedLog.empty() && UncommittedLog.front().Index <= commitIndex) {
+        UncommittedLogBytes -= UncommittedLog.front().Bytes;
+        UncommittedLog.pop_front();
+    }
+}
+
+void TRaft::RemoveUncommittedLogSuffix(uint64_t firstIndex) {
+    while (!UncommittedLog.empty() && UncommittedLog.back().Index >= firstIndex) {
+        UncommittedLogBytes -= UncommittedLog.back().Bytes;
+        UncommittedLog.pop_back();
+    }
+}
+
+void TRaft::RecordUncommittedLogEntry(uint64_t index, uint32_t bytes) {
+    if ((!UncommittedLog.empty() && index != UncommittedLog.back().Index + 1) ||
+        (UncommittedLog.empty() && index <= std::max(State->CommitIndex, State->SnapshotIndex)))
+        throw std::logic_error("Noncontiguous uncommitted Raft log accounting");
+    if (bytes > UINT64_MAX - UncommittedLogBytes)
+        throw std::overflow_error("Uncommitted Raft log byte accounting overflow");
+    UncommittedLog.push_back({index, bytes});
+    UncommittedLogBytes += bytes;
+}
+
+bool TRaft::FitsUncommittedLog(uint64_t bytes, size_t entries) const {
+    return UncommittedLogBytes <= LogLimits.MaxUncommittedBytes &&
+        bytes <= LogLimits.MaxUncommittedBytes - UncommittedLogBytes &&
+        UncommittedLog.size() <= LogLimits.MaxUncommittedEntries &&
+        entries <= LogLimits.MaxUncommittedEntries - UncommittedLog.size();
+}
+
+void TRaft::EnsureProposalLogCapacity(uint64_t bytes, size_t entries) const {
+    const auto proposalBytes = LogLimits.MaxUncommittedBytes - LogLimits.ReservedControlBytes;
+    const auto proposalEntries = LogLimits.MaxUncommittedEntries - LogLimits.ReservedControlEntries;
+    if (UncommittedLogBytes > proposalBytes || bytes > proposalBytes - UncommittedLogBytes ||
+        UncommittedLog.size() > proposalEntries || entries > proposalEntries - UncommittedLog.size())
+        throw TRaftLogCapacityExceeded();
+}
+
 void TRaft::AdvanceCommitIndex(uint64_t index) {
     if (index > State->LastLogIndex)
         throw std::logic_error("Invalid Raft commit index advance");
@@ -2520,6 +2657,7 @@ void TRaft::AdvanceCommitIndex(uint64_t index) {
         State->Commit();
     }
     VolatileState->CommitIndex = target;
+    PruneCommittedLogUsage(target);
     if (ConfigurationScanRequired) RefreshConfiguration(target);
 }
 
@@ -2775,10 +2913,17 @@ void TRequestProcessor::OnWriteRequest(TMessageHolder<TCommandRequest> command,
 
     if (stateName == EState::LEADER) {
         const auto term = Raft->GetState()->CurrentTerm;
-        uint64_t index = Raft->Append(std::move(Rsm->Prepare(command)));
-        if (replyTo) {
-            PendingWriteTerms[index] = term;
-            Waiting.emplace(TWaiting{index, 0, std::move(command), replyTo, term, admissionId});
+        const auto cookie = command->Cookie;
+        try {
+            uint64_t index = Raft->Append(std::move(Rsm->Prepare(command)));
+            if (replyTo) {
+                PendingWriteTerms[index] = term;
+                Waiting.emplace(TWaiting{index, 0, std::move(command), replyTo, term, admissionId});
+            }
+        } catch (const TRaftLogCapacityExceeded&) {
+            ReleaseAdmission(admissionId);
+            if (replyTo) replyTo->Send(NewHoldedMessage(TCommandResponse{
+                .Cookie = cookie, .ErrorCode = TCommandResponse::Overloaded}));
         }
     } else {
         Forward(std::move(command), replyTo, admissionId);
