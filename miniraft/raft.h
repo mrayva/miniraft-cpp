@@ -371,12 +371,17 @@ public:
         size_t MaxPendingRequests = 1024;
         uint64_t MaxPendingRequestBytes = 64 * 1024 * 1024;
         uint64_t MaxPendingReplyBytes = 64 * 1024 * 1024;
+        // End-to-end lifetime from admission, including leader discovery and forwarding.
+        ITimeSource::Time::duration RequestTimeout = std::chrono::seconds(30);
     };
 
     // Construct after restoring the RSM and before accepting network traffic.
     TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_ptr<IRsm> rsm, const TNodeDict& nodes);
     TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_ptr<IRsm> rsm,
                       const TNodeDict& nodes, TAdmissionLimits admissionLimits);
+    TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_ptr<IRsm> rsm,
+                      const TNodeDict& nodes, TAdmissionLimits admissionLimits,
+                      std::shared_ptr<ITimeSource> timeSource);
 
     void CheckStateChange();
     void OnCommandRequest(TMessageHolder<TCommandRequest> message, const std::shared_ptr<INode>& replyTo);
@@ -393,6 +398,7 @@ public:
 private:
     bool TryAdmit(const TMessageHolder<TCommandRequest>& message, const std::shared_ptr<INode>& replyTo,
                   uint64_t& admissionId);
+    bool AdmissionExpired(uint64_t admissionId, ITimeSource::Time now) const;
     void ReleaseAdmission(uint64_t admissionId) noexcept;
     void EraseWriteAnswer(uint64_t index) noexcept;
     void DispatchCommandRequest(TMessageHolder<TCommandRequest> message,
@@ -404,13 +410,16 @@ private:
     void OnWriteRequest(TMessageHolder<TCommandRequest> message, const std::shared_ptr<INode>& replyTo,
                         uint64_t admissionId);
     void PruneRequests(const std::shared_ptr<INode>& disconnected = {});
+    void ExpireRequests(ITimeSource::Time now, const std::shared_ptr<INode>& disconnected = {});
     void CancelForwarded(const std::shared_ptr<INode>& disconnected = {}, bool peerFailure = false);
 
     std::shared_ptr<TRaft> Raft;
     std::shared_ptr<IRsm> Rsm;
     TNodeDict Nodes;
     TAdmissionLimits AdmissionLimits;
-    std::unordered_map<uint64_t, uint64_t> Admissions;
+    std::shared_ptr<ITimeSource> TimeSource;
+    struct TAdmission { uint64_t Bytes; ITimeSource::Time Deadline; };
+    std::unordered_map<uint64_t, TAdmission> Admissions;
     uint64_t PendingRequestBytes = 0;
     uint64_t PendingReplyBytes = 0;
     uint64_t NextAdmissionId = 1;

@@ -178,6 +178,7 @@ struct TCommandResponse: public TMessage {
         Failed = 1,
         ApplicationReadFailed = 2,
         Overloaded = 3,
+        TimedOut = 4,
     };
     uint64_t Index = 0;
     uint32_t Cookie = 0;

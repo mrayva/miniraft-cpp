@@ -39,12 +39,29 @@ Requests over either limit receive ErrorCode=3 (`Overloaded`) before
 application validation, append or forwarding, so that response means the
 request was not admitted.
 
+Every admitted request also has a 30-second default deadline measured from
+admission using the monotonic clock. Configure `TAdmissionLimits::RequestTimeout`
+to change it. The deadline covers local reads and writes, strong reads, leader
+discovery and forwarded routes. The server's periodic timer expires requests
+even when no network traffic arrives; directly managed processors must keep
+calling their normal polling methods. Expired requests receive ErrorCode=4
+(`TimedOut`) and release their pending-request and cached-reply reservations.
+Older clients can treat this as any other nonzero error.
+
 Cached local write replies have a separate 64 MiB default limit. If a committed
 write's application reply cannot fit, the request processor drops that cached
 result and returns a small ErrorCode=1 response when completing the waiter; the
 command has already applied, so its outcome is unknown to the client.
-Admissions are released on completion, forwarding response, role cancellation
-and disconnect cleanup.
+Admissions are released on completion, forwarding response, role cancellation,
+disconnect cleanup and deadline expiry.
+
+Expiration cancels response tracking, not replicated work. A write already
+appended can still commit and apply after its caller receives `TimedOut`; its
+outcome is unknown and callers should not blindly retry non-idempotent writes.
+Forwarding deadlines are local to each processor because the request wire
+format has no deadline field. The originating processor still responds at its
+own deadline and drops late replies, while a remote leader may retain and apply
+the forwarded write independently until its own deadline or completion.
 
 These limits bound request-processor memory. They do not bound the persistent
 uncommitted Raft log: a write already appended remains in the log after its
@@ -123,9 +140,10 @@ processor. No independent reviewer approval is claimed.
 ## Remaining gaps
 
 Exactly-once retries, durable request IDs, forwarded-request lifecycle across
-leader failures, request deadlines, transport validation and broader generated
-history/linearizability testing remain open. The log budget bounds resource
-growth but can stop progress at exhaustion, as described above.
+leader failures, transport validation and broader generated
+history/linearizability testing remain open. Forwarding deadlines are local to
+each processor rather than propagated on the wire. The log budget bounds
+resource growth but can stop progress at exhaustion, as described above.
 This change does not promise successful completion during quorum loss or
 establish library-wide linearizability. Unanswered writes after process crashes
 also have unknown outcomes.

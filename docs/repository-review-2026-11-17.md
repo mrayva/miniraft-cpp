@@ -40,7 +40,7 @@ Deterministic regressions cover disconnected queue count and byte caps, retry
 coalescing, and rejected forwarded work. These are per-peer bounds; aggregate
 memory still scales with the number of peers.
 
-### P1: pending client work has no deadline budget — partially fixed
+### P1: pending client work needs bounded lifetime and admission — partially fixed
 
 `miniraft/raft.h:334-418` and `miniraft/raft.cpp:2540-2940`: waiting reads,
 writes, requests awaiting a leader and forwarded requests now share default
@@ -50,18 +50,20 @@ receive ErrorCode=3 before application validation, append or forwarding. The
 limits are configurable at processor/server construction and are covered across
 write, leader-wait and forwarded paths.
 
-Requests still have no deadline and can remain pending while their role or peer
-state does not change, though their count and memory are bounded. A disconnected
-client's already-appended write remains in the durable log. Follow-up work now
-bounds each node's uncommitted suffix to 256 MiB / 65,536 entries by default,
+Pending operations now expire after a configurable 30 seconds by default with
+ErrorCode=4, releasing local waiters, forwarded routes and cached replies. The
+server uses its monotonic timer even when traffic is idle. Forwarded deadlines
+are local because the wire request has no deadline field, so a remote leader
+may still apply an already-forwarded write after the origin times out. A
+disconnected client's already-appended write likewise remains in the durable
+log. Follow-up work also bounds each node's uncommitted suffix to 256 MiB /
+65,536 entries by default,
 reserves one no-op entry for control progress, rejects over-budget local writes
 as Overloaded, and makes followers reject oversized AppendEntries batches before
 mutation. Repeated uncommitted terms can consume the finite control reserve;
 recovered suffixes above the configured cap are retained and prevent further
 proposals. This bounds storage but does not provide a recovery protocol for a
-saturated log. Request deadlines remain open. ErrorCode=1 still means the
-outcome may be unknown after an admitted write is cancelled or its reply cannot
-be retained.
+saturated log. A timed-out or cancelled write still has an unknown outcome.
 
 ### P2: readiness omitted exhausted log capacity — fixed
 
@@ -158,7 +160,7 @@ Sources consulted:
 - https://github.com/eBay/NuRaft/blob/master/docs/streaming_mode.md
 
 Recommended order: fix endpoint parsing; bound transport and client admission;
-add deadlines and leadership expiration; implement pre-vote; then address WAL
+add quorum-based leadership expiration; implement pre-vote; then address WAL
 performance, large snapshots, membership administration and generated failure
 testing. Authentication and shutdown are necessary before exposing this as a
 general production service. No new consensus safety violation was established

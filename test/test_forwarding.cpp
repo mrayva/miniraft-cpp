@@ -22,6 +22,10 @@ struct TEndpoint : INode {
     }
     void Drain() override {}
 };
+struct TManualTimeSource : ITimeSource {
+    Time Current{};
+    Time Now() override { return Current; }
+};
 struct TClient {
     struct TReply { uint32_t Cookie, Error; std::string Data; };
     std::vector<TReply> Replies;
@@ -46,8 +50,9 @@ struct TFollower {
     std::shared_ptr<TDummyRsm> Rsm = std::make_shared<TDummyRsm>();
     TRequestProcessor Processor{Raft, Rsm, Peers};
     explicit TFollower(bool known = true,
-            TRequestProcessor::TAdmissionLimits limits = TRequestProcessor::TAdmissionLimits{})
-        : Processor{Raft, Rsm, Peers, limits} {
+            TRequestProcessor::TAdmissionLimits limits = TRequestProcessor::TAdmissionLimits{},
+            std::shared_ptr<ITimeSource> timeSource = {})
+        : Processor{Raft, Rsm, Peers, limits, std::move(timeSource)} {
         if (known) LearnLeader(1, 3);
     }
     void LearnLeader(uint32_t id, uint64_t term) {
@@ -135,6 +140,32 @@ void test_forwarded_requests_share_admission_budget_and_release_it(void**) {
     follower.Processor.CleanUp(second.Endpoint);
     follower.Request(second, 24); // Disconnect cleanup releases the replacement route.
     assert_int_equal(follower.Sent.size(), 3);
+}
+
+void test_forwarded_request_deadline_removes_route_and_ignores_late_reply(void**) {
+    auto clock = std::make_shared<TManualTimeSource>();
+    TFollower follower(true, TRequestProcessor::TAdmissionLimits{
+        .MaxPendingRequests = 2,
+        .MaxPendingRequestBytes = 1024,
+        .MaxPendingReplyBytes = 1024,
+        .RequestTimeout = std::chrono::milliseconds(10),
+    }, clock);
+    TClient client;
+    follower.Request(client, 71);
+    assert_int_equal(follower.Sent.size(), 1);
+    const auto forwardedCookie = follower.Sent[0]->Cookie;
+
+    clock->Current += std::chrono::milliseconds(10);
+    follower.Processor.ProcessWaiting();
+    assert_int_equal(client.Replies.size(), 1);
+    assert_int_equal(client.Replies[0].Cookie, 71);
+    assert_int_equal(client.Replies[0].Error, TCommandResponse::TimedOut);
+
+    auto late = NewHoldedMessage(TCommandResponse{.Cookie = forwardedCookie});
+    follower.Processor.OnCommandResponse(late, follower.Leader);
+    assert_int_equal(client.Replies.size(), 1);
+    follower.Request(client, 72); // Expiration released the shared admission slot.
+    assert_int_equal(follower.Sent.size(), 2);
 }
 
 void test_nonzero_client_cookies_are_forwarded(void**) {
@@ -340,6 +371,7 @@ int main() {
         cmocka_unit_test(test_malformed_forwarded_reply_does_not_consume_route),
         cmocka_unit_test(test_forwarded_send_rejection_fails_client_and_discards_route),
         cmocka_unit_test(test_forwarded_requests_share_admission_budget_and_release_it),
+        cmocka_unit_test(test_forwarded_request_deadline_removes_route_and_ignores_late_reply),
         cmocka_unit_test(test_nonzero_client_cookies_are_forwarded),
         cmocka_unit_test(test_zero_client_cookie_is_restored),
         cmocka_unit_test(test_forwarding_copies_request_and_marks_one_hop),

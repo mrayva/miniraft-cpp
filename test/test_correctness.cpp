@@ -17,6 +17,11 @@ struct TEndpoint : INode {
     void Drain() override {}
 };
 
+struct TManualTimeSource : ITimeSource {
+    Time Current{};
+    Time Now() override { return Current; }
+};
+
 // Virtual time and a manually scheduled network: no sockets, sleeps or wall clock.
 struct TCluster {
     ITimeSource::Time Now{};
@@ -147,6 +152,24 @@ struct TEchoRsm : IRsm {
         memcpy(reply->Data, entry->Data, size);
         LastReply = reply.RawData;
         return reply;
+    }
+};
+struct TDeadlineAdvancingRsm : TEchoRsm {
+    std::shared_ptr<TManualTimeSource> Clock;
+    bool AdvanceValidate = false;
+    bool AdvancePrepare = false;
+    bool AdvanceRead = false;
+    explicit TDeadlineAdvancingRsm(std::shared_ptr<TManualTimeSource> clock) : Clock(std::move(clock)) {}
+    void Validate(TMessageHolder<TCommandRequest>) const override {
+        if (AdvanceValidate) Clock->Current += std::chrono::milliseconds(10);
+    }
+    TMessageHolder<TLogEntry> Prepare(TMessageHolder<TCommandRequest> command) override {
+        if (AdvancePrepare) Clock->Current += std::chrono::milliseconds(10);
+        return TEchoRsm::Prepare(std::move(command));
+    }
+    TMessageHolder<TMessage> Read(TMessageHolder<TCommandRequest> command, uint64_t index) override {
+        if (AdvanceRead) Clock->Current += std::chrono::milliseconds(10);
+        return TEchoRsm::Read(std::move(command), index);
     }
 };
 struct TCountingValidateRsm : TEchoRsm {
@@ -377,6 +400,223 @@ void test_pending_write_admission_is_bounded_and_released_on_completion_or_disco
     processor.CleanUp(endpoint);
     write(14, "after disconnect cleanup");
     assert_int_equal(cluster.Nodes[0]->GetLastIndex(), before + 3);
+}
+
+void test_pending_write_deadline_releases_admission_but_does_not_cancel_log_entry(void**) {
+    TCluster cluster(3);
+    cluster.Elect(1);
+    cluster.Replicate(1);
+    auto clock = std::make_shared<TManualTimeSource>();
+    auto rsm = std::make_shared<TEchoRsm>();
+    std::vector<std::pair<uint32_t, uint32_t>> replies;
+    auto endpoint = std::make_shared<TEndpoint>([&](auto message) {
+        auto response = message.template Cast<TCommandResponse>();
+        replies.emplace_back(response->Cookie, response->ErrorCode);
+    });
+    TRequestProcessor processor(cluster.Nodes[0], rsm, {},
+        TRequestProcessor::TAdmissionLimits{
+            .MaxPendingRequests = 1,
+            .MaxPendingRequestBytes = 1024,
+            .MaxPendingReplyBytes = 1024,
+            .RequestTimeout = std::chrono::milliseconds(10),
+        }, clock);
+    auto write = [&](uint32_t cookie, std::string_view data) {
+        auto command = NewHoldedMessage<TCommandRequest>(sizeof(TCommandRequest) + data.size());
+        command->Cookie = cookie;
+        command->Flags = TCommandRequest::EWrite;
+        memcpy(command->Data, data.data(), data.size());
+        processor.OnCommandRequest(command, endpoint);
+    };
+
+    const auto before = cluster.Nodes[0]->GetLastIndex();
+    write(41, "outcome unknown after timeout");
+    const auto timedOutIndex = cluster.Nodes[0]->GetLastIndex();
+    assert_int_equal(timedOutIndex, before + 1);
+    write(42, "budget still occupied");
+    assert_int_equal(replies.size(), 1);
+    assert_int_equal(replies[0].first, 42);
+    assert_int_equal(replies[0].second, TCommandResponse::Overloaded);
+
+    clock->Current += std::chrono::milliseconds(10);
+    processor.ProcessWaiting();
+    assert_int_equal(replies.size(), 2);
+    assert_int_equal(replies[1].first, 41);
+    assert_int_equal(replies[1].second, TCommandResponse::TimedOut);
+    write(43, "admission released");
+    assert_int_equal(cluster.Nodes[0]->GetLastIndex(), timedOutIndex + 1);
+
+    cluster.Replicate(1);
+    processor.ProcessCommitted();
+    processor.ProcessWaiting();
+    assert_true(rsm->Applied == (std::vector<std::string>{
+        "outcome unknown after timeout", "admission released"}));
+    assert_int_equal(replies.size(), 3);
+    assert_int_equal(replies[2].first, 43);
+    assert_int_equal(replies[2].second, TCommandResponse::Success);
+}
+
+void test_write_deadline_releases_already_cached_application_reply(void**) {
+    TCluster cluster(1);
+    cluster.Elect(1);
+    cluster.Replicate(1);
+    auto clock = std::make_shared<TManualTimeSource>();
+    auto rsm = std::make_shared<TEchoRsm>();
+    std::vector<uint32_t> replies;
+    auto endpoint = std::make_shared<TEndpoint>([&](auto message) {
+        replies.push_back(message.template Cast<TCommandResponse>()->ErrorCode);
+    });
+    TRequestProcessor processor(cluster.Nodes[0], rsm, {},
+        TRequestProcessor::TAdmissionLimits{
+            .MaxPendingRequests = 2,
+            .MaxPendingRequestBytes = 1024,
+            .MaxPendingReplyBytes = 1024,
+            .RequestTimeout = std::chrono::milliseconds(10),
+        }, clock);
+    auto command = NewHoldedMessage<TCommandRequest>(sizeof(TCommandRequest) + 5);
+    command->Cookie = 44;
+    command->Flags = TCommandRequest::EWrite;
+    memcpy(command->Data, "reply", 5);
+    processor.OnCommandRequest(command, endpoint);
+
+    cluster.Replicate(1);
+    processor.ProcessCommitted(); // Cache the reply but do not complete the waiter.
+    assert_false(rsm->LastReply.expired());
+    clock->Current += std::chrono::milliseconds(10);
+    processor.ProcessWaiting();
+    assert_int_equal(replies.size(), 1);
+    assert_int_equal(replies[0], TCommandResponse::TimedOut);
+    assert_true(rsm->LastReply.expired());
+}
+
+void test_deadlines_expire_local_reads_and_leader_waiters(void**) {
+    TCluster cluster(3);
+    auto clock = std::make_shared<TManualTimeSource>();
+    std::vector<std::pair<uint32_t, uint32_t>> replies;
+    auto endpoint = std::make_shared<TEndpoint>([&](auto message) {
+        auto response = message.template Cast<TCommandResponse>();
+        replies.emplace_back(response->Cookie, response->ErrorCode);
+    });
+    TRequestProcessor processor(cluster.Nodes[0], std::make_shared<TDummyRsm>(), {},
+        TRequestProcessor::TAdmissionLimits{
+            .MaxPendingRequests = 4,
+            .MaxPendingRequestBytes = 1024,
+            .MaxPendingReplyBytes = 1024,
+            .RequestTimeout = std::chrono::milliseconds(10),
+        }, clock);
+    auto read = [&](uint32_t cookie, uint32_t flags) {
+        auto command = NewHoldedMessage<TCommandRequest>(sizeof(TCommandRequest) + sizeof(int64_t));
+        command->Cookie = cookie;
+        command->Flags = flags;
+        const int64_t index = 0;
+        memcpy(command->Data, &index, sizeof(index));
+        processor.OnCommandRequest(command, endpoint);
+    };
+    read(51, TCommandRequest::EStale);      // Local committed-prefix queue.
+    read(52, TCommandRequest::EConsistent); // Waiting for leader discovery.
+    assert_true(replies.empty());
+
+    clock->Current += std::chrono::milliseconds(10);
+    processor.ProcessWaiting();
+    assert_int_equal(replies.size(), 2);
+    assert_int_equal(replies[0].first, 51);
+    assert_int_equal(replies[0].second, TCommandResponse::TimedOut);
+    assert_int_equal(replies[1].first, 52);
+    assert_int_equal(replies[1].second, TCommandResponse::TimedOut);
+
+    cluster.Elect(1);
+    processor.CheckStateChange();
+    processor.ProcessCommitted();
+    processor.ProcessWaiting();
+    assert_int_equal(replies.size(), 2);
+}
+
+void test_deadline_expires_strong_read_waiting_for_quorum(void**) {
+    TCluster cluster(3);
+    cluster.Elect(1);
+    auto clock = std::make_shared<TManualTimeSource>();
+    std::vector<uint32_t> replies;
+    auto endpoint = std::make_shared<TEndpoint>([&](auto message) {
+        replies.push_back(message.template Cast<TCommandResponse>()->ErrorCode);
+    });
+    TRequestProcessor processor(cluster.Nodes[0], std::make_shared<TDummyRsm>(), {},
+        TRequestProcessor::TAdmissionLimits{
+            .MaxPendingRequests = 2,
+            .MaxPendingRequestBytes = 1024,
+            .MaxPendingReplyBytes = 1024,
+            .RequestTimeout = std::chrono::milliseconds(10),
+        }, clock);
+    auto command = NewHoldedMessage<TCommandRequest>(sizeof(TCommandRequest) + sizeof(int64_t));
+    command->Cookie = 61;
+    command->Flags = TCommandRequest::EConsistent;
+    const int64_t index = 0;
+    memcpy(command->Data, &index, sizeof(index));
+    processor.OnCommandRequest(command, endpoint);
+    assert_true(replies.empty());
+
+    clock->Current += std::chrono::milliseconds(10);
+    processor.ProcessWaiting();
+    assert_int_equal(replies.size(), 1);
+    assert_int_equal(replies[0], TCommandResponse::TimedOut);
+    cluster.Replicate(1);
+    processor.ProcessCommitted();
+    processor.ProcessWaiting();
+    assert_int_equal(replies.size(), 1);
+}
+
+void test_deadlines_cover_slow_validation_preparation_and_read_callbacks(void**) {
+    TCluster cluster(1);
+    cluster.Elect(1);
+    cluster.Replicate(1);
+    auto clock = std::make_shared<TManualTimeSource>();
+    auto rsm = std::make_shared<TDeadlineAdvancingRsm>(clock);
+    std::vector<std::pair<uint32_t, uint32_t>> replies;
+    auto endpoint = std::make_shared<TEndpoint>([&](auto message) {
+        auto response = message.template Cast<TCommandResponse>();
+        replies.emplace_back(response->Cookie, response->ErrorCode);
+    });
+    TRequestProcessor processor(cluster.Nodes[0], rsm, {},
+        TRequestProcessor::TAdmissionLimits{
+            .MaxPendingRequests = 4,
+            .MaxPendingRequestBytes = 1024,
+            .MaxPendingReplyBytes = 1024,
+            .RequestTimeout = std::chrono::milliseconds(10),
+        }, clock);
+    processor.ProcessCommitted();
+    processor.ProcessWaiting();
+    const auto before = cluster.Nodes[0]->GetLastIndex();
+    auto write = [&](uint32_t cookie) {
+        auto command = NewHoldedMessage<TCommandRequest>(sizeof(TCommandRequest) + 1);
+        command->Cookie = cookie;
+        command->Flags = TCommandRequest::EWrite;
+        command->Data[0] = 'x';
+        processor.OnCommandRequest(command, endpoint);
+    };
+
+    rsm->AdvanceValidate = true;
+    write(71);
+    rsm->AdvanceValidate = false;
+    assert_int_equal(cluster.Nodes[0]->GetLastIndex(), before);
+    assert_int_equal(replies.size(), 1);
+    assert_int_equal(replies[0].first, 71);
+    assert_int_equal(replies[0].second, TCommandResponse::TimedOut);
+
+    rsm->AdvancePrepare = true;
+    write(72);
+    rsm->AdvancePrepare = false;
+    assert_int_equal(cluster.Nodes[0]->GetLastIndex(), before);
+    assert_int_equal(replies.size(), 2);
+    assert_int_equal(replies[1].first, 72);
+    assert_int_equal(replies[1].second, TCommandResponse::TimedOut);
+
+    rsm->AdvanceRead = true;
+    auto read = NewHoldedMessage<TCommandRequest>();
+    read->Cookie = 73;
+    read->Flags = TCommandRequest::EStale;
+    processor.OnCommandRequest(read, endpoint);
+    processor.ProcessWaiting();
+    assert_int_equal(replies.size(), 3);
+    assert_int_equal(replies[2].first, 73);
+    assert_int_equal(replies[2].second, TCommandResponse::TimedOut);
 }
 
 void test_uncommitted_log_budget_survives_disconnect_and_releases_after_commit(void**) {
@@ -1112,6 +1352,11 @@ int main() {
         cmocka_unit_test(test_replaced_write_never_receives_another_commands_reply),
         cmocka_unit_test(test_stepdown_rejects_write_without_waiting_for_application),
         cmocka_unit_test(test_pending_write_admission_is_bounded_and_released_on_completion_or_disconnect),
+        cmocka_unit_test(test_pending_write_deadline_releases_admission_but_does_not_cancel_log_entry),
+        cmocka_unit_test(test_write_deadline_releases_already_cached_application_reply),
+        cmocka_unit_test(test_deadlines_expire_local_reads_and_leader_waiters),
+        cmocka_unit_test(test_deadline_expires_strong_read_waiting_for_quorum),
+        cmocka_unit_test(test_deadlines_cover_slow_validation_preparation_and_read_callbacks),
         cmocka_unit_test(test_uncommitted_log_budget_survives_disconnect_and_releases_after_commit),
         cmocka_unit_test(test_follower_rejects_append_batch_that_exceeds_uncommitted_log_budget),
         cmocka_unit_test(test_follower_log_budget_is_reclaimed_when_leader_replaces_uncommitted_suffix),

@@ -262,7 +262,7 @@ public:
         : Poller(poller)
         , Socket(std::move(socket))
         , Raft(raft)
-        , RequestProcessor(std::make_shared<TRequestProcessor>(raft, rsm, nodes, admissionLimits))
+        , RequestProcessor(std::make_shared<TRequestProcessor>(raft, rsm, nodes, admissionLimits, ts))
         , TimeSource(ts)
     {
         for (const auto& [id, node] : nodes) {

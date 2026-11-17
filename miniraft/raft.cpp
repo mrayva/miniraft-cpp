@@ -2686,9 +2686,18 @@ TRequestProcessor::TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_pt
 
 TRequestProcessor::TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_ptr<IRsm> rsm,
         const TNodeDict& nodes, TAdmissionLimits admissionLimits)
+    : TRequestProcessor(std::move(raft), std::move(rsm), nodes, admissionLimits,
+        std::make_shared<TTimeSource>())
+{ }
+
+TRequestProcessor::TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_ptr<IRsm> rsm,
+        const TNodeDict& nodes, TAdmissionLimits admissionLimits, std::shared_ptr<ITimeSource> timeSource)
     : Raft(std::move(raft)), Rsm(std::move(rsm)), Nodes(nodes), AdmissionLimits(admissionLimits)
+    , TimeSource(timeSource ? std::move(timeSource) : std::make_shared<TTimeSource>())
 {
     if (!Raft || !Rsm) throw std::invalid_argument("Request processor requires Raft and application state");
+    if (AdmissionLimits.RequestTimeout <= ITimeSource::Time::duration::zero())
+        throw std::invalid_argument("Request timeout must be positive");
     if (auto snapshot = Raft->GetState()->GetSnapshot(); snapshot && Rsm->LastAppliedIndex < snapshot->Index)
         RestoreSnapshot(*snapshot, *Raft, *Rsm);
     if (Rsm->LastAppliedIndex < Raft->GetState()->SnapshotIndex)
@@ -2712,7 +2721,10 @@ bool TRequestProcessor::TryAdmit(const TMessageHolder<TCommandRequest>& message,
         ++id;
         if (!id) id = 1;
     }
-    const bool inserted = Admissions.emplace(id, bytes).second;
+    const auto now = TimeSource->Now();
+    const auto deadline = now > ITimeSource::Max - AdmissionLimits.RequestTimeout
+        ? ITimeSource::Max : now + AdmissionLimits.RequestTimeout;
+    const bool inserted = Admissions.emplace(id, TAdmission{bytes, deadline}).second;
     if (!inserted) throw std::logic_error("Duplicate pending request admission ID");
     PendingRequestBytes += bytes;
     NextAdmissionId = id + 1;
@@ -2720,12 +2732,18 @@ bool TRequestProcessor::TryAdmit(const TMessageHolder<TCommandRequest>& message,
     return true;
 }
 
+bool TRequestProcessor::AdmissionExpired(uint64_t admissionId, ITimeSource::Time now) const {
+    if (!admissionId) return false;
+    auto it = Admissions.find(admissionId);
+    return it != Admissions.end() && now >= it->second.Deadline;
+}
+
 void TRequestProcessor::ReleaseAdmission(uint64_t admissionId) noexcept {
     if (!admissionId) return;
     auto it = Admissions.find(admissionId);
     if (it == Admissions.end()) return;
-    if (it->second > PendingRequestBytes) std::terminate();
-    PendingRequestBytes -= it->second;
+    if (it->second.Bytes > PendingRequestBytes) std::terminate();
+    PendingRequestBytes -= it->second.Bytes;
     Admissions.erase(it);
 }
 
@@ -2862,6 +2880,7 @@ void TRequestProcessor::OnReadRequest(TMessageHolder<TCommandRequest> command,
 }
 
 void TRequestProcessor::PruneRequests(const std::shared_ptr<INode>& disconnected) {
+    ExpireRequests(TimeSource->Now(), disconnected);
     const auto term = Raft->GetState()->CurrentTerm;
     const auto state = Raft->CurrentStateName();
     const bool leader = state == EState::LEADER;
@@ -2900,6 +2919,47 @@ void TRequestProcessor::PruneRequests(const std::shared_ptr<INode>& disconnected
             .Cookie = cookie, .ErrorCode = TCommandResponse::Failed}));
 }
 
+void TRequestProcessor::ExpireRequests(ITimeSource::Time now,
+        const std::shared_ptr<INode>& disconnected) {
+    std::unordered_set<uint64_t> expired;
+    for (const auto& [id, admission] : Admissions)
+        if (now >= admission.Deadline) expired.insert(id);
+    if (expired.empty()) return;
+
+    std::vector<std::pair<std::shared_ptr<INode>, uint32_t>> rejected;
+    for (auto* queue : {&Waiting, &StrongWaiting, &WaitingStateChange}) {
+        std::queue<TWaiting> retained;
+        while (!queue->empty()) {
+            auto waiting = std::move(queue->front());
+            queue->pop();
+            if (!expired.contains(waiting.AdmissionId)) {
+                retained.push(std::move(waiting));
+                continue;
+            }
+            if (waiting.Command->Flags & TCommandRequest::EWrite) {
+                PendingWriteTerms.erase(waiting.Index);
+                EraseWriteAnswer(waiting.Index);
+            }
+            if (waiting.ReplyTo && waiting.ReplyTo != disconnected)
+                rejected.emplace_back(waiting.ReplyTo, waiting.Command->Cookie);
+        }
+        queue->swap(retained);
+    }
+
+    for (auto it = Forwarded.begin(); it != Forwarded.end();) {
+        if (!expired.contains(it->second.AdmissionId)) { ++it; continue; }
+        auto pending = std::move(it->second);
+        it = Forwarded.erase(it);
+        if (pending.Client && pending.Client != disconnected)
+            rejected.emplace_back(pending.Client, pending.OriginalCookie);
+    }
+
+    for (auto id : expired) ReleaseAdmission(id);
+    for (auto& [replyTo, cookie] : rejected)
+        replyTo->Send(NewHoldedMessage(TCommandResponse{
+            .Cookie = cookie, .ErrorCode = TCommandResponse::TimedOut}));
+}
+
 void TRequestProcessor::CancelForwarded(const std::shared_ptr<INode>& disconnected, bool peerFailure) {
     for (auto it = Forwarded.begin(); it != Forwarded.end();) {
         const auto& route = it->second;
@@ -2925,16 +2985,32 @@ void TRequestProcessor::OnWriteRequest(TMessageHolder<TCommandRequest> command,
     if (stateName == EState::LEADER) {
         const auto term = Raft->GetState()->CurrentTerm;
         const auto cookie = command->Cookie;
-        try {
-            uint64_t index = Raft->Append(std::move(Rsm->Prepare(command)));
-            if (replyTo) {
-                PendingWriteTerms[index] = term;
-                Waiting.emplace(TWaiting{index, 0, std::move(command), replyTo, term, admissionId});
-            }
-        } catch (const TRaftLogCapacityExceeded&) {
+        auto prepared = Rsm->Prepare(command);
+        if (AdmissionExpired(admissionId, TimeSource->Now())) {
             ReleaseAdmission(admissionId);
             if (replyTo) replyTo->Send(NewHoldedMessage(TCommandResponse{
-                .Cookie = cookie, .ErrorCode = TCommandResponse::Overloaded}));
+                .Cookie = cookie, .ErrorCode = TCommandResponse::TimedOut}));
+            return;
+        }
+        uint64_t index;
+        try {
+            index = Raft->Append(std::move(prepared));
+        } catch (const TRaftLogCapacityExceeded&) {
+            const bool expired = AdmissionExpired(admissionId, TimeSource->Now());
+            ReleaseAdmission(admissionId);
+            if (replyTo) replyTo->Send(NewHoldedMessage(TCommandResponse{
+                .Cookie = cookie, .ErrorCode = expired ? TCommandResponse::TimedOut : TCommandResponse::Overloaded}));
+            return;
+        }
+        if (AdmissionExpired(admissionId, TimeSource->Now())) {
+            ReleaseAdmission(admissionId);
+            if (replyTo) replyTo->Send(NewHoldedMessage(TCommandResponse{
+                .Cookie = cookie, .ErrorCode = TCommandResponse::TimedOut}));
+            return;
+        }
+        if (replyTo) {
+            PendingWriteTerms[index] = term;
+            Waiting.emplace(TWaiting{index, 0, std::move(command), replyTo, term, admissionId});
         }
     } else {
         Forward(std::move(command), replyTo, admissionId);
@@ -2946,14 +3022,21 @@ void TRequestProcessor::OnCommandRequest(TMessageHolder<TCommandRequest> command
         throw TMessageError("Invalid command request");
     ValidateMessageTree(command);
     PruneRequests();
+    const auto cookie = command->Cookie;
     uint64_t admissionId = 0;
     if (!TryAdmit(command, replyTo, admissionId)) {
         if (replyTo) replyTo->Send(NewHoldedMessage(TCommandResponse{
-            .Cookie = command->Cookie, .ErrorCode = TCommandResponse::Overloaded}));
+            .Cookie = cookie, .ErrorCode = TCommandResponse::Overloaded}));
         return;
     }
     try {
         Rsm->Validate(command);
+        if (AdmissionExpired(admissionId, TimeSource->Now())) {
+            ReleaseAdmission(admissionId);
+            if (replyTo) replyTo->Send(NewHoldedMessage(TCommandResponse{
+                .Cookie = cookie, .ErrorCode = TCommandResponse::TimedOut}));
+            return;
+        }
         DispatchCommandRequest(std::move(command), replyTo, admissionId);
     } catch (...) {
         ReleaseAdmission(admissionId);
@@ -3066,6 +3149,8 @@ void TRequestProcessor::ProcessWaiting() {
                 reply = NewHoldedMessage(TCommandResponse{.Index = w.Index, .ErrorCode = 2});
             }
         }
+        if (AdmissionExpired(w.AdmissionId, TimeSource->Now()))
+            reply = NewHoldedMessage(TCommandResponse{.Index = w.Index, .ErrorCode = TCommandResponse::TimedOut});
         reply->Cookie = cookie;
         ReleaseAdmission(w.AdmissionId);
         w.ReplyTo->Send(std::move(reply));
@@ -3087,6 +3172,8 @@ void TRequestProcessor::ProcessWaiting() {
         catch (const std::exception&) {
             reply = NewHoldedMessage(TCommandResponse{.Index = w.Index, .ErrorCode = 2});
         }
+        if (AdmissionExpired(w.AdmissionId, TimeSource->Now()))
+            reply = NewHoldedMessage(TCommandResponse{.Index = w.Index, .ErrorCode = TCommandResponse::TimedOut});
         reply->Cookie = cookie;
         ReleaseAdmission(w.AdmissionId);
         w.ReplyTo->Send(std::move(reply));
