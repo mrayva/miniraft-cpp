@@ -87,6 +87,16 @@ processing. Snapshot installation commits at least the included boundary, and
 storage refuses to truncate a committed entry. The legacy TDiskState backend
 does not persist CommitIndex.
 
+An offline active voter deliberately blocks membership-bearing compaction until
+it acknowledges the committed configuration. If a reachable quorum can satisfy
+both sides of a joint transition, an operator can first remove that voter
+through the normal joint-consensus API. Once the stable successor commits, the
+compaction barrier covers only the remaining active voters. When the retired
+node returns, it can install a snapshot whose bounded history is anchored to
+its persisted original voter binding; it rejoins as a learner and must be
+explicitly promoted again. This does not permit compaction while the node is
+still an active voter.
+
 ## Transfer protocol
 
 The previously reserved message types 6/7 now carry InstallSnapshot requests and

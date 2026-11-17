@@ -82,7 +82,10 @@ callers must still handle capacity changes before proposing.
 - `TRaft::Compact` requires every active voter to acknowledge the committed
   configuration (`raft.cpp:2122-2132`). An offline active voter can block
   compaction although a quorum can continue committing; the retained log grows.
-  Relaxing this needs a safe recovery design, not simply removal of the guard.
+  A deterministic end-to-end regression now covers the safe operational path:
+  remove the unreachable voter using joint consensus, compact under the new
+  stable set, then install the anchored snapshot on return as a learner. The
+  guard remains necessary while that node is still an active voter.
 - Snapshots are complete in-memory images, capped at 64 MiB including metadata
   (`snapshot.h`). Transfer is chunked, but capture, encoding and installation
   still materialize the whole image. Large databases need streaming or logical

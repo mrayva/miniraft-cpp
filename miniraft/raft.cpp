@@ -259,6 +259,23 @@ bool HasPersistedRecoveryState(const IState& state) {
     return state.LastLogIndex || state.SnapshotIndex || state.CommitIndex || state.VotedFor || state.GetSnapshot();
 }
 
+bool HasTrustedEmptyVoterBaseline(uint32_t receiverId, const IState& state,
+        const std::vector<uint32_t>& localVoters, const TConfigurationHistory* committed) {
+    return state.SupportsVoterBinding() && state.SupportsCommitIndexPersistence() &&
+        state.GetBoundVoters() == localVoters &&
+        std::binary_search(localVoters.begin(), localVoters.end(), receiverId) &&
+        !state.LastLogIndex && !state.LastLogTerm && !state.CommitIndex && !state.VotedFor &&
+        !state.SnapshotIndex && !state.SnapshotTerm && !state.GetSnapshot() &&
+        committed && !committed->IsJoint() && committed->OldVoters() == localVoters &&
+        !committed->ConfigurationIndex() && !committed->ConfigurationTerm() && !committed->ThroughIndex();
+}
+
+bool MayRecoverMembershipFromSnapshot(uint32_t receiverId, const IState& state,
+        const std::vector<uint32_t>& localVoters, const TConfigurationHistory* committed) {
+    return HasPersistedRecoveryState(state) ||
+        HasTrustedEmptyVoterBaseline(receiverId, state, localVoters, committed);
+}
+
 bool SnapshotMetadataExtendsKnownStable(const TConfigurationHistory* committed,
         bool stableLineage, bool staleState, const std::vector<uint32_t>& incomingVoters,
         const std::vector<uint32_t>& previousVoters, uint64_t previousConfigurationIndex,
@@ -1572,7 +1589,7 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
                 pendingConfiguration,
                 CanBootstrapFreshLearnerSnapshot(Id, *State, GetVoterIds(), application.get(),
                     committedConfiguration, !pendingConfiguration),
-                HasPersistedRecoveryState(*State),
+                MayRecoverMembershipFromSnapshot(Id, *State, GetVoterIds(), committedConfiguration),
                 request->LeaderId, Id);
             if (!probe.Complete) {
                 // Large, valid membership histories can exceed one transport
@@ -2536,7 +2553,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         const auto probe = ProbeSnapshotMetadata(prefix, request->TotalBytes,
             request->SnapshotIndex, request->SnapshotTerm, snapshotVoters, knownSnapshot.get(),
             committedConfiguration, pendingConfiguration,
-            false, HasPersistedRecoveryState(*State), request->LeaderId, Id);
+            false, MayRecoverMembershipFromSnapshot(Id, *State, GetVoterIds(), committedConfiguration),
+            request->LeaderId, Id);
         if (!probe.Complete) { reply(true, false, prefix.size()); return; }
         IncomingSnapshot.reset();
         if (probe.Supported) acceptLeaderContact();
@@ -2578,7 +2596,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         committedConfiguration, pendingConfiguration,
         CanBootstrapFreshLearnerSnapshot(Id, *State, GetVoterIds(), application.get(),
             committedConfiguration, !pendingConfiguration),
-        HasPersistedRecoveryState(*State),
+        MayRecoverMembershipFromSnapshot(Id, *State, GetVoterIds(), committedConfiguration),
         request->LeaderId, Id);
     if (!probe.Complete) { reply(true, false, bytes.size()); return; }
     if (!probe.Supported) { IncomingSnapshot.reset(); reply(false, false, 0); return; }
@@ -2671,19 +2689,22 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         size_t staleStableHistoryAnchor = 0;
         const bool staleStableLineage = !pendingConfiguration &&
             (snapshot.ConfigurationTransitions.empty() && SnapshotMetadataExtendsKnownStable(&Configuration->Committed,
-                snapshot.HasStablePredecessor(), HasPersistedRecoveryState(*State),
+                snapshot.HasStablePredecessor(),
+                MayRecoverMembershipFromSnapshot(Id, *State, GetVoterIds(), &Configuration->Committed),
                 snapshot.Voters, snapshot.PreviousVoters,
                 snapshot.PreviousConfigurationIndex, snapshot.PreviousConfigurationTerm,
                 snapshot.PreviousJointIndex, snapshot.PreviousJointTerm,
                 snapshot.ConfigurationIndex, snapshot.ConfigurationTerm, request->LeaderId) ||
              SnapshotHistoryExtendsKnownStable(&Configuration->Committed,
-                HasPersistedRecoveryState(*State), snapshot.ConfigurationTransitions,
+                MayRecoverMembershipFromSnapshot(Id, *State, GetVoterIds(), &Configuration->Committed),
+                snapshot.ConfigurationTransitions,
                 snapshot.Voters, snapshot.ConfigurationIndex, snapshot.ConfigurationTerm,
                 request->LeaderId, &staleStableHistoryAnchor));
         size_t staleJointHistoryAnchor = 0;
         const bool staleJointLineage = !pendingConfiguration && snapshot.IsJoint() &&
             SnapshotHistoryExtendsKnownStableToJoint(&Configuration->Committed,
-                HasPersistedRecoveryState(*State), snapshot.ConfigurationTransitions,
+                MayRecoverMembershipFromSnapshot(Id, *State, GetVoterIds(), &Configuration->Committed),
+                snapshot.ConfigurationTransitions,
                 snapshot.Voters, snapshot.JointVoters, snapshot.ConfigurationIndex,
                 snapshot.ConfigurationTerm, request->LeaderId, &staleJointHistoryAnchor);
         if (staleStableLineage && snapshot.ConfigurationTransitions.empty() &&

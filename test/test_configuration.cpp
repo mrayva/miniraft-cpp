@@ -1253,6 +1253,117 @@ void test_removed_member_rejoins_from_fresh_snapshot_after_compaction(void**) {
     std::filesystem::remove_all(dir, ignored);
 #endif
 }
+void test_quorum_retires_offline_voter_before_compaction_and_snapshot_rejoin(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-offline-voter-compaction-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const std::vector<uint32_t> originalVoters{1, 2, 3};
+    std::array<std::shared_ptr<TDurableState>, 4> states{};
+    std::array<std::shared_ptr<TRaft>, 4> rafts{};
+    std::array<std::shared_ptr<TSnapshotRsm>, 4> applications{};
+    std::array<std::shared_ptr<TRequestProcessor>, 4> processors{};
+    std::array<std::array<std::shared_ptr<TEndpoint>, 4>, 4> endpoints{};
+    ITimeSource::Time now{};
+    bool offline = true;
+    unsigned snapshotRequestsToRetired = 0;
+    unsigned snapshotRepliesFromRetired = 0, successfulSnapshotReplies = 0;
+    uint64_t lastSnapshotOffset = 0;
+
+    for (uint32_t id = 1; id <= 3; ++id) {
+        states[id] = std::make_shared<TDurableState>((dir / "raft").string(), id);
+        states[id]->BindVoters(originalVoters);
+        states[id]->Commit();
+        for (uint32_t peer = 1; peer <= 3; ++peer)
+            if (peer != id) endpoints[id][peer] = std::make_shared<TEndpoint>();
+    }
+    for (uint32_t id = 1; id <= 3; ++id) {
+        TNodeDict peers;
+        for (uint32_t peer = 1; peer <= 3; ++peer)
+            if (peer != id) peers.emplace(peer, endpoints[id][peer]);
+        rafts[id] = std::make_shared<TRaft>(states[id], id, peers);
+        applications[id] = std::make_shared<TSnapshotRsm>();
+        processors[id] = std::make_shared<TRequestProcessor>(rafts[id], applications[id], peers);
+    }
+    for (uint32_t from = 1; from <= 3; ++from) {
+        for (uint32_t to = 1; to <= 3; ++to) {
+            if (from == to) continue;
+            endpoints[from][to]->Route = [&, from, to](auto message) {
+                if (offline && (from == 3 || to == 3)) return;
+                if (from == 1 && to == 3 && message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_REQUEST))
+                    ++snapshotRequestsToRetired;
+                if (from == 3 && to == 1 && message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_RESPONSE)) {
+                    ++snapshotRepliesFromRetired;
+                    const auto response = message.template Cast<TInstallSnapshotResponse>();
+                    if (response->Success) ++successfulSnapshotReplies;
+                    lastSnapshotOffset = response->NextOffset;
+                }
+                rafts[to]->Process(now, std::move(message));
+                processors[to]->ProcessCommitted();
+            };
+        }
+    }
+    auto tick = [&] {
+        now += std::chrono::seconds(1);
+        rafts[1]->ProcessTimeout(now);
+        for (uint32_t id = 1; id <= 3; ++id) processors[id]->ProcessCommitted();
+    };
+
+    now += std::chrono::seconds(20);
+    rafts[1]->ProcessTimeout(now); // Pre-vote campaign reaches voter 2 only.
+    rafts[1]->ProcessTimeout(now + std::chrono::milliseconds(1)); // Start real election.
+    now += std::chrono::milliseconds(2);
+    rafts[1]->ProcessTimeout(now); // Voter 2's real grant elects node 1.
+    assert_true(rafts[1]->CurrentStateName() == EState::LEADER);
+    for (unsigned i = 0; i < 8 && rafts[1]->GetVolatileState()->CommitIndex < 1; ++i) tick();
+    assert_int_equal(rafts[1]->GetVolatileState()->CommitIndex, 1);
+
+    const auto jointIndex = rafts[1]->ProposeJointConfiguration({1, 2});
+    for (unsigned i = 0; i < 8 && rafts[1]->GetVolatileState()->CommitIndex < jointIndex; ++i) tick();
+    assert_int_equal(rafts[1]->GetVolatileState()->CommitIndex, jointIndex);
+    assert_true(rafts[1]->GetVoterIds() == originalVoters); // Both sets still govern the joint phase.
+    assert_true(states[3]->CommitIndex < jointIndex);
+    const auto beforeBlockedCompaction = states[1]->SnapshotIndex;
+    Reject([&] { rafts[1]->Compact(); }); // The offline active voter cannot be skipped safely.
+    assert_int_equal(states[1]->SnapshotIndex, beforeBlockedCompaction);
+
+    const auto stableIndex = rafts[1]->FinalizeConfiguration();
+    for (unsigned i = 0; i < 8 && rafts[1]->GetVolatileState()->CommitIndex < stableIndex; ++i) tick();
+    assert_int_equal(rafts[1]->GetVolatileState()->CommitIndex, stableIndex);
+    for (unsigned i = 0; i < 8 && states[2]->CommitIndex < stableIndex; ++i) tick();
+    assert_int_equal(states[2]->CommitIndex, stableIndex);
+    assert_true(rafts[1]->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+    for (unsigned i = 0; i < 8 &&
+        rafts[2]->GetVolatileState()->CompactionSafeConfigurationIndex < stableIndex; ++i) tick();
+    assert_true(rafts[2]->GetVolatileState()->CompactionSafeConfigurationIndex >= stableIndex);
+    assert_true(rafts[1]->GetVolatileState()->CommitAckIndex.at(2) >= stableIndex);
+
+    const auto snapshot = rafts[1]->Compact();
+    assert_true(snapshot.StableConfiguration);
+    assert_true(snapshot.Voters == (std::vector<uint32_t>{1, 2}));
+    assert_int_equal(snapshot.ConfigurationIndex, stableIndex);
+    assert_int_equal(states[1]->SnapshotIndex, stableIndex);
+    assert_true(rafts[1]->GetVolatileState()->NextIndex.at(3) <= snapshot.Index);
+
+    // The retired process comes back only after compaction. The proven stable
+    // transition installs it as a learner while preserving its original
+    // durable voter binding; it does not silently restore its old vote.
+    offline = false;
+    for (unsigned i = 0; i < 12 && states[3]->SnapshotIndex < snapshot.Index; ++i) tick();
+    assert_true(snapshotRequestsToRetired > 0);
+    assert_true(snapshotRepliesFromRetired > 0);
+    assert_true(successfulSnapshotReplies > 0);
+    assert_true(lastSnapshotOffset > 0);
+    assert_int_equal(states[3]->SnapshotIndex, snapshot.Index);
+    assert_false(rafts[3]->IsVoter(3));
+    assert_true(rafts[3]->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+    assert_true(states[3]->GetBoundVoters() == originalVoters);
+    assert_true(*states[3]->GetSnapshot() == snapshot);
+
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
 void test_removed_member_rejoins_through_fresh_joint_snapshot_bootstrap(void**) {
 #ifdef __linux__
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-snapshot-rejoin-" +
@@ -4231,6 +4342,7 @@ int main() {
         cmocka_unit_test(test_new_stable_leader_replays_transition_to_lagging_joiner),
         cmocka_unit_test(test_runtime_peer_provisioning_commits_joint_membership_across_replicas),
         cmocka_unit_test(test_removed_member_rejoins_from_fresh_snapshot_after_compaction),
+        cmocka_unit_test(test_quorum_retires_offline_voter_before_compaction_and_snapshot_rejoin),
         cmocka_unit_test(test_removed_member_rejoins_through_fresh_joint_snapshot_bootstrap),
         cmocka_unit_test(test_fresh_joint_snapshot_rejoin_recovers_voter_role_after_restart),
         cmocka_unit_test(test_joint_membership_addition_and_finalization_replicate_deterministically),
