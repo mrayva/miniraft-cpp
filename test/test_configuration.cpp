@@ -590,6 +590,101 @@ void test_follower_can_register_future_voter_endpoint_before_joint_entry(void**)
     std::filesystem::remove_all(dir, ignored);
 #endif
 }
+void test_joint_configuration_readiness_reports_log_and_index_capacity(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-readiness-capacity-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    {
+        auto state = std::make_shared<TDurableState>((dir / "capacity").string(), 1);
+        state->BindVoters({1});
+        state->Commit();
+        state->Append(Ordinary(1));
+        state->CommitIndex = 1;
+        state->Commit();
+        state->Append(Ordinary(1)); // Fill the proposal slot left by the control reserve.
+        TRaft raft(state, 1, {{2, std::make_shared<TEndpoint>()}}, {2},
+            TRaft::TLogLimits{.MaxUncommittedBytes = 1024, .MaxUncommittedEntries = 2});
+        raft.Become(EState::LEADER);
+        auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
+        volatileState->MatchIndex[2] = state->LastLogIndex;
+        volatileState->CommitAckIndex[2] = state->CommitIndex;
+
+        const auto readiness = raft.CheckJointConfigurationReadiness({1, 2});
+        assert_true(readiness.IsLeader);
+        assert_true(readiness.HasDurableMembershipStorage);
+        assert_true(readiness.HasStableConfiguration);
+        assert_true(readiness.HasCommittedCurrentTermEntry);
+        assert_true(readiness.ChangesVoterSet);
+        assert_true(readiness.MissingPeerTargets.empty());
+        assert_true(readiness.AddedVotersWithoutCommitAck.empty());
+        assert_false(readiness.HasLogCapacity);
+        assert_false(readiness.Ready());
+    }
+    {
+        const auto jointEntry = EncodeConfigurationEntry(TConfigurationRecord{
+            EConfigurationPhase::Joint, 1, 0, 0, {1}, {1, 2}});
+        auto state = std::make_shared<TDurableState>((dir / "byte-capacity").string(), 1);
+        state->BindVoters({1});
+        state->Commit();
+        state->Append(Ordinary(1));
+        state->CommitIndex = 1;
+        state->Commit();
+        const TRaft::TLogLimits limits{
+            .MaxUncommittedBytes = sizeof(TLogEntry) + jointEntry->Len - 1,
+            .MaxUncommittedEntries = 2,
+        };
+        TRaft raft(state, 1, {{2, std::make_shared<TEndpoint>()}}, {2}, limits);
+        raft.Become(EState::LEADER);
+        auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
+        volatileState->MatchIndex[2] = state->LastLogIndex;
+        volatileState->CommitAckIndex[2] = state->CommitIndex;
+
+        const auto readiness = raft.CheckJointConfigurationReadiness({1, 2});
+        assert_true(readiness.IsLeader);
+        assert_true(readiness.HasDurableMembershipStorage);
+        assert_true(readiness.HasStableConfiguration);
+        assert_true(readiness.HasCommittedCurrentTermEntry);
+        assert_true(readiness.ChangesVoterSet);
+        assert_true(readiness.MissingPeerTargets.empty());
+        assert_true(readiness.AddedVotersWithoutCommitAck.empty());
+        assert_false(readiness.HasLogCapacity);
+        assert_false(readiness.Ready());
+        const auto before = static_cast<TStateFields>(*state);
+        Reject([&] { raft.ProposeJointConfiguration({1, 2}); });
+        assert_true(static_cast<TStateFields>(*state) == before);
+    }
+    {
+        auto state = std::make_shared<TDurableState>((dir / "exhausted").string(), 1);
+        state->BindVoters({1});
+        state->Commit();
+        TSnapshot snapshot;
+        snapshot.Index = uint64_t(INT64_MAX);
+        snapshot.Term = 1;
+        snapshot.Voters = {1};
+        state->InstallSnapshot(snapshot);
+
+        TRaft raft(state, 1, {{2, std::make_shared<TEndpoint>()}}, {2});
+        raft.Become(EState::LEADER);
+        auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
+        volatileState->MatchIndex[2] = state->LastLogIndex;
+        volatileState->CommitAckIndex[2] = state->CommitIndex;
+
+        const auto readiness = raft.CheckJointConfigurationReadiness({1, 2});
+        assert_true(readiness.IsLeader);
+        assert_true(readiness.HasDurableMembershipStorage);
+        assert_true(readiness.HasStableConfiguration);
+        assert_true(readiness.HasCommittedCurrentTermEntry);
+        assert_true(readiness.ChangesVoterSet);
+        assert_true(readiness.MissingPeerTargets.empty());
+        assert_true(readiness.AddedVotersWithoutCommitAck.empty());
+        assert_false(readiness.HasLogCapacity);
+        assert_false(readiness.Ready());
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
 void test_new_voter_leader_can_forward_prior_term_joint_entry(void**) {
 #ifdef __linux__
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-new-side-joint-forward-" +
@@ -965,6 +1060,7 @@ void test_runtime_peer_provisioning_commits_joint_membership_across_replicas(voi
 
         const auto ready = leader.CheckJointConfigurationReadiness({1, 2, 3});
         assert_true(ready.Ready());
+        assert_true(ready.HasLogCapacity);
         assert_true(ready.MissingPeerTargets.empty());
         assert_true(ready.AddedVotersWithoutCommitAck.empty());
 
@@ -4060,6 +4156,7 @@ int main() {
         cmocka_unit_test(test_configuration_rejects_invalid_fields_and_valid_crc_corruption),
         cmocka_unit_test(test_configuration_rpc_and_proposal_are_rejected_before_mutation),
         cmocka_unit_test(test_follower_can_register_future_voter_endpoint_before_joint_entry),
+        cmocka_unit_test(test_joint_configuration_readiness_reports_log_and_index_capacity),
         cmocka_unit_test(test_new_voter_leader_can_forward_prior_term_joint_entry),
         cmocka_unit_test(test_new_side_election_replays_joint_entry_to_old_peer),
         cmocka_unit_test(test_new_stable_leader_replays_transition_to_lagging_joiner),

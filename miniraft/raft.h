@@ -68,12 +68,13 @@ struct TJointConfigurationReadiness {
     bool HasStableConfiguration = false;
     bool HasCommittedCurrentTermEntry = false;
     bool ChangesVoterSet = false;
+    bool HasLogCapacity = false;
     std::vector<uint32_t> MissingPeerTargets;
     std::vector<uint32_t> AddedVotersWithoutCommitAck;
 
     bool Ready() const {
         return IsLeader && HasDurableMembershipStorage && HasStableConfiguration &&
-            HasCommittedCurrentTermEntry && ChangesVoterSet && MissingPeerTargets.empty() &&
+            HasCommittedCurrentTermEntry && ChangesVoterSet && HasLogCapacity && MissingPeerTargets.empty() &&
             AddedVotersWithoutCommitAck.empty();
     }
 };
@@ -326,6 +327,7 @@ private:
     void RemoveUncommittedLogSuffix(uint64_t firstIndex);
     void RecordUncommittedLogEntry(uint64_t index, uint32_t bytes);
     bool FitsUncommittedLog(uint64_t bytes, size_t entries) const;
+    bool FitsProposalLog(uint64_t bytes, size_t entries) const;
     void EnsureProposalLogCapacity(uint64_t bytes, size_t entries) const;
 
     uint32_t Id;

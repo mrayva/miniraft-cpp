@@ -1892,10 +1892,18 @@ TJointConfigurationReadiness TRaft::CheckJointConfigurationReadiness(
         !Configuration->Committed.IsJoint();
     readiness.HasCommittedCurrentTermEntry = VolatileState->CommitIndex &&
         State->LogTerm(VolatileState->CommitIndex) == State->CurrentTerm;
+    readiness.HasLogCapacity = State->LastLogIndex < uint64_t(INT64_MAX);
 
     if (readiness.HasStableConfiguration) {
         const auto& oldVoters = Configuration->Committed.OldVoters();
         readiness.ChangesVoterSet = newVoters != oldVoters;
+        if (readiness.HasLogCapacity && readiness.ChangesVoterSet) {
+            const auto& latest = Configuration->Latest;
+            auto proposed = EncodeConfigurationEntry(TConfigurationRecord{
+                EConfigurationPhase::Joint, State->CurrentTerm,
+                latest.ConfigurationIndex(), latest.ConfigurationTerm(), oldVoters, newVoters});
+            readiness.HasLogCapacity = FitsProposalLog(proposed->Len, 1);
+        }
         if (readiness.IsLeader) {
             for (auto id : newVoters) {
                 if (!std::binary_search(oldVoters.begin(), oldVoters.end(), id) &&
@@ -2638,12 +2646,15 @@ bool TRaft::FitsUncommittedLog(uint64_t bytes, size_t entries) const {
         entries <= LogLimits.MaxUncommittedEntries - UncommittedLog.size();
 }
 
-void TRaft::EnsureProposalLogCapacity(uint64_t bytes, size_t entries) const {
+bool TRaft::FitsProposalLog(uint64_t bytes, size_t entries) const {
     const auto proposalBytes = LogLimits.MaxUncommittedBytes - LogLimits.ReservedControlBytes;
     const auto proposalEntries = LogLimits.MaxUncommittedEntries - LogLimits.ReservedControlEntries;
-    if (UncommittedLogBytes > proposalBytes || bytes > proposalBytes - UncommittedLogBytes ||
-        UncommittedLog.size() > proposalEntries || entries > proposalEntries - UncommittedLog.size())
-        throw TRaftLogCapacityExceeded();
+    return UncommittedLogBytes <= proposalBytes && bytes <= proposalBytes - UncommittedLogBytes &&
+        UncommittedLog.size() <= proposalEntries && entries <= proposalEntries - UncommittedLog.size();
+}
+
+void TRaft::EnsureProposalLogCapacity(uint64_t bytes, size_t entries) const {
+    if (!FitsProposalLog(bytes, entries)) throw TRaftLogCapacityExceeded();
 }
 
 void TRaft::AdvanceCommitIndex(uint64_t index) {

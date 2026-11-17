@@ -63,20 +63,20 @@ saturated log. Request deadlines remain open. ErrorCode=1 still means the
 outcome may be unknown after an admitted write is cancelled or its reply cannot
 be retained.
 
-### P2: readiness omits exhausted log capacity
+### P2: readiness omitted exhausted log capacity — fixed
 
-`miniraft/raft.cpp:1806-1838,1847`: the report has no capacity condition, while
-the proposal rejects `LastLogIndex >= INT64_MAX`. At that boundary, a removal
-with otherwise satisfied prerequisites can report Ready and then always fail.
-Add a capacity field to the report or narrow its documented meaning. Test a
-synthetic exhausted-index store. This is an API diagnostic inconsistency, not
-evidence that an unsafe proposal is accepted.
+`TJointConfigurationReadiness` now reports `HasLogCapacity`, and `Ready()`
+requires it. The check accounts for both `INT64_MAX` and the encoded joint entry
+against the configured uncommitted-log proposal budget. Deterministic tests
+cover an exhausted snapshot index and a full proposal-entry budget while all
+other readiness prerequisites are satisfied. The report remains point-in-time;
+callers must still handle capacity changes before proposing.
 
 ## Membership and snapshot limits still present
 
-- Endpoints are provisioned separately on every replica. The new report exposes
-  missing local targets, but there is no cluster-wide endpoint rollout protocol
-  or automated administrator workflow.
+- Endpoints are provisioned separately on every replica. The readiness report
+  exposes missing local targets and proposal capacity, but there is no
+  cluster-wide endpoint rollout protocol or automated administrator workflow.
 - `TRaft::Compact` requires every active voter to acknowledge the committed
   configuration (`raft.cpp:2122-2132`). An offline active voter can block
   compaction although a quorum can continue committing; the retained log grows.
@@ -157,10 +157,9 @@ Sources consulted:
 - https://github.com/eBay/NuRaft/blob/master/docs/snapshot_transmission.md
 - https://github.com/eBay/NuRaft/blob/master/docs/streaming_mode.md
 
-Recommended order: fix endpoint parsing; bound transport, client admission and
-the uncommitted log; add deadlines and leadership expiration; implement
-pre-vote; then address WAL performance, large snapshots, membership
-administration and generated failure testing. Authentication and shutdown are
-necessary before exposing this as a general production service. No new
-consensus safety violation was established in this review; no independent
-reviewer approval is claimed.
+Recommended order: fix endpoint parsing; bound transport and client admission;
+add deadlines and leadership expiration; implement pre-vote; then address WAL
+performance, large snapshots, membership administration and generated failure
+testing. Authentication and shutdown are necessary before exposing this as a
+general production service. No new consensus safety violation was established
+in this review; no independent reviewer approval is claimed.
