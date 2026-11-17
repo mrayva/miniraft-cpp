@@ -85,7 +85,8 @@ struct TCluster {
         }
     }
     void Elect(uint32_t id) {
-        Now += std::chrono::seconds(10);
+        Now += std::chrono::seconds(30);
+        Nodes[id - 1]->ProcessTimeout(Now); Drain();
         Nodes[id - 1]->ProcessTimeout(Now); Drain();
         Nodes[id - 1]->ProcessTimeout(Now); Drain();
         assert_int_equal(Nodes[id - 1]->CurrentStateName(), EState::LEADER);
@@ -144,7 +145,7 @@ void test_compaction_lagging_follower_installs_snapshot_then_tail(void**) {
 void test_simultaneous_startup_candidates_use_distinct_election_deadlines(void**) {
     TCluster cluster;
     for (auto& node : cluster.Nodes) node->ProcessTimeout(cluster.Now);
-    cluster.Drain(); // all voted for themselves in the first term
+    cluster.Drain(); // All campaign without persisting a term; grants remain speculative.
     std::set<ITimeSource::Time> deadlines;
     uint32_t first = 1;
     for (uint32_t id = 1; id <= 3; ++id) {
@@ -154,9 +155,8 @@ void test_simultaneous_startup_candidates_use_distinct_election_deadlines(void**
     }
     assert_int_equal(deadlines.size(), 3);
     cluster.Now = *deadlines.begin();
-    for (auto& node : cluster.Nodes) node->ProcessTimeout(cluster.Now);
-    cluster.Drain();
     cluster.Nodes[first - 1]->ProcessTimeout(cluster.Now); cluster.Drain();
+    cluster.Nodes[first - 1]->ProcessTimeout(cluster.Now);
     assert_int_equal(cluster.Nodes[first - 1]->CurrentStateName(), EState::LEADER);
 }
 void test_partial_transfer_restart_and_delayed_ack_are_safe(void**) {
@@ -527,6 +527,7 @@ void test_unmatched_joint_snapshot_does_not_accept_leader_contact(void**) {
     raft->Become(EState::CANDIDATE);
     const auto before = static_cast<TStateFields>(*state);
     const auto electionDue = raft->GetVolatileState()->ElectionDue;
+    const auto leaderContactDue = raft->GetVolatileState()->LeaderContactDue;
 
     // This image is newer than the local commit boundary, so it exercises the
     // full installation path rather than the covered-prefix fast path.
@@ -534,12 +535,14 @@ void test_unmatched_joint_snapshot_does_not_accept_leader_contact(void**) {
     assert_true(replies.back()->Success); assert_false(replies.back()->Installed);
     assert_int_equal(raft->CurrentStateName(), EState::CANDIDATE);
     assert_true(raft->GetVolatileState()->ElectionDue == electionDue);
+    assert_true(raft->GetVolatileState()->LeaderContactDue == leaderContactDue);
     raft->Process({}, Chunk(joint, bytes, 4, 4));
     assert_false(replies.back()->Success); assert_false(replies.back()->Installed);
     raft->Process({}, Chunk(joint, bytes, 0, static_cast<uint32_t>(bytes.size())));
     assert_false(replies.back()->Success); assert_false(replies.back()->Installed);
     assert_int_equal(raft->CurrentStateName(), EState::CANDIDATE);
     assert_true(raft->GetVolatileState()->ElectionDue == electionDue);
+    assert_true(raft->GetVolatileState()->LeaderContactDue == leaderContactDue);
     assert_true(static_cast<TStateFields>(*state) == before);
     assert_int_equal(app->Loads, 0); assert_int_equal(app->LastAppliedIndex, 0);
 }
@@ -700,6 +703,8 @@ void test_corrupt_snapshot_and_invalid_headers_cannot_mutate_application(void**)
     }
     auto valid = Chunk(snapshot, encoded, 0, encoded.size()); raft->Process({}, valid);
     assert_true(replies.back()->Installed); assert_int_equal(app->Loads, 1);
+    assert_true(raft->GetVolatileState()->LeaderContactDue == raft->GetVolatileState()->ElectionDue);
+    assert_true(raft->GetVolatileState()->LeaderContactDue > ITimeSource::Time{});
     assert_true(Read(*app, "a") == "new");
     raft->Process({}, valid); assert_int_equal(app->Loads, 1); // duplicate completion is idempotent
     snapshot.Index = 3; auto stale = EncodeSnapshot(snapshot);

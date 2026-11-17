@@ -19,10 +19,10 @@ single-voter cluster remains leader because its local voter is available.
 
 The timeout is currently a fixed constant, not a per-cluster option. It is a
 liveness measure, not a leadership lease: it does not guarantee that an old
-leader and a newly elected leader never overlap during a partition. The
-implementation also has no pre-vote phase. Strong reads continue to require a
-fresh quorum acknowledgement; default leader reads do not provide that
-guarantee.
+leader and a newly elected leader never overlap during a partition. Pre-vote
+reduces term disruption from isolated candidates, but does not provide that
+lease guarantee. Strong reads continue to require a fresh quorum
+acknowledgement; default leader reads do not provide that guarantee.
 
 The deterministic regression keeps a healthy leader active beyond one expiry
 window, then isolates it and checks that it yields exactly when the last known

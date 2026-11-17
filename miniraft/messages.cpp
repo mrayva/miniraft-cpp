@@ -12,6 +12,8 @@ void ValidateMessageHeader(uint32_t type, uint32_t length, const TMessageLimits&
     case EMessageType::LOG_ENTRY: minimum = sizeof(TLogEntry); fixed = false; break;
     case EMessageType::REQUEST_VOTE_REQUEST: minimum = sizeof(TRequestVoteRequest); break;
     case EMessageType::REQUEST_VOTE_RESPONSE: minimum = sizeof(TRequestVoteResponse); break;
+    case EMessageType::PRE_VOTE_REQUEST: minimum = sizeof(TPreVoteRequest); break;
+    case EMessageType::PRE_VOTE_RESPONSE: minimum = sizeof(TPreVoteResponse); break;
     case EMessageType::APPEND_ENTRIES_REQUEST: minimum = sizeof(TAppendEntriesRequest); break;
     case EMessageType::APPEND_ENTRIES_RESPONSE: minimum = sizeof(TAppendEntriesResponse); break;
     case EMessageType::INSTALL_SNAPSHOT_REQUEST:

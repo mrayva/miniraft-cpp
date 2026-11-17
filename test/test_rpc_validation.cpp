@@ -73,6 +73,48 @@ void test_candidate_identity_must_match_sender(void**) {
     assert_int_equal(fixture.State->VotedFor, 1);
     assert_true(fixture.Peer->Sent.empty());
 }
+void test_pre_vote_grant_is_non_persistent(void**) {
+    TFixture fixture;
+    const auto beforeElectionDue = fixture.Raft.GetVolatileState()->ElectionDue;
+    auto request = NewHoldedMessage(TMessageEx{.Src = 2, .Dst = 1, .Term = 3, .Seqno = 1},
+        TPreVoteRequest{.ProspectiveTerm = 4, .LastLogIndex = 0, .LastLogTerm = 0, .CandidateId = 2});
+    fixture.Raft.Process(fixture.Now, request);
+    assert_int_equal(fixture.State->CurrentTerm, 3);
+    assert_int_equal(fixture.State->VotedFor, 1);
+    assert_true(fixture.Raft.GetVolatileState()->ElectionDue == beforeElectionDue);
+    assert_int_equal(fixture.Peer->Sent.size(), 1);
+    auto response = fixture.Peer->Sent.back().Cast<TPreVoteResponse>();
+    assert_int_equal(response->ProspectiveTerm, 4);
+    assert_true(response->VoteGranted);
+}
+void test_high_term_pre_vote_cannot_disrupt_recent_leader(void**) {
+    TFixture fixture;
+    auto heartbeat = NewHoldedMessage(TMessageEx{.Src = 2, .Dst = 1, .Term = 3},
+        TAppendEntriesRequest{.PrevLogIndex = 0, .PrevLogTerm = 0, .LeaderCommit = 0,
+            .LeaderId = 2, .Nentries = 0});
+    fixture.Raft.Process(fixture.Now, heartbeat);
+    const auto electionDue = fixture.Raft.GetVolatileState()->ElectionDue;
+    auto preVote = NewHoldedMessage(TMessageEx{.Src = 3, .Dst = 1, .Term = 99, .Seqno = 1},
+        TPreVoteRequest{.ProspectiveTerm = 100, .LastLogIndex = 0, .LastLogTerm = 0, .CandidateId = 3});
+    fixture.Raft.Process(fixture.Now, preVote);
+    assert_int_equal(fixture.State->CurrentTerm, 3);
+    assert_int_equal(fixture.State->VotedFor, 1);
+    assert_true(fixture.Raft.GetVolatileState()->ElectionDue == electionDue);
+    assert_int_equal(fixture.Peer->Sent.size(), 1);
+    assert_int_equal(fixture.Other->Sent.size(), 1);
+    auto response = fixture.Other->Sent.back().Cast<TPreVoteResponse>();
+    assert_int_equal(response->ProspectiveTerm, 100);
+    assert_false(response->VoteGranted);
+}
+void test_malformed_pre_vote_is_ignored(void**) {
+    TFixture fixture;
+    auto request = NewHoldedMessage(TMessageEx{.Src = 2, .Dst = 1, .Term = 3, .Seqno = 1},
+        TPreVoteRequest{.ProspectiveTerm = 5, .LastLogIndex = 0, .LastLogTerm = 0, .CandidateId = 2});
+    fixture.Raft.Process(fixture.Now, request);
+    assert_int_equal(fixture.State->CurrentTerm, 3);
+    assert_int_equal(fixture.State->VotedFor, 1);
+    assert_true(fixture.Peer->Sent.empty());
+}
 void test_configuration_barrier_requires_current_term_and_committed_leader_contact(void**) {
     TFixture fixture;
     auto higherTerm = NewHoldedMessage(
@@ -289,6 +331,9 @@ int main() {
         cmocka_unit_test(test_unknown_sender_cannot_change_term),
         cmocka_unit_test(test_wrong_destination_cannot_change_term),
         cmocka_unit_test(test_candidate_identity_must_match_sender),
+        cmocka_unit_test(test_pre_vote_grant_is_non_persistent),
+        cmocka_unit_test(test_high_term_pre_vote_cannot_disrupt_recent_leader),
+        cmocka_unit_test(test_malformed_pre_vote_is_ignored),
         cmocka_unit_test(test_configuration_barrier_requires_current_term_and_committed_leader_contact),
         cmocka_unit_test(test_out_of_range_ack_cannot_wrap_next_index),
         cmocka_unit_test(test_unknown_sequence_cannot_commit),

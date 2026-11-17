@@ -1061,6 +1061,8 @@ void TRaft::RefreshConfiguration(uint64_t commitIndex) {
 
     if (!IsVoter(Id)) {
         VolatileState->Votes.clear();
+        VolatileState->PreVoting = false;
+        VolatileState->PreVoteTerm = 0;
         if (StateName == EState::CANDIDATE || StateName == EState::LEADER) {
             StateName = EState::FOLLOWER;
             VolatileState->LeaderId = 0;
@@ -1104,7 +1106,30 @@ void TRaft::OnRequestVote(ITimeSource::Time now, TMessageHolder<TRequestVoteRequ
 }
 
 void TRaft::OnRequestVote(TMessageHolder<TRequestVoteResponse> message) {
-    if (message->VoteGranted && message->Term == State->CurrentTerm) {
+    if (!VolatileState->PreVoting && message->VoteGranted && message->Term == State->CurrentTerm) {
+        (*VolatileState)
+            .Vote(message->Src)
+            .SetRpcDue(message->Src, ITimeSource::Max);
+    }
+}
+
+void TRaft::OnPreVote(ITimeSource::Time now, TMessageHolder<TPreVoteRequest> message) {
+    bool accept = false;
+    if (IsVoter(Id) && State->CurrentTerm != UINT64_MAX &&
+        message->ProspectiveTerm > State->CurrentTerm && VolatileState->LeaderContactDue <= now) {
+        accept = message->LastLogTerm > State->LogTerm();
+        if (message->LastLogTerm == State->LogTerm())
+            accept = message->LastLogIndex >= State->LastLogIndex;
+    }
+    (void)Nodes.at(message->Src)->TrySend(NewHoldedMessage(
+        TMessageEx{.Src = Id, .Dst = message->Src, .Term = State->CurrentTerm, .Seqno = message->Seqno},
+        TPreVoteResponse{.ProspectiveTerm = message->ProspectiveTerm, .VoteGranted = uint32_t(accept)}));
+}
+
+void TRaft::OnPreVote(TMessageHolder<TPreVoteResponse> message) {
+    if (VolatileState->PreVoting && message->VoteGranted &&
+        message->ProspectiveTerm == VolatileState->PreVoteTerm &&
+        message->Seqno == VolatileState->PreVoteSeqno) {
         (*VolatileState)
             .Vote(message->Src)
             .SetRpcDue(message->Src, ITimeSource::Max);
@@ -1224,7 +1249,11 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
     (*VolatileState)
         .SetLeaderId(message->LeaderId)
         .SetElectionDue(MakeElection(now));
+    VolatileState->LeaderContactDue = VolatileState->ElectionDue;
 
+    VolatileState->PreVoting = false;
+    VolatileState->PreVoteTerm = 0;
+    VolatileState->Votes.clear();
     Become(EState::FOLLOWER);
     (void)Nodes[reply->Dst]->TrySend(std::move(reply));
 }
@@ -1301,6 +1330,17 @@ TMessageHolder<TRequestVoteRequest> TRaft::CreateVote(uint32_t nodeId) {
     return mes;
 }
 
+TMessageHolder<TPreVoteRequest> TRaft::CreatePreVote(uint32_t nodeId) {
+    return NewHoldedMessage(
+        TMessageEx{.Src = Id, .Dst = nodeId, .Term = State->CurrentTerm, .Seqno = VolatileState->PreVoteSeqno},
+        TPreVoteRequest{
+            .ProspectiveTerm = VolatileState->PreVoteTerm,
+            .LastLogIndex = State->LastLogIndex,
+            .LastLogTerm = State->LastLogTerm,
+            .CandidateId = Id,
+        });
+}
+
 TMessageHolder<TAppendEntriesRequest> TRaft::CreateAppendEntries(uint32_t nodeId) {
     int batchSize = std::max(1, VolatileState->BatchSize[nodeId]);
     auto prevIndex = VolatileState->NextIndex[nodeId] - 1;
@@ -1344,7 +1384,9 @@ TMessageHolder<TAppendEntriesRequest> TRaft::CreateAppendEntries(uint32_t nodeId
 }
 
 void TRaft::Follower(ITimeSource::Time now, TMessageHolder<TMessage> message) {
-    if (auto maybeRequestVote = message.Maybe<TRequestVoteRequest>()) {
+    if (auto maybePreVote = message.Maybe<TPreVoteRequest>()) {
+        OnPreVote(now, std::move(maybePreVote.Cast()));
+    } else if (auto maybeRequestVote = message.Maybe<TRequestVoteRequest>()) {
         OnRequestVote(now, std::move(maybeRequestVote.Cast()));
     } else if (auto maybeAppendEntries = message.Maybe<TAppendEntriesRequest>()) {
         OnAppendEntries(now, std::move(maybeAppendEntries.Cast()));
@@ -1358,7 +1400,11 @@ void TRaft::Follower(ITimeSource::Time now, TMessageHolder<TMessage> message) {
 }
 
 void TRaft::Candidate(ITimeSource::Time now, TMessageHolder<TMessage> message) {
-    if (auto maybeResponseVote = message.Maybe<TRequestVoteResponse>()) {
+    if (auto maybePreVoteResponse = message.Maybe<TPreVoteResponse>()) {
+        OnPreVote(std::move(maybePreVoteResponse.Cast()));
+    } else if (auto maybePreVoteRequest = message.Maybe<TPreVoteRequest>()) {
+        OnPreVote(now, std::move(maybePreVoteRequest.Cast()));
+    } else if (auto maybeResponseVote = message.Maybe<TRequestVoteResponse>()) {
         OnRequestVote(std::move(maybeResponseVote.Cast()));
     } else if (auto maybeRequestVote = message.Maybe<TRequestVoteRequest>()) {
         OnRequestVote(now, std::move(maybeRequestVote.Cast()));
@@ -1372,7 +1418,9 @@ void TRaft::Candidate(ITimeSource::Time now, TMessageHolder<TMessage> message) {
 }
 
 void TRaft::Leader(ITimeSource::Time now, TMessageHolder<TMessage> message) {
-    if (auto snapshot = message.Maybe<TInstallSnapshotResponse>()) {
+    if (auto maybePreVote = message.Maybe<TPreVoteRequest>()) {
+        OnPreVote(now, std::move(maybePreVote.Cast()));
+    } else if (auto snapshot = message.Maybe<TInstallSnapshotResponse>()) {
         OnInstallSnapshot(now, snapshot.Cast());
     } else if (auto maybeAppendEntries = message.Maybe<TAppendEntriesResponse>()) {
         OnAppendEntries(now, std::move(maybeAppendEntries.Cast()));
@@ -1401,11 +1449,18 @@ void TRaft::Process(ITimeSource::Time now, TMessageHolder<TMessage> message, con
     if (!ValidateRpc(message)) return;
     if (message.IsEx()) {
         auto messageEx = message.Cast<TMessageEx>();
-        if (messageEx->Term > State->CurrentTerm) {
+        const auto type = EMessageType(message->Type);
+        const bool preVote = type == EMessageType::PRE_VOTE_REQUEST || type == EMessageType::PRE_VOTE_RESPONSE;
+        if (!preVote && messageEx->Term > State->CurrentTerm) {
             State->CurrentTerm = messageEx->Term;
             State->VotedFor = 0;
             State->Commit();
+            if (VolatileState->LeaderContactDue == ITimeSource::Max)
+                VolatileState->LeaderContactDue = now;
             StateName = EState::FOLLOWER;
+            VolatileState->PreVoting = false;
+            VolatileState->PreVoteTerm = 0;
+            VolatileState->Votes.clear();
             VolatileState->LeadershipTransfer.reset();
             IncomingSnapshot.reset();
             VolatileState->SnapshotRpcs.clear();
@@ -1461,6 +1516,18 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
     }
     case EMessageType::REQUEST_VOTE_RESPONSE:
         return message.Cast<TRequestVoteResponse>()->VoteGranted <= 1;
+    case EMessageType::PRE_VOTE_REQUEST: {
+        auto vote = message.Cast<TPreVoteRequest>();
+        return header->Term != UINT64_MAX && header->Seqno != 0 &&
+            vote->ProspectiveTerm == header->Term + 1 &&
+            vote->CandidateId == header->Src && vote->LastLogIndex <= maxIndex &&
+            vote->LastLogTerm <= header->Term &&
+            ((vote->LastLogIndex == 0) == (vote->LastLogTerm == 0));
+    }
+    case EMessageType::PRE_VOTE_RESPONSE: {
+        auto vote = message.Cast<TPreVoteResponse>();
+        return header->Seqno != 0 && vote->ProspectiveTerm > 0 && vote->VoteGranted <= 1;
+    }
     case EMessageType::APPEND_ENTRIES_RESPONSE: {
         auto reply = message.Cast<TAppendEntriesResponse>();
         return reply->Success <= 1 && reply->MatchIndex <= maxIndex &&
@@ -1708,9 +1775,43 @@ void TRaft::CandidateTimeout(ITimeSource::Time now) {
         if (!IsVoter(id)) continue;
         if (VolatileState->RpcDue[id] <= now) {
             VolatileState->RpcDue[id] = now + TTimeout::Rpc;
-            (void)node->TrySend(CreateVote(id));
+            if (VolatileState->PreVoting) (void)node->TrySend(CreatePreVote(id));
+            else (void)node->TrySend(CreateVote(id));
         }
     }
+}
+
+void TRaft::StartPreVote(ITimeSource::Time now) {
+    if (State->CurrentTerm == UINT64_MAX) throw std::overflow_error("Raft term exhausted");
+    IncomingSnapshot.reset();
+    auto next = std::make_unique<TVolatileState>();
+    next->CommitIndex = VolatileState->CommitIndex;
+    next->LeaderContactDue = VolatileState->LeaderContactDue;
+    next->ElectionDue = MakeElection(now);
+    next->PreVoting = true;
+    next->PreVoteTerm = State->CurrentTerm + 1;
+    next->PreVoteSeqno = NextSeqno();
+    for (const auto& [id, _] : Nodes) {
+        next->NextIndex[id] = 1;
+        if (IsVoter(id)) next->RpcDue[id] = ITimeSource::Time{};
+    }
+    VolatileState = std::move(next);
+    VolatileState->LeaderId = 0;
+    Become(EState::CANDIDATE);
+}
+
+void TRaft::StartElection(ITimeSource::Time now) {
+    if (!VolatileState->PreVoting || State->CurrentTerm == UINT64_MAX)
+        throw std::logic_error("Invalid pre-vote to election transition");
+    State->CurrentTerm++;
+    State->VotedFor = Id;
+    State->Commit();
+    VolatileState->PreVoting = false;
+    VolatileState->PreVoteTerm = 0;
+    VolatileState->Votes.clear();
+    VolatileState->ElectionDue = MakeElection(now);
+    for (const auto& [id, _] : Nodes)
+        if (IsVoter(id)) VolatileState->RpcDue[id] = ITimeSource::Time{};
 }
 
 void TRaft::LeaderTimeout(ITimeSource::Time now) {
@@ -1770,6 +1871,7 @@ void TRaft::ExpireLeadership(ITimeSource::Time now) {
     Become(EState::FOLLOWER);
     VolatileState->LeaderId = 0;
     VolatileState->ElectionDue = MakeElection(now);
+    VolatileState->LeaderContactDue = now;
     VolatileState->LeadershipExpiryDue = ITimeSource::Max;
     VolatileState->QuorumResponseTime.clear();
     VolatileState->LeadershipTransfer.reset();
@@ -1815,26 +1917,21 @@ void TRaft::ProcessTimeout(ITimeSource::Time now) {
         now - IncomingSnapshot->LastProgress >= TTimeout::SnapshotTransferIdle)
         IncomingSnapshot.reset();
     if (!IsVoter(Id)) return;
+    if (StateName == EState::CANDIDATE && VolatileState->PreVoting &&
+        VotingQuorum->HasQuorum(VolatileState->Votes, Id))
+        StartElection(now);
+
     if (StateName == EState::CANDIDATE || StateName == EState::FOLLOWER) {
         if (VolatileState->ElectionDue <= now) {
-            if (State->CurrentTerm == UINT64_MAX) throw std::overflow_error("Raft term exhausted");
-            IncomingSnapshot.reset();
-            auto nextVolatileState = std::make_unique<TVolatileState>();
-            for (auto [id, _] : Nodes) {
-                nextVolatileState->NextIndex[id] = 1;
-            }
-            nextVolatileState->ElectionDue = MakeElection(now);
-            nextVolatileState->CommitIndex = VolatileState->CommitIndex;
-            VolatileState = std::move(nextVolatileState);
-            State->VotedFor = Id;
-            State->CurrentTerm ++;
-            State->Commit();
-            Become(EState::CANDIDATE);
+            StartPreVote(now);
         }
     }
 
     if (StateName == EState::CANDIDATE) {
-        if (VotingQuorum->HasQuorum(VolatileState->Votes, Id)) {
+        if (VolatileState->PreVoting && VotingQuorum->HasQuorum(VolatileState->Votes, Id))
+            StartElection(now);
+
+        if (!VolatileState->PreVoting && VotingQuorum->HasQuorum(VolatileState->Votes, Id)) {
             if (State->LastLogIndex >= uint64_t(INT64_MAX)) throw std::overflow_error("Raft log index exhausted");
             auto value = State->LastLogIndex+1;
             const std::vector<uint32_t>* previousVoters = nullptr;
@@ -1870,6 +1967,7 @@ void TRaft::ProcessTimeout(ITimeSource::Time now) {
                 .NextIndex = nextIndex,
                 .RpcDue = rpcDue,
                 .ElectionDue = ITimeSource::Max,
+                .LeaderContactDue = ITimeSource::Max,
                 .LeadershipExpiryDue = now + TTimeout::LeadershipExpiration,
             });
 
@@ -2068,6 +2166,7 @@ void TRaft::TransferLeadership(uint32_t target, ITimeSource::Time now) {
     Become(EState::FOLLOWER);
     VolatileState->LeaderId = 0;
     VolatileState->ElectionDue = MakeElection(now);
+    VolatileState->LeaderContactDue = now;
     VolatileState->LeadershipTransfer = TVolatileState::TLeadershipTransfer{
         .TargetId = target,
         .LastLogIndex = State->LastLogIndex,
@@ -2092,7 +2191,10 @@ void TRaft::OnTimeoutNow(ITimeSource::Time now, TMessageHolder<TTimeoutNowReques
     // from the committed new set and that this node has the exact transfer
     // boundary. Reuse the normal election path so term persistence, vote
     // clearing and joint-quorum arithmetic stay identical to timeout elections.
-    VolatileState->ElectionDue = now;
+    StartPreVote(now);
+    // The validated, committed transfer instruction authorizes skipping only
+    // the pre-vote probe. Real RequestVote grants still need the active quorum.
+    StartElection(now);
     ProcessTimeout(now);
 }
 
@@ -2388,9 +2490,13 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     // until the complete bounded metadata prefix is supported.
     auto acceptLeaderContact = [&] {
         Become(EState::FOLLOWER);
+        VolatileState->PreVoting = false;
+        VolatileState->PreVoteTerm = 0;
+        VolatileState->Votes.clear();
         VolatileState->LeadershipTransfer.reset();
         VolatileState->LeaderId = request->LeaderId;
         VolatileState->ElectionDue = MakeElection(now);
+        VolatileState->LeaderContactDue = VolatileState->ElectionDue;
     };
     if (request->SnapshotIndex <= VolatileState->CommitIndex) {
         const auto term = State->LogTerm(request->SnapshotIndex);

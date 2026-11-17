@@ -63,8 +63,11 @@ struct TCluster {
         }
     }
     void Elect(uint32_t id) {
-        Now += std::chrono::seconds(10);
+        Drain(); // Deliver prior leader activity before measuring the timeout interval.
+        Now += std::chrono::seconds(30);
         auto& node = Nodes.at(id - 1);
+        node->ProcessTimeout(Now);
+        Drain();
         node->ProcessTimeout(Now);
         Drain();
         node->ProcessTimeout(Now);
@@ -1210,6 +1213,31 @@ void test_partition_leader_replacement_and_heal(void**) {
     cluster.AssertCommittedPrefix();
 }
 
+void test_stale_isolated_candidate_cannot_raise_live_voter_terms(void**) {
+    TCluster cluster(3);
+    cluster.Elect(1);
+    cluster.Replicate(1);
+    const auto liveTerm = cluster.Nodes[0]->GetState()->CurrentTerm;
+    const auto candidateState = cluster.Nodes[2]->GetState();
+    candidateState->CurrentTerm = liveTerm + 100;
+    candidateState->VotedFor = 3; // A term inflated during an earlier isolation.
+    candidateState->Commit();
+    const auto isolatedTerm = candidateState->CurrentTerm;
+
+    // The leader is separated, while voter 2 still has recent heartbeat contact.
+    // Candidate 3 can reach voter 2, but its high term is carried by pre-vote RPCs
+    // and must not demote the healthy voter or disturb the surviving leader.
+    cluster.Isolated = {1};
+    cluster.Nodes[2]->ProcessTimeout(cluster.Now);
+    cluster.Drain();
+    assert_int_equal(candidateState->CurrentTerm, isolatedTerm);
+    assert_int_equal(candidateState->VotedFor, 3);
+    assert_int_equal(cluster.Nodes[1]->GetState()->CurrentTerm, liveTerm);
+    assert_true(cluster.Nodes[1]->GetVolatileState()->ElectionDue > cluster.Now);
+    assert_int_equal(cluster.Nodes[0]->GetState()->CurrentTerm, liveTerm);
+    assert_int_equal(cluster.Nodes[0]->CurrentStateName(), EState::LEADER);
+}
+
 void test_even_cluster_partition_requires_majority(void**) {
     TCluster cluster(4);
     cluster.Elect(1);
@@ -1364,6 +1392,7 @@ int main() {
         cmocka_unit_test(test_partial_write_completion),
         cmocka_unit_test(test_loss_reorder_duplicate_and_recovery),
         cmocka_unit_test(test_partition_leader_replacement_and_heal),
+        cmocka_unit_test(test_stale_isolated_candidate_cannot_raise_live_voter_terms),
         cmocka_unit_test(test_even_cluster_partition_requires_majority),
         cmocka_unit_test(test_strong_reads_require_fresh_majority_in_all_cluster_sizes),
         cmocka_unit_test(test_stale_leader_with_one_follower_cannot_serve_strong_read),

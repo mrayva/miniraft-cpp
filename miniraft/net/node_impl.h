@@ -4,7 +4,8 @@
 template<typename TSocket>
 typename TNode<TSocket>::EQueueClass TNode<TSocket>::QueueClassFor(uint32_t type) {
     switch (EMessageType(type)) {
-    case EMessageType::REQUEST_VOTE_REQUEST: return EQueueClass::Vote;
+    case EMessageType::REQUEST_VOTE_REQUEST:
+    case EMessageType::PRE_VOTE_REQUEST: return EQueueClass::Vote;
     case EMessageType::APPEND_ENTRIES_REQUEST:
     case EMessageType::INSTALL_SNAPSHOT_REQUEST: return EQueueClass::Replication;
     case EMessageType::TIMEOUT_NOW_REQUEST: return EQueueClass::TimeoutNow;

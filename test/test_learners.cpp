@@ -90,7 +90,8 @@ struct TCluster {
         }
     }
     void Elect(uint32_t id) {
-        Now += std::chrono::seconds(10); Nodes[id - 1]->ProcessTimeout(Now); Drain();
+        Now += std::chrono::seconds(30); Nodes[id - 1]->ProcessTimeout(Now); Drain();
+        Nodes[id - 1]->ProcessTimeout(Now); Drain();
         Nodes[id - 1]->ProcessTimeout(Now); Drain();
         assert_int_equal(Nodes[id - 1]->CurrentStateName(), EState::LEADER);
     }

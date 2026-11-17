@@ -884,6 +884,20 @@ void test_new_side_election_replays_joint_entry_to_old_peer(void**) {
     const_cast<TVolatileState*>(leader->GetVolatileState())->SetElectionDue(now);
     leader->ProcessTimeout(now);
     assert_true(leader->CurrentStateName() == EState::CANDIDATE);
+    auto grantPreVote = [&](uint32_t voter, const std::shared_ptr<TEndpoint>& endpoint) {
+        const auto request = std::find_if(endpoint->Messages.rbegin(), endpoint->Messages.rend(), [](const auto& item) {
+            return item->Type == uint32_t(EMessageType::PRE_VOTE_REQUEST);
+        });
+        assert_true(request != endpoint->Messages.rend());
+        const auto preVote = request->Cast<TPreVoteRequest>();
+        leader->Process(now,
+            NewHoldedMessage(TMessageEx{.Src = voter, .Dst = 4, .Term = preVote->Term,
+                    .Seqno = preVote->Seqno},
+                TPreVoteResponse{.ProspectiveTerm = preVote->ProspectiveTerm, .VoteGranted = 1}));
+    };
+    grantPreVote(1, toOne);
+    grantPreVote(3, toThree); // Together with self 4, this forms both joint pre-vote majorities.
+    leader->ProcessTimeout(now); // Pre-vote quorum starts the durable election term.
     auto grantVote = [&](uint32_t voter, const std::shared_ptr<TEndpoint>& endpoint) {
         const auto request = std::find_if(endpoint->Messages.rbegin(), endpoint->Messages.rend(), [](const auto& item) {
             return item->Type == uint32_t(EMessageType::REQUEST_VOTE_REQUEST);
@@ -976,6 +990,15 @@ void test_new_stable_leader_replays_transition_to_lagging_joiner(void**) {
     const_cast<TVolatileState*>(leader->GetVolatileState())->SetElectionDue(now);
     leader->ProcessTimeout(now);
     assert_true(leader->CurrentStateName() == EState::CANDIDATE);
+    const auto preVoteRequest = std::find_if(toThree->Messages.rbegin(), toThree->Messages.rend(), [](const auto& item) {
+        return item->Type == uint32_t(EMessageType::PRE_VOTE_REQUEST);
+    });
+    assert_true(preVoteRequest != toThree->Messages.rend());
+    const auto preVoteHeader = preVoteRequest->Cast<TPreVoteRequest>();
+    leader->Process(now, NewHoldedMessage(
+        TMessageEx{.Src = 3, .Dst = 4, .Term = preVoteHeader->Term, .Seqno = preVoteHeader->Seqno},
+        TPreVoteResponse{.ProspectiveTerm = preVoteHeader->ProspectiveTerm, .VoteGranted = 1}));
+    leader->ProcessTimeout(now); // The stable set's quorum starts the durable election term.
     const auto voteRequest = std::find_if(toThree->Messages.rbegin(), toThree->Messages.rend(), [](const auto& item) {
         return item->Type == uint32_t(EMessageType::REQUEST_VOTE_REQUEST);
     });
@@ -1046,8 +1069,9 @@ void test_runtime_peer_provisioning_commits_joint_membership_across_replicas(voi
             leader.ProcessTimeout(rpcNow);
         };
         rpcNow = start + std::chrono::seconds(20);
-        leader.ProcessTimeout(rpcNow); // Elect leader 1 with old voters {1, 3}.
-        leader.ProcessTimeout(rpcNow); // Process the synchronous follower vote.
+        leader.ProcessTimeout(rpcNow); // Start pre-vote for old voters {1, 3}.
+        leader.ProcessTimeout(rpcNow); // Pre-vote quorum starts the durable election.
+        leader.ProcessTimeout(rpcNow); // Process the synchronous vote and become leader.
         assert_true(leader.CurrentStateName() == EState::LEADER);
         const auto beforeLearnerAck = leader.CheckJointConfigurationReadiness({1, 2, 3});
         assert_true(beforeLearnerAck.IsLeader);
@@ -1646,11 +1670,17 @@ void test_live_joint_transition_waits_for_both_nontrivial_majorities(void**) {
             const auto start = ITimeSource::Time{};
 
             leader.ProcessTimeout(start);
-            const auto electionTerm = state->CurrentTerm;
+            const auto prospectiveTerm = state->CurrentTerm + 1;
             leader.Process(start + std::chrono::milliseconds(1),
+                    NewHoldedMessage(TMessageEx{.Src = 2, .Dst = 1, .Term = state->CurrentTerm,
+                            .Seqno = leader.GetVolatileState()->PreVoteSeqno},
+                    TPreVoteResponse{.ProspectiveTerm = prospectiveTerm, .VoteGranted = 1}));
+            leader.ProcessTimeout(start + std::chrono::milliseconds(2));
+            const auto electionTerm = state->CurrentTerm;
+            leader.Process(start + std::chrono::milliseconds(3),
                 NewHoldedMessage(TMessageEx{.Src = 2, .Dst = 1, .Term = electionTerm},
                     TRequestVoteResponse{.VoteGranted = 1}));
-            leader.ProcessTimeout(start + std::chrono::milliseconds(2));
+            leader.ProcessTimeout(start + std::chrono::milliseconds(4));
             assert_true(leader.CurrentStateName() == EState::LEADER);
 
             auto ackLatestAppend = [&](uint32_t source, std::chrono::milliseconds offset) {
@@ -1775,6 +1805,7 @@ void test_disjoint_membership_change_transfers_finalizes_and_restarts(void**) {
     };
 
     rafts[1]->ProcessTimeout(now);
+    tick(1);
     tick(1);
     assert_true(rafts[1]->CurrentStateName() == EState::LEADER);
     for (unsigned i = 0; i < 8 && rafts[1]->GetVolatileState()->CommitIndex < 1; ++i) tick(1);
@@ -1925,6 +1956,7 @@ void test_live_disjoint_joint_entry_waits_for_old_majority_over_network(void**) 
     };
     rafts[1]->ProcessTimeout(now);
     tick();
+    tick();
     assert_true(rafts[1]->CurrentStateName() == EState::LEADER);
     for (unsigned i = 0; i < 8 && rafts[1]->GetVolatileState()->CommitIndex < 1; ++i) tick();
     assert_int_equal(rafts[1]->GetVolatileState()->CommitIndex, 1);
@@ -2001,11 +2033,18 @@ void test_joint_strong_read_waits_for_both_disjoint_majorities(void**) {
             const auto now = ITimeSource::Time{};
             raft->ProcessTimeout(now);
             assert_true(raft->CurrentStateName() == EState::CANDIDATE);
+            const auto prospectiveTerm = state->CurrentTerm + 1;
             for (uint32_t voter : {1, 2, 5})
                 raft->Process(now + std::chrono::milliseconds(1),
+                    NewHoldedMessage(TMessageEx{.Src = voter, .Dst = 4, .Term = state->CurrentTerm,
+                            .Seqno = raft->GetVolatileState()->PreVoteSeqno},
+                        TPreVoteResponse{.ProspectiveTerm = prospectiveTerm, .VoteGranted = 1}));
+            raft->ProcessTimeout(now + std::chrono::milliseconds(2));
+            for (uint32_t voter : {1, 2, 5})
+                raft->Process(now + std::chrono::milliseconds(3),
                     NewHoldedMessage(TMessageEx{.Src = voter, .Dst = 4, .Term = state->CurrentTerm},
                         TRequestVoteResponse{.VoteGranted = 1}));
-            raft->ProcessTimeout(now + std::chrono::milliseconds(2));
+            raft->ProcessTimeout(now + std::chrono::milliseconds(4));
             assert_true(raft->CurrentStateName() == EState::LEADER);
             assert_int_equal(raft->GetLastIndex(), 2);
 
@@ -2146,6 +2185,7 @@ void test_timeout_now_retries_and_falls_back_under_joint_quorum(void**) {
                 // timer still lets it recover under the active joint quorum.
                 leaderTimeout(std::chrono::seconds(55));
                 leaderTimeout(std::chrono::seconds(55) + std::chrono::milliseconds(1));
+                leaderTimeout(std::chrono::seconds(55) + std::chrono::milliseconds(2));
                 assert_true(leader.CurrentStateName() == EState::LEADER);
                 assert_true(learner.CurrentStateName() == EState::FOLLOWER);
             }
@@ -2209,13 +2249,28 @@ void test_old_side_leader_can_transfer_after_joint_snapshot_with_pending_stable_
     const ITimeSource::Time start{};
     leader->ProcessTimeout(start);
     assert_true(leader->CurrentStateName() == EState::CANDIDATE);
+    auto grantPreVote = [&](uint32_t voter, const std::shared_ptr<TEndpoint>& endpoint) {
+        const auto request = std::find_if(endpoint->Messages.rbegin(), endpoint->Messages.rend(), [](const auto& item) {
+            return item->Type == uint32_t(EMessageType::PRE_VOTE_REQUEST);
+        });
+        assert_true(request != endpoint->Messages.rend());
+        const auto preVote = request->Cast<TPreVoteRequest>();
+        leader->Process(start + std::chrono::milliseconds(1),
+            NewHoldedMessage(TMessageEx{.Src = voter, .Dst = 3, .Term = preVote->Term,
+                    .Seqno = preVote->Seqno},
+                TPreVoteResponse{.ProspectiveTerm = preVote->ProspectiveTerm, .VoteGranted = 1}));
+    };
+    grantPreVote(1, toOne);
+    grantPreVote(4, toFour);
+    grantPreVote(5, toTarget);
+    leader->ProcessTimeout(start + std::chrono::milliseconds(2));
     auto grantVote = [&](uint32_t voter, const std::shared_ptr<TEndpoint>& endpoint) {
         const auto request = std::find_if(endpoint->Messages.rbegin(), endpoint->Messages.rend(), [](const auto& item) {
             return item->Type == uint32_t(EMessageType::REQUEST_VOTE_REQUEST);
         });
         assert_true(request != endpoint->Messages.rend());
         const auto vote = request->Cast<TRequestVoteRequest>();
-        leader->Process(start + std::chrono::milliseconds(1),
+        leader->Process(start + std::chrono::milliseconds(3),
             NewHoldedMessage(TMessageEx{.Src = voter, .Dst = 3, .Term = vote->Term,
                 .Seqno = request->Cast<TMessageEx>()->Seqno},
                 TRequestVoteResponse{.VoteGranted = 1}));
@@ -2224,7 +2279,7 @@ void test_old_side_leader_can_transfer_after_joint_snapshot_with_pending_stable_
     grantVote(1, toOne);
     grantVote(4, toFour);
     grantVote(5, toTarget); // Old-side 3 leads with votes from both disjoint majorities.
-    leader->ProcessTimeout(start + std::chrono::milliseconds(2));
+    leader->ProcessTimeout(start + std::chrono::milliseconds(4));
     assert_true(leader->CurrentStateName() == EState::LEADER);
     assert_true(leaderState->CurrentTerm == 5);
     assert_int_equal(leaderState->CommitIndex, 1); // Current-term no-op remains uncommitted.
@@ -3228,12 +3283,25 @@ void test_raft_recovers_joint_quorum_for_candidate_election(void**) {
         assert_int_equal(raft->GetNservers(), disjoint ? 6 : 5);
 
         auto now = ITimeSource::Time{};
-        raft->ProcessTimeout(now); // self vote alone cannot satisfy either joint majority
+        raft->ProcessTimeout(now); // Start a joint pre-vote campaign.
         assert_true(raft->CurrentStateName() == EState::CANDIDATE);
+        const auto prospectiveTerm = state->CurrentTerm + 1;
+        auto preVote = [&](uint32_t source) {
+            raft->Process(now, NewHoldedMessage(TMessageEx{.Src = source, .Dst = 4, .Term = state->CurrentTerm,
+                    .Seqno = raft->GetVolatileState()->PreVoteSeqno},
+                TPreVoteResponse{.ProspectiveTerm = prospectiveTerm, .VoteGranted = 1}));
+        };
+        if (disjoint) {
+            for (uint32_t source : {1, 2, 5}) preVote(source);
+        } else {
+            for (uint32_t source : {1, 3}) preVote(source);
+        }
+        raft->ProcessTimeout(now + std::chrono::milliseconds(1)); // Pre-vote quorum starts the election term.
+        assert_int_equal(state->CurrentTerm, 3);
         auto vote = [&](uint32_t source) {
-            raft->Process(now, NewHoldedMessage(TMessageEx{.Src = source, .Dst = 4, .Term = 3},
+            raft->Process(now, NewHoldedMessage(TMessageEx{.Src = source, .Dst = 4, .Term = state->CurrentTerm},
                 TRequestVoteResponse{.VoteGranted = 1}));
-            raft->ProcessTimeout(now + std::chrono::milliseconds(1));
+            raft->ProcessTimeout(now + std::chrono::milliseconds(2));
         };
 
         vote(1); // This leaves both voter sets below their strict majority.
@@ -3575,6 +3643,7 @@ void test_verified_multihop_disjoint_snapshot_recovers_and_readds_stale_voter(vo
     // then use the normal joint protocol to add it back as a voter.
     const_cast<TVolatileState*>(rafts[7]->GetVolatileState())->SetElectionDue(now);
     rafts[7]->ProcessTimeout(now);
+    rafts[7]->ProcessTimeout(now); // Turn the synchronous pre-vote quorum into a real election.
     rafts[7]->ProcessTimeout(now); // Consume the synchronous vote responses.
     assert_true(rafts[7]->CurrentStateName() == EState::LEADER);
     auto tick = [&] {

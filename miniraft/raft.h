@@ -133,11 +133,19 @@ struct TVolatileState {
     // Highest leader commit boundary confirmed by a correlated replication ACK.
     std::unordered_map<uint32_t, uint64_t> CommitAckIndex;
     std::unordered_set<uint32_t> Votes;
+    // Pre-votes use the same distinct-voter set as real votes, but never
+    // persist a term or vote until a joint-aware quorum has granted them.
+    bool PreVoting = false;
+    uint64_t PreVoteTerm = 0;
+    uint64_t PreVoteSeqno = 0;
     std::unordered_map<uint32_t, ITimeSource::Time> HeartbeatDue;
     std::unordered_map<uint32_t, ITimeSource::Time> RpcDue;
     std::unordered_map<uint32_t, int> BatchSize;
     std::unordered_map<uint32_t, int> BackOff;
     ITimeSource::Time ElectionDue;
+    // Tracks only valid leader contact. Campaign and vote retry timers must
+    // not make a voter appear to have recently heard from a leader.
+    ITimeSource::Time LeaderContactDue{};
     ITimeSource::Time LeadershipExpiryDue = ITimeSource::Max;
     std::unordered_map<uint32_t, ITimeSource::Time> QuorumResponseTime;
 
@@ -309,6 +317,8 @@ private:
 
     void OnRequestVote(ITimeSource::Time now, TMessageHolder<TRequestVoteRequest> message);
     void OnRequestVote(TMessageHolder<TRequestVoteResponse> message);
+    void OnPreVote(ITimeSource::Time now, TMessageHolder<TPreVoteRequest> message);
+    void OnPreVote(TMessageHolder<TPreVoteResponse> message);
     void OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntriesRequest> message);
     void OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntriesResponse> message);
 
@@ -321,6 +331,9 @@ private:
     void ExpireLeadership(ITimeSource::Time now);
 
     TMessageHolder<TRequestVoteRequest> CreateVote(uint32_t nodeId);
+    TMessageHolder<TPreVoteRequest> CreatePreVote(uint32_t nodeId);
+    void StartPreVote(ITimeSource::Time now);
+    void StartElection(ITimeSource::Time now);
     TMessageHolder<TAppendEntriesRequest> CreateAppendEntries(uint32_t nodeId);
     ITimeSource::Time MakeElection(ITimeSource::Time now);
     uint64_t NextSeqno();

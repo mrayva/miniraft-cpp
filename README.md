@@ -14,6 +14,9 @@ The [strong-read follow-up](docs/strong-reads.md) requires a fresh majority for
 `--consistent` reads and rejects pending reads when their leadership term ends.
 The [leadership-expiration follow-up](docs/leadership-expiration.md) makes a
 leader yield after it stops hearing from a fresh quorum of active voters.
+The [pre-vote follow-up](docs/pre-vote.md) probes the active stable or joint
+quorum before persisting a new election term; all voters must be upgraded
+together because older wire protocols do not recognize the new message types.
 The [pending request follow-up](docs/pending-requests.md) prevents replacement
 write acknowledgements, cleans up obsolete or disconnected requests, and bounds
 pending request admission and lifetime, cached write replies and uncommitted

@@ -34,6 +34,8 @@ enum class EMessageType : uint32_t {
     TIMEOUT_NOW_REQUEST = 10,
     CONFIGURATION_BARRIER_REQUEST = 11,
     CONFIGURATION_BARRIER_RESPONSE = 12,
+    PRE_VOTE_REQUEST = 13,
+    PRE_VOTE_RESPONSE = 14,
 };
 
 struct TMessage {
@@ -84,6 +86,26 @@ struct TRequestVoteResponse: public TMessageEx {
 };
 
 static_assert(sizeof(TRequestVoteResponse) == sizeof(TMessageEx)+8);
+
+struct TPreVoteRequest: public TMessageEx {
+    static constexpr EMessageType MessageType = EMessageType::PRE_VOTE_REQUEST;
+    uint64_t ProspectiveTerm;
+    uint64_t LastLogIndex;
+    uint64_t LastLogTerm;
+    uint32_t CandidateId;
+    uint32_t Padding = 0;
+};
+
+static_assert(sizeof(TPreVoteRequest) == sizeof(TMessageEx)+32);
+
+struct TPreVoteResponse: public TMessageEx {
+    static constexpr EMessageType MessageType = EMessageType::PRE_VOTE_RESPONSE;
+    uint64_t ProspectiveTerm;
+    uint32_t VoteGranted;
+    uint32_t Padding = 0;
+};
+
+static_assert(sizeof(TPreVoteResponse) == sizeof(TMessageEx)+16);
 
 struct TAppendEntriesRequest: public TMessageEx {
     static constexpr EMessageType MessageType = EMessageType::APPEND_ENTRIES_REQUEST;
@@ -271,7 +293,7 @@ struct TMessageHolder {
     bool IsEx() const {
         return HasValidExtent() && Mes->Len >= sizeof(TMessageEx) &&
             ((2 <= Mes->Type && Mes->Type <= 7) ||
-             (10 <= Mes->Type && Mes->Type <= 12));
+             (10 <= Mes->Type && Mes->Type <= 14));
     }
 
     template<typename U>

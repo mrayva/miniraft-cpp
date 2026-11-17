@@ -230,7 +230,7 @@ void test_stale_append_entries_does_not_postpone_election(void**) {
     };
     auto ts = std::make_shared<TFakeTimeSource>();
     auto raft = MakeRaft(onSend, 3);
-    // start an election, current term becomes 2, election due is in the future
+    // Start a pre-vote without persisting a new term.
     raft->ProcessTimeout(ts->Now());
     assert_true(raft->CurrentStateName() == EState::CANDIDATE);
     auto term = raft->GetState()->CurrentTerm;
@@ -257,10 +257,11 @@ void test_stale_append_entries_does_not_postpone_election(void**) {
         assert_int_equal(raft->GetState()->CurrentTerm, term);
     }
 
-    // the original deadline still starts the next election round
+    // the original deadline starts another pre-vote round; it still does not
+    // persist a term without a voter quorum.
     ts->Advance(std::chrono::duration_cast<std::chrono::milliseconds>(electionDue - ts->Now()));
     raft->ProcessTimeout(ts->Now());
-    assert_int_equal(raft->GetState()->CurrentTerm, term + 1);
+    assert_int_equal(raft->GetState()->CurrentTerm, term);
     assert_true(raft->CurrentStateName() == EState::CANDIDATE);
 }
 
@@ -425,9 +426,9 @@ void test_follower_append_entries_empty_to_empty_log(void**) {
 }
 
 void test_candidate_initiate_election(void**) {
-    std::vector<TMessageHolder<TRequestVoteRequest>> messages;
+    std::vector<TMessageHolder<TMessage>> messages;
     auto onSend = [&](auto message) {
-        messages.emplace_back(message.template Cast<TRequestVoteRequest>());
+        messages.emplace_back(std::move(message));
     };
     auto ts = std::make_shared<TFakeTimeSource>();
     auto raft = MakeRaft(onSend, 3);
@@ -435,21 +436,67 @@ void test_candidate_initiate_election(void**) {
     auto term = raft->GetState()->CurrentTerm;
     raft->Become(EState::CANDIDATE);
     raft->ProcessTimeout(ts->Now());
-    assert_int_equal(raft->GetState()->CurrentTerm, term+1);
+    assert_int_equal(raft->GetState()->CurrentTerm, term);
+    assert_int_equal(raft->GetState()->VotedFor, 0);
     assert_int_equal(messages.size(), 2);
-    auto r = NewHoldedMessage(TMessageEx {
+    auto preVote = NewHoldedMessage(TMessageEx {
         .Src = 1,
         .Dst = 0,
-        .Term = term+1,
-    }, TRequestVoteRequest {
+        .Term = term,
+        .Seqno = messages[0].Cast<TMessageEx>()->Seqno,
+    }, TPreVoteRequest {
+        .ProspectiveTerm = term+1,
         .LastLogIndex = 0,
         .LastLogTerm = 0,
         .CandidateId = raft->GetId(),
     });
-    messages[0]->Dst = 0;
-    assert_message_equal(messages[0], *r.Mes);
-    messages[1]->Dst = 0;
-    assert_message_equal(messages[1], *r.Mes);
+    messages[0].Cast<TMessageEx>()->Dst = 0;
+    assert_message_equal(messages[0], *preVote.Mes);
+    messages[1].Cast<TMessageEx>()->Dst = 0;
+    assert_message_equal(messages[1], *preVote.Mes);
+
+    raft->Process(ts->Now(), NewHoldedMessage(TMessageEx{.Src = 2, .Dst = 1, .Term = term,
+            .Seqno = messages[0].Cast<TMessageEx>()->Seqno},
+        TPreVoteResponse{.ProspectiveTerm = term+1, .VoteGranted = 1}));
+    assert_true(raft->GetVolatileState()->PreVoting);
+    assert_true(raft->GetVolatileState()->Votes.contains(2));
+    raft->ProcessTimeout(ts->Now());
+    assert_int_equal(raft->GetState()->CurrentTerm, term+1);
+    assert_int_equal(raft->GetState()->VotedFor, 1);
+    assert_int_equal(messages.size(), 4);
+    auto vote = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 0, .Term = term+1},
+        TRequestVoteRequest{.LastLogIndex = 0, .LastLogTerm = 0, .CandidateId = 1});
+    for (size_t i = 2; i < messages.size(); ++i) {
+        messages[i].Cast<TMessageEx>()->Dst = 0;
+        assert_message_equal(messages[i], *vote.Mes);
+    }
+}
+
+void test_stale_pre_vote_response_cannot_authorize_retry_campaign(void**) {
+    auto ts = std::make_shared<TFakeTimeSource>();
+    std::vector<TMessageHolder<TMessage>> messages;
+    auto raft = MakeRaft([&](auto message) { messages.emplace_back(std::move(message)); }, 3);
+    ts->Advance(std::chrono::seconds(10));
+    raft->ProcessTimeout(ts->Now());
+    const auto firstSeqno = raft->GetVolatileState()->PreVoteSeqno;
+    const auto prospectiveTerm = raft->GetVolatileState()->PreVoteTerm;
+    assert_true(firstSeqno != 0);
+
+    const_cast<TVolatileState*>(raft->GetVolatileState())->ElectionDue = ts->Now();
+    ts->Advance(std::chrono::milliseconds(1));
+    raft->ProcessTimeout(ts->Now());
+    const auto retrySeqno = raft->GetVolatileState()->PreVoteSeqno;
+    assert_true(retrySeqno != firstSeqno);
+    raft->Process(ts->Now(), NewHoldedMessage(
+        TMessageEx{.Src = 2, .Dst = 1, .Term = raft->GetState()->CurrentTerm, .Seqno = firstSeqno},
+        TPreVoteResponse{.ProspectiveTerm = prospectiveTerm, .VoteGranted = 1}));
+    assert_false(raft->GetVolatileState()->Votes.contains(2));
+    raft->Process(ts->Now(), NewHoldedMessage(
+        TMessageEx{.Src = 2, .Dst = 1, .Term = raft->GetState()->CurrentTerm, .Seqno = retrySeqno},
+        TPreVoteResponse{.ProspectiveTerm = prospectiveTerm, .VoteGranted = 1}));
+    assert_true(raft->GetVolatileState()->Votes.contains(2));
+    raft->ProcessTimeout(ts->Now());
+    assert_int_equal(raft->GetState()->CurrentTerm, prospectiveTerm);
 }
 
 void test_candidate_vote_request_small_term(void**) {
@@ -540,6 +587,12 @@ void test_candidate_vote_after_start(void**) {
     ts->Advance(std::chrono::milliseconds(10000));
     raft->Become(EState::CANDIDATE);
     raft->ProcessTimeout(ts->Now());
+    assert_int_equal(raft->GetState()->VotedFor, 0);
+    assert_int_equal(raft->GetState()->CurrentTerm, 1);
+    raft->Process(ts->Now(), NewHoldedMessage(TMessageEx{.Src = 2, .Dst = 1, .Term = 1,
+            .Seqno = raft->GetVolatileState()->PreVoteSeqno},
+        TPreVoteResponse{.ProspectiveTerm = 2, .VoteGranted = 1}));
+    raft->ProcessTimeout(ts->Now());
     assert_int_equal(raft->GetState()->VotedFor, 1);
     assert_int_equal(raft->GetState()->CurrentTerm, 2);
     auto req = NewHoldedMessage(TMessageEx {
@@ -576,26 +629,23 @@ void test_election_5_nodes(void**) {
     auto raft = MakeRaft({}, 5);
     ts->Advance(std::chrono::milliseconds(10000));
     raft->Become(EState::CANDIDATE);
-    auto req = NewHoldedMessage(TMessageEx {
-        .Src = 2,
-        .Dst = 1,
-        .Term = 2,
-    }, TRequestVoteResponse {
-        .VoteGranted = true,
-    });
     ts->Advance(std::chrono::milliseconds(10000));
     raft->ProcessTimeout(ts->Now());
-
-    raft->Process(ts->Now(), req);
-
-    assert_int_equal(raft->CurrentStateName(), EState::CANDIDATE);
-    req->Src = 2;
-    raft->Process(ts->Now(), req);
+    auto preVote = NewHoldedMessage(TMessageEx{.Src = 2, .Dst = 1, .Term = 1,
+            .Seqno = raft->GetVolatileState()->PreVoteSeqno},
+        TPreVoteResponse{.ProspectiveTerm = 2, .VoteGranted = 1});
+    raft->Process(ts->Now(), preVote);
+    preVote->Src = 3;
+    raft->Process(ts->Now(), preVote);
     raft->ProcessTimeout(ts->Now());
     assert_int_equal(raft->CurrentStateName(), EState::CANDIDATE);
-
-    req->Src = 4;
-    raft->Process(ts->Now(), req);
+    auto vote = NewHoldedMessage(TMessageEx{.Src = 2, .Dst = 1, .Term = 2},
+        TRequestVoteResponse{.VoteGranted = 1});
+    raft->Process(ts->Now(), vote);
+    raft->ProcessTimeout(ts->Now());
+    assert_int_equal(raft->CurrentStateName(), EState::CANDIDATE);
+    vote->Src = 4;
+    raft->Process(ts->Now(), vote);
     raft->ProcessTimeout(ts->Now());
     assert_int_equal(raft->CurrentStateName(), EState::LEADER);
 }
@@ -776,6 +826,7 @@ int main() {
         cmocka_unit_test(test_follower_append_entries_7f),
         cmocka_unit_test(test_follower_append_entries_empty_to_empty_log),
         cmocka_unit_test(test_candidate_initiate_election),
+        cmocka_unit_test(test_stale_pre_vote_response_cannot_authorize_retry_campaign),
         cmocka_unit_test(test_candidate_vote_request_small_term),
         cmocka_unit_test(test_candidate_vote_request_ok_term),
         cmocka_unit_test(test_candidate_vote_request_big),

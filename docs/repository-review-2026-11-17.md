@@ -99,14 +99,16 @@ callers must still handle capacity changes before proposing.
 
 ## General production gaps
 
-- No pre-vote RPC phase: timeout increments the durable term directly
-  (`raft.cpp:1690-1714`). Rejoining partitioned voters can disrupt a healthy
-  leader through inflated terms.
+- Pre-vote elections are now implemented. Grants are non-persistent, use the
+  active stable or joint quorum, and are suppressed until the recent leader
+  contact deadline passes. The deterministic suite covers high-term isolated
+  candidates and stale campaign responses. This reduces term disruption; it
+  is not a lease, and the new RPC types require all voters to upgrade together.
 - Quorum-contact leadership expiration is now implemented in LeaderTimeout.
   It uses the active stable or joint voter quorum and a fixed 20-second timeout.
   This is not a lease and does not guarantee there is no overlap with a newly
-  elected leader; pre-vote and configurable expiry remain open. Default leader
-  reads are weaker than consistent reads.
+  elected leader. The fixed expiry is not configurable. Default leader reads
+  are weaker than consistent reads.
 - TDurableState synchronously serializes and republishes the snapshot and
   retained log on every update (`durable.cpp:245-298`). There is no efficient
   WAL/group-commit path; disk work blocks the event loop. Legacy TDiskState
@@ -146,8 +148,8 @@ has narrower recovery, resource management and operational interfaces.
 NuRaft's streaming mode explicitly provides log-gap and in-flight byte caps;
 its logical snapshot callbacks permit application-defined objects; and its
 configurable leadership expiry can step down after missing quorum responses.
-MiniRaft now has a fixed-timeout counterpart, without NuRaft's configurable
-expiry or a pre-vote phase. Custom quorum policies, asynchronous replication
+MiniRaft now has pre-vote and a fixed-timeout leadership-expiration
+counterpart, without NuRaft's configurable expiry. Custom quorum policies, asynchronous replication
 and election priorities should follow the correctness/resource priorities:
 they add semantics and are not prerequisites for a robust standard Raft core.
 NuRaft's user-defined log-store support is not itself a guarantee that any
@@ -162,8 +164,8 @@ Sources consulted:
 - https://github.com/eBay/NuRaft/blob/master/docs/streaming_mode.md
 
 Recommended order: fix endpoint parsing; bound transport and client admission;
-implement pre-vote; then address WAL
-performance, large snapshots, membership administration and generated failure
-testing. Authentication and shutdown are necessary before exposing this as a
-general production service. No new consensus safety violation was established
-in this review; no independent reviewer approval is claimed.
+then address WAL performance, large snapshots, membership administration and
+generated failure testing. Authentication and shutdown are necessary before
+exposing this as a general production service. No new consensus safety
+violation was established in this review; no independent reviewer approval is
+claimed.
