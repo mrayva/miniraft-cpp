@@ -42,6 +42,28 @@ TMessageHolder<TLogEntry> MakeEntry(const char* text) {
 
 } // namespace
 
+void test_host_endpoint_parser_validates_all_fields(void**) {
+    const THost uneven{"localhost:80:12345"};
+    assert_string_equal(uneven.Address.c_str(), "localhost");
+    assert_int_equal(uneven.Port, 80);
+    assert_int_equal(uneven.Id, 12345);
+
+    const THost maximum{"[2001:db8::1]:65535:4294967295"};
+    assert_string_equal(maximum.Address.c_str(), "2001:db8::1");
+    assert_int_equal(maximum.Port, 65535);
+    assert_true(maximum.Id == UINT32_MAX);
+
+    for (const auto* endpoint : {"", "localhost", ":80:1", "localhost::1",
+            "localhost:0:1", "localhost:65536:1", "localhost:80:0",
+            "localhost:80:4294967296", "localhost:80:1:extra", "[]:80:1",
+            "[::1]80:1", "[::1]:80:1:extra"}) {
+        bool rejected = false;
+        try { (void)THost{endpoint}; }
+        catch (const std::invalid_argument&) { rejected = true; }
+        assert_true(rejected);
+    }
+}
+
 void test_message_send_recv(void**) {
     auto mes = MakeEntry("MESSAGE");
 
@@ -354,6 +376,7 @@ void test_serving_server_retires_demoted_joint_voter_reader(void**) {
 
 int main() {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test(test_host_endpoint_parser_validates_all_fields),
         cmocka_unit_test(test_message_send_recv),
         cmocka_unit_test(test_read_write),
         cmocka_unit_test(test_read_write_payload),

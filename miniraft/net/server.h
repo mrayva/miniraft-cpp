@@ -1,8 +1,11 @@
 #pragma once
 
 #include <exception>
+#include <cstdint>
 #include <memory>
 #include <coroutine>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <charconv>
 #include <optional>
@@ -100,14 +103,48 @@ struct THost {
     }
 
     THost(const std::string& str) {
-        std::string_view s(str);
-        auto p = s.find(':');
-        Address = s.substr(0, p);
-        s = s.substr(p + 1);
-        p = s.find(':');
-        std::from_chars(s.begin(), s.begin()+p, Port);
-        s = s.substr(p + 1);
-        std::from_chars(s.begin(), s.begin()+p, Id);
+        const std::string_view input(str);
+        size_t addressBegin = 0;
+        size_t addressEnd = 0;
+        size_t portBegin = 0;
+        size_t portEnd = 0;
+        size_t idBegin = 0;
+
+        if (!input.empty() && input.front() == '[') {
+            const auto close = input.find(']');
+            if (close == std::string_view::npos || close == 1 || close + 1 >= input.size() ||
+                input[close + 1] != ':')
+                throw std::invalid_argument("Invalid bracketed node address");
+            addressBegin = 1;
+            addressEnd = close;
+            portBegin = close + 2;
+            portEnd = input.find(':', portBegin);
+            if (portEnd == std::string_view::npos || input.find(':', portEnd + 1) != std::string_view::npos)
+                throw std::invalid_argument("Node endpoint must be address:port:id");
+            idBegin = portEnd + 1;
+        } else {
+            addressEnd = input.find(':');
+            if (addressEnd == std::string_view::npos || addressEnd == 0)
+                throw std::invalid_argument("Node endpoint must be address:port:id");
+            portBegin = addressEnd + 1;
+            portEnd = input.find(':', portBegin);
+            if (portEnd == std::string_view::npos || input.find(':', portEnd + 1) != std::string_view::npos)
+                throw std::invalid_argument("Node endpoint must be address:port:id");
+            idBegin = portEnd + 1;
+        }
+
+        const auto address = input.substr(addressBegin, addressEnd - addressBegin);
+        const auto port = input.substr(portBegin, portEnd - portBegin);
+        const auto id = input.substr(idBegin);
+        uint32_t parsedPort = 0;
+        const auto parsedPortResult = std::from_chars(port.data(), port.data() + port.size(), parsedPort);
+        const auto parsedIdResult = std::from_chars(id.data(), id.data() + id.size(), Id);
+        if (address.empty() || parsedPortResult.ec != std::errc{} ||
+            parsedPortResult.ptr != port.data() + port.size() || parsedPort == 0 || parsedPort > 65535 ||
+            parsedIdResult.ec != std::errc{} || parsedIdResult.ptr != id.data() + id.size() || !Id)
+            throw std::invalid_argument("Invalid node address, port, or ID");
+        Address.assign(address);
+        Port = static_cast<int>(parsedPort);
     }
 
     void DebugPrint() const {
