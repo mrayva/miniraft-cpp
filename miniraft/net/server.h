@@ -31,6 +31,11 @@ void ReconcilePeerResponseReaders(const TPeerMap& peers,
 }
 }
 
+class TNodeQueueFull : public std::runtime_error {
+public:
+    TNodeQueueFull() : std::runtime_error("Outbound node queue limit exceeded") {}
+};
+
 template<typename TSocket>
 class TMessageReader {
 public:
@@ -157,6 +162,13 @@ struct THost {
 template<typename TSocket>
 class TNode: public INode {
 public:
+    static constexpr size_t MaxQueuedDataMessages = 128;
+    static constexpr uint64_t MaxQueuedDataBytes = 16 * 1024 * 1024;
+    // Four pending control messages; queued retries are coalesced by traffic
+    // class. AppendEntries and snapshot chunks share the replication class.
+    static constexpr size_t MaxQueuedRaftMessages = 4;
+    static constexpr uint64_t MaxQueuedRaftBytes = 64 * 1024 * 1024 + 4096;
+
     TNode(const std::function<TSocket(const NNet::TAddress&)> factory, const std::string& name, NNet::TAddress address, const std::shared_ptr<ITimeSource>& ts)
         : Name(name)
         , Address(address)
@@ -172,6 +184,7 @@ public:
     { }
 
     void Send(TMessageHolder<TMessage> message) override;
+    bool TrySend(TMessageHolder<TMessage> message) override;
     void Drain() override;
     // Called after a failed outbound read, once its reader has unwound. A stale
     // reader cannot disconnect a newer connection or its pending connector.
@@ -203,6 +216,12 @@ public:
     }
 
 private:
+    enum class EQueueClass : uint8_t { Client, Vote, Replication, TimeoutNow, ConfigurationBarrier };
+    static EQueueClass QueueClassFor(uint32_t type);
+    static bool TryGetMessageTreeBytes(const TMessageHolder<TMessage>& message, uint64_t& bytes);
+    void RecountPendingMessages();
+    void CompletePendingMessage(EQueueClass queueClass, uint64_t bytes);
+
     void Connect();
     void ShutdownSocket() noexcept;
 
@@ -224,6 +243,9 @@ private:
     std::coroutine_handle<> Connector;
 
     std::vector<TMessageHolder<TMessage>> Messages;
+    // Includes messages in Messages and in the active writer batch.
+    size_t PendingDataMessages = 0, PendingRaftMessages = 0;
+    uint64_t PendingDataBytes = 0, PendingRaftBytes = 0;
 };
 
 template<typename TSocket>

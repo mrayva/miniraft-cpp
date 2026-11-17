@@ -1047,7 +1047,7 @@ void TRaft::RefreshConfiguration(uint64_t commitIndex) {
 
 void TRaft::OnRequestVote(ITimeSource::Time now, TMessageHolder<TRequestVoteRequest> message) {
     if (!IsVoter(Id)) {
-        Nodes.at(message->Src)->Send(NewHoldedMessage(
+        (void)Nodes.at(message->Src)->TrySend(NewHoldedMessage(
             TMessageEx{.Src = Id, .Dst = message->Src, .Term = State->CurrentTerm}, TRequestVoteResponse{.VoteGranted = false}));
         return;
     }
@@ -1055,7 +1055,7 @@ void TRaft::OnRequestVote(ITimeSource::Time now, TMessageHolder<TRequestVoteRequ
         auto reply = NewHoldedMessage(
             TMessageEx {.Src = Id, .Dst = message->Src, .Term = State->CurrentTerm},
             TRequestVoteResponse {.VoteGranted = false});
-        Nodes[reply->Dst]->Send(std::move(reply));
+        (void)Nodes[reply->Dst]->TrySend(std::move(reply));
     } else if (message->Term == State->CurrentTerm) {
         bool accept = false;
         if (State->VotedFor == 0 || State->VotedFor == message->CandidateId) {
@@ -1076,7 +1076,7 @@ void TRaft::OnRequestVote(ITimeSource::Time now, TMessageHolder<TRequestVoteRequ
             State->Commit();
         }
 
-        Nodes[reply->Dst]->Send(std::move(reply));
+        (void)Nodes[reply->Dst]->TrySend(std::move(reply));
     }
 }
 
@@ -1102,7 +1102,7 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
                 .Success = false,
                 .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier,
             });
-        Nodes[reply->Dst]->Send(std::move(reply));
+        (void)Nodes[reply->Dst]->TrySend(std::move(reply));
         return;
     }
 
@@ -1155,7 +1155,7 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
         .SetElectionDue(MakeElection(now));
 
     Become(EState::FOLLOWER);
-    Nodes[reply->Dst]->Send(std::move(reply));
+    (void)Nodes[reply->Dst]->TrySend(std::move(reply));
 }
 
 void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntriesResponse> message) {
@@ -1616,7 +1616,7 @@ void TRaft::FollowerTimeout(ITimeSource::Time now) {
         now < VolatileState->ElectionDue) {
         auto& transfer = *VolatileState->LeadershipTransfer;
         transfer.RetryDue = now + TTimeout::LeadershipTransferRetry;
-        Nodes.at(transfer.TargetId)->Send(NewHoldedMessage(
+        (void)Nodes.at(transfer.TargetId)->TrySend(NewHoldedMessage(
             TMessageEx{.Src = Id, .Dst = transfer.TargetId, .Term = State->CurrentTerm},
             TTimeoutNowRequest{
                 .LeaderId = Id, .TargetId = transfer.TargetId,
@@ -1636,7 +1636,7 @@ void TRaft::CandidateTimeout(ITimeSource::Time now) {
         if (!IsVoter(id)) continue;
         if (VolatileState->RpcDue[id] <= now) {
             VolatileState->RpcDue[id] = now + TTimeout::Rpc;
-            node->Send(CreateVote(id));
+            (void)node->TrySend(CreateVote(id));
         }
     }
 }
@@ -1649,8 +1649,8 @@ void TRaft::LeaderTimeout(ITimeSource::Time now) {
         {
             VolatileState->HeartbeatDue[id] = now + TTimeout::Election / 2;
             VolatileState->RpcDue[id] = now + TTimeout::Rpc;
-            if (VolatileState->NextIndex[id] <= State->SnapshotIndex) node->Send(CreateInstallSnapshot(id));
-            else node->Send(CreateAppendEntries(id));
+            if (VolatileState->NextIndex[id] <= State->SnapshotIndex) (void)node->TrySend(CreateInstallSnapshot(id));
+            else (void)node->TrySend(CreateAppendEntries(id));
         }
     }
 
@@ -1666,8 +1666,8 @@ uint64_t TRaft::ApproveRead() {
     // emitted below is newer than this barrier; old replies cannot satisfy it.
     const uint64_t seqno = NextSeqno();
     for (auto& [id, node] : Nodes) {
-        if (VolatileState->NextIndex[id] <= State->SnapshotIndex) node->Send(CreateInstallSnapshot(id));
-        else node->Send(CreateAppendEntries(id));
+        if (VolatileState->NextIndex[id] <= State->SnapshotIndex) (void)node->TrySend(CreateInstallSnapshot(id));
+        else (void)node->TrySend(CreateAppendEntries(id));
     }
     return seqno;
 }
@@ -1936,7 +1936,7 @@ void TRaft::TransferLeadership(uint32_t target, ITimeSource::Time now) {
     IncomingSnapshot.reset();
     EncodedSnapshot.reset();
     EncodedSnapshotIndex = 0;
-    Nodes.at(target)->Send(std::move(request));
+    (void)Nodes.at(target)->TrySend(std::move(request));
 }
 
 void TRaft::OnTimeoutNow(ITimeSource::Time now, TMessageHolder<TTimeoutNowRequest>) {
@@ -1965,7 +1965,7 @@ void TRaft::OnConfigurationBarrier(TMessageHolder<TConfigurationBarrierRequest> 
             .ConfigurationTerm = request->ConfigurationTerm,
             .Accepted = uint32_t(accepted),
         });
-    Nodes.at(reply->Dst)->Send(std::move(reply));
+    (void)Nodes.at(reply->Dst)->TrySend(std::move(reply));
 }
 
 void TRaft::OnConfigurationBarrier(ITimeSource::Time now,
@@ -2029,7 +2029,7 @@ void TRaft::MaybeDistributeConfigurationBarrier(ITimeSource::Time now) {
             });
         VolatileState->ConfigurationBarrierRpcs[voter] = {
             seqno, index, term, now + TTimeout::Rpc};
-        Nodes.at(voter)->Send(std::move(request));
+        (void)Nodes.at(voter)->TrySend(std::move(request));
     }
 }
 
@@ -2224,7 +2224,7 @@ void TRaft::OnInstallSnapshot(TMessageHolder<TInstallSnapshotResponse> response)
 
 void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnapshotRequest> request) {
     auto reply = [&](bool success, bool installed, uint64_t offset) {
-        Nodes.at(request->Src)->Send(NewHoldedMessage(
+        (void)Nodes.at(request->Src)->TrySend(NewHoldedMessage(
             TMessageEx{.Src = Id, .Dst = request->Src, .Term = State->CurrentTerm, .Seqno = request->Seqno},
             TInstallSnapshotResponse{.SnapshotIndex = request->SnapshotIndex, .NextOffset = offset,
                 .Success = uint32_t(success), .Installed = uint32_t(installed)}));
@@ -2598,7 +2598,10 @@ void TRequestProcessor::Forward(TMessageHolder<TCommandRequest> command, const s
         auto peer = Nodes.at(leaderId);
         Forwarded.emplace(cookie, TForwarded{replyTo, peer, command->Cookie,
                                             leaderId, Raft->GetState()->CurrentTerm});
-        peer->Send(std::move(forwarded));
+        if (!peer->TrySend(std::move(forwarded))) {
+            Forwarded.erase(cookie);
+            replyTo->Send(NewHoldedMessage(TCommandResponse{.Cookie = command->Cookie, .ErrorCode = 1}));
+        }
         return;
     }
 

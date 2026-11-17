@@ -64,6 +64,49 @@ void test_host_endpoint_parser_validates_all_fields(void**) {
     }
 }
 
+void test_node_send_queue_bounds_data_and_coalesces_raft_retries(void**) {
+    NNet::TLoop<NNet::TPoll> loop;
+    auto& poller = loop.Poller();
+    auto timeSource = std::make_shared<TTimeSource>();
+    auto makeNode = [&] {
+        return TNode<NNet::TSocket>(
+            [&](const NNet::TAddress& address) { return NNet::TSocket(address, poller); },
+            "queue-test", NNet::TAddress{"127.0.0.1", 65534}, timeSource);
+    };
+
+    auto countBounded = makeNode();
+    for (size_t i = 0; i < TNode<NNet::TSocket>::MaxQueuedDataMessages; ++i)
+        assert_true(countBounded.TrySend(NewHoldedMessage<TCommandResponse>()));
+    assert_false(countBounded.TrySend(NewHoldedMessage<TCommandResponse>()));
+    bool sendRejected = false;
+    try { countBounded.Send(NewHoldedMessage<TCommandResponse>()); }
+    catch (const TNodeQueueFull&) { sendRejected = true; }
+    assert_true(sendRejected);
+
+    auto byteBounded = makeNode();
+    constexpr size_t halfBudget = TNode<NNet::TSocket>::MaxQueuedDataBytes / 2;
+    const auto largeReply = [&] {
+        return NewHoldedMessage<TCommandResponse>(halfBudget);
+    };
+    assert_true(byteBounded.TrySend(largeReply()));
+    assert_true(byteBounded.TrySend(largeReply()));
+    assert_false(byteBounded.TrySend(largeReply()));
+
+    auto coalesced = makeNode();
+    for (uint64_t i = 1; i <= 1000; ++i) {
+        auto request = NewHoldedMessage<TAppendEntriesRequest>();
+        request->Term = i;
+        assert_true(coalesced.TrySend(std::move(request)));
+    }
+    assert_true(coalesced.TrySend(NewHoldedMessage<TConfigurationBarrierRequest>()));
+    assert_true(coalesced.TrySend(NewHoldedMessage<TRequestVoteRequest>()));
+
+    auto retired = makeNode();
+    retired.Retire();
+    assert_false(retired.TrySend(NewHoldedMessage<TCommandResponse>()));
+    retired.Send(NewHoldedMessage<TCommandResponse>()); // Preserve retired Send's no-op behavior.
+}
+
 void test_message_send_recv(void**) {
     auto mes = MakeEntry("MESSAGE");
 
@@ -377,6 +420,7 @@ void test_serving_server_retires_demoted_joint_voter_reader(void**) {
 int main() {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_host_endpoint_parser_validates_all_fields),
+        cmocka_unit_test(test_node_send_queue_bounds_data_and_coalesces_raft_retries),
         cmocka_unit_test(test_message_send_recv),
         cmocka_unit_test(test_read_write),
         cmocka_unit_test(test_read_write_payload),

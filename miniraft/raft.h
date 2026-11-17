@@ -19,6 +19,12 @@
 struct INode {
     virtual ~INode() = default;
     virtual void Send(TMessageHolder<TMessage> message) = 0;
+    // Bounded transports may reject best-effort protocol work without
+    // throwing. Existing transports remain source compatible by default.
+    virtual bool TrySend(TMessageHolder<TMessage> message) {
+        Send(std::move(message));
+        return true;
+    }
     virtual void Drain() = 0;
 };
 

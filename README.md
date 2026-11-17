@@ -18,6 +18,8 @@ The [forwarding follow-up](docs/forwarding.md) preserves client cookies and bind
 forwarded replies to their original leader, term and outbound peer.
 The [network framing follow-up](docs/network-frames.md) handles fragmented input
 and enforces type, frame, batch and AppendEntries payload bounds.
+The [outbound queue follow-up](docs/outbound-queue-bounds.md) bounds per-peer
+retained traffic and coalesces obsolete Raft retries.
 The [consensus validation follow-up](docs/consensus-validation.md) checks RPC
 identities and indices, protects committed prefixes and correlates acknowledgements.
 The [application payload follow-up](docs/application-payloads.md) validates KV,

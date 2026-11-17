@@ -23,19 +23,21 @@ This affected example endpoint configuration, including the advertised full
 32-bit node-ID support. The working tree now parses the actual port and ID
 fields, rejects malformed numeric input and invalid ranges, and accepts
 bracketed IPv6 addresses. A regression covers unequal field lengths, full-width
-IDs, missing fields, overflow, invalid ports and trailing garbage. The fix has
-not yet been committed.
+IDs, missing fields, overflow, invalid ports and trailing garbage.
 
-### P1: outbound queues grow without bounds while a peer is unavailable
+### P1: outbound queues grow without bounds while a peer is unavailable — fixed
 
-`miniraft/net/node_impl.h:5-7,21-23`: Send always appends; a disconnected Drain
-only attempts connection. LeaderTimeout and ApproveRead continue generating
-replication traffic. An unavailable learner or voter can therefore retain
-increasing numbers of messages while a healthy majority continues working.
-The bounded AppendEntries correlation deque does not bound this transport queue.
-Add byte/count budgets and a policy for superseding obsolete replication
-messages. Keep client response failure behavior distinct from retryable Raft
-traffic. Verify prolonged disconnect and recovery under ongoing writes.
+Each `TNode` now bounds pending data traffic to 128 messages / 16 MiB and Raft
+control traffic to four messages / 64 MiB plus 4 KiB. Queued requests are
+coalesced by traffic class; AppendEntries and snapshot chunks share the
+replication class. The accounting includes messages detached into the active
+writer batch. Raft peer messages use `TrySend` and rely on their protocol retry
+paths after rejection. Forwarding uses `TrySend` to reject the specific command
+with the existing error response and remove its route. Direct `Send` reports
+overflow with `TNodeQueueFull`, and the server's periodic task survives it.
+Deterministic regressions cover disconnected queue count and byte caps, retry
+coalescing, and rejected forwarded work. These are per-peer bounds; aggregate
+memory still scales with the number of peers.
 
 ### P1: pending client work has no admission or deadline budget
 

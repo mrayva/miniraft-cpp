@@ -11,8 +11,15 @@ extern "C" {
 namespace {
 struct TEndpoint : INode {
     std::function<void(TMessageHolder<TMessage>)> Callback;
+    std::vector<TMessageHolder<TMessage>> Rejected;
+    bool Accept = true;
     explicit TEndpoint(std::function<void(TMessageHolder<TMessage>)> cb) : Callback(std::move(cb)) {}
     void Send(TMessageHolder<TMessage> message) override { Callback(std::move(message)); }
+    bool TrySend(TMessageHolder<TMessage> message) override {
+        if (!Accept) { Rejected.push_back(std::move(message)); return false; }
+        Send(std::move(message));
+        return true;
+    }
     void Drain() override {}
 };
 struct TClient {
@@ -83,6 +90,23 @@ void test_malformed_forwarded_reply_does_not_consume_route(void**) {
     assert_int_equal(client.Replies.size(), 1);
     assert_int_equal(client.Replies[0].Cookie, 42);
     assert_string_equal(client.Replies[0].Data.c_str(), "answer");
+}
+
+void test_forwarded_send_rejection_fails_client_and_discards_route(void**) {
+    TFollower follower;
+    TClient client;
+    follower.Leader->Accept = false;
+    follower.Request(client, 42);
+
+    assert_int_equal(follower.Leader->Rejected.size(), 1);
+    assert_int_equal(client.Replies.size(), 1);
+    assert_int_equal(client.Replies[0].Cookie, 42);
+    assert_int_equal(client.Replies[0].Error, 1);
+
+    const auto forwarded = follower.Leader->Rejected[0].Cast<TCommandRequest>();
+    auto lateReply = NewHoldedMessage(TCommandResponse{.Cookie = forwarded->Cookie});
+    follower.Processor.OnCommandResponse(lateReply, follower.Leader);
+    assert_int_equal(client.Replies.size(), 1);
 }
 
 void test_nonzero_client_cookies_are_forwarded(void**) {
@@ -286,6 +310,7 @@ void test_runtime_peer_endpoint_updates_forwarding_routes(void**) {
 int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_malformed_forwarded_reply_does_not_consume_route),
+        cmocka_unit_test(test_forwarded_send_rejection_fails_client_and_discards_route),
         cmocka_unit_test(test_nonzero_client_cookies_are_forwarded),
         cmocka_unit_test(test_zero_client_cookie_is_restored),
         cmocka_unit_test(test_forwarding_copies_request_and_marks_one_hop),
