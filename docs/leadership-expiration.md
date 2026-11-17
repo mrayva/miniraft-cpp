@@ -1,8 +1,9 @@
 # Quorum-contact leadership expiration
 
-A leader that stops hearing from a voting quorum now yields leadership after
-`TTimeout::LeadershipExpiration` (20 seconds by default). The timer uses the
-same monotonic timestamps supplied to `TRaft::Process` and
+A leader that stops hearing from a voting quorum yields leadership after
+`TRaft::TLogLimits::LeadershipExpiration` (20 seconds by default). Configure
+it on each `TRaft` instance before processing network traffic. The timer uses
+the same monotonic timestamps supplied to `TRaft::Process` and
 `TRaft::ProcessTimeout`.
 
 Only correlated responses from active voters count. AppendEntries responses
@@ -17,13 +18,17 @@ volatile replication-transfer state, and starts an ordinary randomized
 election timeout. Expiration does not increment or persist the term. A
 single-voter cluster remains leader because its local voter is available.
 
-The timeout is currently a fixed constant, not a per-cluster option. It is a
-liveness measure, not a leadership lease: it does not guarantee that an old
-leader and a newly elected leader never overlap during a partition. Pre-vote
-reduces term disruption from isolated candidates, but does not provide that
-lease guarantee. Strong reads continue to require a fresh quorum
-acknowledgement; default leader reads do not provide that guarantee.
+The timeout is configured per Raft instance and must exceed the fixed heartbeat
+interval (`TTimeout::Election / 2`, currently 2.5 seconds), so a healthy leader
+can receive a response before expiration. It is a liveness measure, not a
+leadership lease: it does not guarantee that an old leader and a newly elected
+leader never overlap during a partition. Pre-vote reduces term disruption from
+isolated candidates, but does not provide that lease guarantee. Strong reads
+continue to require a fresh quorum acknowledgement; default leader reads do not
+provide that guarantee.
 
-The deterministic regression keeps a healthy leader active beyond one expiry
-window, then isolates it and checks that it yields exactly when the last known
-quorum response expires.
+Deterministic regressions keep a healthy leader active beyond the default
+expiry window, then isolate it and check that it yields at the last known quorum
+response deadline. A second regression configures a shorter timeout and verifies
+that it controls the deadline; nonpositive values and values no greater than
+the heartbeat interval are rejected.

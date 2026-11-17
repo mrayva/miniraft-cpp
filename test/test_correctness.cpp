@@ -25,10 +25,12 @@ struct TManualTimeSource : ITimeSource {
 // Virtual time and a manually scheduled network: no sockets, sleeps or wall clock.
 struct TCluster {
     ITimeSource::Time Now{};
+    TRaft::TLogLimits Limits;
     std::vector<std::shared_ptr<TRaft>> Nodes;
     std::deque<TMessageHolder<TMessage>> Packets;
     std::set<uint32_t> Isolated;
-    explicit TCluster(uint32_t count) {
+    explicit TCluster(uint32_t count, TRaft::TLogLimits limits = {})
+        : Limits(std::move(limits)) {
         for (uint32_t id = 1; id <= count; ++id) {
             TNodeDict peers;
             for (uint32_t dst = 1; dst <= count; ++dst) {
@@ -36,7 +38,8 @@ struct TCluster {
                     Packets.push_back(std::move(m));
                 });
             }
-            Nodes.push_back(std::make_shared<TRaft>(std::make_shared<TState>(), id, peers));
+            Nodes.push_back(std::make_shared<TRaft>(std::make_shared<TState>(), id, peers,
+                std::vector<uint32_t>{}, Limits));
         }
     }
     void Restart(uint32_t id) {
@@ -48,7 +51,8 @@ struct TCluster {
             });
         }
         // Retain stable term/vote/log; discard all Raft volatile state.
-        Nodes.at(id - 1) = std::make_shared<TRaft>(state, id, peers);
+        Nodes.at(id - 1) = std::make_shared<TRaft>(state, id, peers,
+            std::vector<uint32_t>{}, Limits);
     }
     void Drain(bool reverse = false, bool duplicate = false) {
         size_t budget = 10000;
@@ -644,6 +648,43 @@ void test_leader_expires_after_losing_fresh_voter_quorum(void**) {
     leader->ProcessTimeout(cluster.Now);
     assert_int_equal(leader->CurrentStateName(), EState::FOLLOWER);
     assert_int_equal(leader->GetLeaderId(), 0);
+}
+
+void test_leader_expiration_uses_configured_timeout(void**) {
+    constexpr auto timeout = std::chrono::seconds(4);
+    TCluster cluster(3, TRaft::TLogLimits{.LeadershipExpiration = timeout});
+    cluster.Elect(1);
+    cluster.Replicate(1);
+
+    auto& leader = cluster.Nodes[0];
+    cluster.Now += std::chrono::seconds(2);
+    leader->ProcessTimeout(cluster.Now);
+    cluster.Drain(); // Anchor expiry to a fresh quorum response at a known time.
+    cluster.Isolated.insert(1);
+
+    cluster.Now += timeout - std::chrono::milliseconds(1);
+    leader->ProcessTimeout(cluster.Now);
+    assert_int_equal(leader->CurrentStateName(), EState::LEADER);
+
+    cluster.Now += std::chrono::milliseconds(1);
+    leader->ProcessTimeout(cluster.Now);
+    assert_int_equal(leader->CurrentStateName(), EState::FOLLOWER);
+    assert_int_equal(leader->GetLeaderId(), 0);
+}
+
+void test_invalid_leadership_expiration_is_rejected(void**) {
+    for (auto timeout : {std::chrono::milliseconds::zero(), std::chrono::milliseconds(-1),
+                         TTimeout::Election / 2}) {
+        auto limits = TRaft::TLogLimits{};
+        limits.LeadershipExpiration = timeout;
+        bool rejected = false;
+        try {
+            TRaft raft(std::make_shared<TState>(), 1, TNodeDict{}, std::vector<uint32_t>{}, limits);
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        assert_true(rejected);
+    }
 }
 
 void test_uncommitted_log_budget_survives_disconnect_and_releases_after_commit(void**) {
@@ -1411,6 +1452,8 @@ int main() {
         cmocka_unit_test(test_deadline_expires_strong_read_waiting_for_quorum),
         cmocka_unit_test(test_deadlines_cover_slow_validation_preparation_and_read_callbacks),
         cmocka_unit_test(test_leader_expires_after_losing_fresh_voter_quorum),
+        cmocka_unit_test(test_leader_expiration_uses_configured_timeout),
+        cmocka_unit_test(test_invalid_leadership_expiration_is_rejected),
         cmocka_unit_test(test_uncommitted_log_budget_survives_disconnect_and_releases_after_commit),
         cmocka_unit_test(test_follower_rejects_append_batch_that_exceeds_uncommitted_log_budget),
         cmocka_unit_test(test_follower_log_budget_is_reclaimed_when_leader_replaces_uncommitted_suffix),

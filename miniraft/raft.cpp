@@ -905,6 +905,10 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
         LogLimits.ReservedControlBytes > LogLimits.MaxUncommittedBytes ||
         LogLimits.ReservedControlEntries > LogLimits.MaxUncommittedEntries)
         throw std::invalid_argument("Raft uncommitted-log limits must be positive");
+    if (LogLimits.LeadershipExpiration <= TTimeout::Election / 2 ||
+        LogLimits.LeadershipExpiration > std::chrono::duration_cast<std::chrono::milliseconds>(
+            ITimeSource::Time::duration::max()))
+        throw std::invalid_argument("Leadership expiration must exceed the heartbeat interval");
     // Equal seeds make simultaneously started voters campaign in lockstep.
     // An odd multiplier gives every nonzero node ID a distinct stream.
     Seed = Id * 0x9e3779b9u;
@@ -1856,7 +1860,7 @@ void TRaft::LeaderTimeout(ITimeSource::Time now) {
 bool TRaft::HasRecentLeadershipQuorum(ITimeSource::Time now) const {
     const auto latestQuorumResponse = LatestLeadershipQuorumResponse(now);
     return latestQuorumResponse && now >= *latestQuorumResponse &&
-        now - *latestQuorumResponse < TTimeout::LeadershipExpiration;
+        now - *latestQuorumResponse < LogLimits.LeadershipExpiration;
 }
 
 std::optional<ITimeSource::Time> TRaft::LatestLeadershipQuorumResponse(ITimeSource::Time now) const {
@@ -1872,14 +1876,22 @@ void TRaft::RecordLeadershipResponse(ITimeSource::Time now, uint32_t nodeId) {
     if (StateName != EState::LEADER || nodeId == Id || !IsVoter(nodeId)) return;
     VolatileState->QuorumResponseTime[nodeId] = now;
     if (const auto latest = LatestLeadershipQuorumResponse(now))
-        VolatileState->LeadershipExpiryDue = *latest + TTimeout::LeadershipExpiration;
+        VolatileState->LeadershipExpiryDue = LeadershipExpirationDeadline(*latest);
+}
+
+ITimeSource::Time TRaft::LeadershipExpirationDeadline(ITimeSource::Time latestResponse) const {
+    const auto timeout = std::chrono::duration_cast<ITimeSource::Time::duration>(
+        LogLimits.LeadershipExpiration);
+    if (latestResponse > ITimeSource::Time::max() - timeout)
+        return ITimeSource::Time::max();
+    return latestResponse + timeout;
 }
 
 void TRaft::ExpireLeadership(ITimeSource::Time now) {
     if (StateName != EState::LEADER || now < VolatileState->LeadershipExpiryDue) return;
     if (HasRecentLeadershipQuorum(now)) {
         if (const auto latest = LatestLeadershipQuorumResponse(now))
-            VolatileState->LeadershipExpiryDue = *latest + TTimeout::LeadershipExpiration;
+            VolatileState->LeadershipExpiryDue = LeadershipExpirationDeadline(*latest);
         return;
     }
 

@@ -108,10 +108,10 @@ callers must still handle capacity changes before proposing.
   candidates and stale campaign responses. This reduces term disruption; it
   is not a lease, and the new RPC types require all voters to upgrade together.
 - Quorum-contact leadership expiration is now implemented in LeaderTimeout.
-  It uses the active stable or joint voter quorum and a fixed 20-second timeout.
-  This is not a lease and does not guarantee there is no overlap with a newly
-  elected leader. The fixed expiry is not configurable. Default leader reads
-  are weaker than consistent reads.
+  It uses the active stable or joint voter quorum and a configurable timeout
+  that defaults to 20 seconds. This is not a lease and does not guarantee there
+  is no overlap with a newly elected leader. Default leader reads are weaker
+  than consistent reads.
 - TDurableState synchronously serializes and republishes the snapshot and
   retained log on every update (`durable.cpp:245-298`). There is no efficient
   WAL/group-commit path; disk work blocks the event loop. Legacy TDiskState
@@ -151,10 +151,10 @@ has narrower recovery, resource management and operational interfaces.
 NuRaft's streaming mode explicitly provides log-gap and in-flight byte caps;
 its logical snapshot callbacks permit application-defined objects; and its
 configurable leadership expiry can step down after missing quorum responses.
-MiniRaft now has pre-vote and a fixed-timeout leadership-expiration
-counterpart, without NuRaft's configurable expiry. Custom quorum policies, asynchronous replication
-and election priorities should follow the correctness/resource priorities:
-they add semantics and are not prerequisites for a robust standard Raft core.
+MiniRaft now has pre-vote and configurable leadership expiration. Custom
+quorum policies, asynchronous replication and election priorities should follow
+the correctness/resource priorities: they add semantics and are not
+prerequisites for a robust standard Raft core.
 NuRaft's user-defined log-store support is not itself a guarantee that any
 particular storage implementation is durable.
 

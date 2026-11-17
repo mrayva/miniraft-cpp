@@ -182,9 +182,9 @@ enum class EState: int {
 
 class TRaft {
 public:
-    // Hard per-node bound for the suffix above the commit index. Reserve room
-    // for one current-term leader no-op; repeated uncommitted terms may consume
-    // the finite reserve and require operator recovery to restore progress.
+    // Per-node proposal and failure-detection settings. The log limits reserve
+    // room for a current-term leader no-op; repeated uncommitted terms may
+    // consume the finite reserve and require operator recovery to restore progress.
     struct TLogLimits {
         uint64_t MaxUncommittedBytes = 256ull * 1024 * 1024;
         size_t MaxUncommittedEntries = 65536;
@@ -192,6 +192,8 @@ public:
         // Repeated failed terms can still consume this finite reserve.
         uint64_t ReservedControlBytes = sizeof(TLogEntry);
         size_t ReservedControlEntries = 1;
+        // Yield leadership after this long without a fresh voter quorum.
+        std::chrono::milliseconds LeadershipExpiration = TTimeout::LeadershipExpiration;
     };
 
     // Nodes contains every configured replication peer; learners may include
@@ -328,6 +330,7 @@ private:
     std::optional<ITimeSource::Time> LatestLeadershipQuorumResponse(ITimeSource::Time now) const;
     bool HasRecentLeadershipQuorum(ITimeSource::Time now) const;
     void RecordLeadershipResponse(ITimeSource::Time now, uint32_t nodeId);
+    ITimeSource::Time LeadershipExpirationDeadline(ITimeSource::Time latestResponse) const;
     void ExpireLeadership(ITimeSource::Time now);
 
     TMessageHolder<TRequestVoteRequest> CreateVote(uint32_t nodeId);
