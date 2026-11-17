@@ -257,11 +257,12 @@ public:
         const std::shared_ptr<TRaft>& raft,
         const std::shared_ptr<IRsm>& rsm,
         const TNodeDict& nodes,
-        const std::shared_ptr<ITimeSource>& ts)
+        const std::shared_ptr<ITimeSource>& ts,
+        TRequestProcessor::TAdmissionLimits admissionLimits = {})
         : Poller(poller)
         , Socket(std::move(socket))
         , Raft(raft)
-        , RequestProcessor(std::make_shared<TRequestProcessor>(raft, rsm, nodes))
+        , RequestProcessor(std::make_shared<TRequestProcessor>(raft, rsm, nodes, admissionLimits))
         , TimeSource(ts)
     {
         for (const auto& [id, node] : nodes) {

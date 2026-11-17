@@ -39,16 +39,22 @@ Deterministic regressions cover disconnected queue count and byte caps, retry
 coalescing, and rejected forwarded work. These are per-peer bounds; aggregate
 memory still scales with the number of peers.
 
-### P1: pending client work has no admission or deadline budget
+### P1: pending client work has no admission or deadline budget — partially fixed
 
-`miniraft/raft.h:364-386` and `miniraft/raft.cpp:2568-2698`: waiting reads,
-writes, requests awaiting a leader and forwarded requests have no aggregate
-byte/count limit or request deadline. Role changes and disconnects clean up
-some requests, but an open connection with an unchanged role can keep requests
-alive indefinitely. Quorum loss plus continued admission can exhaust memory;
-the leader may also keep growing its uncommitted durable log.
-Add admission limits before append/forwarding, request deadlines, and explicit
-overload/unknown-write-outcome responses. This is distinct from per-frame limits.
+`miniraft/raft.h:334-418` and `miniraft/raft.cpp:2540-2940`: waiting reads,
+writes, requests awaiting a leader and forwarded requests now share default
+limits of 1024 requests and 64 MiB of request frames per processor. A separate
+64 MiB cap bounds cached local write replies. Requests rejected at admission
+receive ErrorCode=3 before application validation, append or forwarding. The
+limits are configurable at processor/server construction and are covered across
+write, leader-wait and forwarded paths.
+
+Requests still have no deadline and can remain pending while their role or peer
+state does not change, though their count and memory are bounded. A disconnected
+client's already-appended write remains in the durable log; the log itself has
+no uncommitted-entry budget. Those two controls remain open. ErrorCode=1 still
+means the outcome may be unknown after an admitted write is cancelled or its
+reply cannot be retained.
 
 ### P2: readiness omits exhausted log capacity
 

@@ -2532,7 +2532,12 @@ void TRaft::AdvanceLeaderCommit() {
 }
 
 TRequestProcessor::TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_ptr<IRsm> rsm, const TNodeDict& nodes)
-    : Raft(std::move(raft)), Rsm(std::move(rsm)), Nodes(nodes)
+    : TRequestProcessor(std::move(raft), std::move(rsm), nodes, TAdmissionLimits{})
+{ }
+
+TRequestProcessor::TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_ptr<IRsm> rsm,
+        const TNodeDict& nodes, TAdmissionLimits admissionLimits)
+    : Raft(std::move(raft)), Rsm(std::move(rsm)), Nodes(nodes), AdmissionLimits(admissionLimits)
 {
     if (!Raft || !Rsm) throw std::invalid_argument("Request processor requires Raft and application state");
     if (auto snapshot = Raft->GetState()->GetSnapshot(); snapshot && Rsm->LastAppliedIndex < snapshot->Index)
@@ -2541,6 +2546,53 @@ TRequestProcessor::TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_pt
         throw std::invalid_argument("Application progress precedes compacted log");
     Raft->RestoreAppliedIndex(Rsm->LastAppliedIndex);
     Raft->SnapshotApplication = Rsm;
+}
+
+bool TRequestProcessor::TryAdmit(const TMessageHolder<TCommandRequest>& message,
+        const std::shared_ptr<INode>& replyTo, uint64_t& admissionId) {
+    admissionId = 0;
+    if (!replyTo) return true;
+    const uint64_t bytes = message->Len;
+    if (Admissions.size() >= AdmissionLimits.MaxPendingRequests ||
+        PendingRequestBytes > AdmissionLimits.MaxPendingRequestBytes ||
+        bytes > AdmissionLimits.MaxPendingRequestBytes - PendingRequestBytes)
+        return false;
+
+    auto id = NextAdmissionId ? NextAdmissionId : 1;
+    while (Admissions.contains(id)) {
+        ++id;
+        if (!id) id = 1;
+    }
+    const bool inserted = Admissions.emplace(id, bytes).second;
+    if (!inserted) throw std::logic_error("Duplicate pending request admission ID");
+    PendingRequestBytes += bytes;
+    NextAdmissionId = id + 1;
+    admissionId = id;
+    return true;
+}
+
+void TRequestProcessor::ReleaseAdmission(uint64_t admissionId) noexcept {
+    if (!admissionId) return;
+    auto it = Admissions.find(admissionId);
+    if (it == Admissions.end()) return;
+    if (it->second > PendingRequestBytes) std::terminate();
+    PendingRequestBytes -= it->second;
+    Admissions.erase(it);
+}
+
+void TRequestProcessor::EraseWriteAnswer(uint64_t index) noexcept {
+    auto it = WriteAnswers.find(index);
+    if (it == WriteAnswers.end()) return;
+    if (it->second.Reply->Len > PendingReplyBytes) std::terminate();
+    PendingReplyBytes -= it->second.Reply->Len;
+    WriteAnswers.erase(it);
+}
+
+void TRequestProcessor::DispatchCommandRequest(TMessageHolder<TCommandRequest> message,
+        const std::shared_ptr<INode>& replyTo, uint64_t admissionId) {
+    if (!(message->Flags & TCommandRequest::EWrite))
+        return OnReadRequest(std::move(message), replyTo, admissionId);
+    return OnWriteRequest(std::move(message), replyTo, admissionId);
 }
 
 void TRequestProcessor::CheckStateChange() {
@@ -2561,19 +2613,31 @@ void TRequestProcessor::CheckStateChange() {
     WaitingStateChange.swap(apply);
     while (!apply.empty()) {
         auto w = std::move(apply.front()); apply.pop();
-        OnCommandRequest(std::move(w.Command), w.ReplyTo);
+        try {
+            DispatchCommandRequest(std::move(w.Command), w.ReplyTo, w.AdmissionId);
+        } catch (...) {
+            ReleaseAdmission(w.AdmissionId);
+            while (!apply.empty()) {
+                ReleaseAdmission(apply.front().AdmissionId);
+                apply.pop();
+            }
+            throw;
+        }
     }
 }
 
-void TRequestProcessor::Forward(TMessageHolder<TCommandRequest> command, const std::shared_ptr<INode>& replyTo)
+void TRequestProcessor::Forward(TMessageHolder<TCommandRequest> command,
+        const std::shared_ptr<INode>& replyTo, uint64_t admissionId)
 {
     if (!replyTo) {
+        ReleaseAdmission(admissionId);
         return;
     }
 
     if (command->Flags & TCommandRequest::EForwarded) {
         // already forwarded
-        replyTo->Send(NewHoldedMessage(TCommandResponse{.Cookie = command->Cookie, .ErrorCode = 1}));
+        ReleaseAdmission(admissionId);
+        replyTo->Send(NewHoldedMessage(TCommandResponse{.Cookie = command->Cookie, .ErrorCode = TCommandResponse::Failed}));
         return;
     }
 
@@ -2581,13 +2645,15 @@ void TRequestProcessor::Forward(TMessageHolder<TCommandRequest> command, const s
     auto leaderId = Raft->GetLeaderId();
     if (stateName == EState::CANDIDATE || leaderId == 0 ||
         leaderId == Raft->GetId() || !Nodes.contains(leaderId)) {
-        WaitingStateChange.emplace(TWaiting{0, 0, std::move(command), replyTo});
+        WaitingStateChange.emplace(TWaiting{0, 0, std::move(command), replyTo, 0, admissionId});
         return;
     }
 
     if (stateName == EState::FOLLOWER) {
         if (NextForwardCookie > UINT32_MAX) {
-            replyTo->Send(NewHoldedMessage(TCommandResponse{.Cookie = command->Cookie, .ErrorCode = 1}));
+            ReleaseAdmission(admissionId);
+            replyTo->Send(NewHoldedMessage(TCommandResponse{.Cookie = command->Cookie,
+                .ErrorCode = TCommandResponse::Failed}));
             return;
         }
         const auto cookie = uint32_t(NextForwardCookie++);
@@ -2597,10 +2663,19 @@ void TRequestProcessor::Forward(TMessageHolder<TCommandRequest> command, const s
         forwarded->Flags |= TCommandRequest::EForwarded;
         auto peer = Nodes.at(leaderId);
         Forwarded.emplace(cookie, TForwarded{replyTo, peer, command->Cookie,
-                                            leaderId, Raft->GetState()->CurrentTerm});
-        if (!peer->TrySend(std::move(forwarded))) {
+                                            leaderId, Raft->GetState()->CurrentTerm, admissionId});
+        bool accepted = false;
+        try {
+            accepted = peer->TrySend(std::move(forwarded));
+        } catch (...) {
             Forwarded.erase(cookie);
-            replyTo->Send(NewHoldedMessage(TCommandResponse{.Cookie = command->Cookie, .ErrorCode = 1}));
+            throw;
+        }
+        if (!accepted) {
+            Forwarded.erase(cookie);
+            ReleaseAdmission(admissionId);
+            replyTo->Send(NewHoldedMessage(TCommandResponse{.Cookie = command->Cookie,
+                .ErrorCode = TCommandResponse::Overloaded}));
         }
         return;
     }
@@ -2608,7 +2683,8 @@ void TRequestProcessor::Forward(TMessageHolder<TCommandRequest> command, const s
     assert(false && "Wrong state");
 }
 
-void TRequestProcessor::OnReadRequest(TMessageHolder<TCommandRequest> command, const std::shared_ptr<INode>& replyTo)
+void TRequestProcessor::OnReadRequest(TMessageHolder<TCommandRequest> command,
+        const std::shared_ptr<INode>& replyTo, uint64_t admissionId)
 {
     auto stateName = Raft->CurrentStateName();
     auto flags = command->Flags;
@@ -2620,12 +2696,12 @@ void TRequestProcessor::OnReadRequest(TMessageHolder<TCommandRequest> command, c
         const bool stale = flags & TCommandRequest::EStale;
         const auto index = stale ? Raft->GetVolatileState()->CommitIndex : Raft->GetLastIndex();
         const auto term = stale ? 0 : Raft->GetState()->CurrentTerm;
-        Waiting.emplace(TWaiting{index, 0, std::move(command), replyTo, term});
+        Waiting.emplace(TWaiting{index, 0, std::move(command), replyTo, term, admissionId});
         return;
     }
 
     if (stateName != EState::LEADER) {
-        return Forward(std::move(command), replyTo);
+        return Forward(std::move(command), replyTo, admissionId);
     }
 
     // Consistent read
@@ -2633,7 +2709,7 @@ void TRequestProcessor::OnReadRequest(TMessageHolder<TCommandRequest> command, c
     const auto index = Raft->GetLastIndex();
     auto seqno = Raft->ApproveRead();
     assert(StrongWaiting.empty() || (StrongWaiting.back().Index <= index && StrongWaiting.back().Seqno <= seqno));
-    StrongWaiting.emplace(TWaiting{index, seqno, std::move(command), replyTo, term});
+    StrongWaiting.emplace(TWaiting{index, seqno, std::move(command), replyTo, term, admissionId});
 }
 
 void TRequestProcessor::PruneRequests(const std::shared_ptr<INode>& disconnected) {
@@ -2647,6 +2723,7 @@ void TRequestProcessor::PruneRequests(const std::shared_ptr<INode>& disconnected
         RequestsState = state;
         RequestsLeaderId = leaderId;
     }
+    std::vector<std::pair<std::shared_ptr<INode>, uint32_t>> rejected;
     for (auto* queue : {&Waiting, &StrongWaiting, &WaitingStateChange}) {
         std::queue<TWaiting> retained;
         while (!queue->empty()) {
@@ -2660,14 +2737,18 @@ void TRequestProcessor::PruneRequests(const std::shared_ptr<INode>& disconnected
             }
             if (waiting.Command->Flags & TCommandRequest::EWrite) {
                 PendingWriteTerms.erase(waiting.Index);
-                WriteAnswers.erase(waiting.Index);
+                EraseWriteAnswer(waiting.Index);
             }
-            if (!disconnected && waiting.ReplyTo) waiting.ReplyTo->Send(NewHoldedMessage(
-                TCommandResponse{.Cookie = waiting.Command->Cookie, .ErrorCode = 1}));
+            ReleaseAdmission(waiting.AdmissionId);
+            if (!disconnected && waiting.ReplyTo)
+                rejected.emplace_back(waiting.ReplyTo, waiting.Command->Cookie);
         }
         queue->swap(retained);
     }
     CancelForwarded(disconnected);
+    for (auto& [replyTo, cookie] : rejected)
+        replyTo->Send(NewHoldedMessage(TCommandResponse{
+            .Cookie = cookie, .ErrorCode = TCommandResponse::Failed}));
 }
 
 void TRequestProcessor::CancelForwarded(const std::shared_ptr<INode>& disconnected, bool peerFailure) {
@@ -2680,12 +2761,14 @@ void TRequestProcessor::CancelForwarded(const std::shared_ptr<INode>& disconnect
         if (!remove) { ++it; continue; }
         auto pending = std::move(it->second);
         it = Forwarded.erase(it);
+        ReleaseAdmission(pending.AdmissionId);
         if (!disconnected || peerFailure) pending.Client->Send(NewHoldedMessage(
-            TCommandResponse{.Cookie = pending.OriginalCookie, .ErrorCode = 1}));
+            TCommandResponse{.Cookie = pending.OriginalCookie, .ErrorCode = TCommandResponse::Failed}));
     }
 }
 
-void TRequestProcessor::OnWriteRequest(TMessageHolder<TCommandRequest> command, const std::shared_ptr<INode>& replyTo) {
+void TRequestProcessor::OnWriteRequest(TMessageHolder<TCommandRequest> command,
+        const std::shared_ptr<INode>& replyTo, uint64_t admissionId) {
     auto stateName = Raft->CurrentStateName();
     auto flags = command->Flags;
     assert((flags & TCommandRequest::EWrite));
@@ -2695,10 +2778,10 @@ void TRequestProcessor::OnWriteRequest(TMessageHolder<TCommandRequest> command, 
         uint64_t index = Raft->Append(std::move(Rsm->Prepare(command)));
         if (replyTo) {
             PendingWriteTerms[index] = term;
-            Waiting.emplace(TWaiting{index, 0, std::move(command), replyTo, term});
+            Waiting.emplace(TWaiting{index, 0, std::move(command), replyTo, term, admissionId});
         }
     } else {
-        Forward(std::move(command), replyTo);
+        Forward(std::move(command), replyTo, admissionId);
     }
 }
 
@@ -2706,14 +2789,19 @@ void TRequestProcessor::OnCommandRequest(TMessageHolder<TCommandRequest> command
     if (!command.HasValidExtent() || command->Type != uint32_t(EMessageType::COMMAND_REQUEST))
         throw TMessageError("Invalid command request");
     ValidateMessageTree(command);
-    Rsm->Validate(command);
     PruneRequests();
-    auto flags = command->Flags;
-
-    if (!(flags & TCommandRequest::EWrite)) {
-        return OnReadRequest(std::move(command), replyTo);
-    } else {
-        return OnWriteRequest(std::move(command), replyTo);
+    uint64_t admissionId = 0;
+    if (!TryAdmit(command, replyTo, admissionId)) {
+        if (replyTo) replyTo->Send(NewHoldedMessage(TCommandResponse{
+            .Cookie = command->Cookie, .ErrorCode = TCommandResponse::Overloaded}));
+        return;
+    }
+    try {
+        Rsm->Validate(command);
+        DispatchCommandRequest(std::move(command), replyTo, admissionId);
+    } catch (...) {
+        ReleaseAdmission(admissionId);
+        throw;
     }
 }
 
@@ -2727,6 +2815,7 @@ void TRequestProcessor::OnCommandResponse(TMessageHolder<TCommandResponse> comma
     if (it == Forwarded.end() || !peer || it->second.Peer != peer) return;
     auto pending = std::move(it->second);
     Forwarded.erase(it);
+    ReleaseAdmission(pending.AdmissionId);
     auto reply = NewHoldedMessage<TCommandResponse>(command->Len);
     memcpy(reply.Mes, command.Mes, command->Len);
     reply->Cookie = pending.OriginalCookie;
@@ -2777,10 +2866,17 @@ void TRequestProcessor::ProcessCommitted() {
         catch (...) { std::terminate(); }
         auto pending = PendingWriteTerms.find(i);
         if (pending != PendingWriteTerms.end() && pending->second == entry->Term) {
-            WriteAnswers.emplace(i, TAnswer {
-                .Term = entry->Term,
-                .Reply = reply ? reply : NewHoldedMessage(TCommandResponse {.Index = i})
-            });
+            auto heldReply = reply ? reply : NewHoldedMessage(TCommandResponse {.Index = i});
+            const auto answerBytes = heldReply->Len;
+            if (PendingReplyBytes <= AdmissionLimits.MaxPendingReplyBytes &&
+                answerBytes <= AdmissionLimits.MaxPendingReplyBytes - PendingReplyBytes) {
+                auto [answer, inserted] = WriteAnswers.emplace(i, TAnswer {
+                    .Term = entry->Term, .Reply = std::move(heldReply)
+                });
+                if (inserted) PendingReplyBytes += answer->second.Reply->Len;
+            }
+            // If it does not fit, ProcessWaiting returns a small unknown-outcome
+            // error for this already-applied write instead of caching the result.
         }
     }
     Rsm->LastAppliedIndex = commitIndex;
@@ -2807,7 +2903,7 @@ void TRequestProcessor::ProcessWaiting() {
                 reply = NewHoldedMessage(TCommandResponse{.ErrorCode = 1});
             }
             PendingWriteTerms.erase(w.Index);
-            WriteAnswers.erase(w.Index);
+            EraseWriteAnswer(w.Index);
         } else {
             try { reply = Rsm->Read(std::move(w.Command), w.Index).Cast<TCommandResponse>(); }
             catch (const std::exception&) {
@@ -2815,6 +2911,7 @@ void TRequestProcessor::ProcessWaiting() {
             }
         }
         reply->Cookie = cookie;
+        ReleaseAdmission(w.AdmissionId);
         w.ReplyTo->Send(std::move(reply));
     }
 
@@ -2835,6 +2932,7 @@ void TRequestProcessor::ProcessWaiting() {
             reply = NewHoldedMessage(TCommandResponse{.Index = w.Index, .ErrorCode = 2});
         }
         reply->Cookie = cookie;
+        ReleaseAdmission(w.AdmissionId);
         w.ReplyTo->Send(std::move(reply));
     }
 }

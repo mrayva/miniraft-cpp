@@ -149,6 +149,10 @@ struct TEchoRsm : IRsm {
         return reply;
     }
 };
+struct TCountingValidateRsm : TEchoRsm {
+    mutable uint32_t Validated = 0;
+    void Validate(TMessageHolder<TCommandRequest>) const override { ++Validated; }
+};
 struct TWriteClient {
     struct TReply { uint32_t Cookie, Error; std::string Data; };
     std::vector<TReply> Replies;
@@ -323,6 +327,113 @@ void test_stepdown_rejects_write_without_waiting_for_application(void**) {
     client.Processor.CheckStateChange();
     assert_int_equal(client.Replies.size(), 1);
     assert_int_equal(client.Replies[0].Error, 1);
+}
+
+void test_pending_write_admission_is_bounded_and_released_on_completion_or_disconnect(void**) {
+    TCluster cluster(3);
+    cluster.Elect(1);
+    cluster.Replicate(1);
+
+    auto rsm = std::make_shared<TCountingValidateRsm>();
+    std::vector<std::pair<uint32_t, uint32_t>> replies;
+    auto endpoint = std::make_shared<TEndpoint>([&](auto message) {
+        auto response = message.template Cast<TCommandResponse>();
+        replies.emplace_back(response->Cookie, response->ErrorCode);
+    });
+    TRequestProcessor processor(cluster.Nodes[0], rsm, {},
+        TRequestProcessor::TAdmissionLimits{
+            .MaxPendingRequests = 1,
+            .MaxPendingRequestBytes = 1024,
+            .MaxPendingReplyBytes = 1024,
+        });
+    auto write = [&](uint32_t cookie, std::string_view data) {
+        auto command = NewHoldedMessage<TCommandRequest>(sizeof(TCommandRequest) + data.size());
+        command->Cookie = cookie;
+        command->Flags = TCommandRequest::EWrite;
+        memcpy(command->Data, data.data(), data.size());
+        processor.OnCommandRequest(command, endpoint);
+    };
+
+    const auto before = cluster.Nodes[0]->GetLastIndex();
+    write(11, "first");
+    assert_int_equal(cluster.Nodes[0]->GetLastIndex(), before + 1);
+    assert_int_equal(rsm->Validated, 1);
+    write(12, "rejected");
+    assert_int_equal(cluster.Nodes[0]->GetLastIndex(), before + 1);
+    assert_int_equal(rsm->Validated, 1);
+    assert_int_equal(replies.size(), 1);
+    assert_int_equal(replies[0].first, 12);
+    assert_int_equal(replies[0].second, TCommandResponse::Overloaded);
+
+    cluster.Replicate(1);
+    processor.ProcessCommitted();
+    processor.ProcessWaiting();
+    assert_int_equal(replies.size(), 2);
+    assert_int_equal(replies[1].first, 11);
+    assert_int_equal(replies[1].second, TCommandResponse::Success);
+    write(13, "after completion");
+    assert_int_equal(cluster.Nodes[0]->GetLastIndex(), before + 2);
+
+    processor.CleanUp(endpoint);
+    write(14, "after disconnect cleanup");
+    assert_int_equal(cluster.Nodes[0]->GetLastIndex(), before + 3);
+}
+
+void test_pending_request_byte_admission_covers_leader_wait_queue(void**) {
+    TCluster cluster(3);
+    std::vector<uint32_t> replies;
+    auto endpoint = std::make_shared<TEndpoint>([&](auto message) {
+        replies.push_back(message.template Cast<TCommandResponse>()->ErrorCode);
+    });
+    constexpr uint64_t requestBytes = sizeof(TCommandRequest) + sizeof(int64_t);
+    TRequestProcessor processor(cluster.Nodes[0], std::make_shared<TDummyRsm>(), {},
+        TRequestProcessor::TAdmissionLimits{
+            .MaxPendingRequests = 10,
+            .MaxPendingRequestBytes = requestBytes,
+            .MaxPendingReplyBytes = 1024,
+        });
+    auto read = [&](uint32_t cookie) {
+        auto command = NewHoldedMessage<TCommandRequest>(requestBytes);
+        command->Cookie = cookie;
+        command->Flags = TCommandRequest::EConsistent;
+        const int64_t index = 0;
+        memcpy(command->Data, &index, sizeof(index));
+        processor.OnCommandRequest(command, endpoint);
+    };
+
+    read(21); // Waits for leader discovery and consumes the complete byte budget.
+    read(22);
+    assert_int_equal(replies.size(), 1);
+    assert_int_equal(replies[0], TCommandResponse::Overloaded);
+    processor.CleanUp(endpoint);
+    read(23);
+    assert_int_equal(replies.size(), 1);
+}
+
+void test_cached_write_reply_budget_returns_unknown_outcome(void**) {
+    TCluster cluster(3);
+    cluster.Elect(1);
+    cluster.Replicate(1);
+    std::vector<uint32_t> replies;
+    auto endpoint = std::make_shared<TEndpoint>([&](auto message) {
+        replies.push_back(message.template Cast<TCommandResponse>()->ErrorCode);
+    });
+    TRequestProcessor processor(cluster.Nodes[0], std::make_shared<TEchoRsm>(), {},
+        TRequestProcessor::TAdmissionLimits{
+            .MaxPendingRequests = 2,
+            .MaxPendingRequestBytes = 1024,
+            .MaxPendingReplyBytes = sizeof(TCommandResponse),
+        });
+    auto command = NewHoldedMessage<TCommandRequest>(sizeof(TCommandRequest) + 5);
+    command->Flags = TCommandRequest::EWrite;
+    memcpy(command->Data, "reply", 5);
+    processor.OnCommandRequest(command, endpoint);
+
+    cluster.Replicate(1);
+    processor.ProcessCommitted();
+    processor.ProcessWaiting();
+    assert_int_equal(replies.size(), 1);
+    assert_int_equal(replies[0], TCommandResponse::Failed);
 }
 
 void test_committed_but_unanswered_write_has_unknown_outcome_on_stepdown(void**) {
@@ -917,6 +1028,9 @@ int main() {
         cmocka_unit_test(test_old_term_read_is_rejected_after_reelection),
         cmocka_unit_test(test_replaced_write_never_receives_another_commands_reply),
         cmocka_unit_test(test_stepdown_rejects_write_without_waiting_for_application),
+        cmocka_unit_test(test_pending_write_admission_is_bounded_and_released_on_completion_or_disconnect),
+        cmocka_unit_test(test_pending_request_byte_admission_covers_leader_wait_queue),
+        cmocka_unit_test(test_cached_write_reply_budget_returns_unknown_outcome),
         cmocka_unit_test(test_committed_but_unanswered_write_has_unknown_outcome_on_stepdown),
         cmocka_unit_test(test_old_write_is_rejected_after_unobserved_reelection),
         cmocka_unit_test(test_default_read_of_lost_tail_is_rejected_on_stepdown),

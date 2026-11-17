@@ -45,7 +45,11 @@ struct TFollower {
     std::shared_ptr<TRaft> Raft = std::make_shared<TRaft>(std::make_shared<TState>(), 2, Peers);
     std::shared_ptr<TDummyRsm> Rsm = std::make_shared<TDummyRsm>();
     TRequestProcessor Processor{Raft, Rsm, Peers};
-    explicit TFollower(bool known = true) { if (known) LearnLeader(1, 3); }
+    explicit TFollower(bool known = true,
+            TRequestProcessor::TAdmissionLimits limits = TRequestProcessor::TAdmissionLimits{})
+        : Processor{Raft, Rsm, Peers, limits} {
+        if (known) LearnLeader(1, 3);
+    }
     void LearnLeader(uint32_t id, uint64_t term) {
         auto message = NewHoldedMessage(TMessageEx{.Src = id, .Dst = 2, .Term = term},
                                        TAppendEntriesRequest{.LeaderId = id});
@@ -101,12 +105,36 @@ void test_forwarded_send_rejection_fails_client_and_discards_route(void**) {
     assert_int_equal(follower.Leader->Rejected.size(), 1);
     assert_int_equal(client.Replies.size(), 1);
     assert_int_equal(client.Replies[0].Cookie, 42);
-    assert_int_equal(client.Replies[0].Error, 1);
+    assert_int_equal(client.Replies[0].Error, TCommandResponse::Overloaded);
 
     const auto forwarded = follower.Leader->Rejected[0].Cast<TCommandRequest>();
     auto lateReply = NewHoldedMessage(TCommandResponse{.Cookie = forwarded->Cookie});
     follower.Processor.OnCommandResponse(lateReply, follower.Leader);
     assert_int_equal(client.Replies.size(), 1);
+}
+
+void test_forwarded_requests_share_admission_budget_and_release_it(void**) {
+    TFollower follower(true, TRequestProcessor::TAdmissionLimits{
+        .MaxPendingRequests = 1,
+        .MaxPendingRequestBytes = 1024,
+        .MaxPendingReplyBytes = 1024,
+    });
+    TClient first, second;
+    follower.Request(first, 11);
+    assert_int_equal(follower.Sent.size(), 1);
+    follower.Request(second, 22);
+    assert_int_equal(follower.Sent.size(), 1);
+    assert_int_equal(second.Replies.size(), 1);
+    assert_int_equal(second.Replies[0].Cookie, 22);
+    assert_int_equal(second.Replies[0].Error, TCommandResponse::Overloaded);
+
+    follower.Reply(0);
+    assert_int_equal(first.Replies.size(), 1);
+    follower.Request(second, 23); // Completing the route releases its reservation.
+    assert_int_equal(follower.Sent.size(), 2);
+    follower.Processor.CleanUp(second.Endpoint);
+    follower.Request(second, 24); // Disconnect cleanup releases the replacement route.
+    assert_int_equal(follower.Sent.size(), 3);
 }
 
 void test_nonzero_client_cookies_are_forwarded(void**) {
@@ -311,6 +339,7 @@ int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_malformed_forwarded_reply_does_not_consume_route),
         cmocka_unit_test(test_forwarded_send_rejection_fails_client_and_discards_route),
+        cmocka_unit_test(test_forwarded_requests_share_admission_budget_and_release_it),
         cmocka_unit_test(test_nonzero_client_cookies_are_forwarded),
         cmocka_unit_test(test_zero_client_cookie_is_restored),
         cmocka_unit_test(test_forwarding_copies_request_and_marks_one_hop),

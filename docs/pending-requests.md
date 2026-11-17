@@ -26,8 +26,30 @@ Write application replies are retained only while a matching local request is
 pending. Both index and term must match before a success is returned. Replies
 for follower/background application are released immediately. Completion,
 leadership cancellation and disconnect cleanup remove cached replies and their
-pending-write records. The retained reply cache is bounded by pending writes,
-although admission limits for the request queues themselves remain open.
+pending-write records.
+
+## Bounded request admission
+
+Each `TRequestProcessor` now admits at most 1024 pending client requests and
+64 MiB of their request frames by default. This budget is shared across ordinary
+and strong reads, writes, requests waiting for leader discovery, and forwarded
+requests. `TRequestProcessor` and `TRaftServer` constructors accept smaller or
+larger limits for deployments.
+Requests over either limit receive ErrorCode=3 (`Overloaded`) before
+application validation, append or forwarding, so that response means the
+request was not admitted.
+
+Cached local write replies have a separate 64 MiB default limit. If a committed
+write's application reply cannot fit, the request processor drops that cached
+result and returns a small ErrorCode=1 response when completing the waiter; the
+command has already applied, so its outcome is unknown to the client.
+Admissions are released on completion, forwarding response, role cancellation
+and disconnect cleanup.
+
+These limits bound request-processor memory. They do not bound the persistent
+uncommitted Raft log: a write already appended remains in the log after its
+client disconnects. A separate uncommitted-log budget is still needed to bound
+storage growth during quorum loss.
 
 Cancellation concerns the response, not the replicated command. Committed
 commands still apply even if their client disconnected or their leader changed.
@@ -72,6 +94,11 @@ All 81 tests pass locally under ASan/UBSan, with core Debug/Release verification
 Hosted CI executes the same targets; its results are separate from local checks.
 The wire format and public request-processor methods are unchanged.
 
+The bounded-admission follow-up adds deterministic count and byte rejection,
+completion/disconnect release, forwarded-route release and cached-reply budget
+coverage. The focused correctness and forwarding targets pass with 40 and 16
+tests respectively.
+
 Self-review checked index-and-term matching, reply-cache bounds, cancellation
 before log application, disconnect ownership, leader routing and timer/inbound
 ordering. Access must remain serialized and callbacks must not re-enter the
@@ -80,8 +107,8 @@ processor. No independent reviewer approval is claimed.
 ## Remaining gaps
 
 Exactly-once retries, durable request IDs, forwarded-request lifecycle across
-leader failures, queue admission limits, deadlines, transport validation and
-broader generated history/linearizability testing remain separate work. This
-change does not promise successful completion during quorum loss or establish
-library-wide linearizability. Unanswered writes after process crashes also have
-unknown outcomes.
+leader failures, request deadlines, an uncommitted-log budget, transport
+validation and broader generated history/linearizability testing remain open.
+This change does not promise successful completion during quorum loss or
+establish library-wide linearizability. Unanswered writes after process crashes
+also have unknown outcomes.

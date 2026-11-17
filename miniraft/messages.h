@@ -173,6 +173,12 @@ static_assert(sizeof(TCommandRequest) == sizeof(TMessage) + 8);
 
 struct TCommandResponse: public TMessage {
     static constexpr EMessageType MessageType = EMessageType::COMMAND_RESPONSE;
+    enum EErrorCode : uint32_t {
+        Success = 0,
+        Failed = 1,
+        ApplicationReadFailed = 2,
+        Overloaded = 3,
+    };
     uint64_t Index = 0;
     uint32_t Cookie = 0;
     uint32_t ErrorCode = 0;

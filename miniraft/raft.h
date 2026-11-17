@@ -333,8 +333,16 @@ private:
 
 class TRequestProcessor {
 public:
+    struct TAdmissionLimits {
+        size_t MaxPendingRequests = 1024;
+        uint64_t MaxPendingRequestBytes = 64 * 1024 * 1024;
+        uint64_t MaxPendingReplyBytes = 64 * 1024 * 1024;
+    };
+
     // Construct after restoring the RSM and before accepting network traffic.
     TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_ptr<IRsm> rsm, const TNodeDict& nodes);
+    TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_ptr<IRsm> rsm,
+                      const TNodeDict& nodes, TAdmissionLimits admissionLimits);
 
     void CheckStateChange();
     void OnCommandRequest(TMessageHolder<TCommandRequest> message, const std::shared_ptr<INode>& replyTo);
@@ -349,15 +357,29 @@ public:
     void CleanUp(const std::shared_ptr<INode>& replyTo);
 
 private:
-    void Forward(TMessageHolder<TCommandRequest> message, const std::shared_ptr<INode>& replyTo);
-    void OnReadRequest(TMessageHolder<TCommandRequest> message, const std::shared_ptr<INode>& replyTo);
-    void OnWriteRequest(TMessageHolder<TCommandRequest> message, const std::shared_ptr<INode>& replyTo);
+    bool TryAdmit(const TMessageHolder<TCommandRequest>& message, const std::shared_ptr<INode>& replyTo,
+                  uint64_t& admissionId);
+    void ReleaseAdmission(uint64_t admissionId) noexcept;
+    void EraseWriteAnswer(uint64_t index) noexcept;
+    void DispatchCommandRequest(TMessageHolder<TCommandRequest> message,
+                                const std::shared_ptr<INode>& replyTo, uint64_t admissionId);
+    void Forward(TMessageHolder<TCommandRequest> message, const std::shared_ptr<INode>& replyTo,
+                 uint64_t admissionId);
+    void OnReadRequest(TMessageHolder<TCommandRequest> message, const std::shared_ptr<INode>& replyTo,
+                       uint64_t admissionId);
+    void OnWriteRequest(TMessageHolder<TCommandRequest> message, const std::shared_ptr<INode>& replyTo,
+                        uint64_t admissionId);
     void PruneRequests(const std::shared_ptr<INode>& disconnected = {});
     void CancelForwarded(const std::shared_ptr<INode>& disconnected = {}, bool peerFailure = false);
 
     std::shared_ptr<TRaft> Raft;
     std::shared_ptr<IRsm> Rsm;
     TNodeDict Nodes;
+    TAdmissionLimits AdmissionLimits;
+    std::unordered_map<uint64_t, uint64_t> Admissions;
+    uint64_t PendingRequestBytes = 0;
+    uint64_t PendingReplyBytes = 0;
+    uint64_t NextAdmissionId = 1;
 
     struct TWaiting {
         uint64_t Index;
@@ -366,6 +388,7 @@ private:
         std::shared_ptr<INode> ReplyTo;
         // Zero is reserved for requests not owned by a leadership term.
         uint64_t Term = 0;
+        uint64_t AdmissionId = 0;
     };
     std::queue<TWaiting> Waiting;
     std::queue<TWaiting> StrongWaiting;
@@ -386,6 +409,7 @@ private:
         std::shared_ptr<INode> Client, Peer;
         uint32_t OriginalCookie, LeaderId;
         uint64_t Term;
+        uint64_t AdmissionId;
     };
     // Never reuse a wire cookie within this processor, including after failure.
     uint64_t NextForwardCookie = 1;
