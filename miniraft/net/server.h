@@ -17,13 +17,14 @@
 #include <miniraft/raft.h>
 
 namespace NNet::TDetail {
-// Start one response reader the first time a registered peer enters the voter
-// set. The started set prevents duplicates until that endpoint is removed.
-template<class TPeerMap, class TVoterPredicate, class TStarted, class TStartReader>
-void ReconcilePeerResponseReaders(const TPeerMap& peers, TVoterPredicate isVoter,
+// Every registered peer is a replication target, including staged learners
+// whose AppendEntries replies provide the catch-up proof needed for promotion.
+// The started set prevents duplicate readers until that endpoint is removed.
+template<class TPeerMap, class TStarted, class TStartReader>
+void ReconcilePeerResponseReaders(const TPeerMap& peers,
         TStarted& started, TStartReader startReader) {
     for (const auto& [id, peer] : peers)
-        if (isVoter(id) && started.insert(id).second) startReader(id, peer);
+        if (started.insert(id).second) startReader(id, peer);
 }
 }
 
@@ -154,6 +155,7 @@ public:
         return !Connected && (!Drainer || Drainer.done()) && (!Connector || Connector.done());
     }
     bool IsRetired() const { return Retired; }
+    bool HasResponseReader() const { return ResponseReaderActive; }
     void MarkResponseReaderStarted() { ResponseReaderActive = true; }
     void MarkResponseReaderStopped() { ResponseReaderActive = false; }
     bool RetirementComplete() const { return Retired && RetiredCleaned; }
@@ -221,6 +223,12 @@ public:
     // Leader-only catch-up staging and endpoint removal wrappers.
     void AddLearnerTarget(uint32_t id, std::shared_ptr<TNode<TSocket>> node);
     std::shared_ptr<TNode<TSocket>> RemoveLearnerTarget(uint32_t id);
+    // Local preflight for a joint voter change. Calls must be serialized with
+    // the poller loop and Raft work, like endpoint registration.
+    TJointConfigurationReadiness CheckJointConfigurationReadiness(
+        const std::vector<uint32_t>& newVoters) const {
+        return Raft->CheckJointConfigurationReadiness(newVoters);
+    }
 
 private:
     NNet::TVoidTask InboundServe();

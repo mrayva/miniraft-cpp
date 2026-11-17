@@ -1,10 +1,13 @@
 # Offline configuration history validation: v0.1.0-alpha.27
 
-`TConfigurationHistory::MakeSnapshot` projects the history at its through-index
-and term into an offline snapshot. It selects MRFTS002 for a joint configuration,
-MRFTS003 for a stable configuration with a known configuration entry, and the
-legacy MRFTS001 format when the trusted baseline asserts no earlier configuration
-entry. That legacy format does not encode or prove the zero-identity assertion.
+TConfigurationHistory::MakeSnapshot projects the history at its through-index
+and term into an offline snapshot. It emits MRFTS007 for a joint configuration
+and MRFTS006 for a stable configuration when a transition chain is retained.
+Older snapshots without a chain retain the MRFTS002/MRFTS003 formats, and
+MRFTS005/MRFTS004 remain supported for snapshots carrying only their bounded
+predecessor link. The legacy MRFTS001 format is used when the trusted baseline
+asserts no earlier configuration entry; it does not encode or prove that
+zero-identity assertion.
 The caller must independently establish that the history boundary is committed
 and that the supplied application image corresponds exactly to that boundary.
 The method validates snapshot metadata and size; it does not capture application
@@ -31,7 +34,8 @@ a replacement branch from that point. This models validation of rollback; it doe
 not truncate a live log or decide when a configuration becomes active.
 
 FromJointSnapshot validates the snapshot metadata and starts at its included
-index and term, using its joint configuration identity. Stable accepts an explicit
+index and term, using its joint configuration identity and preserving any
+encoded predecessor lineage. Stable accepts an explicit
 configuration identity and scanned-prefix boundary. The caller must establish that
 baseline independently: a v1 fixed snapshot contains voter IDs but does not prove
 the latest configuration entry's identity. Passing a zero identity asserts that no
@@ -58,6 +62,14 @@ corruption. A durable test scans configuration entries after a fixed snapshot an
 restart, confirms the fixture's known bootstrap baseline, and verifies that Raft
 still rejects the unsupported entries without rewriting storage. Full tests also
 cover existing snapshot installation and learner catch-up.
+
+Snapshots retain at most 32 contiguous membership transitions. The runtime can
+use this chain for online stale-store recovery when a transition predecessor
+matches the receiver's trusted stable baseline. Stable images require the
+sender in both voter sets for every transition after that anchor. A joint image
+requires this for completed transitions and accepts a sender from either side
+of the active joint configuration. The chain cannot authorize a disjoint path
+without an independent history source.
 
 This validator is one component of live reconfiguration. Joint entry activation,
 rollback and guarded transitions are described in

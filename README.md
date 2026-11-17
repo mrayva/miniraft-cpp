@@ -84,8 +84,9 @@ The [snapshot metadata preflight follow-up](docs/snapshot-metadata-term-prefligh
 checks the boundary, fixed voters, and stable identity before that term update.
 The [configuration entry support](docs/configuration-entries.md) describes the
 live joint-to-stable transition API and snapshot catch-up across committed
-transitions. Joint snapshot transfer requires matching committed history and
-all voters must understand MRFTS002.
+transitions. Joint snapshot transfer requires matching committed history.
+Upgrade every voter to support MRFTS002 through MRFTS007 before using the
+corresponding snapshot transfers.
 The [stable snapshot membership follow-up](docs/stable-snapshot-membership-install.md)
 documents the committed-history checks for snapshot transfer after a voter
 change.
@@ -112,9 +113,29 @@ The [snapshot pin budget follow-up](docs/snapshot-pin-budget.md) bounds outgoing
 transfer retention to two image generations and defers local compaction at the cap.
 The [stable configuration snapshot foundation](docs/stable-configuration-snapshots.md)
 preserves configuration identity. Raft can recover and install stable metadata
-snapshots after local compaction across a stable membership change. Network
-installation still requires the receiver's active voter set to match; joint
-snapshots and transition-crossing transfers remain disabled.
+snapshots after local compaction across a stable membership change. The runtime
+accepts them when the receiver's committed active set and stable identity match.
+MRFTS002 joint snapshots can also be compacted and installed when the receiver
+has the exact committed joint history. A snapshot may confirm a receiver's exact
+validated pending transition at its boundary, but cannot introduce unknown
+membership history. A receiver with that exact committed joint snapshot can
+also install its stable successor when the image names the joint new voter set
+and a voter in that stable set sends it. See the
+[joint snapshot runtime rules](docs/joint-snapshot-runtime.md).
+MRFTS004 stable and MRFTS005 joint snapshots retain the immediately preceding
+stable voter set, its configuration identity, and the joint entry identity.
+MRFTS006 stable and MRFTS007 joint snapshots add a bounded chain of up to 32
+membership transitions. A nonempty stale store can recover across multiple
+compacted transitions when a transition in the chain matches its exact trusted
+stable configuration and the sender belongs to every old and new voter set in
+the suffix from that anchor. For a joint snapshot, the sender must belong to
+both sets in each completed transition and to at least one side of the active
+joint configuration. The runtime checks this metadata before persisting a
+higher term. A disjoint transition, a chain that exceeds the bound, or a sender
+missing from a required set still needs a fresh learner baseline or
+independently verified history. Snapshot metadata and CRC do not authenticate
+a peer or prove commitment by themselves. All voters must understand MRFTS002
+through MRFTS007 before using these snapshot formats.
 The [durable configuration snapshot follow-up](docs/durable-configuration-snapshots.md)
 documents its voter-binding requirement and recovery boundary.
 The [trusted legacy voter binding follow-up](docs/trusted-legacy-voter-binding.md)
@@ -173,8 +194,8 @@ log replication, and fault tolerance in a distributed system.
 - **Leader Election** (supported)
 - **Log Replication** (supported)
 - **Persistence** (supported)
-- **Snapshots** (opt-in KV compaction and InstallSnapshot; Linux durable backend)
-- **Membership Change** (durable joint-consensus add/remove, leadership transfer for leader removal, and snapshots for an already committed matching joint configuration)
+- **Snapshots** (opt-in KV compaction and InstallSnapshot; Linux durable backend, with stable/joint membership metadata when receiver history matches)
+- **Membership Change** (durable joint-consensus add/remove, leadership transfer for leader removal, and matching-history snapshot recovery)
 
 The project focuses on a clear, modular design that leverages C++20 coroutines to simplify asynchronous flows.
 

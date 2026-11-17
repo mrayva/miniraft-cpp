@@ -19,9 +19,12 @@ and payload. MRFTD001, MRFTD002 and MRFTD003 remain readable; their commit floor
 is conservatively initialized to SnapshotIndex, since those formats did not
 record commit progress. Their next successful publication writes MRFTD004.
 
-This closes commit-boundary recovery for `TDurableState`; it does not implement
-live membership changes or joint consensus. The legacy `TDiskState` format does
-not persist this field and cannot provide the same recovery guarantee.
+At alpha.3, this closed commit-boundary recovery for `TDurableState`; live
+membership changes and joint consensus were added in later milestones. The
+current bounded transition path is documented in
+[live membership](configuration-entries.md) and requires `TDurableState`.
+The legacy `TDiskState` format does not persist the commit boundary and cannot
+provide the same recovery guarantee.
 
 TDurableState is an opt-in storage backend with synchronous durable publication.
 It closes the missing file-sync and atomic-publication gap for new stores, under

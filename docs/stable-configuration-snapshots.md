@@ -10,6 +10,34 @@ configuration identity must be nonzero, no later than the snapshot boundary, and
 have the same term when both indices coincide. Voters are sorted and bounded.
 MRFTS001 and MRFTS002 encoding is unchanged.
 
+When the validated history knows the immediately preceding transition, MRFTS004
+extends the stable format with the predecessor's configuration index/term,
+preceding joint entry index/term, and old voter set. MRFTS005 carries the same
+lineage in a joint snapshot so a restart after joint compaction can preserve it
+through the stable successor. The lineage is bounded to one transition; it is
+not a quorum certificate or cryptographic proof.
+
+MRFTS006 stable and MRFTS007 joint snapshots add a bounded chain of up to 32
+transitions. Each entry records the predecessor stable configuration identity,
+joint entry identity, stable successor identity (zero only for the final active
+joint phase), and both voter sets. The chain must be contiguous and its tail
+must match the snapshot's active configuration. It enables stale-store recovery
+across multiple compacted transitions when the receiver can anchor the first
+entry to its trusted baseline and the sender belongs to every old and new voter
+set. It remains lineage metadata, not a commitment certificate.
+
+MRFTS004 places the lineage fields after the stable configuration index/term,
+then stores the active and predecessor voter lists before application data.
+MRFTS005 places them after the joint new-voter count, then stores the old,
+new, and predecessor voter lists. Both formats retain the CRC32 trailer and the
+64 MiB snapshot bound.
+
+MRFTS006 and MRFTS007 keep the corresponding MRFTS004/MRFTS005 header and voter
+lists, then append transition count[4] and transition records before application
+data. A record stores six 64-bit index/term fields, old and new voter counts[4
+each], and sorted old and new voter IDs[4 each]. These formats retain the CRC32
+trailer and the 64 MiB total snapshot bound.
+
 `TConfigurationHistory::FromStableSnapshot` initializes offline history from
 this identity. The retained-log scanner checks the baseline identity against
 the snapshot before checking subsequent joint/stable entries. These checks do
@@ -32,9 +60,9 @@ binding, for offline history validation. That storage support does not make the
 image acceptable to live Raft or authenticate its membership claim; callers must
 provide a trusted history baseline.
 
-Older binaries may falsely acknowledge covered unknown formats; do not send these
-images to a mixed-version cluster. Later follow-ups added live configuration
-activation and matching-history joint snapshots. Snapshot metadata still cannot
+Older binaries may falsely acknowledge covered unknown formats; do not send
+MRFTS004 or MRFTS005 images to a mixed-version cluster. Later follow-ups added
+live configuration activation and matching-history joint snapshots. Snapshot metadata still cannot
 invent an uncommitted configuration. A matching snapshot can cover committed
 progress before a pending configuration entry while preserving that entry in
 the suffix. A snapshot at or beyond the entry is accepted only when its phase,

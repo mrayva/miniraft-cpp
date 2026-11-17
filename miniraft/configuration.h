@@ -48,12 +48,22 @@ public:
     const std::vector<uint32_t>& NewVoters() const { return New; }
     uint64_t ConfigurationIndex() const { return ConfigIndex; }
     uint64_t ConfigurationTerm() const { return ConfigTerm; }
+    const std::vector<uint32_t>& PreviousVoters() const { return Previous; }
+    uint64_t PreviousConfigurationIndex() const { return PreviousConfigIndex; }
+    uint64_t PreviousConfigurationTerm() const { return PreviousConfigTerm; }
+    uint64_t PreviousJointIndex() const { return PreviousJointConfigIndex; }
+    uint64_t PreviousJointTerm() const { return PreviousJointConfigTerm; }
+    const std::vector<TSnapshotConfigurationTransition>& ConfigurationTransitions() const { return Transitions; }
     uint64_t ThroughIndex() const { return Through; }
     uint64_t ThroughTerm() const { return ThroughLogTerm; }
 private:
     TConfigurationHistory() = default;
     std::vector<uint32_t> Old, New;
     uint64_t ConfigIndex = 0, ConfigTerm = 0, Through = 0, ThroughLogTerm = 0;
+    std::vector<uint32_t> Previous;
+    uint64_t PreviousConfigIndex = 0, PreviousConfigTerm = 0;
+    uint64_t PreviousJointConfigIndex = 0, PreviousJointConfigTerm = 0;
+    std::vector<TSnapshotConfigurationTransition> Transitions;
 };
 
 struct IState;
@@ -65,7 +75,13 @@ struct TConfigurationScan {
             Committed.ConfigurationTerm() != Latest.ConfigurationTerm() ||
             Committed.IsJoint() != Latest.IsJoint() ||
             Committed.OldVoters() != Latest.OldVoters() ||
-            Committed.NewVoters() != Latest.NewVoters();
+            Committed.NewVoters() != Latest.NewVoters() ||
+            Committed.PreviousVoters() != Latest.PreviousVoters() ||
+            Committed.PreviousConfigurationIndex() != Latest.PreviousConfigurationIndex() ||
+            Committed.PreviousConfigurationTerm() != Latest.PreviousConfigurationTerm() ||
+            Committed.PreviousJointIndex() != Latest.PreviousJointIndex() ||
+            Committed.PreviousJointTerm() != Latest.PreviousJointTerm() ||
+            Committed.ConfigurationTransitions() != Latest.ConfigurationTransitions();
     }
 };
 
@@ -73,6 +89,11 @@ struct TConfigurationScan {
 // baseline and commit boundary; neither is proven by this scan.
 TConfigurationScan ScanConfigurationHistory(const IState& state,
     TConfigurationHistory baseline, uint64_t commitIndex);
+
+// Recover configuration identity at a particular committed index without
+// interpreting later retained entries as part of that boundary.
+TConfigurationHistory ScanConfigurationHistoryPrefix(const IState& state,
+    TConfigurationHistory baseline, uint64_t throughIndex);
 
 // Read the committed boundary from storage instead of accepting a caller's
 // guess. Requires voter binding and a backend that persists CommitIndex; the

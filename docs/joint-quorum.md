@@ -44,4 +44,21 @@ Self-review checked overlap, strict majorities, current-term commitment, stable
 path equivalence and learner exclusion. Runtime tests verify that elections,
 commit advancement and strong-read confirmation each wait for both majorities
 under an in-progress joint configuration. No independent reviewer approval is
-claimed. The live transition API remains disabled.
+claimed. At alpha.24, the live transition API was still disabled. It is now
+available through the bounded durable path in
+[live membership](configuration-entries.md); exact-history snapshot rules are
+described in [joint snapshot runtime](joint-snapshot-runtime.md). Live
+reconfiguration tests now exercise one-sided quorum schedules with both
+overlapping `{1, 2, 3}` to `{3, 4, 5}` sets and disjoint `{1, 2, 3}` to
+`{4, 5, 6}` sets. Restarted joint configurations also exercise elections and
+current-term commits under both overlap patterns. An end-to-end disjoint
+transition test now stages the new voters as learners, commits the joint
+configuration, transfers leadership to a new-only voter, commits the stable
+configuration, propagates its watermark, compacts the stable snapshot on each
+active voter, and restarts replicas with endpoints only for the final voter
+set. It also drops links to two new voters while the joint entry is pending,
+confirms the old-side quorum plus one new-side voter cannot commit it, then
+restores links and observes the joint commit.
+A complementary network test isolates both old-side peers while all three new
+voters acknowledge the joint entry; the new majority alone cannot commit it,
+and the entry commits only after the old-side links return.

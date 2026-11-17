@@ -11,10 +11,22 @@
 class TRaft;
 struct IRsm;
 
+// One committed stable -> joint -> stable voter transition. A zero stable
+// successor identifies the final, currently active joint phase.
+struct TSnapshotConfigurationTransition {
+    static constexpr size_t MaxVoters = 4096;
+    std::vector<uint32_t> OldVoters, NewVoters;
+    uint64_t PreviousConfigurationIndex = 0, PreviousConfigurationTerm = 0;
+    uint64_t JointIndex = 0, JointTerm = 0;
+    uint64_t StableIndex = 0, StableTerm = 0;
+    bool operator==(const TSnapshotConfigurationTransition&) const = default;
+};
+
 // Versioned application snapshot, shared by local compaction and state transfer.
 struct TSnapshot {
     static constexpr size_t MaxBytes = 64 * 1024 * 1024;
     static constexpr uint32_t MaxVoters = 4096;
+    static constexpr size_t MaxConfigurationTransitions = 32;
     uint64_t Index = 0, Term = 0;
     std::vector<uint32_t> Voters;
     std::string Data;
@@ -24,6 +36,17 @@ struct TSnapshot {
     // Stable-configuration identity. Offline storage retains the original
     // persisted voter binding while this field records the active voter set.
     bool StableConfiguration = false;
+    // Optional bounded membership lineage. For a stable snapshot these identify
+    // its preceding stable voter set and joint entry. For a joint snapshot they
+    // preserve that predecessor and identify the current joint entry.
+    std::vector<uint32_t> PreviousVoters;
+    uint64_t PreviousConfigurationIndex = 0, PreviousConfigurationTerm = 0;
+    uint64_t PreviousJointIndex = 0, PreviousJointTerm = 0;
+    // Bounded, contiguous committed history for online recovery of stores that
+    // missed more than one compaction. Legacy snapshots retain only the tail.
+    std::vector<TSnapshotConfigurationTransition> ConfigurationTransitions;
+    bool HasConfigurationLineage() const { return !PreviousVoters.empty(); }
+    bool HasStablePredecessor() const { return StableConfiguration && !PreviousVoters.empty(); }
     bool IsJoint() const { return !JointVoters.empty() || (!StableConfiguration && (ConfigurationIndex || ConfigurationTerm)); }
     bool HasConfigurationMetadata() const { return StableConfiguration || IsJoint(); }
     bool operator==(const TSnapshot&) const = default;

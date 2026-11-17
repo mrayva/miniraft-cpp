@@ -347,9 +347,18 @@ uint64_t TDurableState::RetainedLogFlags(int64_t index) const {
 std::shared_ptr<const TSnapshot> TDurableState::GetSnapshot() const { return Impl->Snapshot; }
 
 void TDurableState::InstallSnapshot(const TSnapshot& snapshot) {
+    InstallSnapshotImpl(snapshot, false);
+}
+
+void TDurableState::InstallRaftSnapshot(const TSnapshot& snapshot,
+        const TRaftInstallSnapshotPermit&) {
+    InstallSnapshotImpl(snapshot, true);
+}
+
+void TDurableState::InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated) {
     ValidateSnapshot(snapshot);
     TSnapshot image = snapshot;
-    PreserveStableSnapshotIdentity(Impl->Snapshot.get(), image);
+    if (!configurationHistoryValidated) PreserveStableSnapshotIdentity(Impl->Snapshot.get(), image);
     ValidateSnapshot(image);
     if (!SnapshotCompatibleWithVoterBinding(image, Impl->Voters))
         throw std::invalid_argument("Snapshot is incompatible with the persisted voter binding");
@@ -387,7 +396,7 @@ void TDurableState::BindVoters(const std::vector<uint32_t>& voters) {
     Commit(); // Bind before acknowledging any vote/replication traffic.
 }
 
-void TDurableState::BindVotersFromTrustedBaseline(const std::vector<uint32_t>& voters) {
+void TDurableState::ValidateTrustedLegacyVoterBaseline(const std::vector<uint32_t>& voters) const {
     ValidateFixedVoters(voters);
     if (Impl->RaftStarted)
         throw std::invalid_argument("Trusted legacy voter migration must happen before Raft startup");
@@ -424,6 +433,26 @@ void TDurableState::BindVotersFromTrustedBaseline(const std::vector<uint32_t>& v
     }
     if (LastLogTerm != previousTerm)
         throw std::invalid_argument("Legacy log last term mismatch");
+}
+
+bool TDurableState::CanBindVotersFromTrustedBaseline(const std::vector<uint32_t>& voters,
+        std::string* reason) const {
+    if (reason) reason->clear();
+    try {
+        ValidateTrustedLegacyVoterBaseline(voters);
+        return true;
+    } catch (const std::exception& error) {
+        if (reason) *reason = error.what();
+        return false;
+    } catch (...) {
+        if (reason) *reason = "Unknown trusted legacy voter baseline validation failure";
+        return false;
+    }
+}
+
+void TDurableState::BindVotersFromTrustedBaseline(const std::vector<uint32_t>& voters) {
+    ValidateTrustedLegacyVoterBaseline(voters);
+    if (Impl->Voters == voters) return;
 
     // Persist the operator-supplied baseline before Raft can serve votes or
     // install configuration snapshots against it.

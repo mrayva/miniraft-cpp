@@ -6,12 +6,21 @@
 #include <functional>
 #include <stdexcept>
 #include <vector>
+#include <filesystem>
 
+#include <miniraft/configuration.h>
+#include <miniraft/durable.h>
 #include <miniraft/messages.h>
 #include <miniraft/raft.h>
 #include <miniraft/net/server.h>
 #include <miniraft/timesource.h>
 #include <coroio/all.hpp>
+#ifdef __linux__
+#include <sys/wait.h>
+#include <unistd.h>
+#include "../coroio/tests/server.crt"
+#include "../coroio/tests/server.key"
+#endif
 
 #include <stdarg.h>
 #include <stddef.h>
@@ -174,6 +183,12 @@ void test_server_stages_and_removes_runtime_learner(void**) {
     assert_true(raft->GetLearnerIds() == std::vector<uint32_t>({2}));
     assert_int_equal(raft->GetNpeers(), 1);
     assert_int_equal(raft->GetNservers(), 1);
+    const auto readiness = server.CheckJointConfigurationReadiness({1, 2});
+    assert_true(readiness.IsLeader);
+    assert_false(readiness.HasDurableMembershipStorage);
+    assert_true(readiness.MissingPeerTargets.empty());
+    assert_true(readiness.AddedVotersWithoutCommitAck == std::vector<uint32_t>({2}));
+    assert_false(readiness.Ready());
 
     bool duplicateRejected = false;
     try {
@@ -217,12 +232,135 @@ void test_server_stages_and_removes_runtime_learner(void**) {
     assert_true(raft->GetLearnerIds().empty());
 }
 
+#ifdef __linux__
+int RunServingServerMembershipReaderTest(const std::filesystem::path& dir) {
+    using TTlsSocket = NNet::TRetirableSslSocket<NNet::TSocket>;
+    if (!std::filesystem::create_directory(dir)) return 1;
+
+    NNet::TLoop<NNet::TPoll> loop;
+    auto timeSource = std::make_shared<TTimeSource>();
+    auto clientContext = NNet::TSslContext::Client();
+    auto serverContext = NNet::TSslContext::ServerFromMem(testMemCert, testMemKey);
+    auto makePeer = [&](const char* name) {
+        return std::make_shared<TNode<TTlsSocket>>(
+            [&](const NNet::TAddress& address) {
+                return TTlsSocket(NNet::TSocket(address, loop.Poller()), clientContext);
+            }, name, NNet::TAddress{"127.0.0.1", 1}, timeSource);
+    };
+
+    auto state = std::make_shared<TDurableState>((dir / "raft").string(), 1);
+    TNodeDict peers{{2, makePeer("old-voter")}};
+    auto raft = std::make_shared<TRaft>(state, 1, peers);
+    NNet::TSocket rawListener(NNet::TAddress{"127.0.0.1", 0}, loop.Poller());
+    rawListener.Bind();
+    rawListener.Listen();
+    TRaftServer<TTlsSocket> server(loop.Poller(), TTlsSocket(std::move(rawListener), serverContext),
+        raft, std::make_shared<TDummyRsm>(), peers, timeSource);
+
+    auto joiningPeer = makePeer("joining-voter");
+    server.RegisterPeerTarget(3, joiningPeer);
+    server.Serve(); // Starts readers for voters 1/2 and staged target 3.
+    if (!joiningPeer->HasResponseReader()) return 8;
+
+    TConfigurationRecord addJoint{EConfigurationPhase::Joint, 2, 0, 0, {1, 2}, {1, 2, 3}};
+    auto addRequest = NewHoldedMessage(
+        TMessageEx{.Src = 2, .Dst = 1, .Term = 2},
+        TAppendEntriesRequest{.LeaderCommit = 1, .LeaderId = 2, .Nentries = 1});
+    addRequest.InitPayload(1);
+    addRequest.Payload[0] = EncodeConfigurationEntry(addJoint);
+    raft->Process({}, std::move(addRequest));
+    if (!raft->IsVoter(3)) return 2;
+
+    // Registering another endpoint invokes the production reconciliation path
+    // while the server is serving, without a timer wait or socket traffic.
+    auto unrelatedLearner = makePeer("unrelated-learner");
+    server.RegisterPeerTarget(4, unrelatedLearner);
+    if (!unrelatedLearner->HasResponseReader()) return 9;
+
+    TConfigurationRecord addStable{EConfigurationPhase::Stable, 2, 1, 2, {1, 2}, {1, 2, 3}};
+    TConfigurationRecord removeJoint{EConfigurationPhase::Joint, 2, 2, 2, {1, 2, 3}, {1, 2}};
+    TConfigurationRecord removeStable{EConfigurationPhase::Stable, 2, 3, 2, {1, 2, 3}, {1, 2}};
+    auto removeRequest = NewHoldedMessage(
+        TMessageEx{.Src = 2, .Dst = 1, .Term = 2},
+        TAppendEntriesRequest{.PrevLogIndex = 1, .PrevLogTerm = 2, .LeaderCommit = 4,
+            .LeaderId = 2, .Nentries = 3});
+    removeRequest.InitPayload(3);
+    removeRequest.Payload[0] = EncodeConfigurationEntry(addStable);
+    removeRequest.Payload[1] = EncodeConfigurationEntry(removeJoint);
+    removeRequest.Payload[2] = EncodeConfigurationEntry(removeStable);
+    raft->Process({}, std::move(removeRequest));
+    if (raft->IsVoter(3)) return 3;
+
+    // Successful retirement proves the serving server started and tracked the
+    // reader when peer 3 was promoted, then kept it until demotion completed.
+    auto removed = server.UnregisterPeerTarget(3);
+    if (removed != joiningPeer || !removed->IsRetired() ||
+        raft->GetLearnerIds() != std::vector<uint32_t>({4})) return 4;
+
+    // Reuse the peer ID before the retired endpoint's reader has necessarily
+    // unwound. The replacement must get a fresh response reader when promoted.
+    auto replacementPeer = makePeer("replacement-voter");
+    server.RegisterPeerTarget(3, replacementPeer);
+    TConfigurationRecord readdJoint{EConfigurationPhase::Joint, 2, 4, 2, {1, 2}, {1, 2, 3}};
+    auto readdRequest = NewHoldedMessage(
+        TMessageEx{.Src = 2, .Dst = 1, .Term = 2},
+        TAppendEntriesRequest{.PrevLogIndex = 4, .PrevLogTerm = 2, .LeaderCommit = 5,
+            .LeaderId = 2, .Nentries = 1});
+    readdRequest.InitPayload(1);
+    readdRequest.Payload[0] = EncodeConfigurationEntry(readdJoint);
+    raft->Process({}, std::move(readdRequest));
+    if (!raft->IsVoter(3)) return 5;
+
+    // Reconciliation observes the replacement while it is in the active voter union.
+    server.RegisterPeerTarget(5, makePeer("reconciliation-trigger"));
+    TConfigurationRecord readdStable{EConfigurationPhase::Stable, 2, 5, 2, {1, 2}, {1, 2, 3}};
+    TConfigurationRecord removeAgainJoint{EConfigurationPhase::Joint, 2, 6, 2, {1, 2, 3}, {1, 2}};
+    TConfigurationRecord removeAgainStable{EConfigurationPhase::Stable, 2, 7, 2, {1, 2, 3}, {1, 2}};
+    auto reuseRequest = NewHoldedMessage(
+        TMessageEx{.Src = 2, .Dst = 1, .Term = 2},
+        TAppendEntriesRequest{.PrevLogIndex = 5, .PrevLogTerm = 2, .LeaderCommit = 8,
+            .LeaderId = 2, .Nentries = 3});
+    reuseRequest.InitPayload(3);
+    reuseRequest.Payload[0] = EncodeConfigurationEntry(readdStable);
+    reuseRequest.Payload[1] = EncodeConfigurationEntry(removeAgainJoint);
+    reuseRequest.Payload[2] = EncodeConfigurationEntry(removeAgainStable);
+    raft->Process({}, std::move(reuseRequest));
+    if (raft->IsVoter(3)) return 6;
+
+    // The demoted replacement still has a reader, so unregister must retire it.
+    server.RegisterPeerTarget(6, makePeer("reconciliation-trigger"));
+    auto removedReplacement = server.UnregisterPeerTarget(3);
+    if (removedReplacement != replacementPeer || !removedReplacement->IsRetired() ||
+        raft->GetLearnerIds() != std::vector<uint32_t>({4, 5, 6})) return 7;
+    return 0;
+}
+
+void test_serving_server_retires_demoted_joint_voter_reader(void**) {
+    const auto dir = std::filesystem::temp_directory_path() /
+        ("miniraft-serving-membership-reader-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto child = ::fork();
+    assert_true(child >= 0);
+    if (child == 0) _exit(RunServingServerMembershipReaderTest(dir));
+
+    int status = 0;
+    assert_int_equal(::waitpid(child, &status, 0), child);
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+    assert_true(WIFEXITED(status));
+    assert_int_equal(WEXITSTATUS(status), 0);
+}
+#endif
+
 int main() {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_message_send_recv),
         cmocka_unit_test(test_read_write),
         cmocka_unit_test(test_read_write_payload),
         cmocka_unit_test(test_server_stages_and_removes_runtime_learner),
+#ifdef __linux__
+        cmocka_unit_test(test_serving_server_retires_demoted_joint_voter_reader),
+#endif
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 };

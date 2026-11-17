@@ -89,13 +89,38 @@ TConfigurationHistory TConfigurationHistory::FromJointSnapshot(const TSnapshot& 
     history.Old = snapshot.Voters; history.New = snapshot.JointVoters;
     history.ConfigIndex = snapshot.ConfigurationIndex; history.ConfigTerm = snapshot.ConfigurationTerm;
     history.Through = snapshot.Index; history.ThroughLogTerm = snapshot.Term;
+    history.Previous = snapshot.PreviousVoters;
+    history.PreviousConfigIndex = snapshot.PreviousConfigurationIndex;
+    history.PreviousConfigTerm = snapshot.PreviousConfigurationTerm;
+    history.PreviousJointConfigIndex = snapshot.PreviousJointIndex;
+    history.PreviousJointConfigTerm = snapshot.PreviousJointTerm;
+    history.Transitions = snapshot.ConfigurationTransitions;
+    if (history.Transitions.empty() && snapshot.HasConfigurationLineage()) {
+        history.Transitions.push_back({snapshot.Voters, snapshot.JointVoters,
+            snapshot.PreviousConfigurationIndex, snapshot.PreviousConfigurationTerm,
+            snapshot.ConfigurationIndex, snapshot.ConfigurationTerm, 0, 0});
+    }
     return history;
 }
 
 TConfigurationHistory TConfigurationHistory::FromStableSnapshot(const TSnapshot& snapshot) {
     ValidateSnapshot(snapshot);
     if (!snapshot.StableConfiguration) throw std::invalid_argument("Snapshot does not identify a stable configuration");
-    return Stable(snapshot.Voters, snapshot.ConfigurationIndex, snapshot.ConfigurationTerm, snapshot.Index, snapshot.Term);
+    auto history = Stable(snapshot.Voters, snapshot.ConfigurationIndex, snapshot.ConfigurationTerm,
+        snapshot.Index, snapshot.Term);
+    history.Previous = snapshot.PreviousVoters;
+    history.PreviousConfigIndex = snapshot.PreviousConfigurationIndex;
+    history.PreviousConfigTerm = snapshot.PreviousConfigurationTerm;
+    history.PreviousJointConfigIndex = snapshot.PreviousJointIndex;
+    history.PreviousJointConfigTerm = snapshot.PreviousJointTerm;
+    history.Transitions = snapshot.ConfigurationTransitions;
+    if (history.Transitions.empty() && snapshot.HasStablePredecessor()) {
+        history.Transitions.push_back({snapshot.PreviousVoters, snapshot.Voters,
+            snapshot.PreviousConfigurationIndex, snapshot.PreviousConfigurationTerm,
+            snapshot.PreviousJointIndex, snapshot.PreviousJointTerm,
+            snapshot.ConfigurationIndex, snapshot.ConfigurationTerm});
+    }
+    return history;
 }
 
 TSnapshot TConfigurationHistory::MakeSnapshot(std::string data) const {
@@ -103,9 +128,21 @@ TSnapshot TConfigurationHistory::MakeSnapshot(std::string data) const {
     if (IsJoint()) {
         snapshot.JointVoters = New;
         snapshot.ConfigurationIndex = ConfigIndex; snapshot.ConfigurationTerm = ConfigTerm;
+        snapshot.PreviousVoters = Previous;
+        snapshot.PreviousConfigurationIndex = PreviousConfigIndex;
+        snapshot.PreviousConfigurationTerm = PreviousConfigTerm;
+        snapshot.PreviousJointIndex = PreviousJointConfigIndex;
+        snapshot.PreviousJointTerm = PreviousJointConfigTerm;
+        snapshot.ConfigurationTransitions = Transitions;
     } else if (ConfigIndex) {
         snapshot.StableConfiguration = true;
         snapshot.ConfigurationIndex = ConfigIndex; snapshot.ConfigurationTerm = ConfigTerm;
+        snapshot.PreviousVoters = Previous;
+        snapshot.PreviousConfigurationIndex = PreviousConfigIndex;
+        snapshot.PreviousConfigurationTerm = PreviousConfigTerm;
+        snapshot.PreviousJointIndex = PreviousJointConfigIndex;
+        snapshot.PreviousJointTerm = PreviousJointConfigTerm;
+        snapshot.ConfigurationTransitions = Transitions;
     }
     ValidateSnapshot(snapshot);
     return snapshot;
@@ -121,10 +158,28 @@ TConfigurationHistory TConfigurationHistory::Advance(uint64_t index, TMessageHol
         if (record.Phase != EConfigurationPhase::Joint || record.OldVoters != Old || record.NewVoters == Old)
             throw std::invalid_argument("Expected a joint configuration from the stable voter set");
         next.New = record.NewVoters;
+        next.Previous = record.OldVoters;
+        next.PreviousConfigIndex = ConfigIndex;
+        next.PreviousConfigTerm = ConfigTerm;
+        next.PreviousJointConfigIndex = index;
+        next.PreviousJointConfigTerm = record.Term;
+        if (next.Transitions.size() == TSnapshot::MaxConfigurationTransitions)
+            next.Transitions.erase(next.Transitions.begin());
+        next.Transitions.push_back({Old, record.NewVoters, ConfigIndex, ConfigTerm,
+            index, record.Term, 0, 0});
     } else {
         if (record.Phase != EConfigurationPhase::Stable || record.OldVoters != Old || record.NewVoters != New)
             throw std::invalid_argument("Expected the stable successor of the joint configuration");
         next.Old = New; next.New.clear();
+        if (!next.Transitions.empty()) {
+            if (next.Transitions.back().StableIndex || next.Transitions.back().OldVoters != Old ||
+                next.Transitions.back().NewVoters != New ||
+                next.Transitions.back().JointIndex != ConfigIndex ||
+                next.Transitions.back().JointTerm != ConfigTerm)
+                throw std::invalid_argument("Configuration transition history is missing its active joint phase");
+            next.Transitions.back().StableIndex = index;
+            next.Transitions.back().StableTerm = record.Term;
+        }
     }
     next.ConfigIndex = next.Through = index;
     next.ConfigTerm = next.ThroughLogTerm = record.Term;
@@ -147,13 +202,14 @@ TConfigurationHistory TConfigurationHistory::ObserveMetadata(uint64_t index, uin
     return next;
 }
 
-TConfigurationScan ScanConfigurationHistory(const IState& state,
-    TConfigurationHistory baseline, uint64_t commitIndex) {
+namespace {
+TConfigurationScan ScanConfigurationHistoryThrough(const IState& state,
+    TConfigurationHistory baseline, uint64_t commitIndex, uint64_t scanThrough) {
     if (!state.CurrentTerm || state.LastLogIndex > uint64_t(INT64_MAX) ||
         state.SnapshotIndex > state.LastLogIndex || state.SnapshotTerm > state.CurrentTerm ||
         state.LastLogTerm > state.CurrentTerm ||
         baseline.ThroughIndex() != state.SnapshotIndex || baseline.ThroughTerm() != state.SnapshotTerm ||
-        commitIndex < state.SnapshotIndex || commitIndex > state.LastLogIndex)
+        commitIndex < state.SnapshotIndex || commitIndex > scanThrough || scanThrough > state.LastLogIndex)
         throw std::invalid_argument("Invalid configuration scan boundaries");
 
     const auto snapshot = state.GetSnapshot();
@@ -167,11 +223,25 @@ TConfigurationScan ScanConfigurationHistory(const IState& state,
             if (!baseline.IsJoint() || baseline.OldVoters() != expected.OldVoters() ||
                 baseline.NewVoters() != expected.NewVoters() ||
                 baseline.ConfigurationIndex() != expected.ConfigurationIndex() ||
-                baseline.ConfigurationTerm() != expected.ConfigurationTerm())
+                baseline.ConfigurationTerm() != expected.ConfigurationTerm() ||
+                baseline.PreviousVoters() != expected.PreviousVoters() ||
+                baseline.PreviousConfigurationIndex() != expected.PreviousConfigurationIndex() ||
+                baseline.PreviousConfigurationTerm() != expected.PreviousConfigurationTerm() ||
+                baseline.PreviousJointIndex() != expected.PreviousJointIndex() ||
+                baseline.PreviousJointTerm() != expected.PreviousJointTerm() ||
+                (!snapshot->ConfigurationTransitions.empty() &&
+                 baseline.ConfigurationTransitions() != expected.ConfigurationTransitions()))
                 throw std::invalid_argument("Joint snapshot baseline mismatch");
         } else if (baseline.IsJoint() || baseline.OldVoters() != snapshot->Voters ||
             (snapshot->StableConfiguration && (baseline.ConfigurationIndex() != snapshot->ConfigurationIndex ||
-                baseline.ConfigurationTerm() != snapshot->ConfigurationTerm))) {
+                baseline.ConfigurationTerm() != snapshot->ConfigurationTerm ||
+                baseline.PreviousVoters() != snapshot->PreviousVoters ||
+                baseline.PreviousConfigurationIndex() != snapshot->PreviousConfigurationIndex ||
+                baseline.PreviousConfigurationTerm() != snapshot->PreviousConfigurationTerm ||
+                baseline.PreviousJointIndex() != snapshot->PreviousJointIndex ||
+                baseline.PreviousJointTerm() != snapshot->PreviousJointTerm ||
+                (!snapshot->ConfigurationTransitions.empty() &&
+                 baseline.ConfigurationTransitions() != snapshot->ConfigurationTransitions)))) {
             throw std::invalid_argument("Fixed snapshot baseline mismatch");
         }
     } else if (snapshot || state.SnapshotTerm || baseline.IsJoint()) {
@@ -188,7 +258,7 @@ TConfigurationScan ScanConfigurationHistory(const IState& state,
 
     auto latest = baseline;
     auto committed = baseline;
-    for (uint64_t index = state.SnapshotIndex + 1; index <= state.LastLogIndex; ++index) {
+    for (uint64_t index = state.SnapshotIndex + 1; index <= scanThrough; ++index) {
         const auto term = state.RetainedLogTerm(index);
         const auto flags = state.RetainedLogFlags(index);
         if (!term || term > state.CurrentTerm) throw std::invalid_argument("Invalid retained log term");
@@ -209,9 +279,23 @@ TConfigurationScan ScanConfigurationHistory(const IState& state,
         }
         if (index == commitIndex) committed = latest;
     }
-    if (latest.ThroughTerm() != state.LastLogTerm)
+    const auto lastTerm = scanThrough == state.LastLogIndex
+        ? state.LastLogTerm
+        : scanThrough == state.SnapshotIndex ? state.SnapshotTerm : state.RetainedLogTerm(scanThrough);
+    if (latest.ThroughTerm() != lastTerm)
         throw std::invalid_argument("Configuration scan last term mismatch");
     return {committed, latest};
+}
+}
+
+TConfigurationScan ScanConfigurationHistory(const IState& state,
+    TConfigurationHistory baseline, uint64_t commitIndex) {
+    return ScanConfigurationHistoryThrough(state, std::move(baseline), commitIndex, state.LastLogIndex);
+}
+
+TConfigurationHistory ScanConfigurationHistoryPrefix(const IState& state,
+    TConfigurationHistory baseline, uint64_t throughIndex) {
+    return ScanConfigurationHistoryThrough(state, std::move(baseline), throughIndex, throughIndex).Committed;
 }
 
 TConfigurationScan ScanCommittedConfigurationHistory(const IState& state,

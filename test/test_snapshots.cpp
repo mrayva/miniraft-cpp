@@ -149,6 +149,71 @@ void test_stable_configuration_snapshot_codec_and_runtime_guards(void**) {
     { TDurableState state(files.Name, 1); Reject([&] { state.InstallSnapshot(snapshot); }); }
 #endif
 }
+void test_transition_lineage_snapshot_codecs_and_stable_identity_guard(void**) {
+    auto joint = JointSample();
+    joint.PreviousVoters = joint.Voters;
+    joint.PreviousJointIndex = joint.ConfigurationIndex;
+    joint.PreviousJointTerm = joint.ConfigurationTerm;
+    const auto jointBytes = EncodeSnapshot(joint);
+    assert_true(jointBytes.substr(0, 8) == "MRFTS005");
+    assert_true(DecodeSnapshot(jointBytes) == joint);
+    for (size_t i = 0; i < jointBytes.size(); ++i) {
+        auto damaged = jointBytes; damaged[i] ^= 1;
+        Reject([&] { DecodeSnapshot(damaged); });
+        Reject([&] { DecodeSnapshot(std::string_view(jointBytes).substr(0, i)); });
+    }
+
+    auto damagedJoint = jointBytes;
+    damagedJoint[124] = 4; // Keep the prior voter list valid but different from the old set.
+    FixChecksum(damagedJoint);
+    Reject([&] { DecodeSnapshot(damagedJoint); });
+
+    auto stable = Sample();
+    stable.Voters = {1};
+    stable.StableConfiguration = true;
+    stable.ConfigurationIndex = 2;
+    stable.ConfigurationTerm = 1;
+    stable.PreviousVoters = {1, 2, 3};
+    stable.PreviousJointIndex = 1;
+    stable.PreviousJointTerm = 1;
+    const auto stableBytes = EncodeSnapshot(stable);
+    assert_true(stableBytes.substr(0, 8) == "MRFTS004");
+    assert_true(DecodeSnapshot(stableBytes) == stable);
+    for (size_t i = 0; i < stableBytes.size(); ++i) {
+        auto damaged = stableBytes; damaged[i] ^= 1;
+        Reject([&] { DecodeSnapshot(damaged); });
+        Reject([&] { DecodeSnapshot(std::string_view(stableBytes).substr(0, i)); });
+    }
+
+    auto chained = Sample();
+    chained.Index = 7; chained.Term = 3; chained.Voters = {4}; chained.Data = "chain";
+    chained.StableConfiguration = true;
+    chained.ConfigurationIndex = 6; chained.ConfigurationTerm = 3;
+    chained.PreviousVoters = {2, 3, 4};
+    chained.PreviousConfigurationIndex = 3; chained.PreviousConfigurationTerm = 2;
+    chained.PreviousJointIndex = 5; chained.PreviousJointTerm = 3;
+    chained.ConfigurationTransitions = {
+        {{1, 2, 3}, {2, 3, 4}, 0, 0, 2, 2, 3, 2},
+        {{2, 3, 4}, {4}, 3, 2, 5, 3, 6, 3},
+    };
+    const auto chainedBytes = EncodeSnapshot(chained);
+    assert_true(chainedBytes.substr(0, 8) == "MRFTS006");
+    assert_true(DecodeSnapshot(chainedBytes) == chained);
+    auto brokenChain = chainedBytes;
+    brokenChain[188] = 2; // Second transition no longer follows the first stable identity.
+    FixChecksum(brokenChain);
+    Reject([&] { DecodeSnapshot(brokenChain); });
+
+    auto differentLineage = stable;
+    differentLineage.PreviousVoters = {2, 3, 4};
+    Reject([&] { PreserveStableSnapshotIdentity(&stable, differentLineage); });
+
+    auto oldStable = Sample();
+    oldStable.StableConfiguration = true;
+    oldStable.ConfigurationIndex = 1;
+    oldStable.ConfigurationTerm = 1;
+    Reject([&] { PreserveStableSnapshotIdentity(&oldStable, stable); });
+}
 void test_joint_snapshot_metadata_rejects_invalid_boundaries_and_voters(void**) {
     for (int mode = 0; mode < 10; ++mode) {
         auto bad = JointSample();
@@ -746,6 +811,7 @@ int main() {
         cmocka_unit_test(test_snapshot_codec_roundtrip_and_all_byte_corruption),
         cmocka_unit_test(test_joint_snapshot_codec_roundtrip_and_corruption),
         cmocka_unit_test(test_stable_configuration_snapshot_codec_and_runtime_guards),
+        cmocka_unit_test(test_transition_lineage_snapshot_codecs_and_stable_identity_guard),
         cmocka_unit_test(test_joint_snapshot_metadata_rejects_invalid_boundaries_and_voters),
         cmocka_unit_test(test_joint_snapshot_requires_matching_runtime_history_and_binding),
         cmocka_unit_test(test_startup_rejects_inconsistent_snapshot_boundaries_before_binding),

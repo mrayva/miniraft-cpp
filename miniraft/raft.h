@@ -55,6 +55,22 @@ private:
 
 using TNodeDict = std::unordered_map<uint32_t, std::shared_ptr<INode>>;
 
+struct TJointConfigurationReadiness {
+    bool IsLeader = false;
+    bool HasDurableMembershipStorage = false;
+    bool HasStableConfiguration = false;
+    bool HasCommittedCurrentTermEntry = false;
+    bool ChangesVoterSet = false;
+    std::vector<uint32_t> MissingPeerTargets;
+    std::vector<uint32_t> AddedVotersWithoutCommitAck;
+
+    bool Ready() const {
+        return IsLeader && HasDurableMembershipStorage && HasStableConfiguration &&
+            HasCommittedCurrentTermEntry && ChangesVoterSet && MissingPeerTargets.empty() &&
+            AddedVotersWithoutCommitAck.empty();
+    }
+};
+
 struct TVolatileState {
     struct TAppendRpc { uint64_t Seqno, LastIndex, LeaderCommit; };
     static constexpr size_t MaxPendingAppendRpcs = 256;
@@ -147,6 +163,9 @@ public:
     // the local ID. Retained validated configuration history determines active
     // voter roles and joint quorum arithmetic.
     TRaft(std::shared_ptr<IState> state, int node, const TNodeDict& nodes, std::vector<uint32_t> learners = {});
+    // Node IDs are uint32_t on the wire and in membership records. Keep the int
+    // overload for source compatibility while allowing the full voter ID range.
+    TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& nodes, std::vector<uint32_t> learners = {});
 
     void Process(ITimeSource::Time now, TMessageHolder<TMessage> message, const std::shared_ptr<INode>& replyTo = {});
     void ProcessTimeout(ITimeSource::Time now);
@@ -158,6 +177,10 @@ public:
     // be staged as a learner and have acknowledged this leader's committed
     // boundary. A transition may exclude the leader; transfer leadership to a
     // caught-up voter in the new set after the joint entry commits.
+    // Readiness is local to this replica: collect reports from every replica
+    // before proposing to verify the configured target set is complete.
+    TJointConfigurationReadiness CheckJointConfigurationReadiness(
+        const std::vector<uint32_t>& newVoters) const;
     uint64_t ProposeJointConfiguration(std::vector<uint32_t> newVoters);
     // Append the stable successor after the joint entry has committed.
     uint64_t FinalizeConfiguration();
@@ -168,6 +191,9 @@ public:
     uint32_t GetLeaderId() const;
     uint64_t GetLastIndex() const;
     std::vector<uint32_t> GetVoterIds() const;
+    // Snapshot of validated committed and latest log configurations. This
+    // distinguishes the active joint quorum from an uncommitted transition.
+    TConfigurationScan GetConfigurationState() const;
     std::vector<uint32_t> GetLearnerIds() const { return Learners; }
     bool IsVoter(uint32_t id) const;
     // Leader-only, point-in-time log catch-up; not permission to promote.

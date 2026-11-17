@@ -131,32 +131,29 @@ void test_connect_cannot_leave_a_second_deadline_wakeup_after_completion(void**)
     poller.Tick(); // A leftover deadline must not resume the destroyed connector.
     assert_false(node.IsConnected());
 }
-void test_peer_response_readers_start_once_when_voters_are_added(void**) {
-    const std::unordered_map<uint32_t, std::string> peers{{1, "old voter"}, {2, "staged learner"}, {3, "other"}};
-    std::unordered_set<uint32_t> voters{1};
+void test_peer_response_readers_start_once_for_replication_targets(void**) {
+    std::unordered_map<uint32_t, std::string> peers{{1, "old voter"}, {2, "staged learner"}};
     std::unordered_set<uint32_t> started;
-    std::vector<uint32_t> calls;
+    std::unordered_set<uint32_t> calls;
+    unsigned startCount = 0;
     const auto reconcile = [&] {
-        NNet::TDetail::ReconcilePeerResponseReaders(peers,
-            [&](uint32_t id) { return voters.contains(id); }, started,
-            [&](uint32_t id, const std::string&) { calls.push_back(id); });
+        NNet::TDetail::ReconcilePeerResponseReaders(peers, started,
+            [&](uint32_t id, const std::string&) { calls.insert(id); ++startCount; });
     };
 
     reconcile();
-    assert_true(started == std::unordered_set<uint32_t>{1});
-    assert_true(calls == std::vector<uint32_t>{1});
-
-    voters.insert(2); // Joint configuration activates the staged peer.
-    reconcile();
     assert_true(started == std::unordered_set<uint32_t>({1, 2}));
-    assert_true(calls == std::vector<uint32_t>({1, 2}));
+    assert_true(calls == started); // The staged learner can return catch-up ACKs.
+    assert_int_equal(startCount, 2);
+
+    peers.emplace(3, "newly staged learner");
+    reconcile();
+    assert_true(started == std::unordered_set<uint32_t>({1, 2, 3}));
+    assert_true(calls == started);
+    assert_int_equal(startCount, 3);
 
     reconcile(); // Repeated processing must not launch a duplicate reader.
-    assert_true(calls == std::vector<uint32_t>({1, 2}));
-    voters.erase(1); // A demoted peer's in-flight reader remains tracked.
-    reconcile();
-    assert_true(started == std::unordered_set<uint32_t>({1, 2}));
-    assert_true(calls == std::vector<uint32_t>({1, 2}));
+    assert_int_equal(startCount, 3);
 }
 NNet::TVoidTask WaitForRetiredResponseReader(
         std::shared_ptr<TNode<TAsyncSocket>> node, bool& stopped) {
@@ -287,7 +284,7 @@ int main() {
         cmocka_unit_test(test_disconnect_during_pending_connect_does_not_destroy_timer_target),
         cmocka_unit_test(test_old_reader_failure_cannot_disconnect_writer_reconnect),
         cmocka_unit_test(test_connect_cannot_leave_a_second_deadline_wakeup_after_completion),
-        cmocka_unit_test(test_peer_response_readers_start_once_when_voters_are_added),
+        cmocka_unit_test(test_peer_response_readers_start_once_for_replication_targets),
         cmocka_unit_test(test_retirement_wakes_reader_and_writer_before_socket_cleanup),
 #ifdef __linux__
         cmocka_unit_test(test_socket_shutdown_wakes_a_real_pending_read),

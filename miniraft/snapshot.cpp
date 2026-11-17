@@ -17,12 +17,33 @@ using namespace NSnapshotCodec;
 constexpr std::string_view Magic = "MRFTS001";
 constexpr std::string_view JointMagic = "MRFTS002";
 constexpr std::string_view StableMagic = "MRFTS003";
+constexpr std::string_view StableLineageMagic = "MRFTS004";
+constexpr std::string_view JointLineageMagic = "MRFTS005";
+constexpr std::string_view StableHistoryMagic = "MRFTS006";
+constexpr std::string_view JointHistoryMagic = "MRFTS007";
 void Validate(const TSnapshot& snapshot) {
+    size_t historyBytes = snapshot.ConfigurationTransitions.empty() ? 0 : 4;
+    for (const auto& transition : snapshot.ConfigurationTransitions) {
+        if (transition.OldVoters.size() > TSnapshot::MaxVoters ||
+            transition.NewVoters.size() > TSnapshot::MaxVoters ||
+            historyBytes > TSnapshot::MaxBytes - 56 -
+                4 * (transition.OldVoters.size() + transition.NewVoters.size()))
+            throw std::runtime_error("Invalid snapshot configuration history size");
+        historyBytes += 56 + 4 * (transition.OldVoters.size() + transition.NewVoters.size());
+    }
+    const size_t baseBytes = snapshot.HasStablePredecessor() ? 92 :
+        snapshot.HasConfigurationLineage() ? 96 :
+        snapshot.StableConfiguration ? 56 : snapshot.IsJoint() ? 60 : 40;
+    const size_t voterBytes = 4 * (snapshot.Voters.size() + snapshot.JointVoters.size() +
+        snapshot.PreviousVoters.size());
     if (!snapshot.Index || snapshot.Index > uint64_t(INT64_MAX) || !snapshot.Term ||
         snapshot.Voters.empty() || snapshot.Voters.size() > TSnapshot::MaxVoters ||
         snapshot.JointVoters.size() > TSnapshot::MaxVoters ||
-        snapshot.Data.size() > TSnapshot::MaxBytes - (snapshot.StableConfiguration ? 56 : snapshot.IsJoint() ? 60 : 40) -
-            4 * (snapshot.Voters.size() + snapshot.JointVoters.size()))
+        snapshot.PreviousVoters.size() > TSnapshot::MaxVoters ||
+        snapshot.ConfigurationTransitions.size() > TSnapshot::MaxConfigurationTransitions ||
+        baseBytes > TSnapshot::MaxBytes || voterBytes > TSnapshot::MaxBytes - baseBytes ||
+        historyBytes > TSnapshot::MaxBytes - baseBytes - voterBytes ||
+        snapshot.Data.size() > TSnapshot::MaxBytes - baseBytes - voterBytes - historyBytes)
         throw std::runtime_error("Invalid snapshot metadata/size");
     const auto validateVoters = [](const auto& voters) {
         uint32_t previous = 0;
@@ -32,6 +53,76 @@ void Validate(const TSnapshot& snapshot) {
         }
     };
     validateVoters(snapshot.Voters);
+    validateVoters(snapshot.PreviousVoters);
+    bool hasIncompleteTransition = false;
+    for (size_t i = 0; i < snapshot.ConfigurationTransitions.size(); ++i) {
+        const auto& transition = snapshot.ConfigurationTransitions[i];
+        validateVoters(transition.OldVoters);
+        validateVoters(transition.NewVoters);
+        if (transition.OldVoters.empty() || transition.NewVoters.empty() ||
+            transition.OldVoters == transition.NewVoters ||
+            ((transition.PreviousConfigurationIndex == 0) != (transition.PreviousConfigurationTerm == 0)) ||
+            !transition.JointIndex || !transition.JointTerm ||
+            transition.JointIndex <= transition.PreviousConfigurationIndex ||
+            transition.JointTerm < transition.PreviousConfigurationTerm ||
+            ((transition.StableIndex == 0) != (transition.StableTerm == 0)) ||
+            (transition.StableIndex && (transition.StableIndex <= transition.JointIndex ||
+                transition.StableTerm < transition.JointTerm)))
+            throw std::runtime_error("Invalid snapshot configuration transition");
+        if (i) {
+            const auto& previous = snapshot.ConfigurationTransitions[i - 1];
+            if (!previous.StableIndex || previous.NewVoters != transition.OldVoters ||
+                previous.StableIndex != transition.PreviousConfigurationIndex ||
+                previous.StableTerm != transition.PreviousConfigurationTerm ||
+                transition.JointIndex <= previous.StableIndex || transition.JointTerm < previous.StableTerm)
+                throw std::runtime_error("Discontinuous snapshot configuration history");
+        }
+        if (!transition.StableIndex) {
+            if (i + 1 != snapshot.ConfigurationTransitions.size())
+                throw std::runtime_error("Incomplete snapshot configuration transition is not the tail");
+            hasIncompleteTransition = true;
+        }
+    }
+    if (!snapshot.ConfigurationTransitions.empty()) {
+        const auto& tail = snapshot.ConfigurationTransitions.back();
+        const bool tailMatches = snapshot.StableConfiguration
+            ? tail.StableIndex == snapshot.ConfigurationIndex && tail.StableTerm == snapshot.ConfigurationTerm &&
+                tail.NewVoters == snapshot.Voters
+            : snapshot.IsJoint() && !tail.StableIndex && tail.JointIndex == snapshot.ConfigurationIndex &&
+                tail.JointTerm == snapshot.ConfigurationTerm && tail.OldVoters == snapshot.Voters &&
+                tail.NewVoters == snapshot.JointVoters;
+        if (!tailMatches || hasIncompleteTransition == snapshot.StableConfiguration)
+            throw std::runtime_error("Snapshot configuration history does not match its active configuration");
+    }
+    if (snapshot.HasConfigurationLineage()) {
+        const bool invalidStableLineage = snapshot.StableConfiguration &&
+            (snapshot.PreviousVoters == snapshot.Voters ||
+             snapshot.PreviousJointIndex <= snapshot.PreviousConfigurationIndex ||
+             snapshot.ConfigurationIndex <= snapshot.PreviousJointIndex ||
+             snapshot.PreviousJointTerm > snapshot.ConfigurationTerm);
+        const bool invalidJointLineage = snapshot.IsJoint() &&
+            (snapshot.PreviousVoters != snapshot.Voters ||
+             snapshot.PreviousJointIndex != snapshot.ConfigurationIndex ||
+             snapshot.PreviousJointTerm != snapshot.ConfigurationTerm);
+        if (!snapshot.HasConfigurationMetadata() || invalidStableLineage || invalidJointLineage ||
+            !snapshot.PreviousJointIndex || snapshot.PreviousJointIndex <= snapshot.PreviousConfigurationIndex ||
+            ((snapshot.PreviousConfigurationIndex == 0) != (snapshot.PreviousConfigurationTerm == 0)) ||
+            snapshot.PreviousJointTerm < snapshot.PreviousConfigurationTerm ||
+            snapshot.PreviousJointIndex > snapshot.Index || !snapshot.PreviousJointTerm)
+            throw std::runtime_error("Invalid snapshot configuration lineage");
+        if (!snapshot.ConfigurationTransitions.empty()) {
+            const auto& tail = snapshot.ConfigurationTransitions.back();
+            if (tail.OldVoters != snapshot.PreviousVoters ||
+                tail.PreviousConfigurationIndex != snapshot.PreviousConfigurationIndex ||
+                tail.PreviousConfigurationTerm != snapshot.PreviousConfigurationTerm ||
+                tail.JointIndex != snapshot.PreviousJointIndex ||
+                tail.JointTerm != snapshot.PreviousJointTerm)
+                throw std::runtime_error("Snapshot configuration history tail disagrees with lineage");
+        }
+    } else if (!snapshot.PreviousVoters.empty() || snapshot.PreviousConfigurationIndex ||
+        snapshot.PreviousConfigurationTerm || snapshot.PreviousJointIndex || snapshot.PreviousJointTerm) {
+        throw std::runtime_error("Incomplete snapshot configuration lineage");
+    }
     if (snapshot.HasConfigurationMetadata()) {
         if ((snapshot.StableConfiguration ? !snapshot.JointVoters.empty() : snapshot.JointVoters.empty()) || !snapshot.ConfigurationIndex ||
             snapshot.ConfigurationIndex > snapshot.Index || !snapshot.ConfigurationTerm ||
@@ -43,6 +134,40 @@ void Validate(const TSnapshot& snapshot) {
 }
 void CheckSnapshotConfigurationContinuity(const TSnapshot* current, const TSnapshot& incoming) {
     if (!current || !current->HasConfigurationMetadata()) return;
+    if (!incoming.ConfigurationTransitions.empty() && !current->ConfigurationTransitions.empty()) {
+        bool sameTail = true;
+        const auto count = std::min(incoming.ConfigurationTransitions.size(), current->ConfigurationTransitions.size());
+        for (size_t i = 0; i < count; ++i) {
+            if (incoming.ConfigurationTransitions[incoming.ConfigurationTransitions.size() - count + i] !=
+                current->ConfigurationTransitions[current->ConfigurationTransitions.size() - count + i]) {
+                sameTail = false;
+                break;
+            }
+        }
+        if (!sameTail) {
+            bool completesKnownJoint = incoming.ConfigurationTransitions.size() == current->ConfigurationTransitions.size();
+            for (size_t i = 0; completesKnownJoint && i + 1 < count; ++i) {
+                if (incoming.ConfigurationTransitions[incoming.ConfigurationTransitions.size() - count + i] !=
+                    current->ConfigurationTransitions[current->ConfigurationTransitions.size() - count + i])
+                    completesKnownJoint = false;
+            }
+            if (completesKnownJoint) {
+                const auto& knownJoint = current->ConfigurationTransitions.back();
+                const auto& stableSuccessor = incoming.ConfigurationTransitions.back();
+                completesKnownJoint = !knownJoint.StableIndex && !knownJoint.StableTerm &&
+                    stableSuccessor.StableIndex > knownJoint.JointIndex &&
+                    stableSuccessor.StableTerm >= knownJoint.JointTerm &&
+                    stableSuccessor.OldVoters == knownJoint.OldVoters &&
+                    stableSuccessor.NewVoters == knownJoint.NewVoters &&
+                    stableSuccessor.PreviousConfigurationIndex == knownJoint.PreviousConfigurationIndex &&
+                    stableSuccessor.PreviousConfigurationTerm == knownJoint.PreviousConfigurationTerm &&
+                    stableSuccessor.JointIndex == knownJoint.JointIndex &&
+                    stableSuccessor.JointTerm == knownJoint.JointTerm;
+            }
+            if (!completesKnownJoint)
+                throw std::invalid_argument("Snapshot configuration history changed");
+        }
+    }
     if (current->StableConfiguration) {
         if (incoming.StableConfiguration) {
             if (incoming.ConfigurationIndex != current->ConfigurationIndex ||
@@ -50,6 +175,14 @@ void CheckSnapshotConfigurationContinuity(const TSnapshot* current, const TSnaps
                 throw std::invalid_argument("Stable snapshot configuration identity changed");
             if (incoming.Voters != current->Voters)
                 throw std::invalid_argument("Stable snapshot voters changed without a new configuration identity");
+            if (incoming.HasStablePredecessor() &&
+                (!current->HasStablePredecessor() ||
+                 incoming.PreviousVoters != current->PreviousVoters ||
+                 incoming.PreviousConfigurationIndex != current->PreviousConfigurationIndex ||
+                 incoming.PreviousConfigurationTerm != current->PreviousConfigurationTerm ||
+                 incoming.PreviousJointIndex != current->PreviousJointIndex ||
+                 incoming.PreviousJointTerm != current->PreviousJointTerm))
+                throw std::invalid_argument("Stable snapshot predecessor lineage changed");
             return;
         }
         if (incoming.IsJoint()) {
@@ -57,6 +190,11 @@ void CheckSnapshotConfigurationContinuity(const TSnapshot* current, const TSnaps
                 incoming.ConfigurationIndex <= current->Index ||
                 incoming.ConfigurationTerm < current->Term)
                 throw std::invalid_argument("Joint snapshot does not extend the stable configuration");
+            if (incoming.HasConfigurationLineage() &&
+                (incoming.PreviousVoters != current->Voters ||
+                 incoming.PreviousConfigurationIndex != current->ConfigurationIndex ||
+                 incoming.PreviousConfigurationTerm != current->ConfigurationTerm))
+                throw std::invalid_argument("Joint snapshot predecessor lineage is not continuous");
             return;
         }
         if (incoming.Voters != current->Voters)
@@ -69,6 +207,14 @@ void CheckSnapshotConfigurationContinuity(const TSnapshot* current, const TSnaps
             incoming.ConfigurationIndex != current->ConfigurationIndex ||
             incoming.ConfigurationTerm != current->ConfigurationTerm)
             throw std::invalid_argument("Joint snapshot configuration changed without a stable successor");
+        if (incoming.HasConfigurationLineage() &&
+            (incoming.PreviousVoters != current->Voters ||
+             incoming.PreviousJointIndex != current->ConfigurationIndex ||
+             incoming.PreviousJointTerm != current->ConfigurationTerm ||
+             (current->HasConfigurationLineage() &&
+                (incoming.PreviousConfigurationIndex != current->PreviousConfigurationIndex ||
+                 incoming.PreviousConfigurationTerm != current->PreviousConfigurationTerm))))
+            throw std::invalid_argument("Joint snapshot predecessor lineage changed");
         return;
     }
     if (incoming.StableConfiguration) {
@@ -76,11 +222,28 @@ void CheckSnapshotConfigurationContinuity(const TSnapshot* current, const TSnaps
             incoming.ConfigurationIndex <= current->Index ||
             incoming.ConfigurationTerm < current->Term)
             throw std::invalid_argument("Stable snapshot does not extend the joint configuration");
+        if (incoming.HasStablePredecessor() &&
+            (incoming.PreviousVoters != current->Voters ||
+             incoming.PreviousJointIndex != current->ConfigurationIndex ||
+             incoming.PreviousJointTerm != current->ConfigurationTerm ||
+             (current->HasConfigurationLineage() &&
+                (incoming.PreviousConfigurationIndex != current->PreviousConfigurationIndex ||
+                 incoming.PreviousConfigurationTerm != current->PreviousConfigurationTerm))))
+            throw std::invalid_argument("Stable snapshot predecessor lineage is not continuous");
         return;
     }
     throw std::invalid_argument("Legacy snapshot cannot discard joint configuration metadata");
 }
 bool MatchesConfiguration(const TSnapshot& snapshot, const TConfigurationHistory& committed) {
+    if (!snapshot.ConfigurationTransitions.empty() && !committed.ConfigurationTransitions().empty()) {
+        const auto count = std::min(snapshot.ConfigurationTransitions.size(),
+            committed.ConfigurationTransitions().size());
+        for (size_t i = 0; i < count; ++i) {
+            if (snapshot.ConfigurationTransitions[snapshot.ConfigurationTransitions.size() - count + i] !=
+                committed.ConfigurationTransitions()[committed.ConfigurationTransitions().size() - count + i])
+                return false;
+        }
+    }
     if (committed.IsJoint()) {
         return snapshot.IsJoint() && !snapshot.StableConfiguration &&
             snapshot.Voters == committed.OldVoters() && snapshot.JointVoters == committed.NewVoters() &&
@@ -125,19 +288,58 @@ void Sync(int fd) {
 void ValidateSnapshot(const TSnapshot& snapshot) { Validate(snapshot); }
 
 void PreserveStableSnapshotIdentity(const TSnapshot* current, TSnapshot& incoming) {
-    CheckSnapshotConfigurationContinuity(current, incoming);
     if (current && current->StableConfiguration && !incoming.HasConfigurationMetadata()) {
         // Legacy images carry no membership claim, so retain the known stable
         // identity after confirming their active voters are unchanged.
+        if (incoming.Voters != current->Voters)
+            throw std::invalid_argument("Legacy snapshot would change the active voter set");
         incoming.StableConfiguration = true;
         incoming.ConfigurationIndex = current->ConfigurationIndex;
         incoming.ConfigurationTerm = current->ConfigurationTerm;
+        incoming.PreviousVoters = current->PreviousVoters;
+        incoming.PreviousConfigurationIndex = current->PreviousConfigurationIndex;
+        incoming.PreviousConfigurationTerm = current->PreviousConfigurationTerm;
+        incoming.PreviousJointIndex = current->PreviousJointIndex;
+        incoming.PreviousJointTerm = current->PreviousJointTerm;
+        incoming.ConfigurationTransitions = current->ConfigurationTransitions;
+    } else if (current && current->StableConfiguration && incoming.StableConfiguration &&
+        incoming.Voters == current->Voters &&
+        incoming.ConfigurationIndex == current->ConfigurationIndex &&
+        incoming.ConfigurationTerm == current->ConfigurationTerm &&
+        !incoming.HasStablePredecessor() && current->HasStablePredecessor()) {
+        // An older peer may send MRFTS003 after this node learned the bounded
+        // predecessor from its own committed history. Keep the local lineage.
+        incoming.PreviousVoters = current->PreviousVoters;
+        incoming.PreviousConfigurationIndex = current->PreviousConfigurationIndex;
+        incoming.PreviousConfigurationTerm = current->PreviousConfigurationTerm;
+        incoming.PreviousJointIndex = current->PreviousJointIndex;
+        incoming.PreviousJointTerm = current->PreviousJointTerm;
+        incoming.ConfigurationTransitions = current->ConfigurationTransitions;
+    } else if (current && current->StableConfiguration && incoming.StableConfiguration &&
+        incoming.Voters == current->Voters &&
+        incoming.ConfigurationIndex == current->ConfigurationIndex &&
+        incoming.ConfigurationTerm == current->ConfigurationTerm &&
+        incoming.ConfigurationTransitions.empty() && !current->ConfigurationTransitions.empty() &&
+        incoming.HasStablePredecessor() &&
+        incoming.PreviousVoters == current->PreviousVoters &&
+        incoming.PreviousConfigurationIndex == current->PreviousConfigurationIndex &&
+        incoming.PreviousConfigurationTerm == current->PreviousConfigurationTerm &&
+        incoming.PreviousJointIndex == current->PreviousJointIndex &&
+        incoming.PreviousJointTerm == current->PreviousJointTerm) {
+        // Older peers can carry the bounded tail but not the complete history.
+        // Retain the already validated chain when both snapshots share its tail.
+        incoming.ConfigurationTransitions = current->ConfigurationTransitions;
     }
+    CheckSnapshotConfigurationContinuity(current, incoming);
 }
 
 std::string EncodeSnapshot(const TSnapshot& snapshot) {
     Validate(snapshot);
-    std::string out(snapshot.StableConfiguration ? StableMagic : snapshot.IsJoint() ? JointMagic : Magic);
+    std::string out(!snapshot.ConfigurationTransitions.empty()
+        ? (snapshot.StableConfiguration ? StableHistoryMagic : JointHistoryMagic)
+        : snapshot.HasStablePredecessor() ? StableLineageMagic :
+        snapshot.HasConfigurationLineage() ? JointLineageMagic :
+        snapshot.StableConfiguration ? StableMagic : snapshot.IsJoint() ? JointMagic : Magic);
     Put(out, snapshot.Index, 8);
     Put(out, snapshot.Term, 8);
     Put(out, snapshot.Voters.size(), 4);
@@ -146,9 +348,32 @@ std::string EncodeSnapshot(const TSnapshot& snapshot) {
         Put(out, snapshot.ConfigurationIndex, 8);
         Put(out, snapshot.ConfigurationTerm, 8);
         if (!snapshot.StableConfiguration) Put(out, snapshot.JointVoters.size(), 4);
+        if (snapshot.HasConfigurationLineage()) {
+            Put(out, snapshot.PreviousConfigurationIndex, 8);
+            Put(out, snapshot.PreviousConfigurationTerm, 8);
+            Put(out, snapshot.PreviousJointIndex, 8);
+            Put(out, snapshot.PreviousJointTerm, 8);
+            Put(out, snapshot.PreviousVoters.size(), 4);
+        }
     }
     for (auto voter : snapshot.Voters) Put(out, voter, 4);
     for (auto voter : snapshot.JointVoters) Put(out, voter, 4);
+    for (auto voter : snapshot.PreviousVoters) Put(out, voter, 4);
+    if (!snapshot.ConfigurationTransitions.empty()) {
+        Put(out, snapshot.ConfigurationTransitions.size(), 4);
+        for (const auto& transition : snapshot.ConfigurationTransitions) {
+            Put(out, transition.PreviousConfigurationIndex, 8);
+            Put(out, transition.PreviousConfigurationTerm, 8);
+            Put(out, transition.JointIndex, 8);
+            Put(out, transition.JointTerm, 8);
+            Put(out, transition.StableIndex, 8);
+            Put(out, transition.StableTerm, 8);
+            Put(out, transition.OldVoters.size(), 4);
+            Put(out, transition.NewVoters.size(), 4);
+            for (auto voter : transition.OldVoters) Put(out, voter, 4);
+            for (auto voter : transition.NewVoters) Put(out, voter, 4);
+        }
+    }
     Append(out, snapshot.Data);
     Put(out, Checksum(out), 4);
     return out;
@@ -162,8 +387,11 @@ TSnapshot DecodeSnapshot(std::string_view bytes) {
         throw std::runtime_error("Snapshot checksum mismatch");
     TReader reader{bytes.substr(0, bytes.size() - 4)};
     const auto magic = reader.Read(Magic.size());
-    const bool joint = magic == JointMagic;
-    const bool stable = magic == StableMagic;
+    const bool jointLineage = magic == JointLineageMagic || magic == JointHistoryMagic;
+    const bool joint = magic == JointMagic || jointLineage;
+    const bool stableLineage = magic == StableLineageMagic || magic == StableHistoryMagic;
+    const bool stable = magic == StableMagic || stableLineage;
+    const bool configurationHistory = magic == StableHistoryMagic || magic == JointHistoryMagic;
     if (!joint && !stable && magic != Magic) throw std::runtime_error("Unknown snapshot format");
     TSnapshot snapshot;
     snapshot.StableConfiguration = stable;
@@ -171,17 +399,47 @@ TSnapshot DecodeSnapshot(std::string_view bytes) {
     snapshot.Term = reader.Take(8);
     const auto count = reader.Take(4);
     const auto length = reader.Take(8);
-    uint64_t newCount = 0;
+    uint64_t newCount = 0, previousCount = 0;
     if (joint || stable) {
         snapshot.ConfigurationIndex = reader.Take(8);
         snapshot.ConfigurationTerm = reader.Take(8);
         if (joint) newCount = reader.Take(4);
+        if (stableLineage || jointLineage) {
+            snapshot.PreviousConfigurationIndex = reader.Take(8);
+            snapshot.PreviousConfigurationTerm = reader.Take(8);
+            snapshot.PreviousJointIndex = reader.Take(8);
+            snapshot.PreviousJointTerm = reader.Take(8);
+            previousCount = reader.Take(4);
+        }
     }
     if (count > TSnapshot::MaxVoters || newCount > TSnapshot::MaxVoters ||
-        count + newCount > reader.Input.size() / 4)
+        previousCount > TSnapshot::MaxVoters ||
+        count + newCount + previousCount > reader.Input.size() / 4)
         throw std::runtime_error("Invalid snapshot voter count");
     for (uint32_t i = 0; i < count; ++i) snapshot.Voters.push_back(reader.Take(4));
     for (uint32_t i = 0; i < newCount; ++i) snapshot.JointVoters.push_back(reader.Take(4));
+    for (uint32_t i = 0; i < previousCount; ++i) snapshot.PreviousVoters.push_back(reader.Take(4));
+    if (configurationHistory) {
+        const auto transitions = reader.Take(4);
+        if (!transitions || transitions > TSnapshot::MaxConfigurationTransitions)
+            throw std::runtime_error("Invalid snapshot configuration history count");
+        for (uint32_t i = 0; i < transitions; ++i) {
+            TSnapshotConfigurationTransition transition;
+            transition.PreviousConfigurationIndex = reader.Take(8);
+            transition.PreviousConfigurationTerm = reader.Take(8);
+            transition.JointIndex = reader.Take(8);
+            transition.JointTerm = reader.Take(8);
+            transition.StableIndex = reader.Take(8);
+            transition.StableTerm = reader.Take(8);
+            const auto oldCount = reader.Take(4), newCount = reader.Take(4);
+            if (oldCount > TSnapshot::MaxVoters || newCount > TSnapshot::MaxVoters ||
+                oldCount + newCount > reader.Input.size() / 4)
+                throw std::runtime_error("Invalid snapshot configuration history voter count");
+            for (uint32_t j = 0; j < oldCount; ++j) transition.OldVoters.push_back(reader.Take(4));
+            for (uint32_t j = 0; j < newCount; ++j) transition.NewVoters.push_back(reader.Take(4));
+            snapshot.ConfigurationTransitions.push_back(std::move(transition));
+        }
+    }
     if (joint && !snapshot.IsJoint()) throw std::runtime_error("Empty joint snapshot configuration");
     if (length > reader.Input.size()) throw std::runtime_error("Invalid snapshot data length");
     snapshot.Data = reader.Read(size_t(length));
@@ -203,14 +461,25 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm) {
     if (committed.ConfigurationIndex() > index)
         throw std::logic_error("Application progress precedes the committed configuration");
     TSnapshot snapshot{index, raft.GetState()->LogTerm(index), committed.OldVoters(), {}};
+    snapshot.ConfigurationTransitions = committed.ConfigurationTransitions();
     if (committed.IsJoint()) {
         snapshot.JointVoters = committed.NewVoters();
         snapshot.ConfigurationIndex = committed.ConfigurationIndex();
         snapshot.ConfigurationTerm = committed.ConfigurationTerm();
+        snapshot.PreviousVoters = committed.PreviousVoters();
+        snapshot.PreviousConfigurationIndex = committed.PreviousConfigurationIndex();
+        snapshot.PreviousConfigurationTerm = committed.PreviousConfigurationTerm();
+        snapshot.PreviousJointIndex = committed.PreviousJointIndex();
+        snapshot.PreviousJointTerm = committed.PreviousJointTerm();
     } else if (committed.ConfigurationIndex()) {
         snapshot.StableConfiguration = true;
         snapshot.ConfigurationIndex = committed.ConfigurationIndex();
         snapshot.ConfigurationTerm = committed.ConfigurationTerm();
+        snapshot.PreviousVoters = committed.PreviousVoters();
+        snapshot.PreviousConfigurationIndex = committed.PreviousConfigurationIndex();
+        snapshot.PreviousConfigurationTerm = committed.PreviousConfigurationTerm();
+        snapshot.PreviousJointIndex = committed.PreviousJointIndex();
+        snapshot.PreviousJointTerm = committed.PreviousJointTerm();
     }
     if (!snapshot.StableConfiguration) {
         const auto previous = raft.GetState()->GetSnapshot();
@@ -218,6 +487,12 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm) {
             snapshot.StableConfiguration = true;
             snapshot.ConfigurationIndex = previous->ConfigurationIndex;
             snapshot.ConfigurationTerm = previous->ConfigurationTerm;
+            snapshot.PreviousVoters = previous->PreviousVoters;
+            snapshot.PreviousConfigurationIndex = previous->PreviousConfigurationIndex;
+            snapshot.PreviousConfigurationTerm = previous->PreviousConfigurationTerm;
+            snapshot.PreviousJointIndex = previous->PreviousJointIndex;
+            snapshot.PreviousJointTerm = previous->PreviousJointTerm;
+            snapshot.ConfigurationTransitions = previous->ConfigurationTransitions;
         }
     }
     CheckLocalLog(snapshot, raft, raft.Configuration->Committed);
@@ -233,8 +508,8 @@ void RestoreSnapshot(const TSnapshot& snapshot, const TRaft& raft, IRsm& rsm) {
     if (snapshot.Index < raft.GetState()->SnapshotIndex ||
         snapshot.Index > raft.GetVolatileState()->CommitIndex || !raft.ConfigurationBaseline)
         throw std::runtime_error("Snapshot is outside the committed retained configuration history");
-    const auto configurationAtBoundary = ScanConfigurationHistory(*raft.GetState(),
-        *raft.ConfigurationBaseline, snapshot.Index).Committed;
+    const auto configurationAtBoundary = ScanConfigurationHistoryPrefix(*raft.GetState(),
+        *raft.ConfigurationBaseline, snapshot.Index);
     CheckLocalLog(snapshot, raft, configurationAtBoundary);
     if (rsm.LastAppliedIndex >= snapshot.Index)
         throw std::runtime_error("Application is not behind the snapshot");

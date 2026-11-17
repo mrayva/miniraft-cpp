@@ -26,6 +26,8 @@ public:
     bool SupportsSnapshots() const override { return true; }
     std::shared_ptr<const TSnapshot> GetSnapshot() const override;
     void InstallSnapshot(const TSnapshot& snapshot) override;
+    void InstallRaftSnapshot(const TSnapshot& snapshot,
+        const TRaftInstallSnapshotPermit& permit) override;
     bool SupportsVoterBinding() const override { return true; }
     bool HasUnboundRecoveredState() const override;
     std::vector<uint32_t> GetBoundVoters() const override;
@@ -34,8 +36,16 @@ public:
     // Explicit legacy migration. Call before constructing TRaft. The caller
     // asserts that voters is the complete original fixed set, verified outside
     // this store.
+    // The dry run reports on-disk consistency only; it cannot prove the
+    // operator-supplied voter set is complete. It returns false with a
+    // diagnostic in reason on failure, clears reason on success, and never
+    // publishes state.
+    bool CanBindVotersFromTrustedBaseline(const std::vector<uint32_t>& voters,
+        std::string* reason = nullptr) const;
     void BindVotersFromTrustedBaseline(const std::vector<uint32_t>& voters);
 private:
+    void ValidateTrustedLegacyVoterBaseline(const std::vector<uint32_t>& voters) const;
+    void InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated);
     struct TImpl;
     std::unique_ptr<TImpl> Impl;
     void Publish();

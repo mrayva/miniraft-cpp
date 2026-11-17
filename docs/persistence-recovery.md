@@ -62,5 +62,11 @@ or record generations, so a bit flip that leaves valid fields can go undetected.
 The three-file format still lacks fsync, atomic metadata publication, directory
 synchronization and a crash-safe replacement protocol. In-place updates can
 destroy an older valid version on power failure. This change rejects detectable
-damage rather than attempting speculative repair. Crash injection, snapshots,
-membership changes and strong-read linearizability remain separate work.
+damage rather than attempting speculative repair. This alpha.2 milestone
+predates the later durable-image crash-boundary tests, snapshot/compaction
+support, live joint membership and fresh-quorum read confirmation. Current
+limits are documented in [durable state](durable-state.md),
+[compaction](compaction.md), [live membership](configuration-entries.md) and
+[strong reads](strong-reads.md). The legacy three-file `TDiskState` backend
+still lacks power-loss durability; the strong-read protocol still does not
+claim end-to-end application linearizability.

@@ -14,6 +14,12 @@ snapshot voter list matches the configured peers before persisting the
 binding. Newly initialized stores still bind their initial peer set during
 startup.
 
+Startup tooling may call `CanBindVotersFromTrustedBaseline(voters, &reason)`
+before the migration to display a non-mutating consistency diagnostic. It runs
+the same vote, snapshot, and retained-log checks as the binding operation. A
+successful check does not prove the supplied voter set is historically
+complete; the operator must still verify it independently.
+
 The rejection does not rewrite the durable file. The alpha.51 startup marker
 also keeps the explicit migration API startup-only. `TDiskState` and in-memory
 state behavior are unchanged. This closes unbound durable startup; it does not

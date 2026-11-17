@@ -594,11 +594,18 @@ void test_trusted_legacy_voter_baseline_migrates_durable_state(void**) {
         TFiles files;
         {
             TDurableState fresh(files.Name, 1);
+            std::string reason;
+            assert_false(fresh.CanBindVotersFromTrustedBaseline({1, 2, 3}, &reason));
+            assert_true(!reason.empty());
             Reject([&] { fresh.BindVotersFromTrustedBaseline({1, 2, 3}); });
         }
         auto recovered = std::make_shared<TDurableState>(files.Name, 1);
         assert_int_equal(recovered->CurrentTerm, 1);
         assert_int_equal(recovered->LastLogIndex, 0);
+        std::string reason = "stale";
+        assert_true(recovered->CanBindVotersFromTrustedBaseline({1, 2, 3}, &reason));
+        assert_true(reason.empty());
+        assert_true(recovered->GetBoundVoters().empty()); // The check is non-mutating.
         Reject([&] { TRaft missingBaseline(recovered, 1, Peers(1, 3)); });
         recovered->BindVotersFromTrustedBaseline({1, 2, 3});
         assert_true(recovered->GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
@@ -606,7 +613,7 @@ void test_trusted_legacy_voter_baseline_migrates_durable_state(void**) {
         assert_true(raft.GetVoterIds() == (std::vector<uint32_t>{1, 2, 3}));
     }
     {
-        TFiles files; TStateFields before;
+        TFiles files; TStateFields before; std::string reason;
         {
             TDurableState legacy(files.Name, 1);
             legacy.CurrentTerm = 3; legacy.VotedFor = 1;
@@ -622,11 +629,22 @@ void test_trusted_legacy_voter_baseline_migrates_durable_state(void**) {
             auto state = std::make_shared<TDurableState>(files.Name, 1);
             assert_true(state->GetBoundVoters().empty());
             Reject([&] { state->BindVoters({1, 2, 3}); });
+            reason.clear();
+            assert_false(state->CanBindVotersFromTrustedBaseline({2, 3}, &reason));
+            assert_true(reason.find("Stored vote is outside") != std::string::npos);
             Reject([&] { state->BindVotersFromTrustedBaseline({2, 3}); });
             assert_true(static_cast<TStateFields>(*state) == before);
             assert_true(state->GetBoundVoters().empty());
             std::ifstream unchanged(path, std::ios::binary);
             assert_true(std::string(std::istreambuf_iterator<char>(unchanged), {}) == original);
+
+            reason.clear();
+            assert_true(state->CanBindVotersFromTrustedBaseline({1, 2, 3}, &reason));
+            assert_true(reason.empty());
+            assert_true(static_cast<TStateFields>(*state) == before);
+            assert_true(state->GetBoundVoters().empty());
+            std::ifstream dryRunUnchanged(path, std::ios::binary);
+            assert_true(std::string(std::istreambuf_iterator<char>(dryRunUnchanged), {}) == original);
 
             state->BindVotersFromTrustedBaseline({1, 2, 3});
             assert_true(static_cast<TStateFields>(*state) == before);
@@ -642,7 +660,7 @@ void test_trusted_legacy_voter_baseline_migrates_durable_state(void**) {
         assert_true(raft.GetVoterIds() == (std::vector<uint32_t>{1, 2, 3}));
     }
     {
-        TFiles files; TStateFields before; std::string application;
+        TFiles files; TStateFields before; std::string application, reason;
         {
             TDurableState legacy(files.Name, 1); TKv image;
             legacy.CurrentTerm = 3; legacy.VotedFor = 1;
@@ -660,11 +678,18 @@ void test_trusted_legacy_voter_baseline_migrates_durable_state(void**) {
 
         {
             auto state = std::make_shared<TDurableState>(files.Name, 1);
+            assert_false(state->CanBindVotersFromTrustedBaseline({1, 2}, &reason));
+            assert_true(reason.find("Legacy snapshot does not match") != std::string::npos);
             Reject([&] { state->BindVotersFromTrustedBaseline({1, 2}); });
             assert_true(static_cast<TStateFields>(*state) == before);
             assert_true(state->GetBoundVoters().empty());
             std::ifstream unchanged(path, std::ios::binary);
             assert_true(std::string(std::istreambuf_iterator<char>(unchanged), {}) == original);
+            reason.clear();
+            assert_true(state->CanBindVotersFromTrustedBaseline({1, 2, 3}, &reason));
+            assert_true(reason.empty());
+            std::ifstream dryRunUnchanged(path, std::ios::binary);
+            assert_true(std::string(std::istreambuf_iterator<char>(dryRunUnchanged), {}) == original);
             state->BindVotersFromTrustedBaseline({1, 2, 3});
             assert_true(static_cast<TStateFields>(*state) == before);
             assert_true(state->GetSnapshot()->Data == application);
@@ -721,6 +746,9 @@ void test_trusted_legacy_voter_baseline_must_precede_raft_startup(void**) {
     assert_true(state->GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
     std::ifstream migratedInput(path, std::ios::binary);
     const std::string migrated(std::istreambuf_iterator<char>(migratedInput), {});
+    std::string reason;
+    assert_false(state->CanBindVotersFromTrustedBaseline({1, 2, 3}, &reason));
+    assert_true(reason.find("before Raft startup") != std::string::npos);
     Reject([&] { state->BindVotersFromTrustedBaseline({1, 2, 3}); });
     std::ifstream after(path, std::ios::binary);
     assert_true(std::string(std::istreambuf_iterator<char>(after), {}) == migrated);

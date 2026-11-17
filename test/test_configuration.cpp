@@ -3,6 +3,7 @@
 #include <miniraft/raft.h>
 #include <miniraft/persist.h>
 #include <miniraft/snapshot_codec.h>
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -64,6 +65,16 @@ struct TSnapshotRsm : TCountingRsm {
 TMessageHolder<TLogEntry> Ordinary(uint64_t term) {
     auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = term; return entry;
 }
+void test_raft_accepts_full_width_voter_ids(void**) {
+    constexpr uint32_t highId = 0x80000001u;
+    auto state = std::make_shared<TState>();
+    TNodeDict peers{{1, std::make_shared<TEndpoint>()}};
+    TRaft raft(state, highId, peers);
+    assert_true(raft.GetId() == highId);
+    assert_true(raft.IsVoter(highId));
+    assert_true(raft.GetVoterIds() == (std::vector<uint32_t>{1, highId}));
+    Reject([&] { TRaft invalid(std::make_shared<TState>(), -1, peers); });
+}
 void test_configuration_snapshot_projection_and_history_resume(void**) {
     auto initial = TConfigurationHistory::Stable({1, 2, 3}, 0, 0, 0, 0);
     Reject([&] { initial.MakeSnapshot("empty boundary"); });
@@ -76,22 +87,42 @@ void test_configuration_snapshot_projection_and_history_resume(void**) {
     auto pending = prefix.Advance(2, EncodeConfigurationEntry(joint)).Observe(3, Ordinary(2));
     const auto pendingSnapshot = pending.MakeSnapshot(std::string("j\0x", 3));
     const auto jointBytes = EncodeSnapshot(pendingSnapshot);
-    assert_true(jointBytes.substr(0, 8) == "MRFTS002");
+    assert_true(jointBytes.substr(0, 8) == "MRFTS007");
+    assert_true(pendingSnapshot.HasConfigurationLineage());
+    assert_true(pendingSnapshot.PreviousVoters == joint.OldVoters);
+    assert_int_equal(pendingSnapshot.PreviousConfigurationIndex, 0);
+    assert_int_equal(pendingSnapshot.PreviousConfigurationTerm, 0);
+    assert_int_equal(pendingSnapshot.PreviousJointIndex, 2);
+    assert_int_equal(pendingSnapshot.PreviousJointTerm, 2);
     auto restoredJoint = TConfigurationHistory::FromJointSnapshot(DecodeSnapshot(jointBytes));
     assert_int_equal(restoredJoint.ThroughIndex(), 3); assert_int_equal(restoredJoint.ConfigurationIndex(), 2);
     assert_true(restoredJoint.OldVoters() == joint.OldVoters); assert_true(restoredJoint.NewVoters() == joint.NewVoters);
+    assert_true(restoredJoint.PreviousVoters() == joint.OldVoters);
     auto final = joint; final.Phase = EConfigurationPhase::Stable; final.Term = 3;
     final.PreviousIndex = 2; final.PreviousTerm = 2;
     auto stable = restoredJoint.Advance(4, EncodeConfigurationEntry(final));
     const auto stableSnapshot = stable.MakeSnapshot("stable");
     const auto stableBytes = EncodeSnapshot(stableSnapshot);
-    assert_true(stableBytes.substr(0, 8) == "MRFTS003");
+    assert_true(stableBytes.substr(0, 8) == "MRFTS006");
+    assert_true(stableSnapshot.ConfigurationTransitions.size() == 1);
+    assert_true(DecodeSnapshot(stableBytes) == stableSnapshot);
+    auto truncatedHistory = stableSnapshot;
+    truncatedHistory.ConfigurationTransitions.back().StableIndex = 0;
+    truncatedHistory.ConfigurationTransitions.back().StableTerm = 0;
+    Reject([&] { EncodeSnapshot(truncatedHistory); });
+    assert_true(stableSnapshot.HasStablePredecessor());
+    assert_true(stableSnapshot.PreviousVoters == joint.OldVoters);
+    assert_int_equal(stableSnapshot.PreviousJointIndex, 2);
+    assert_int_equal(stableSnapshot.PreviousJointTerm, joint.Term);
     auto restoredStable = TConfigurationHistory::FromStableSnapshot(DecodeSnapshot(stableBytes));
     assert_int_equal(restoredStable.ConfigurationIndex(), 4); assert_int_equal(restoredStable.ConfigurationTerm(), 3);
     assert_true(restoredStable.OldVoters() == joint.NewVoters); assert_false(restoredStable.IsJoint());
     TConfigurationRecord next{EConfigurationPhase::Joint, 3, 4, 3, joint.NewVoters, {3, 4, 6}};
     auto resumed = restoredStable.Advance(5, EncodeConfigurationEntry(next));
     assert_true(resumed.IsJoint()); assert_true(resumed.NewVoters() == next.NewVoters);
+    const auto resumedJoint = resumed.MakeSnapshot("second transition");
+    assert_true(EncodeSnapshot(resumedJoint).substr(0, 8) == "MRFTS007");
+    assert_true(DecodeSnapshot(EncodeSnapshot(resumedJoint)) == resumedJoint);
     assert_true(pending.NewVoters() == joint.NewVoters); assert_false(stable.IsJoint());
     TState jointState; jointState.BindVoters(pendingSnapshot.Voters);
     jointState.CurrentTerm = pendingSnapshot.Term;
@@ -105,6 +136,118 @@ void test_configuration_snapshot_projection_and_history_resume(void**) {
     Reject([&] { unbound.InstallSnapshot(pendingSnapshot); });
     unbound.Snapshot = std::make_shared<TSnapshot>(pendingSnapshot);
     Reject([&] { unbound.BindVoters(pendingSnapshot.Voters); });
+}
+void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void**) {
+    const std::vector<uint32_t> firstSet{1, 2, 3};
+    const std::vector<uint32_t> secondSet{2, 3, 4};
+    auto history = TConfigurationHistory::Stable(firstSet, 0, 0, 0, 0)
+        .Observe(1, Ordinary(1));
+    TSnapshot oldestRetainedAnchor;
+
+    for (uint64_t transition = 1; transition <= TSnapshot::MaxConfigurationTransitions + 1; ++transition) {
+        const auto jointIndex = history.ThroughIndex() + 1;
+        const auto stableIndex = jointIndex + 1;
+        const auto nextVoters = transition % 2 ? secondSet : firstSet;
+        TConfigurationRecord joint{EConfigurationPhase::Joint, jointIndex,
+            history.ConfigurationIndex(), history.ConfigurationTerm(), history.OldVoters(), nextVoters};
+        history = history.Advance(jointIndex, EncodeConfigurationEntry(joint));
+        joint.Phase = EConfigurationPhase::Stable;
+        joint.Term = stableIndex;
+        joint.PreviousIndex = jointIndex;
+        joint.PreviousTerm = jointIndex;
+        history = history.Advance(stableIndex, EncodeConfigurationEntry(joint));
+        if (transition == 1)
+            oldestRetainedAnchor = history.MakeSnapshot(std::to_string(history.ThroughIndex()));
+        assert_true(history.ConfigurationTransitions().size() ==
+            std::min<size_t>(transition, TSnapshot::MaxConfigurationTransitions));
+    }
+
+    const auto& retained = history.ConfigurationTransitions();
+    assert_int_equal(retained.size(), TSnapshot::MaxConfigurationTransitions);
+    // The oldest retained edge is a valid suffix anchor at the stable boundary
+    // immediately after the evicted transition.
+    assert_true(retained.front().PreviousConfigurationIndex == 3);
+    assert_true(retained.front().PreviousConfigurationTerm == 3);
+    assert_true(retained.back().StableIndex == history.ConfigurationIndex());
+    assert_true(retained.back().StableTerm == history.ConfigurationTerm());
+    const auto stableImage = history.MakeSnapshot(std::to_string(history.ThroughIndex()));
+    assert_true(EncodeSnapshot(stableImage).substr(0, 8) == "MRFTS006");
+    assert_true(DecodeSnapshot(EncodeSnapshot(stableImage)) == stableImage);
+
+#ifdef __linux__
+    // Once the trusted baseline falls outside the retained suffix, a current
+    // voter cannot use the snapshot to move this stale store to an unknown
+    // configuration or raise its term.
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-history-window-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    auto staleState = std::make_shared<TDurableState>((dir / "stale").string(), 1);
+    staleState->BindVoters(firstSet);
+    staleState->CurrentTerm = 2;
+    staleState->Append(Ordinary(1));
+    staleState->CommitIndex = 1;
+    staleState->Commit();
+    TNodeDict peers;
+    std::array<std::shared_ptr<TEndpoint>, 5> endpoints{};
+    for (auto peer : {2u, 3u, 4u}) {
+        endpoints[peer] = std::make_shared<TEndpoint>();
+        peers.emplace(peer, endpoints[peer]);
+    }
+    auto stale = std::make_shared<TRaft>(staleState, 1, peers, std::vector<uint32_t>{4});
+    auto application = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor processor(stale, application, peers);
+    const auto bytes = EncodeSnapshot(stableImage);
+
+    // The stable identity at the oldest retained suffix boundary still
+    // authorizes recovery through the full 32-transition window.
+    auto retainedState = std::make_shared<TDurableState>((dir / "retained-stale").string(), 4);
+    retainedState->BindVoters(firstSet);
+    retainedState->CurrentTerm = oldestRetainedAnchor.Term;
+    retainedState->Commit();
+    retainedState->InstallSnapshot(oldestRetainedAnchor);
+    TNodeDict retainedPeers{{2, std::make_shared<TEndpoint>()}, {3, std::make_shared<TEndpoint>()}};
+    auto retainedRaft = std::make_shared<TRaft>(retainedState, 4, retainedPeers);
+    auto retainedApplication = std::make_shared<TSnapshotRsm>();
+    retainedApplication->LastAppliedIndex = oldestRetainedAnchor.Index;
+    TRequestProcessor retainedProcessor(retainedRaft, retainedApplication, retainedPeers);
+    auto retainedRequest = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + bytes.size());
+    retainedRequest->Src = 2; retainedRequest->Dst = 4; retainedRequest->Term = stableImage.Term + 1;
+    retainedRequest->SnapshotIndex = stableImage.Index; retainedRequest->SnapshotTerm = stableImage.Term;
+    retainedRequest->Offset = 0; retainedRequest->TotalBytes = bytes.size(); retainedRequest->Done = 1;
+    retainedRequest->LeaderId = 2;
+    memcpy(retainedRequest->Data, bytes.data(), bytes.size());
+    retainedRaft->Process({}, retainedRequest);
+    assert_int_equal(retainedState->CurrentTerm, stableImage.Term + 1);
+    assert_true(*retainedState->GetSnapshot() == stableImage);
+    assert_true(retainedState->GetBoundVoters() == firstSet);
+    assert_true(retainedRaft->GetVoterIds() == secondSet);
+    assert_int_equal(retainedApplication->LastAppliedIndex, stableImage.Index);
+
+    auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + bytes.size());
+    request->Src = 4; request->Dst = 1; request->Term = stableImage.Term + 1;
+    request->SnapshotIndex = stableImage.Index; request->SnapshotTerm = stableImage.Term;
+    request->Offset = 0; request->TotalBytes = bytes.size(); request->Done = 1;
+    request->LeaderId = 4;
+    memcpy(request->Data, bytes.data(), bytes.size());
+    stale->Process({}, request);
+    assert_int_equal(staleState->CurrentTerm, 2);
+    assert_true(!staleState->GetSnapshot());
+    assert_int_equal(application->LastAppliedIndex, 0);
+    assert_true(endpoints[4]->Messages.empty());
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+
+    auto resumed = TConfigurationHistory::FromStableSnapshot(DecodeSnapshot(EncodeSnapshot(stableImage)));
+    const auto nextJointIndex = resumed.ThroughIndex() + 1;
+    TConfigurationRecord nextJoint{EConfigurationPhase::Joint, nextJointIndex,
+        resumed.ConfigurationIndex(), resumed.ConfigurationTerm(), resumed.OldVoters(),
+        resumed.OldVoters() == firstSet ? secondSet : firstSet};
+    resumed = resumed.Advance(nextJointIndex, EncodeConfigurationEntry(nextJoint));
+    const auto jointImage = resumed.MakeSnapshot("bounded joint history");
+    assert_true(EncodeSnapshot(jointImage).substr(0, 8) == "MRFTS007");
+    assert_int_equal(jointImage.ConfigurationTransitions.size(), TSnapshot::MaxConfigurationTransitions);
+    assert_true(DecodeSnapshot(EncodeSnapshot(jointImage)) == jointImage);
 }
 void test_history_validates_joint_stable_chain_and_independent_rollback(void**) {
     auto initial = TConfigurationHistory::Stable({1, 2, 3}, 0, 0, 0, 0);
@@ -420,6 +563,10 @@ void test_follower_can_register_future_voter_endpoint_before_joint_entry(void**)
             return request;
         };
 
+        const auto beforeProvisioning = follower.CheckJointConfigurationReadiness({1, 2, 3});
+        assert_true(beforeProvisioning.MissingPeerTargets == (std::vector<uint32_t>{3}));
+        assert_false(beforeProvisioning.Ready());
+
         const auto beforeMissingEndpoint = static_cast<TStateFields>(*state);
         follower.Process({}, makeRequest());
         assert_true(static_cast<TStateFields>(*state) == beforeMissingEndpoint);
@@ -429,6 +576,9 @@ void test_follower_can_register_future_voter_endpoint_before_joint_entry(void**)
         follower.RegisterPeerTarget(3, std::make_shared<TEndpoint>());
         assert_true(follower.GetVoterIds() == (std::vector<uint32_t>{1, 2}));
         assert_true(follower.GetLearnerIds() == (std::vector<uint32_t>{3}));
+        const auto afterProvisioning = follower.CheckJointConfigurationReadiness({1, 2, 3});
+        assert_true(afterProvisioning.MissingPeerTargets.empty());
+        assert_false(afterProvisioning.Ready()); // A follower cannot propose the transition.
         follower.Process({}, makeRequest());
         assert_int_equal(state->CurrentTerm, 2);
         assert_int_equal(state->LastLogIndex, 1);
@@ -436,6 +586,327 @@ void test_follower_can_register_future_voter_endpoint_before_joint_entry(void**)
         assert_true(follower.GetVoterIds() == (std::vector<uint32_t>{1, 2, 3}));
         Reject([&] { follower.UnregisterPeerTarget(3); }); // Active joint voters cannot be detached.
     }
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
+void test_new_voter_leader_can_forward_prior_term_joint_entry(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-new-side-joint-forward-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    auto oldLeader = std::make_shared<TEndpoint>();
+    auto sharedVoter = std::make_shared<TEndpoint>();
+    auto newLeader = std::make_shared<TEndpoint>();
+    auto otherNewVoter = std::make_shared<TEndpoint>();
+    auto outsider = std::make_shared<TEndpoint>();
+    auto state = std::make_shared<TDurableState>((dir / "raft").string(), 2);
+    state->BindVoters({1, 2, 3});
+    state->CurrentTerm = 2;
+    state->Commit();
+    TRaft follower(state, 2, {{1, oldLeader}, {3, sharedVoter}});
+    follower.RegisterPeerTarget(4, newLeader);
+    follower.RegisterPeerTarget(5, otherNewVoter);
+    follower.RegisterPeerTarget(6, outsider);
+
+    const TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0,
+        {1, 2, 3}, {3, 4, 5}};
+    auto makeRequest = [&](uint64_t term) {
+        auto request = NewHoldedMessage(TMessageEx{.Src = 4, .Dst = 2, .Term = term},
+            TAppendEntriesRequest{.LeaderCommit = 1, .LeaderId = 4, .Nentries = 1});
+        request.InitPayload(1);
+        request.Payload[0] = EncodeConfigurationEntry(joint);
+        return request;
+    };
+
+    // A new-side voter cannot originate this joint entry in its own term.
+    const auto beforeSameTerm = static_cast<TStateFields>(*state);
+    follower.Process({}, makeRequest(2));
+    assert_true(static_cast<TStateFields>(*state) == beforeSameTerm);
+    assert_int_equal(newLeader->Sent, 0);
+
+    auto outsiderRequest = NewHoldedMessage(TMessageEx{.Src = 6, .Dst = 2, .Term = 4},
+        TAppendEntriesRequest{.LeaderCommit = 1, .LeaderId = 6, .Nentries = 1});
+    outsiderRequest.InitPayload(1);
+    outsiderRequest.Payload[0] = EncodeConfigurationEntry(joint);
+    follower.Process({}, std::move(outsiderRequest));
+    assert_true(static_cast<TStateFields>(*state) == beforeSameTerm);
+    assert_int_equal(outsider->Sent, 0);
+
+    // A new-side learner cannot use a joint entry with the correct old voters
+    // but a false predecessor identity to raise the receiver's term.
+    const TConfigurationRecord unrelatedJoint{EConfigurationPhase::Joint, 2, 1, 1,
+        {1, 2, 3}, {3, 6, 7}};
+    auto unrelatedRequest = NewHoldedMessage(TMessageEx{.Src = 6, .Dst = 2, .Term = 4},
+        TAppendEntriesRequest{.PrevLogIndex = 99, .PrevLogTerm = 2, .LeaderCommit = 99,
+            .LeaderId = 6, .Nentries = 1});
+    unrelatedRequest.InitPayload(1);
+    unrelatedRequest.Payload[0] = EncodeConfigurationEntry(unrelatedJoint);
+    follower.Process({}, std::move(unrelatedRequest));
+    assert_true(static_cast<TStateFields>(*state) == beforeSameTerm);
+    assert_int_equal(outsider->Sent, 0);
+
+    // A real new-side leader may replace a conflicting, uncommitted joint
+    // suffix. The committed stable predecessor remains the trust anchor.
+    const std::vector<uint32_t> replacementNewVoters{3, 6, 7};
+    auto pendingState = std::make_shared<TDurableState>((dir / "pending-raft").string(), 2);
+    pendingState->BindVoters({1, 2, 3});
+    pendingState->CurrentTerm = 2;
+    pendingState->Append(EncodeConfigurationEntry(TConfigurationRecord{
+        EConfigurationPhase::Joint, 2, 0, 0, {1, 2, 3}, {3, 4, 5}}));
+    pendingState->Commit();
+    TNodeDict pendingPeers{{1, std::make_shared<TEndpoint>()}, {3, std::make_shared<TEndpoint>()},
+        {4, std::make_shared<TEndpoint>()}, {5, std::make_shared<TEndpoint>()}};
+    TRaft pendingFollower(pendingState, 2, pendingPeers);
+    for (auto id : {6u, 7u})
+        pendingFollower.RegisterPeerTarget(id, std::make_shared<TEndpoint>());
+    const TConfigurationRecord replacementJoint{EConfigurationPhase::Joint, 3, 0, 0,
+        {1, 2, 3}, replacementNewVoters};
+    auto replacementRequest = NewHoldedMessage(TMessageEx{.Src = 6, .Dst = 2, .Term = 4},
+        TAppendEntriesRequest{.LeaderCommit = 0, .LeaderId = 6, .Nentries = 1});
+    replacementRequest.InitPayload(1);
+    replacementRequest.Payload[0] = EncodeConfigurationEntry(replacementJoint);
+    pendingFollower.Process({}, replacementRequest);
+    assert_int_equal(pendingState->CurrentTerm, 4);
+    assert_int_equal(pendingState->LastLogIndex, 1);
+    assert_true(DecodeConfigurationEntry(pendingState->Get(1)) == replacementJoint);
+    assert_true(pendingFollower.GetVoterIds() == (std::vector<uint32_t>{1, 2, 3, 6, 7}));
+
+    // After election in a later term, that voter may forward the prior-term
+    // entry so a lagging new voter can learn the joint configuration.
+    follower.Process({}, makeRequest(3));
+    assert_int_equal(state->CurrentTerm, 3);
+    assert_int_equal(state->LastLogIndex, 1);
+    assert_int_equal(state->CommitIndex, 1);
+    assert_true(follower.IsVoter(4));
+    assert_true(follower.IsVoter(5));
+    assert_true(follower.GetVoterIds() == (std::vector<uint32_t>{1, 2, 3, 4, 5}));
+
+    // A leader still in the old set can relay a stable successor created by a
+    // new-set leader in an earlier term, letting the transfer target catch up.
+    const TConfigurationRecord stable{EConfigurationPhase::Stable, 2, 1, 2,
+        {1, 2, 3}, {3, 4, 5}};
+    auto stableForward = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 2, .Term = 3},
+        TAppendEntriesRequest{.PrevLogIndex = 1, .PrevLogTerm = 2, .LeaderCommit = 1,
+            .LeaderId = 1, .Nentries = 1});
+    stableForward.InitPayload(1);
+    stableForward.Payload[0] = EncodeConfigurationEntry(stable);
+    follower.Process({}, std::move(stableForward));
+    assert_int_equal(state->LastLogIndex, 2);
+    assert_int_equal(state->CommitIndex, 1); // The successor remains pending until the joint quorum commits it.
+    assert_true(DecodeConfigurationEntry(state->Get(2)) == stable);
+    assert_true(follower.GetVoterIds() == (std::vector<uint32_t>{1, 2, 3, 4, 5}));
+
+    // But an old-side leader still cannot originate a stable successor.
+    auto sameTermStable = stable;
+    sameTermStable.Term = 3;
+    auto invalidStable = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 2, .Term = 3},
+        TAppendEntriesRequest{.PrevLogIndex = 1, .PrevLogTerm = 2, .LeaderCommit = 1,
+            .LeaderId = 1, .Nentries = 1});
+    invalidStable.InitPayload(1);
+    invalidStable.Payload[0] = EncodeConfigurationEntry(sameTermStable);
+    const auto beforeInvalidStable = static_cast<TStateFields>(*state);
+    const auto oldLeaderReplies = oldLeader->Sent;
+    follower.Process({}, std::move(invalidStable));
+    assert_true(static_cast<TStateFields>(*state) == beforeInvalidStable);
+    assert_true(DecodeConfigurationEntry(state->Get(2)) == stable);
+    assert_int_equal(oldLeader->Sent, oldLeaderReplies);
+
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
+void test_new_side_election_replays_joint_entry_to_old_peer(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-election-replay-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const std::vector<uint32_t> original{1, 2, 3};
+    const TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0,
+        original, {3, 4, 5}};
+    constexpr uint64_t jointIndex = 1;
+
+    auto leaderState = std::make_shared<TDurableState>((dir / "leader").string(), 4);
+    leaderState->BindVoters(original);
+    leaderState->CurrentTerm = 2;
+    leaderState->Append(EncodeConfigurationEntry(joint));
+    leaderState->CommitIndex = 1;
+    leaderState->Commit();
+
+    auto toOne = std::make_shared<TEndpoint>();
+    auto toTwo = std::make_shared<TEndpoint>();
+    auto toThree = std::make_shared<TEndpoint>();
+    auto toFive = std::make_shared<TEndpoint>();
+    auto leader = std::make_shared<TRaft>(leaderState, 4,
+        TNodeDict{{1, toOne}, {2, toTwo}, {3, toThree}, {5, toFive}});
+
+    auto followerState = std::make_shared<TDurableState>((dir / "follower").string(), 2);
+    followerState->BindVoters(original);
+    followerState->CurrentTerm = 2;
+    auto followerToOne = std::make_shared<TEndpoint>();
+    auto followerToThree = std::make_shared<TEndpoint>();
+    auto followerToLeader = std::make_shared<TEndpoint>();
+    TRaft follower(followerState, 2, {{1, followerToOne}, {3, followerToThree}});
+    follower.RegisterPeerTarget(4, followerToLeader);
+    follower.RegisterPeerTarget(5, std::make_shared<TEndpoint>());
+
+    ITimeSource::Time now = ITimeSource::Time{} + std::chrono::seconds(20);
+    unsigned appendRequests = 0;
+    uint64_t appendPrevIndex = UINT64_MAX;
+    uint64_t appendTerm = 0;
+    uint32_t appendPayloadSize = 0;
+    uint64_t appendLeaderCommit = 0;
+    uint32_t appendLeaderId = 0;
+    uint32_t appendEntryCount = 0;
+    uint64_t forwardedConfigurationTerm = 0;
+    bool replayedJoint = false;
+    toTwo->Route = [&](auto message) {
+        if (message->Type == uint32_t(EMessageType::APPEND_ENTRIES_REQUEST)) {
+            const auto append = message.template Cast<TAppendEntriesRequest>();
+            ++appendRequests;
+            appendPrevIndex = append->PrevLogIndex;
+            appendTerm = append->Term;
+            appendPayloadSize = append.PayloadSize;
+            appendLeaderCommit = append->LeaderCommit;
+            appendLeaderId = append->LeaderId;
+            appendEntryCount = append->Nentries;
+            for (uint32_t i = 0; i < append.PayloadSize; ++i) {
+                const auto entry = append.Payload[i].template Cast<TLogEntry>();
+                if (entry->Flags & TLogEntry::EConfiguration)
+                    forwardedConfigurationTerm = DecodeConfigurationEntry(entry).Term;
+                replayedJoint = replayedJoint ||
+                    bool(entry->Flags & TLogEntry::EConfiguration);
+            }
+        }
+        follower.Process(now, std::move(message));
+    };
+    unsigned followerReplies = 0;
+    followerToLeader->Route = [&](auto message) {
+        ++followerReplies;
+        leader->Process(now, std::move(message));
+    };
+
+    const_cast<TVolatileState*>(leader->GetVolatileState())->SetElectionDue(now);
+    leader->ProcessTimeout(now);
+    assert_true(leader->CurrentStateName() == EState::CANDIDATE);
+    auto grantVote = [&](uint32_t voter, const std::shared_ptr<TEndpoint>& endpoint) {
+        const auto request = std::find_if(endpoint->Messages.rbegin(), endpoint->Messages.rend(), [](const auto& item) {
+            return item->Type == uint32_t(EMessageType::REQUEST_VOTE_REQUEST);
+        });
+        assert_true(request != endpoint->Messages.rend());
+        const auto ex = request->Cast<TMessageEx>();
+        leader->Process(now + std::chrono::milliseconds(1),
+            NewHoldedMessage(TMessageEx{.Src = voter, .Dst = 4, .Term = ex->Term, .Seqno = ex->Seqno},
+                TRequestVoteResponse{.VoteGranted = 1}));
+    };
+    grantVote(1, toOne);
+    grantVote(3, toThree); // Together with self 4, this forms both joint majorities.
+    now += std::chrono::milliseconds(2);
+    leader->ProcessTimeout(now);
+    assert_true(leader->CurrentStateName() == EState::LEADER);
+
+    // The first replication request must include the prior-term joint record;
+    // an empty/no-op-only probe would be rejected by this old-config peer.
+    assert_int_equal(appendRequests, 1);
+    assert_true(replayedJoint);
+    assert_int_equal(appendPrevIndex, 0);
+    assert_int_equal(appendTerm, 3);
+    assert_int_equal(appendPayloadSize, appendEntryCount);
+    assert_int_equal(appendLeaderCommit, 1);
+    assert_int_equal(appendLeaderId, 4);
+    assert_int_equal(forwardedConfigurationTerm, 2);
+    assert_true(appendEntryCount >= 1);
+    assert_int_equal(followerReplies, 1);
+    assert_true(followerState->LastLogIndex >= jointIndex);
+    assert_true(follower.IsVoter(4));
+    assert_true(follower.GetVoterIds() == (std::vector<uint32_t>{1, 2, 3, 4, 5}));
+    assert_int_equal(followerState->CurrentTerm, leaderState->CurrentTerm);
+    assert_int_equal(followerState->CommitIndex, jointIndex);
+    assert_true(leader->GetVolatileState()->MatchIndex.at(2) >= jointIndex);
+
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
+void test_new_stable_leader_replays_transition_to_lagging_joiner(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-stable-election-replay-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const std::vector<uint32_t> original{1, 2, 3};
+    const std::vector<uint32_t> active{3, 4, 5};
+    const TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0, original, active};
+    const TConfigurationRecord stable{EConfigurationPhase::Stable, 3, 1, 2, original, active};
+
+    auto leaderState = std::make_shared<TDurableState>((dir / "leader").string(), 4);
+    leaderState->BindVoters(original);
+    leaderState->CurrentTerm = 3;
+    leaderState->Append(EncodeConfigurationEntry(joint));
+    leaderState->Append(EncodeConfigurationEntry(stable));
+    leaderState->CommitIndex = 2;
+    leaderState->Commit();
+    auto toThree = std::make_shared<TEndpoint>();
+    auto toFive = std::make_shared<TEndpoint>();
+    auto leader = std::make_shared<TRaft>(leaderState, 4, TNodeDict{{3, toThree}, {5, toFive}});
+
+    auto followerState = std::make_shared<TDurableState>((dir / "follower").string(), 5);
+    followerState->BindVoters(original);
+    followerState->CurrentTerm = 3;
+    auto followerToOne = std::make_shared<TEndpoint>();
+    auto followerToTwo = std::make_shared<TEndpoint>();
+    auto followerToThree = std::make_shared<TEndpoint>();
+    auto followerToLeader = std::make_shared<TEndpoint>();
+    TRaft follower(followerState, 5,
+        {{1, followerToOne}, {2, followerToTwo}, {3, followerToThree}}, {5});
+    follower.RegisterPeerTarget(4, followerToLeader);
+
+    ITimeSource::Time now = ITimeSource::Time{} + std::chrono::seconds(30);
+    bool replayedJoint = false;
+    bool replayedStable = false;
+    toFive->Route = [&](auto message) {
+        if (message->Type == uint32_t(EMessageType::APPEND_ENTRIES_REQUEST)) {
+            const auto append = message.template Cast<TAppendEntriesRequest>();
+            for (uint32_t i = 0; i < append.PayloadSize; ++i) {
+                const auto entry = append.Payload[i].template Cast<TLogEntry>();
+                if (!(entry->Flags & TLogEntry::EConfiguration)) continue;
+                const auto record = DecodeConfigurationEntry(entry);
+                replayedJoint = replayedJoint || record.Phase == EConfigurationPhase::Joint;
+                replayedStable = replayedStable || record.Phase == EConfigurationPhase::Stable;
+            }
+        }
+        follower.Process(now, std::move(message));
+    };
+    followerToLeader->Route = [&](auto message) { leader->Process(now, std::move(message)); };
+
+    const_cast<TVolatileState*>(leader->GetVolatileState())->SetElectionDue(now);
+    leader->ProcessTimeout(now);
+    assert_true(leader->CurrentStateName() == EState::CANDIDATE);
+    const auto voteRequest = std::find_if(toThree->Messages.rbegin(), toThree->Messages.rend(), [](const auto& item) {
+        return item->Type == uint32_t(EMessageType::REQUEST_VOTE_REQUEST);
+    });
+    assert_true(voteRequest != toThree->Messages.rend());
+    const auto voteHeader = voteRequest->Cast<TMessageEx>();
+    leader->Process(now + std::chrono::milliseconds(1),
+        NewHoldedMessage(TMessageEx{.Src = 3, .Dst = 4, .Term = voteHeader->Term,
+            .Seqno = voteHeader->Seqno}, TRequestVoteResponse{.VoteGranted = 1}));
+    now += std::chrono::milliseconds(2);
+    leader->ProcessTimeout(now);
+    assert_true(leader->CurrentStateName() == EState::LEADER);
+
+    // The stable-only cursor must include its retained predecessor joint entry,
+    // otherwise this staged learner cannot recognize the new-side leader. The
+    // bounded append batch sends the stable successor in a later round.
+    assert_true(replayedJoint);
+    assert_false(replayedStable);
+    now += std::chrono::seconds(1);
+    leader->ProcessTimeout(now);
+    assert_true(replayedStable);
+    assert_true(follower.IsVoter(5));
+    assert_true(follower.GetVoterIds() == active);
+    assert_int_equal(followerState->CurrentTerm, leaderState->CurrentTerm);
+    assert_int_equal(followerState->CommitIndex, 2);
+    assert_true(leader->GetVolatileState()->MatchIndex.at(5) >= 2);
+
     std::error_code ignored;
     std::filesystem::remove_all(dir, ignored);
 #endif
@@ -461,7 +932,7 @@ void test_runtime_peer_provisioning_commits_joint_membership_across_replicas(voi
         TRaft joining(joiningState, 2, {{1, joiningToLeader}, {3, joiningToFollower}}, {2});
 
         ITimeSource::Time rpcNow{};
-        leaderToJoining->Route = [&](auto message) { joining.Process(rpcNow, std::move(message)); };
+        auto routeLeaderToJoining = [&](auto message) { joining.Process(rpcNow, std::move(message)); };
         leaderToFollower->Route = [&](auto message) { follower.Process(rpcNow, std::move(message)); };
         followerToLeader->Route = [&](auto message) { leader.Process(rpcNow, std::move(message)); };
         followerToJoining->Route = [&](auto message) { joining.Process(rpcNow, std::move(message)); };
@@ -483,9 +954,19 @@ void test_runtime_peer_provisioning_commits_joint_membership_across_replicas(voi
         leader.ProcessTimeout(rpcNow); // Elect leader 1 with old voters {1, 3}.
         leader.ProcessTimeout(rpcNow); // Process the synchronous follower vote.
         assert_true(leader.CurrentStateName() == EState::LEADER);
+        const auto beforeLearnerAck = leader.CheckJointConfigurationReadiness({1, 2, 3});
+        assert_true(beforeLearnerAck.IsLeader);
+        assert_true(beforeLearnerAck.AddedVotersWithoutCommitAck == (std::vector<uint32_t>{2}));
+        assert_false(beforeLearnerAck.Ready());
+        leaderToJoining->Route = routeLeaderToJoining;
         timeout(std::chrono::seconds(30)); // Replicate and commit the current-term leader entry.
         timeout(std::chrono::seconds(40)); // The joining learner acknowledges the commit boundary.
         assert_true(leader.IsLearnerCommitAcknowledged(2));
+
+        const auto ready = leader.CheckJointConfigurationReadiness({1, 2, 3});
+        assert_true(ready.Ready());
+        assert_true(ready.MissingPeerTargets.empty());
+        assert_true(ready.AddedVotersWithoutCommitAck.empty());
 
         const auto jointIndex = leader.ProposeJointConfiguration({1, 2, 3});
         timeout(std::chrono::seconds(50));
@@ -511,6 +992,368 @@ void test_runtime_peer_provisioning_commits_joint_membership_across_replicas(voi
     std::filesystem::remove_all(dir, ignored);
 #endif
 }
+void test_removed_member_rejoins_from_fresh_snapshot_after_compaction(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-rejoin-after-compaction-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+
+    const std::vector<uint32_t> originalVoters{1, 2, 3};
+    auto leaderState = std::make_shared<TDurableState>((dir / "raft").string(), 1);
+    leaderState->BindVoters(originalVoters);
+    leaderState->CurrentTerm = 2;
+    auto history = TConfigurationHistory::Stable(originalVoters, 0, 0, 0, 0);
+    leaderState->Append(Ordinary(1));
+    history = history.Observe(1, Ordinary(1));
+    TConfigurationRecord joint{EConfigurationPhase::Joint, 1, 0, 0, originalVoters, {1}};
+    leaderState->Append(EncodeConfigurationEntry(joint));
+    history = history.Advance(2, EncodeConfigurationEntry(joint));
+    auto stable = joint;
+    stable.Phase = EConfigurationPhase::Stable;
+    stable.PreviousIndex = 2;
+    stable.PreviousTerm = 1;
+    leaderState->Append(EncodeConfigurationEntry(stable));
+    history = history.Advance(3, EncodeConfigurationEntry(stable));
+    leaderState->CommitIndex = 3;
+    leaderState->Commit();
+
+    // Model the active one-voter cluster after removing node 2 and compacting
+    // the complete membership history into its committed stable snapshot.
+    const auto snapshot = history.MakeSnapshot("3");
+    leaderState->InstallSnapshot(snapshot);
+    auto leader = std::make_shared<TRaft>(leaderState, 1, TNodeDict{});
+    auto leaderApp = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor leaderProcessor(leader, leaderApp, {});
+    auto now = ITimeSource::Time{} + std::chrono::seconds(20);
+    leader->ProcessTimeout(now); // The remaining single voter becomes leader.
+    assert_true(leader->CurrentStateName() == EState::LEADER);
+    leaderProcessor.ProcessCommitted();
+    assert_true(leaderState->CommitIndex > snapshot.Index);
+
+    auto sendSnapshot = [&](TRaft& receiver, uint32_t receiverId, uint64_t term,
+            const TSnapshot& image, uint32_t senderId) {
+        const auto bytes = EncodeSnapshot(image);
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + bytes.size());
+        request->Src = senderId; request->Dst = receiverId; request->Term = term;
+        request->SnapshotIndex = image.Index; request->SnapshotTerm = image.Term;
+        request->Offset = 0; request->TotalBytes = bytes.size(); request->Done = 1;
+        request->LeaderId = senderId;
+        memcpy(request->Data, bytes.data(), bytes.size());
+        receiver.Process(now, request);
+    };
+
+    // A nonempty old disk can accept one stable transition when the snapshot
+    // carries the exact prior voter set and joint-entry identity. The removed
+    // node becomes a learner while its original durable voter binding remains.
+    auto staleState = std::make_shared<TDurableState>((dir / "stale").string(), 2);
+    staleState->BindVoters(originalVoters);
+    staleState->CurrentTerm = 1;
+    staleState->Append(Ordinary(1));
+    staleState->CommitIndex = 1;
+    staleState->Commit();
+    auto staleToLeader = std::make_shared<TEndpoint>();
+    auto staleToOther = std::make_shared<TEndpoint>();
+    auto staleToUntrusted = std::make_shared<TEndpoint>();
+    auto stale = std::make_shared<TRaft>(staleState, 2,
+        TNodeDict{{1, staleToLeader}, {3, staleToOther}, {4, staleToUntrusted}}, std::vector<uint32_t>{4});
+    auto staleApp = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor staleProcessor(stale, staleApp,
+        {{1, staleToLeader}, {3, staleToOther}, {4, staleToUntrusted}});
+    auto mismatchedLineage = snapshot;
+    mismatchedLineage.PreviousVoters = {1, 3};
+    mismatchedLineage.ConfigurationTransitions.back().OldVoters = {1, 3};
+    sendSnapshot(*stale, 2, leaderState->CurrentTerm, mismatchedLineage, 1);
+    assert_int_equal(staleState->CurrentTerm, 1);
+    assert_true(staleToLeader->Messages.empty());
+    // An endpoint outside both the receiver's trusted predecessor and the incoming active set cannot raise the term.
+    sendSnapshot(*stale, 2, leaderState->CurrentTerm, snapshot, 4);
+    assert_int_equal(staleState->CurrentTerm, 1);
+    assert_true(staleToUntrusted->Messages.empty());
+    sendSnapshot(*stale, 2, leaderState->CurrentTerm, snapshot, 1);
+    assert_true(*staleState->GetSnapshot() == snapshot);
+    assert_true(staleState->GetBoundVoters() == originalVoters);
+    assert_true(staleToLeader->Messages.size() == 1);
+    assert_true(staleToLeader->Messages.back().Cast<TInstallSnapshotResponse>()->Installed);
+    assert_false(stale->IsVoter(2));
+    assert_true(stale->GetVoterIds() == (std::vector<uint32_t>{1}));
+
+    // Preserve that old store and replace the retired process with a fresh
+    // learner configured from the current {1} voter set. It can bootstrap from
+    // the stable snapshot, catch up, and rejoin through a new joint transition.
+    auto joiningState = std::make_shared<TDurableState>((dir / "fresh").string(), 2);
+    auto joiningToLeader = std::make_shared<TEndpoint>();
+    auto joining = std::make_shared<TRaft>(joiningState, 2, TNodeDict{{1, joiningToLeader}},
+        std::vector<uint32_t>{2});
+    auto joiningApp = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor joiningProcessor(joining, joiningApp, {{1, joiningToLeader}});
+    sendSnapshot(*joining, 2, leaderState->CurrentTerm, snapshot, 1);
+    assert_true(!joiningToLeader->Messages.empty());
+    auto installed = joiningToLeader->Messages.back().Cast<TInstallSnapshotResponse>();
+    assert_true(installed->Success); assert_true(installed->Installed);
+    assert_true(joining->GetVoterIds() == (std::vector<uint32_t>{1}));
+    assert_false(joining->IsVoter(2));
+    assert_true(joiningState->GetBoundVoters() == (std::vector<uint32_t>{1}));
+    assert_true(*joiningState->GetSnapshot() == snapshot);
+
+    auto leaderToJoining = std::make_shared<TEndpoint>();
+    leaderToJoining->Route = [&](auto message) {
+        joining->Process(now, std::move(message));
+        joiningProcessor.ProcessCommitted();
+    };
+    joiningToLeader->Route = [&](auto message) {
+        leader->Process(now, std::move(message));
+        leaderProcessor.ProcessCommitted();
+    };
+    leader->AddLearnerTarget(2, leaderToJoining);
+    auto tick = [&] {
+        now += std::chrono::seconds(1);
+        leader->ProcessTimeout(now);
+        leaderProcessor.ProcessCommitted();
+        joiningProcessor.ProcessCommitted();
+    };
+    for (unsigned i = 0; i < 8 && !leader->IsLearnerCommitAcknowledged(2); ++i) tick();
+    assert_true(leader->IsLearnerCommitAcknowledged(2));
+
+    const auto jointIndex = leader->ProposeJointConfiguration({1, 2});
+    for (unsigned i = 0; i < 8 && leader->GetVolatileState()->CommitIndex < jointIndex; ++i) tick();
+    assert_int_equal(leader->GetVolatileState()->CommitIndex, jointIndex);
+    for (unsigned i = 0; i < 4 && joiningState->CommitIndex < jointIndex; ++i) tick();
+    assert_int_equal(joiningState->CommitIndex, jointIndex);
+    assert_true(joining->IsVoter(2));
+
+    const auto stableIndex = leader->FinalizeConfiguration();
+    for (unsigned i = 0; i < 8 && leader->GetVolatileState()->CommitIndex < stableIndex; ++i) tick();
+    assert_int_equal(leader->GetVolatileState()->CommitIndex, stableIndex);
+    for (unsigned i = 0; i < 4 && joiningState->CommitIndex < stableIndex; ++i) tick();
+    assert_int_equal(joiningState->CommitIndex, stableIndex);
+    assert_true(leader->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+    assert_true(joining->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
+void test_removed_member_rejoins_through_fresh_joint_snapshot_bootstrap(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-snapshot-rejoin-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    {
+        const std::vector<uint32_t> originalVoters{1, 3};
+        TSnapshot jointSnapshot{5, 3, {1}, "5"};
+        jointSnapshot.JointVoters = {1, 2};
+        jointSnapshot.ConfigurationIndex = 4;
+        jointSnapshot.ConfigurationTerm = 2;
+        ValidateSnapshot(jointSnapshot);
+
+        // Node 3 was removed before the active {1} -> {1, 2} transition. Its
+        // nonempty old store cannot skip the committed configuration history.
+        auto staleState = std::make_shared<TDurableState>((dir / "stale").string(), 3);
+        staleState->BindVoters(originalVoters);
+        staleState->Append(Ordinary(1));
+        staleState->CommitIndex = 1;
+        staleState->Commit();
+        auto staleToLeader = std::make_shared<TEndpoint>();
+        auto stale = std::make_shared<TRaft>(staleState, 3, TNodeDict{{1, staleToLeader}});
+        auto staleApp = std::make_shared<TSnapshotRsm>();
+        TRequestProcessor staleProcessor(stale, staleApp, {{1, staleToLeader}});
+        const auto beforeStaleInstall = static_cast<TStateFields>(*staleState);
+        const auto jointBytes = EncodeSnapshot(jointSnapshot);
+        auto makeInstallRequest = [&](uint32_t receiverId) {
+            auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + jointBytes.size());
+            request->Src = 1; request->Dst = receiverId; request->Term = 3;
+            request->SnapshotIndex = jointSnapshot.Index; request->SnapshotTerm = jointSnapshot.Term;
+            request->Offset = 0; request->TotalBytes = jointBytes.size(); request->Done = 1;
+            request->LeaderId = 1;
+            memcpy(request->Data, jointBytes.data(), jointBytes.size());
+            return request;
+        };
+        stale->Process({}, makeInstallRequest(3));
+        assert_true(static_cast<TStateFields>(*staleState) == beforeStaleInstall);
+        assert_true(staleState->GetBoundVoters() == originalVoters);
+        assert_true(staleToLeader->Messages.empty());
+
+        auto leaderState = std::make_shared<TDurableState>((dir / "leader").string(), 1);
+        leaderState->BindVoters(originalVoters);
+        leaderState->CurrentTerm = jointSnapshot.Term;
+        leaderState->Commit();
+        leaderState->InstallSnapshot(jointSnapshot);
+        auto followerState = std::make_shared<TDurableState>((dir / "follower").string(), 2);
+        followerState->BindVoters(originalVoters);
+        followerState->CurrentTerm = jointSnapshot.Term;
+        followerState->Commit();
+        followerState->InstallSnapshot(jointSnapshot);
+
+        auto leaderToFollower = std::make_shared<TEndpoint>();
+        auto followerToLeader = std::make_shared<TEndpoint>();
+        TNodeDict leaderPeers{{2, leaderToFollower}};
+        TNodeDict followerPeers{{1, followerToLeader}};
+        auto leader = std::make_shared<TRaft>(leaderState, 1, leaderPeers);
+        auto follower = std::make_shared<TRaft>(followerState, 2, followerPeers);
+        auto leaderApp = std::make_shared<TSnapshotRsm>();
+        auto followerApp = std::make_shared<TSnapshotRsm>();
+        TRequestProcessor leaderProcessor(leader, leaderApp, leaderPeers);
+        TRequestProcessor followerProcessor(follower, followerApp, followerPeers);
+
+        auto freshState = std::make_shared<TDurableState>((dir / "fresh").string(), 3);
+        auto freshToLeader = std::make_shared<TEndpoint>();
+        auto freshToFollower = std::make_shared<TEndpoint>();
+        TNodeDict freshPeers{{1, freshToLeader}, {2, freshToFollower}};
+        auto fresh = std::make_shared<TRaft>(freshState, 3, freshPeers, std::vector<uint32_t>{3});
+        auto freshApp = std::make_shared<TSnapshotRsm>();
+        TRequestProcessor freshProcessor(fresh, freshApp, freshPeers);
+        ITimeSource::Time now{};
+        leader->Become(EState::LEADER);
+        auto leaderToFresh = std::make_shared<TEndpoint>();
+        leaderToFresh->Route = [&](auto message) {
+            fresh->Process(now, std::move(message));
+            freshProcessor.ProcessCommitted();
+        };
+        leaderToFollower->Route = [&](auto message) {
+            follower->Process(now, std::move(message));
+            followerProcessor.ProcessCommitted();
+        };
+        followerToLeader->Route = [&](auto message) {
+            leader->Process(now, std::move(message));
+            leaderProcessor.ProcessCommitted();
+        };
+        // Start with the leader's normal AppendEntries probe. The empty learner
+        // rejects the compacted prefix; the resulting retry enters InstallSnapshot.
+        freshToLeader->Route = [&](auto message) {
+            leader->Process(now, std::move(message));
+            leaderProcessor.ProcessCommitted();
+        };
+        leader->AddLearnerTarget(3, leaderToFresh);
+
+        auto tick = [&] {
+            now += std::chrono::seconds(10);
+            leader->ProcessTimeout(now);
+            leaderProcessor.ProcessCommitted();
+            followerProcessor.ProcessCommitted();
+            freshProcessor.ProcessCommitted();
+        };
+        for (unsigned i = 0; i < 8 && !freshState->GetSnapshot(); ++i) tick();
+        assert_true(bool(freshState->GetSnapshot()));
+        assert_true(*freshState->GetSnapshot() == jointSnapshot);
+        assert_true(freshState->GetBoundVoters() == (std::vector<uint32_t>{1, 2}));
+        assert_true(fresh->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+        assert_false(fresh->IsVoter(3));
+        assert_int_equal(freshApp->LastAppliedIndex, jointSnapshot.Index);
+        for (unsigned i = 0; i < 8 && !leader->IsLearnerCommitAcknowledged(3); ++i) tick();
+        assert_true(leader->IsLearnerCommitAcknowledged(3));
+
+        // Complete the in-progress {1} -> {1, 2} transition while the returning
+        // node remains a learner, then catch it up to the stable boundary.
+        const auto transitionStable = leader->FinalizeConfiguration();
+        for (unsigned i = 0; i < 8 && leader->GetVolatileState()->CommitIndex < transitionStable; ++i) tick();
+        assert_int_equal(leader->GetVolatileState()->CommitIndex, transitionStable);
+        for (unsigned i = 0; i < 4 && (followerState->CommitIndex < transitionStable ||
+                freshState->CommitIndex < transitionStable); ++i) tick();
+        assert_int_equal(followerState->CommitIndex, transitionStable);
+        assert_int_equal(freshState->CommitIndex, transitionStable);
+        assert_true(leader->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+        assert_true(fresh->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+        assert_false(fresh->IsVoter(3));
+
+        auto followerToFresh = std::make_shared<TEndpoint>();
+        followerToFresh->Route = [&](auto message) {
+            fresh->Process(now, std::move(message));
+            freshProcessor.ProcessCommitted();
+        };
+        follower->RegisterPeerTarget(3, followerToFresh);
+        for (unsigned i = 0; i < 8 && !leader->IsLearnerCommitAcknowledged(3); ++i) tick();
+        assert_true(leader->IsLearnerCommitAcknowledged(3));
+
+        // Re-add the removed ID only after snapshot bootstrap and stable catch-up.
+        const auto rejoinJoint = leader->ProposeJointConfiguration({1, 2, 3});
+        for (unsigned i = 0; i < 8 && leader->GetVolatileState()->CommitIndex < rejoinJoint; ++i) tick();
+        assert_int_equal(leader->GetVolatileState()->CommitIndex, rejoinJoint);
+        for (unsigned i = 0; i < 4 && (followerState->CommitIndex < rejoinJoint ||
+                freshState->CommitIndex < rejoinJoint); ++i) tick();
+        assert_int_equal(followerState->CommitIndex, rejoinJoint);
+        assert_int_equal(freshState->CommitIndex, rejoinJoint);
+        assert_true(fresh->IsVoter(3));
+
+        const auto rejoinStable = leader->FinalizeConfiguration();
+        for (unsigned i = 0; i < 8 && leader->GetVolatileState()->CommitIndex < rejoinStable; ++i) tick();
+        assert_int_equal(leader->GetVolatileState()->CommitIndex, rejoinStable);
+        for (unsigned i = 0; i < 4 && (followerState->CommitIndex < rejoinStable ||
+                freshState->CommitIndex < rejoinStable); ++i) tick();
+        assert_int_equal(followerState->CommitIndex, rejoinStable);
+        assert_int_equal(freshState->CommitIndex, rejoinStable);
+        for (const auto* raft : {leader.get(), follower.get(), fresh.get()})
+            assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2, 3}));
+        assert_true(fresh->IsVoter(3));
+        assert_true(fresh->GetLearnerIds().empty());
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
+void test_fresh_joint_snapshot_rejoin_recovers_voter_role_after_restart(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-rejoin-recovery-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const auto path = (dir / "raft").string();
+    TSnapshot jointSnapshot{5, 3, {1}, "5"};
+    jointSnapshot.JointVoters = {1, 2};
+    jointSnapshot.ConfigurationIndex = 4;
+    jointSnapshot.ConfigurationTerm = 2;
+
+    {
+        TDurableState state(path, 3);
+        state.BindVoters({1, 2}); // Fresh-store bootstrap binding, before node 3 rejoins.
+        state.CurrentTerm = 3;
+        state.Commit();
+        state.InstallSnapshot(jointSnapshot);
+
+        const TConfigurationRecord transitionStable{
+            EConfigurationPhase::Stable, 3, 4, 2, {1}, {1, 2}};
+        state.Append(EncodeConfigurationEntry(transitionStable));
+        state.CommitIndex = 6;
+        state.Commit();
+
+        state.CurrentTerm = 4;
+        state.Commit();
+        const TConfigurationRecord rejoinJoint{
+            EConfigurationPhase::Joint, 4, 6, 3, {1, 2}, {1, 2, 3}};
+        state.Append(EncodeConfigurationEntry(rejoinJoint));
+        state.CommitIndex = 7;
+        state.Commit();
+
+        const TConfigurationRecord rejoinStable{
+            EConfigurationPhase::Stable, 4, 7, 4, {1, 2}, {1, 2, 3}};
+        state.Append(EncodeConfigurationEntry(rejoinStable));
+        state.CommitIndex = 8;
+        state.Commit();
+    }
+
+    {
+        auto state = std::make_shared<TDurableState>(path, 3);
+        assert_true(state->GetBoundVoters() == (std::vector<uint32_t>{1, 2}));
+        assert_true(*state->GetSnapshot() == jointSnapshot);
+        assert_int_equal(state->CommitIndex, 8);
+        TNodeDict peers{{1, std::make_shared<TEndpoint>()}, {2, std::make_shared<TEndpoint>()}};
+        auto baseline = TConfigurationHistory::FromJointSnapshot(*state->GetSnapshot());
+        auto scan = ScanCommittedConfigurationHistory(*state, baseline);
+        assert_false(scan.HasUncommittedConfiguration());
+        assert_true(scan.Committed.OldVoters() == (std::vector<uint32_t>{1, 2, 3}));
+        auto raft = std::make_shared<TRaft>(state, 3, peers);
+        assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2, 3}));
+        assert_true(raft->IsVoter(3));
+        auto application = std::make_shared<TSnapshotRsm>();
+        TRequestProcessor processor(raft, application, peers);
+        processor.ProcessCommitted();
+        assert_int_equal(application->LastAppliedIndex, 8);
+        assert_true(state->GetBoundVoters() == (std::vector<uint32_t>{1, 2}));
+    }
+
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
+
 void test_joint_membership_addition_and_finalization_replicate_deterministically(void**) {
 #ifdef __linux__
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-live-config-" +
@@ -583,15 +1426,34 @@ void test_joint_membership_addition_and_finalization_replicate_deterministically
         // majorities until the stable successor commits.
         const auto removalJoint = leader.ProposeJointConfiguration({1});
         assert_int_equal(removalJoint, 4);
+        auto membership = leader.GetConfigurationState();
+        assert_false(membership.Committed.IsJoint());
+        assert_true(membership.Committed.OldVoters() == (std::vector<uint32_t>{1, 2}));
+        assert_true(membership.Latest.IsJoint());
+        assert_true(membership.Latest.NewVoters() == (std::vector<uint32_t>{1}));
+        assert_true(membership.HasUncommittedConfiguration());
         assert_true(leader.IsVoter(2));
         leaderTimeout(std::chrono::seconds(60));
         assert_int_equal(leader.GetVolatileState()->CommitIndex, removalJoint);
+        membership = leader.GetConfigurationState();
+        assert_true(membership.Committed.IsJoint());
+        assert_false(membership.HasUncommittedConfiguration());
         leaderTimeout(std::chrono::seconds(70));
         assert_int_equal(learnerState->CommitIndex, removalJoint);
         const auto removalStable = leader.FinalizeConfiguration();
         assert_int_equal(removalStable, 5);
+        membership = leader.GetConfigurationState();
+        assert_true(membership.Committed.IsJoint());
+        assert_false(membership.Latest.IsJoint());
+        assert_true(membership.Latest.OldVoters() == (std::vector<uint32_t>{1}));
+        assert_true(membership.HasUncommittedConfiguration());
+        assert_true(leader.GetVoterIds() == (std::vector<uint32_t>{1, 2}));
         leaderTimeout(std::chrono::seconds(80));
         assert_int_equal(leader.GetVolatileState()->CommitIndex, removalStable);
+        membership = leader.GetConfigurationState();
+        assert_false(membership.Committed.IsJoint());
+        assert_false(membership.HasUncommittedConfiguration());
+        assert_true(membership.Committed.OldVoters() == (std::vector<uint32_t>{1}));
         assert_false(leader.IsVoter(2));
         leaderTimeout(std::chrono::seconds(90));
         assert_int_equal(learnerState->CommitIndex, removalStable);
@@ -666,21 +1528,25 @@ void test_joint_membership_addition_and_finalization_replicate_deterministically
 }
 void test_live_joint_transition_waits_for_both_nontrivial_majorities(void**) {
 #ifdef __linux__
-    auto run = [](bool newMajorityFirst) {
+    auto run = [](bool newMajorityFirst, bool disjoint) {
         auto dir = std::filesystem::temp_directory_path() / ("miniraft-live-joint-quorum-" +
             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
-            (newMajorityFirst ? "-new" : "-old"));
+            (disjoint ? "-disjoint" : "-overlap") + (newMajorityFirst ? "-new" : "-old"));
         assert_true(std::filesystem::create_directory(dir));
         {
             auto state = std::make_shared<TDurableState>((dir / "raft").string(), 1);
             std::unordered_map<uint32_t, std::shared_ptr<TEndpoint>> endpoints;
             TNodeDict peers;
-            for (uint32_t id : {2, 3, 4, 5}) {
+            const std::vector<uint32_t> addedVoters = disjoint
+                ? std::vector<uint32_t>{4, 5, 6} : std::vector<uint32_t>{4, 5};
+            std::vector<uint32_t> peerIds{2, 3};
+            peerIds.insert(peerIds.end(), addedVoters.begin(), addedVoters.end());
+            for (uint32_t id : peerIds) {
                 auto endpoint = std::make_shared<TEndpoint>();
                 endpoints.emplace(id, endpoint);
                 peers.emplace(id, endpoint);
             }
-            TRaft leader(state, 1, peers, {4, 5});
+            TRaft leader(state, 1, peers, addedVoters);
             const auto start = ITimeSource::Time{};
 
             leader.ProcessTimeout(start);
@@ -718,24 +1584,27 @@ void test_live_joint_transition_waits_for_both_nontrivial_majorities(void**) {
             assert_int_equal(ackLatestAppend(2, std::chrono::milliseconds(3)), 1);
             assert_int_equal(leader.GetVolatileState()->CommitIndex, 1);
             leader.ApproveRead(); // Send the learners a fresh committed watermark.
-            assert_int_equal(ackLatestAppend(4, std::chrono::milliseconds(4)), 1);
-            assert_int_equal(ackLatestAppend(5, std::chrono::milliseconds(4)), 1);
-            assert_true(leader.IsLearnerCommitAcknowledged(4));
-            assert_true(leader.IsLearnerCommitAcknowledged(5));
+            for (auto id : addedVoters) {
+                assert_int_equal(ackLatestAppend(id, std::chrono::milliseconds(4)), 1);
+                assert_true(leader.IsLearnerCommitAcknowledged(id));
+            }
 
-            const auto jointIndex = leader.ProposeJointConfiguration({3, 4, 5});
+            const auto newVoters = disjoint
+                ? std::vector<uint32_t>{4, 5, 6} : std::vector<uint32_t>{3, 4, 5};
+            const auto jointIndex = leader.ProposeJointConfiguration(newVoters);
             assert_int_equal(jointIndex, 2);
             leader.ProcessTimeout(start + std::chrono::seconds(3));
-            // Shared voter 3 still has to catch up the earlier leader entry. Let
-            // it acknowledge that prefix, then withhold its joint-entry ACK.
+            // Let voter 3 acknowledge the earlier leader entry, then withhold
+            // its joint-entry ACK. It is shared only in the overlapping case.
             assert_int_equal(ackLatestAppend(3, std::chrono::seconds(3) + std::chrono::milliseconds(1)), 1);
             leader.ProcessTimeout(start + std::chrono::seconds(3) + std::chrono::milliseconds(2));
             assert_int_equal(latestAppendMatchIndex(3), jointIndex);
-            for (uint32_t id : {2, 4, 5})
+            for (auto id : std::vector<uint32_t>{2, 4, 5})
                 assert_int_equal(latestAppendMatchIndex(id), jointIndex);
+            if (disjoint) assert_int_equal(latestAppendMatchIndex(6), jointIndex);
 
             if (newMajorityFirst) {
-                // The new-set majority {4, 5} cannot commit without an old majority.
+                // The new-set majority cannot commit without an old majority.
                 ackLatestAppend(4, std::chrono::seconds(3) + std::chrono::milliseconds(4));
                 ackLatestAppend(5, std::chrono::seconds(3) + std::chrono::milliseconds(4));
                 assert_int_equal(leader.GetVolatileState()->CommitIndex, 1);
@@ -751,9 +1620,359 @@ void test_live_joint_transition_waits_for_both_nontrivial_majorities(void**) {
             assert_int_equal(leader.GetVolatileState()->CommitIndex, jointIndex);
             assert_true(leader.IsVoter(1));
             assert_true(leader.IsVoter(5));
-            assert_true(leader.GetVoterIds() == (std::vector<uint32_t>{1, 2, 3, 4, 5}));
+            assert_true(leader.GetVoterIds() == (disjoint
+                ? std::vector<uint32_t>{1, 2, 3, 4, 5, 6}
+                : std::vector<uint32_t>{1, 2, 3, 4, 5}));
         }
         std::error_code ignored; std::filesystem::remove_all(dir, ignored);
+    };
+    run(false, false);
+    run(true, false);
+    run(false, true);
+    run(true, true);
+#endif
+}
+void test_disjoint_membership_change_transfers_finalizes_and_restarts(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-disjoint-live-membership-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const std::vector<uint32_t> oldVoters{1, 2, 3};
+    const std::vector<uint32_t> newVoters{4, 5, 6};
+    std::array<std::shared_ptr<TDurableState>, 7> states{};
+    std::array<std::shared_ptr<TRaft>, 7> rafts{};
+    std::array<std::shared_ptr<TSnapshotRsm>, 7> applications{};
+    std::array<std::shared_ptr<TRequestProcessor>, 7> processors{};
+    std::array<std::array<std::shared_ptr<TEndpoint>, 7>, 7> endpoints{};
+    ITimeSource::Time now{};
+    bool isolateNewMajority = false;
+
+    for (uint32_t id = 1; id <= 6; ++id) {
+        states[id] = std::make_shared<TDurableState>((dir / "raft").string(), id);
+        states[id]->BindVoters(oldVoters);
+        states[id]->Commit();
+        for (uint32_t peer = 1; peer <= 6; ++peer)
+            if (peer != id) endpoints[id][peer] = std::make_shared<TEndpoint>();
+    }
+    for (uint32_t id = 1; id <= 6; ++id) {
+        TNodeDict peers;
+        for (uint32_t peer = 1; peer <= 6; ++peer)
+            if (peer != id) peers.emplace(peer, endpoints[id][peer]);
+        rafts[id] = std::make_shared<TRaft>(states[id], id, peers, newVoters);
+        applications[id] = std::make_shared<TSnapshotRsm>();
+        processors[id] = std::make_shared<TRequestProcessor>(rafts[id], applications[id], peers);
+    }
+    for (uint32_t from = 1; from <= 6; ++from) {
+        for (uint32_t to = 1; to <= 6; ++to) {
+            if (from == to) continue;
+            endpoints[from][to]->Route = [&, from, to](auto message) {
+                if (isolateNewMajority && from == 1 && (to == 5 || to == 6)) return;
+                rafts[to]->Process(now, std::move(message));
+                processors[to]->ProcessCommitted();
+            };
+        }
+    }
+    auto tick = [&](uint32_t leaderId) {
+        now += std::chrono::seconds(1);
+        rafts[leaderId]->ProcessTimeout(now);
+        processors[leaderId]->ProcessCommitted();
+    };
+
+    rafts[1]->ProcessTimeout(now);
+    tick(1);
+    assert_true(rafts[1]->CurrentStateName() == EState::LEADER);
+    for (unsigned i = 0; i < 8 && rafts[1]->GetVolatileState()->CommitIndex < 1; ++i) tick(1);
+    assert_int_equal(rafts[1]->GetVolatileState()->CommitIndex, 1);
+    for (unsigned i = 0; i < 8; ++i) {
+        bool ready = true;
+        for (auto id : newVoters) ready = ready && rafts[1]->IsLearnerCommitAcknowledged(id);
+        if (ready) break;
+        tick(1);
+    }
+    for (auto id : newVoters) assert_true(rafts[1]->IsLearnerCommitAcknowledged(id));
+
+    isolateNewMajority = true;
+    const auto jointIndex = rafts[1]->ProposeJointConfiguration(newVoters);
+    for (unsigned i = 0; i < 4 && rafts[1]->GetVolatileState()->CommitIndex < jointIndex; ++i) tick(1);
+    assert_true(rafts[1]->GetVolatileState()->CommitIndex < jointIndex);
+    assert_int_equal(states[2]->CommitIndex, jointIndex - 1);
+    assert_int_equal(states[4]->CommitIndex, jointIndex - 1);
+    assert_true(rafts[1]->GetVolatileState()->MatchIndex.at(2) >= jointIndex);
+    assert_true(rafts[1]->GetVolatileState()->MatchIndex.at(3) >= jointIndex);
+    assert_true(rafts[1]->GetVolatileState()->MatchIndex.at(4) >= jointIndex);
+    assert_true(rafts[1]->GetVolatileState()->MatchIndex.at(5) < jointIndex);
+    assert_true(rafts[1]->GetVolatileState()->MatchIndex.at(6) < jointIndex);
+    assert_true(states[4]->LastLogIndex >= jointIndex);
+    isolateNewMajority = false;
+    for (unsigned i = 0; i < 8 && rafts[1]->GetVolatileState()->CommitIndex < jointIndex; ++i) tick(1);
+    assert_int_equal(rafts[1]->GetVolatileState()->CommitIndex, jointIndex);
+    for (unsigned i = 0; i < 8; ++i) {
+        bool propagated = true;
+        for (uint32_t id = 2; id <= 6; ++id) propagated = propagated && states[id]->CommitIndex >= jointIndex;
+        if (propagated) break;
+        tick(1);
+    }
+    for (uint32_t id = 1; id <= 6; ++id) {
+        assert_true(rafts[id]->IsVoter(id));
+        assert_true(rafts[id]->GetVoterIds() == (std::vector<uint32_t>{1, 2, 3, 4, 5, 6}));
+    }
+
+    for (unsigned i = 0; i < 8 &&
+        (rafts[1]->GetVolatileState()->MatchIndex.at(4) < states[1]->LastLogIndex ||
+         rafts[1]->GetVolatileState()->CommitAckIndex.at(4) < rafts[1]->GetVolatileState()->CommitIndex); ++i)
+        tick(1);
+    rafts[1]->TransferLeadership(4, now);
+    assert_true(rafts[1]->CurrentStateName() == EState::FOLLOWER);
+    for (unsigned i = 0; i < 4 && rafts[4]->CurrentStateName() != EState::LEADER; ++i) tick(4);
+    assert_true(rafts[4]->CurrentStateName() == EState::LEADER);
+    for (unsigned i = 0; i < 8 && rafts[4]->GetVolatileState()->CommitIndex < states[4]->LastLogIndex; ++i)
+        tick(4); // Commit the new leader's current-term entry under both majorities.
+    assert_true(rafts[4]->GetVolatileState()->CommitIndex > jointIndex);
+
+    const auto stableIndex = rafts[4]->FinalizeConfiguration();
+    for (unsigned i = 0; i < 8 && rafts[4]->GetVolatileState()->CommitIndex < stableIndex; ++i) tick(4);
+    assert_int_equal(rafts[4]->GetVolatileState()->CommitIndex, stableIndex);
+    for (unsigned i = 0; i < 8; ++i) {
+        bool propagated = true;
+        for (uint32_t id = 1; id <= 6; ++id) propagated = propagated && states[id]->CommitIndex >= stableIndex;
+        if (propagated) break;
+        tick(4);
+    }
+    for (uint32_t id = 1; id <= 6; ++id) {
+        assert_true(rafts[id]->GetVoterIds() == newVoters);
+        assert_true(rafts[id]->IsVoter(id) == (id >= 4));
+        assert_true(states[id]->GetBoundVoters() == oldVoters);
+    }
+
+    for (unsigned i = 0; i < 8; ++i) {
+        bool safe = true;
+        for (auto voter : newVoters)
+            safe = safe && rafts[voter]->GetVolatileState()->CompactionSafeConfigurationIndex >= stableIndex;
+        if (safe) break;
+        tick(4);
+    }
+    for (auto voter : newVoters)
+        assert_true(rafts[voter]->GetVolatileState()->CompactionSafeConfigurationIndex >= stableIndex);
+    for (auto voter : newVoters) {
+        const auto snapshot = rafts[voter]->Compact();
+        assert_true(snapshot.StableConfiguration);
+        assert_true(snapshot.Voters == newVoters);
+        assert_int_equal(snapshot.ConfigurationIndex, stableIndex);
+        assert_int_equal(states[voter]->SnapshotIndex, stableIndex);
+        assert_true(states[voter]->GetBoundVoters() == oldVoters);
+    }
+
+    // Restart every replica with endpoints only for the final voter set.
+    processors = {};
+    applications = {};
+    rafts = {};
+    states = {};
+    for (uint32_t id = 1; id <= 6; ++id)
+        states[id] = std::make_shared<TDurableState>((dir / "raft").string(), id);
+    for (uint32_t id = 1; id <= 6; ++id) {
+        TNodeDict peers;
+        for (auto voter : newVoters)
+            if (voter != id) peers.emplace(voter, std::make_shared<TEndpoint>());
+        rafts[id] = std::make_shared<TRaft>(states[id], id, peers);
+        assert_true(rafts[id]->GetVoterIds() == newVoters);
+        assert_true(rafts[id]->IsVoter(id) == (id >= 4));
+        assert_int_equal(rafts[id]->GetVolatileState()->CommitIndex, stableIndex);
+        if (id >= 4) {
+            const auto snapshot = states[id]->GetSnapshot();
+            assert_true(snapshot && snapshot->StableConfiguration);
+            assert_true(snapshot->Voters == newVoters);
+            assert_int_equal(snapshot->ConfigurationIndex, stableIndex);
+        }
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
+void test_live_disjoint_joint_entry_waits_for_old_majority_over_network(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-old-partition-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const std::vector<uint32_t> oldVoters{1, 2, 3};
+    const std::vector<uint32_t> newVoters{4, 5, 6};
+    std::array<std::shared_ptr<TDurableState>, 7> states{};
+    std::array<std::shared_ptr<TRaft>, 7> rafts{};
+    std::array<std::array<std::shared_ptr<TEndpoint>, 7>, 7> endpoints{};
+    ITimeSource::Time now{};
+    bool isolateOldPeers = false;
+
+    for (uint32_t id = 1; id <= 6; ++id) {
+        states[id] = std::make_shared<TDurableState>((dir / "raft").string(), id);
+        states[id]->BindVoters(oldVoters);
+        states[id]->Commit();
+        for (uint32_t peer = 1; peer <= 6; ++peer)
+            if (peer != id) endpoints[id][peer] = std::make_shared<TEndpoint>();
+    }
+    for (uint32_t id = 1; id <= 6; ++id) {
+        TNodeDict peers;
+        for (uint32_t peer = 1; peer <= 6; ++peer)
+            if (peer != id) peers.emplace(peer, endpoints[id][peer]);
+        rafts[id] = std::make_shared<TRaft>(states[id], id, peers, newVoters);
+    }
+    for (uint32_t from = 1; from <= 6; ++from) {
+        for (uint32_t to = 1; to <= 6; ++to) {
+            if (from == to) continue;
+            endpoints[from][to]->Route = [&, from, to](auto message) {
+                if (isolateOldPeers && from == 1 && (to == 2 || to == 3)) return;
+                rafts[to]->Process(now, std::move(message));
+            };
+        }
+    }
+    auto tick = [&] {
+        now += std::chrono::seconds(1);
+        rafts[1]->ProcessTimeout(now);
+    };
+    rafts[1]->ProcessTimeout(now);
+    tick();
+    assert_true(rafts[1]->CurrentStateName() == EState::LEADER);
+    for (unsigned i = 0; i < 8 && rafts[1]->GetVolatileState()->CommitIndex < 1; ++i) tick();
+    assert_int_equal(rafts[1]->GetVolatileState()->CommitIndex, 1);
+    for (unsigned i = 0; i < 8; ++i) {
+        bool ready = true;
+        for (auto id : newVoters) ready = ready && rafts[1]->IsLearnerCommitAcknowledged(id);
+        if (ready) break;
+        tick();
+    }
+    for (auto id : newVoters) assert_true(rafts[1]->IsLearnerCommitAcknowledged(id));
+
+    isolateOldPeers = true;
+    const auto jointIndex = rafts[1]->ProposeJointConfiguration(newVoters);
+    for (unsigned i = 0; i < 4 && rafts[1]->GetVolatileState()->CommitIndex < jointIndex; ++i) tick();
+    assert_true(rafts[1]->GetVolatileState()->CommitIndex < jointIndex);
+    for (auto id : newVoters) {
+        assert_true(rafts[1]->GetVolatileState()->MatchIndex.at(id) >= jointIndex);
+        assert_true(rafts[id]->IsVoter(id));
+        assert_int_equal(states[id]->CommitIndex, jointIndex - 1);
+    }
+    assert_true(rafts[1]->GetVolatileState()->MatchIndex.at(2) < jointIndex);
+    assert_true(rafts[1]->GetVolatileState()->MatchIndex.at(3) < jointIndex);
+
+    isolateOldPeers = false;
+    for (unsigned i = 0; i < 8 && rafts[1]->GetVolatileState()->CommitIndex < jointIndex; ++i) tick();
+    assert_int_equal(rafts[1]->GetVolatileState()->CommitIndex, jointIndex);
+    for (unsigned i = 0; i < 8; ++i) {
+        bool propagated = true;
+        for (uint32_t id = 1; id <= 6; ++id) propagated = propagated && states[id]->CommitIndex >= jointIndex;
+        if (propagated) break;
+        tick();
+    }
+    for (uint32_t id = 1; id <= 6; ++id) {
+        assert_int_equal(states[id]->CommitIndex, jointIndex);
+        assert_true(rafts[id]->GetVoterIds() == (std::vector<uint32_t>{1, 2, 3, 4, 5, 6}));
+    }
+
+    rafts = {};
+    states = {};
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
+void test_joint_strong_read_waits_for_both_disjoint_majorities(void**) {
+#ifdef __linux__
+    auto run = [](bool newMajorityFirst) {
+        auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-read-quorum-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+            (newMajorityFirst ? "-new" : "-old"));
+        assert_true(std::filesystem::create_directory(dir));
+        {
+            auto state = std::make_shared<TDurableState>((dir / "raft").string(), 4);
+            state->BindVoters({1, 2, 3});
+            state->CurrentTerm = 2;
+            state->Commit();
+            const TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0,
+                {1, 2, 3}, {4, 5, 6}};
+            state->Append(EncodeConfigurationEntry(joint));
+            state->CommitIndex = 1;
+            state->Commit();
+
+            std::unordered_map<uint32_t, std::shared_ptr<TEndpoint>> endpoints;
+            TNodeDict peers;
+            for (uint32_t id : {1, 2, 3, 5, 6}) {
+                auto endpoint = std::make_shared<TEndpoint>();
+                endpoints.emplace(id, endpoint);
+                peers.emplace(id, endpoint);
+            }
+            auto raft = std::make_shared<TRaft>(state, 4, peers);
+            auto application = std::make_shared<TDummyRsm>();
+            TRequestProcessor processor(raft, application, {});
+            processor.ProcessCommitted();
+
+            const auto now = ITimeSource::Time{};
+            raft->ProcessTimeout(now);
+            assert_true(raft->CurrentStateName() == EState::CANDIDATE);
+            for (uint32_t voter : {1, 2, 5})
+                raft->Process(now + std::chrono::milliseconds(1),
+                    NewHoldedMessage(TMessageEx{.Src = voter, .Dst = 4, .Term = state->CurrentTerm},
+                        TRequestVoteResponse{.VoteGranted = 1}));
+            raft->ProcessTimeout(now + std::chrono::milliseconds(2));
+            assert_true(raft->CurrentStateName() == EState::LEADER);
+            assert_int_equal(raft->GetLastIndex(), 2);
+
+            auto acknowledgeLatestAppend = [&](uint32_t voter, int responseMillis) {
+                auto& messages = endpoints.at(voter)->Messages;
+                const auto request = std::find_if(messages.rbegin(), messages.rend(), [](const auto& item) {
+                    return item->Type == uint32_t(EMessageType::APPEND_ENTRIES_REQUEST);
+                });
+                assert_true(request != messages.rend());
+                const auto append = request->Cast<TAppendEntriesRequest>();
+                const auto matchIndex = append->PrevLogIndex + append->Nentries;
+                raft->Process(now + std::chrono::milliseconds(responseMillis),
+                    NewHoldedMessage(TMessageEx{.Src = voter, .Dst = 4, .Term = append->Term,
+                        .Seqno = append->Seqno},
+                        TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1}));
+                return matchIndex;
+            };
+
+            raft->ProcessTimeout(now + std::chrono::milliseconds(3));
+            // The new leader first probes the known joint prefix. ACK those
+            // probes, then let it replicate its current-term no-op.
+            assert_int_equal(acknowledgeLatestAppend(1, 4), 1);
+            assert_int_equal(acknowledgeLatestAppend(2, 4), 1);
+            assert_int_equal(acknowledgeLatestAppend(5, 4), 1);
+            raft->ProcessTimeout(now + std::chrono::milliseconds(5));
+            assert_int_equal(acknowledgeLatestAppend(1, 6), 2);
+            assert_int_equal(acknowledgeLatestAppend(2, 6), 2);
+            assert_int_equal(acknowledgeLatestAppend(5, 6), 2);
+            assert_int_equal(raft->GetVolatileState()->CommitIndex, 2);
+            processor.ProcessCommitted();
+            processor.ProcessWaiting();
+            assert_int_equal(application->LastAppliedIndex, 2);
+
+            auto replyTo = std::make_shared<TEndpoint>();
+            auto read = NewHoldedMessage<TCommandRequest>(sizeof(TCommandRequest) + sizeof(int64_t));
+            read->Cookie = 41;
+            read->Flags = TCommandRequest::EConsistent;
+            const int64_t readKey = 0;
+            memcpy(read->Data, &readKey, sizeof(readKey));
+            processor.OnCommandRequest(read, replyTo);
+
+            if (newMajorityFirst) {
+                acknowledgeLatestAppend(5, 5); // New majority alone cannot confirm the read.
+                processor.ProcessWaiting();
+                assert_true(replyTo->Messages.empty());
+                acknowledgeLatestAppend(1, 6); // One old vote is still short of its majority.
+                processor.ProcessWaiting();
+                assert_true(replyTo->Messages.empty());
+                acknowledgeLatestAppend(2, 7);
+            } else {
+                acknowledgeLatestAppend(1, 5);
+                acknowledgeLatestAppend(2, 5); // Old majority alone cannot confirm the read.
+                processor.ProcessWaiting();
+                assert_true(replyTo->Messages.empty());
+                acknowledgeLatestAppend(5, 6);
+            }
+            processor.ProcessCommitted();
+            processor.ProcessWaiting();
+            assert_int_equal(replyTo->Messages.size(), 1);
+            assert_int_equal(replyTo->Messages.front().Cast<TCommandResponse>()->Cookie, 41);
+        }
+        std::error_code ignored;
+        std::filesystem::remove_all(dir, ignored);
     };
     run(false);
     run(true);
@@ -840,42 +2059,55 @@ void test_timeout_now_retries_and_falls_back_under_joint_quorum(void**) {
     }
 #endif
 }
-void test_old_side_leader_can_transfer_with_pending_stable_successor(void**) {
+void test_old_side_leader_can_transfer_after_joint_snapshot_with_pending_stable_successor(void**) {
 #ifdef __linux__
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-pending-stable-transfer-" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     assert_true(std::filesystem::create_directory(dir));
     const auto name = (dir / "raft").string();
-    const std::vector<uint32_t> originalVoters{1, 2, 3, 4};
+    const std::vector<uint32_t> originalVoters{1, 2, 3};
     const TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0,
-        {1, 2, 3, 4}, {1, 2, 4, 5}};
+        {1, 2, 3}, {4, 5, 6}};
+    TSnapshot jointSnapshot{1, 2, joint.OldVoters, "1"};
+    jointSnapshot.JointVoters = joint.NewVoters;
+    jointSnapshot.ConfigurationIndex = 1;
+    jointSnapshot.ConfigurationTerm = 2;
     const TConfigurationRecord stable{EConfigurationPhase::Stable, 3, 1, 2,
         joint.OldVoters, joint.NewVoters};
-    auto makeState = [&](uint32_t id) {
+    auto makeState = [&](uint32_t id, bool includePendingStable) {
         auto state = std::make_shared<TDurableState>(name, id);
         state->BindVoters(originalVoters);
         state->CurrentTerm = 4;
-        state->Append(EncodeConfigurationEntry(joint));
-        state->Append(EncodeConfigurationEntry(stable)); // Same pending successor on both nodes.
-        state->CommitIndex = 1; // The joint entry committed; stable finalization has not.
+        state->InstallSnapshot(jointSnapshot); // Both nodes restart from the committed joint boundary.
+        if (includePendingStable)
+            state->Append(EncodeConfigurationEntry(stable)); // The old-side leader inherits the successor.
         state->Commit();
         return state;
     };
-    auto leaderState = makeState(3);
-    auto targetState = makeState(5);
+    auto leaderState = makeState(3, true);
+    auto targetState = makeState(5, false);
+    assert_true(leaderState->GetSnapshot() && leaderState->GetSnapshot()->IsJoint());
+    assert_true(targetState->GetSnapshot() && targetState->GetSnapshot()->IsJoint());
+    assert_int_equal(leaderState->CommitIndex, jointSnapshot.Index);
+    assert_int_equal(targetState->CommitIndex, jointSnapshot.Index);
+    assert_int_equal(leaderState->LastLogIndex, stable.PreviousIndex + 1);
+    assert_int_equal(targetState->LastLogIndex, jointSnapshot.Index);
 
     auto toOne = std::make_shared<TEndpoint>();
     auto toTwo = std::make_shared<TEndpoint>();
     auto toFour = std::make_shared<TEndpoint>();
     auto toTarget = std::make_shared<TEndpoint>();
-    TNodeDict leaderPeers{{1, toOne}, {2, toTwo}, {4, toFour}, {5, toTarget}};
+    auto toSix = std::make_shared<TEndpoint>();
+    TNodeDict leaderPeers{{1, toOne}, {2, toTwo}, {4, toFour}, {5, toTarget}, {6, toSix}};
     auto leader = std::make_shared<TRaft>(leaderState, 3, leaderPeers);
 
     auto targetToOne = std::make_shared<TEndpoint>();
     auto targetToTwo = std::make_shared<TEndpoint>();
     auto targetToLeader = std::make_shared<TEndpoint>();
     auto targetToFour = std::make_shared<TEndpoint>();
-    TNodeDict targetPeers{{1, targetToOne}, {2, targetToTwo}, {3, targetToLeader}, {4, targetToFour}};
+    auto targetToSix = std::make_shared<TEndpoint>();
+    TNodeDict targetPeers{{1, targetToOne}, {2, targetToTwo}, {3, targetToLeader},
+        {4, targetToFour}, {6, targetToSix}};
     auto target = std::make_shared<TRaft>(targetState, 5, targetPeers);
 
     const ITimeSource::Time start{};
@@ -894,8 +2126,8 @@ void test_old_side_leader_can_transfer_with_pending_stable_successor(void**) {
         assert_true(leader->GetVolatileState()->Votes.contains(voter));
     };
     grantVote(1, toOne);
-    grantVote(2, toTwo);
-    grantVote(4, toFour); // Old-side 3 leads with votes from both joint majorities.
+    grantVote(4, toFour);
+    grantVote(5, toTarget); // Old-side 3 leads with votes from both disjoint majorities.
     leader->ProcessTimeout(start + std::chrono::milliseconds(2));
     assert_true(leader->CurrentStateName() == EState::LEADER);
     assert_true(leaderState->CurrentTerm == 5);
@@ -912,14 +2144,23 @@ void test_old_side_leader_can_transfer_with_pending_stable_successor(void**) {
         assert_true(appendReply != targetToLeader->Messages.rend());
         leader->Process(now, *appendReply);
     };
-    replicateLatestTargetAppend(start + std::chrono::milliseconds(3));
-    leader->ProcessTimeout(start + std::chrono::seconds(1));
-    replicateLatestTargetAppend(start + std::chrono::seconds(1) + std::chrono::milliseconds(1));
+    auto replicationNow = start + std::chrono::milliseconds(3);
+    for (unsigned attempt = 0; attempt < 4 &&
+        leader->GetVolatileState()->MatchIndex.at(5) < leaderState->LastLogIndex; ++attempt) {
+        if (attempt) {
+            replicationNow += std::chrono::seconds(1);
+            leader->ProcessTimeout(replicationNow);
+        }
+        replicationNow += std::chrono::milliseconds(1);
+        replicateLatestTargetAppend(replicationNow);
+    }
     assert_int_equal(leader->GetVolatileState()->MatchIndex.at(5), leaderState->LastLogIndex);
     assert_int_equal(leader->GetVolatileState()->CommitAckIndex.at(5), 1);
+    assert_true(DecodeConfigurationEntry(targetState->Get(stable.PreviousIndex + 1)) == stable);
 
-    // The target has the exact full suffix and committed joint boundary, so
-    // the old-side leader can transfer before the stable successor commits.
+    // The old-side leader first forwards the pending stable successor and its
+    // current-term no-op. Once the target has the complete suffix, it can
+    // transfer leadership before that successor commits.
     leader->TransferLeadership(5, start + std::chrono::seconds(1) + std::chrono::milliseconds(2));
     assert_true(leader->CurrentStateName() == EState::FOLLOWER);
     const auto timeoutNow = std::find_if(toTarget->Messages.rbegin(), toTarget->Messages.rend(), [](const auto& item) {
@@ -946,6 +2187,34 @@ void test_old_side_leader_can_transfer_with_pending_stable_successor(void**) {
     target->ProcessTimeout(start + std::chrono::seconds(1) + std::chrono::milliseconds(4));
     assert_true(target->CurrentStateName() == EState::LEADER);
     assert_int_equal(targetState->CommitIndex, 1); // The stable successor still needs joint replication.
+
+    auto acknowledgeTargetAppend = [&](uint32_t voter, const std::shared_ptr<TEndpoint>& endpoint) {
+        const auto append = std::find_if(endpoint->Messages.rbegin(), endpoint->Messages.rend(), [](const auto& item) {
+            return item->Type == uint32_t(EMessageType::APPEND_ENTRIES_REQUEST);
+        });
+        assert_true(append != endpoint->Messages.rend());
+        const auto request = append->Cast<TAppendEntriesRequest>();
+        const auto matchIndex = request->PrevLogIndex + request->Nentries;
+        target->Process(start + std::chrono::seconds(1) + std::chrono::milliseconds(5),
+            NewHoldedMessage(TMessageEx{.Src = voter, .Dst = 5, .Term = targetState->CurrentTerm,
+                .Seqno = append->Cast<TMessageEx>()->Seqno},
+                TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1,
+                    .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier}));
+        return matchIndex;
+    };
+    const auto firstProbe = acknowledgeTargetAppend(1, targetToOne);
+    assert_int_equal(firstProbe, targetState->LastLogIndex - 1);
+    assert_int_equal(acknowledgeTargetAppend(2, targetToTwo), firstProbe);
+    assert_int_equal(acknowledgeTargetAppend(4, targetToFour), firstProbe);
+    // The new leader first probes the followers' known prefix, then retries
+    // with its current-term no-op after those match ACKs advance NextIndex.
+    target->ProcessTimeout(start + std::chrono::seconds(1) + std::chrono::milliseconds(6));
+    assert_int_equal(acknowledgeTargetAppend(1, targetToOne), targetState->LastLogIndex);
+    assert_int_equal(acknowledgeTargetAppend(2, targetToTwo), targetState->LastLogIndex);
+    assert_int_equal(acknowledgeTargetAppend(4, targetToFour), targetState->LastLogIndex);
+    assert_int_equal(targetState->CommitIndex, targetState->LastLogIndex);
+    assert_true(targetState->CommitIndex > jointSnapshot.Index);
+    assert_true(target->GetVoterIds() == joint.NewVoters);
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 #endif
 }
@@ -1190,7 +2459,12 @@ void test_snapshot_install_validates_and_advances_committed_membership_history(v
         sendSnapshot(valid, 3);
         assert_true(replies.back().Cast<TInstallSnapshotResponse>()->Installed);
         assert_int_equal(state->SnapshotIndex, 4); assert_int_equal(state->CommitIndex, 4);
-        assert_true(*state->GetSnapshot() == valid);
+        auto validWithLineage = valid;
+        validWithLineage.PreviousVoters = {1};
+        validWithLineage.PreviousJointIndex = 2;
+        validWithLineage.PreviousJointTerm = 2;
+        validWithLineage.ConfigurationTransitions.push_back({{1}, {1, 2}, 0, 0, 2, 2, 3, 2});
+        assert_true(*state->GetSnapshot() == validWithLineage);
         assert_int_equal(app->LastAppliedIndex, 4);
 
         // A legacy image beyond this committed transition inherits its identity
@@ -1272,7 +2546,12 @@ void test_snapshot_transfer_before_uncommitted_configuration_preserves_suffix(vo
     sendSnapshot(safe, 4);
     assert_int_equal(replies.size(), 1);
     assert_true(replies.back()->Installed); assert_true(replies.back()->Success);
-    assert_true(*state->GetSnapshot() == safe);
+    auto safeWithLineage = safe;
+    safeWithLineage.PreviousVoters = {1, 2, 3};
+    safeWithLineage.PreviousJointIndex = 1;
+    safeWithLineage.PreviousJointTerm = 2;
+    safeWithLineage.ConfigurationTransitions.push_back({{1, 2, 3}, {1, 2, 3, 4}, 0, 0, 1, 2, 2, 2});
+    assert_true(*state->GetSnapshot() == safeWithLineage);
     assert_int_equal(state->SnapshotIndex, 3); assert_int_equal(state->CommitIndex, 3);
     assert_int_equal(state->LastLogIndex, 4);
     assert_int_equal(state->RetainedLogFlags(4), TLogEntry::EConfiguration);
@@ -1316,6 +2595,13 @@ void test_snapshot_transfer_before_uncommitted_configuration_preserves_suffix(vo
     TSnapshot matchingJoint{4, 3, {1, 2, 3, 4}, "4"};
     matchingJoint.JointVoters = {1, 2, 4, 5};
     matchingJoint.ConfigurationIndex = 4; matchingJoint.ConfigurationTerm = 3;
+    matchingJoint.PreviousVoters = {1, 2, 3, 4};
+    matchingJoint.PreviousConfigurationIndex = 2; matchingJoint.PreviousConfigurationTerm = 2;
+    matchingJoint.PreviousJointIndex = 4; matchingJoint.PreviousJointTerm = 3;
+    matchingJoint.ConfigurationTransitions = {
+        {{1, 2, 3}, {1, 2, 3, 4}, 0, 0, 1, 2, 2, 2},
+        {{1, 2, 3, 4}, {1, 2, 4, 5}, 2, 2, 4, 3, 0, 0},
+    };
     // A newly added voter can lead once the pending joint configuration is
     // active and both majorities authorize its term.
     sendSnapshot(matchingJoint, 5, 5);
@@ -1352,6 +2638,13 @@ void test_snapshot_transfer_before_uncommitted_configuration_preserves_suffix(vo
     TSnapshot matchingStable{5, 5, {1, 2, 4, 5}, "5"};
     matchingStable.StableConfiguration = true;
     matchingStable.ConfigurationIndex = 5; matchingStable.ConfigurationTerm = 5;
+    matchingStable.PreviousVoters = {1, 2, 3, 4};
+    matchingStable.PreviousConfigurationIndex = 2; matchingStable.PreviousConfigurationTerm = 2;
+    matchingStable.PreviousJointIndex = 4; matchingStable.PreviousJointTerm = 3;
+    matchingStable.ConfigurationTransitions = {
+        {{1, 2, 3}, {1, 2, 3, 4}, 0, 0, 1, 2, 2, 2},
+        {{1, 2, 3, 4}, {1, 2, 4, 5}, 2, 2, 4, 3, 5, 5},
+    };
     const auto beforeUnauthorizedSender = static_cast<TStateFields>(*state);
     sendSnapshot(matchingStable, 6, 6);
     assert_true(static_cast<TStateFields>(*state) == beforeUnauthorizedSender);
@@ -1377,6 +2670,18 @@ void test_joint_snapshot_install_requires_matching_joint_history_and_recovers(vo
     TSnapshot snapshot{4, 2, {1}, "4"};
     snapshot.JointVoters = {1, 2};
     snapshot.ConfigurationIndex = 2; snapshot.ConfigurationTerm = 2;
+    snapshot.PreviousVoters = {1};
+    snapshot.PreviousConfigurationIndex = 1; snapshot.PreviousConfigurationTerm = 1;
+    snapshot.PreviousJointIndex = 2; snapshot.PreviousJointTerm = 2;
+    snapshot.ConfigurationTransitions.push_back({{1}, {1, 2}, 1, 1, 2, 2, 0, 0});
+    auto olderFormatSnapshot = snapshot;
+    olderFormatSnapshot.PreviousVoters.clear();
+    olderFormatSnapshot.PreviousConfigurationIndex = 0;
+    olderFormatSnapshot.PreviousConfigurationTerm = 0;
+    olderFormatSnapshot.PreviousJointIndex = 0;
+    olderFormatSnapshot.PreviousJointTerm = 0;
+    olderFormatSnapshot.ConfigurationTransitions.clear();
+    assert_true(EncodeSnapshot(olderFormatSnapshot).substr(0, 8) == "MRFTS002");
     {
         auto state = std::make_shared<TDurableState>(name, 2);
         state->BindVoters({1}); // Original binding stays distinct from active joint membership.
@@ -1410,13 +2715,13 @@ void test_joint_snapshot_install_requires_matching_joint_history_and_recovers(vo
             raft->Process(ITimeSource::Time{}, request);
         };
 
-        auto forged = snapshot; forged.JointVoters = {1, 3};
+        auto forged = olderFormatSnapshot; forged.JointVoters = {1, 3};
         const auto beforeForgery = static_cast<TStateFields>(*state);
         sendSnapshot(forged, 3); // Must reject before persisting the higher RPC term.
         assert_true(static_cast<TStateFields>(*state) == beforeForgery);
         assert_true(replies.empty());
 
-        sendSnapshot(snapshot, 3);
+        sendSnapshot(olderFormatSnapshot, 3);
         assert_int_equal(state->CurrentTerm, 3);
         assert_int_equal(state->SnapshotIndex, snapshot.Index);
         assert_int_equal(state->CommitIndex, snapshot.Index);
@@ -1454,7 +2759,84 @@ void test_joint_snapshot_install_requires_matching_joint_history_and_recovers(vo
         TRequestProcessor processor(raft, app, {{1, peer}});
         processor.ProcessCommitted();
         assert_int_equal(app->LastAppliedIndex, state->CommitIndex);
+        const auto recoveredStable = CaptureSnapshot(*raft, *app);
+        assert_true(recoveredStable.HasStablePredecessor());
+        assert_true(recoveredStable.PreviousVoters == snapshot.PreviousVoters);
+        assert_int_equal(recoveredStable.PreviousConfigurationIndex, snapshot.PreviousConfigurationIndex);
+        assert_int_equal(recoveredStable.PreviousConfigurationTerm, snapshot.PreviousConfigurationTerm);
+        assert_int_equal(recoveredStable.PreviousJointIndex, snapshot.PreviousJointIndex);
+        assert_int_equal(recoveredStable.PreviousJointTerm, snapshot.PreviousJointTerm);
     }
+    std::error_code ignored; std::filesystem::remove_all(dir, ignored);
+#endif
+}
+void test_committed_joint_snapshot_can_install_its_stable_successor(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-stable-successor-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const auto name = (dir / "raft").string();
+
+    auto state = std::make_shared<TDurableState>(name, 2);
+    state->BindVoters({1, 3}); // The original binding remains distinct from active joint voters.
+    state->CurrentTerm = 3;
+    TSnapshot joint{4, 2, {1, 3}, "4"};
+    joint.JointVoters = {1, 2};
+    joint.ConfigurationIndex = 2; joint.ConfigurationTerm = 2;
+    state->InstallSnapshot(joint);
+
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> replies;
+    auto peer = std::make_shared<TEndpoint>();
+    peer->Route = [&](auto message) { replies.push_back(message.template Cast<TInstallSnapshotResponse>()); };
+    auto oldOnlyPeer = std::make_shared<TEndpoint>();
+    TNodeDict peers{{1, peer}, {3, oldOnlyPeer}};
+    auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{2});
+    auto app = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor processor(raft, app, peers);
+    assert_int_equal(app->LastAppliedIndex, joint.Index);
+
+    auto sendSnapshot = [&](const TSnapshot& image, uint32_t leaderId = 1) {
+        const auto bytes = EncodeSnapshot(image);
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + bytes.size());
+        request->Src = leaderId; request->Dst = 2; request->Term = 4;
+        request->Seqno = replies.size() + 1;
+        request->SnapshotIndex = image.Index; request->SnapshotTerm = image.Term;
+        request->Offset = 0; request->TotalBytes = bytes.size(); request->Done = 1; request->LeaderId = leaderId;
+        memcpy(request->Data, bytes.data(), bytes.size());
+        raft->Process(ITimeSource::Time{}, request);
+    };
+
+    TSnapshot wrongVoters{5, 3, {1, 3}, "5"};
+    wrongVoters.StableConfiguration = true;
+    wrongVoters.ConfigurationIndex = 5; wrongVoters.ConfigurationTerm = 3;
+    const auto beforeWrongVoters = static_cast<TStateFields>(*state);
+    sendSnapshot(wrongVoters);
+    assert_true(static_cast<TStateFields>(*state) == beforeWrongVoters);
+    assert_true(replies.empty()); // The invalid higher-term snapshot is rejected in preflight.
+
+    TSnapshot skippedBoundary{5, 3, {1, 2}, "5"};
+    skippedBoundary.StableConfiguration = true;
+    skippedBoundary.ConfigurationIndex = 2; skippedBoundary.ConfigurationTerm = 2;
+    sendSnapshot(skippedBoundary);
+    assert_true(static_cast<TStateFields>(*state) == beforeWrongVoters);
+    assert_true(replies.empty());
+
+    TSnapshot stable{5, 3, {1, 2}, "5"};
+    stable.StableConfiguration = true;
+    stable.ConfigurationIndex = 5; stable.ConfigurationTerm = 3;
+    sendSnapshot(stable, 3); // An old-only member cannot lead after stable finalization.
+    assert_true(static_cast<TStateFields>(*state) == beforeWrongVoters);
+    assert_true(replies.empty());
+
+    sendSnapshot(stable);
+    assert_int_equal(replies.size(), 1);
+    assert_true(replies.back()->Success); assert_true(replies.back()->Installed);
+    assert_int_equal(state->CurrentTerm, 4);
+    assert_true(*state->GetSnapshot() == stable);
+    assert_int_equal(app->LastAppliedIndex, stable.Index);
+    assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+    assert_true(raft->IsVoter(2));
+
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 #endif
 }
@@ -1526,6 +2908,45 @@ void test_durable_restart_recovers_stable_membership_roles(void**) {
         assert_int_equal(raft.GetVolatileState()->CommitIndex, 4);
     }
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
+#endif
+}
+void test_stable_snapshot_restart_accepts_persisted_vote_for_removed_voter(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-removed-vote-snapshot-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const std::vector<uint32_t> originalVoters{1, 2, 3, 4, 5, 6, 7};
+    const std::vector<uint32_t> activeVoters{1, 3, 4, 5, 6};
+    TSnapshot snapshot{3, 3, activeVoters, "stable membership checkpoint"};
+    snapshot.StableConfiguration = true;
+    snapshot.ConfigurationIndex = 2;
+    snapshot.ConfigurationTerm = 3;
+
+    for (uint32_t id : {1, 2}) {
+        const auto name = (dir / "raft").string();
+        {
+            TDurableState state(name, id);
+            state.BindVoters(originalVoters);
+            state.CurrentTerm = 3;
+            state.VotedFor = 2; // This vote preceded removal of voter 2 in term 3.
+            state.Commit();
+            state.InstallSnapshot(snapshot);
+        }
+        {
+            auto state = std::make_shared<TDurableState>(name, id);
+            TNodeDict peers;
+            for (auto voter : activeVoters)
+                if (voter != id) peers.emplace(voter, std::make_shared<TEndpoint>());
+            auto raft = std::make_shared<TRaft>(state, id, peers);
+            assert_true(state->GetBoundVoters() == originalVoters);
+            assert_true(raft->GetVoterIds() == activeVoters);
+            assert_true(raft->IsVoter(id) == (id != 2));
+            assert_int_equal(state->VotedFor, 2);
+        }
+    }
+
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
 #endif
 }
 void test_restart_after_membership_removal_needs_only_active_endpoints(void**) {
@@ -1680,30 +3101,35 @@ void test_offline_history_scan_after_durable_snapshot_and_restart(void**) {
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 }
 void test_raft_recovers_joint_quorum_for_candidate_election(void**) {
-    auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-quorum-" +
-        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    assert_true(std::filesystem::create_directory(dir));
-    const auto name = (dir / "raft").string();
-    {
+    auto run = [](bool disjoint) {
+        auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-quorum-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+            (disjoint ? "-disjoint" : "-overlap"));
+        assert_true(std::filesystem::create_directory(dir));
+        const auto name = (dir / "raft").string();
         auto state = std::make_shared<TDurableState>(name, 4);
         state->BindVoters({1, 2, 3});
         state->CurrentTerm = 2;
         state->Commit();
-        TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0, {1, 2, 3}, {3, 4, 5}};
+        const auto newVoters = disjoint ? std::vector<uint32_t>{4, 5, 6} : std::vector<uint32_t>{3, 4, 5};
+        TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0, {1, 2, 3}, newVoters};
         state->Append(EncodeConfigurationEntry(joint));
         state->Commit();
 
         TNodeDict peers;
         std::unordered_map<uint32_t, std::shared_ptr<TEndpoint>> endpoints;
-        for (uint32_t id : {1, 2, 3, 5}) {
+        const std::vector<uint32_t> peerIds = disjoint
+            ? std::vector<uint32_t>{1, 2, 3, 5, 6} : std::vector<uint32_t>{1, 2, 3, 5};
+        for (uint32_t id : peerIds) {
             auto endpoint = std::make_shared<TEndpoint>();
             endpoints.emplace(id, endpoint);
             peers.emplace(id, endpoint);
         }
-        auto raft = std::make_shared<TRaft>(state, 4, peers, std::vector<uint32_t>{4, 5});
+        auto raft = std::make_shared<TRaft>(state, 4, peers, disjoint
+            ? std::vector<uint32_t>{4, 5, 6} : std::vector<uint32_t>{4, 5});
         assert_true(raft->IsVoter(4));
         assert_true(raft->IsVoter(5));
-        assert_int_equal(raft->GetNservers(), 5);
+        assert_int_equal(raft->GetNservers(), disjoint ? 6 : 5);
 
         auto now = ITimeSource::Time{};
         raft->ProcessTimeout(now); // self vote alone cannot satisfy either joint majority
@@ -1716,7 +3142,13 @@ void test_raft_recovers_joint_quorum_for_candidate_election(void**) {
 
         vote(1); // This leaves both voter sets below their strict majority.
         assert_true(raft->CurrentStateName() == EState::CANDIDATE);
-        vote(3); // 3 plus self satisfies new, while 1 plus 3 satisfies old.
+        if (disjoint) {
+            vote(2); // The old majority alone cannot elect without the new majority.
+            assert_true(raft->CurrentStateName() == EState::CANDIDATE);
+            vote(5);
+        } else {
+            vote(3); // Shared voter 3 completes both majorities.
+        }
         assert_true(raft->CurrentStateName() == EState::LEADER);
 
         raft->ProcessTimeout(now + std::chrono::milliseconds(2));
@@ -1742,8 +3174,12 @@ void test_raft_recovers_joint_quorum_for_candidate_election(void**) {
         ack(1, 2, 5);
         assert_int_equal(raft->GetVolatileState()->CommitIndex, 2);
         assert_true(raft->CommitSeqno() > 0);
-    }
-    std::error_code ignored; std::filesystem::remove_all(dir, ignored);
+        raft.reset();
+        state.reset();
+        std::error_code ignored; std::filesystem::remove_all(dir, ignored);
+    };
+    run(false);
+    run(true);
 }
 void test_raft_keeps_joint_quorum_until_stable_successor_commits(void**) {
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-finalize-" +
@@ -1912,11 +3348,705 @@ void test_configuration_snapshots_preserve_original_binding_across_transitions(v
     }
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 }
+void test_verified_multihop_disjoint_snapshot_recovers_and_readds_stale_voter(void**) {
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-verified-disjoint-recovery-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const auto path = (dir / "raft").string();
+    const std::vector<uint32_t> original{1, 2, 3};
+    const std::vector<uint32_t> intermediate{4, 5, 6};
+    const std::vector<uint32_t> active{7, 8, 9};
+
+    // Model a snapshot whose two-transition history has been verified out of
+    // band. The stale store's original configuration is no longer the immediate
+    // predecessor, and neither disjoint transition has a common voter.
+    auto history = TConfigurationHistory::Stable(original, 0, 0, 0, 0);
+    history = history.Observe(1, Ordinary(1));
+    const TConfigurationRecord firstJoint{EConfigurationPhase::Joint, 2, 0, 0, original, intermediate};
+    history = history.Advance(2, EncodeConfigurationEntry(firstJoint));
+    auto firstStable = firstJoint;
+    firstStable.Phase = EConfigurationPhase::Stable;
+    firstStable.PreviousIndex = 2;
+    firstStable.PreviousTerm = 2;
+    history = history.Advance(3, EncodeConfigurationEntry(firstStable));
+    history = history.Observe(4, Ordinary(2));
+    const TConfigurationRecord secondJoint{EConfigurationPhase::Joint, 3, 3, 2, intermediate, active};
+    history = history.Advance(5, EncodeConfigurationEntry(secondJoint));
+    auto secondStable = secondJoint;
+    secondStable.Phase = EConfigurationPhase::Stable;
+    secondStable.PreviousIndex = 5;
+    secondStable.PreviousTerm = 3;
+    history = history.Advance(6, EncodeConfigurationEntry(secondStable));
+    history = history.Observe(7, Ordinary(3));
+    const auto verified = history.MakeSnapshot("7");
+    assert_true(verified.StableConfiguration);
+    assert_true(verified.Voters == active);
+    assert_true(verified.PreviousVoters == intermediate);
+
+    auto staleState = std::make_shared<TDurableState>(path, 2);
+    staleState->BindVoters(original);
+    staleState->CurrentTerm = 3;
+    staleState->Append(Ordinary(1));
+    staleState->CommitIndex = 1;
+    staleState->Commit();
+    {
+        TNodeDict stalePeers;
+        std::array<std::shared_ptr<TEndpoint>, 10> staleEndpoints{};
+        for (auto peer : original) {
+            if (peer == 2) continue;
+            staleEndpoints[peer] = std::make_shared<TEndpoint>();
+            stalePeers.emplace(peer, staleEndpoints[peer]);
+        }
+        for (auto peer : active) {
+            staleEndpoints[peer] = std::make_shared<TEndpoint>();
+            stalePeers.emplace(peer, staleEndpoints[peer]);
+        }
+        auto staleRaft = std::make_shared<TRaft>(staleState, 2, stalePeers, active);
+        auto staleApplication = std::make_shared<TSnapshotRsm>();
+        TRequestProcessor staleProcessor(staleRaft, staleApplication, stalePeers);
+        const auto beforeNetworkInstall = static_cast<TStateFields>(*staleState);
+        const auto beforeApplicationInstall = staleApplication->LastAppliedIndex;
+        const auto encoded = EncodeSnapshot(verified);
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + encoded.size());
+        request->Src = 7; request->Dst = 2; request->Term = 5;
+        request->SnapshotIndex = verified.Index; request->SnapshotTerm = verified.Term;
+        request->Offset = 0; request->TotalBytes = encoded.size(); request->Done = 1;
+        request->LeaderId = 7;
+        memcpy(request->Data, encoded.data(), encoded.size());
+        staleRaft->Process({}, request);
+        assert_true(static_cast<TStateFields>(*staleState) == beforeNetworkInstall);
+        assert_int_equal(staleApplication->LastAppliedIndex, beforeApplicationInstall);
+        for (auto& message : staleEndpoints[7]->Messages) {
+            const auto response = message.Cast<TInstallSnapshotResponse>();
+            assert_false(response->Success);
+            assert_false(response->Installed);
+        }
+    }
+    // The live transfer above cannot authorize the new voter set. After Raft
+    // stops, the caller may install a snapshot whose history it verified out
+    // of band through the offline API.
+    staleState->InstallSnapshot(verified);
+    assert_true(staleState->GetBoundVoters() == original);
+    assert_true(*staleState->GetSnapshot() == verified);
+    assert_int_equal(staleState->CommitIndex, verified.Index);
+    staleState.reset();
+
+    std::array<std::shared_ptr<TDurableState>, 10> states{};
+    std::array<std::shared_ptr<TRaft>, 10> rafts{};
+    std::array<std::shared_ptr<TSnapshotRsm>, 10> applications{};
+    std::array<std::shared_ptr<TRequestProcessor>, 10> processors{};
+    std::array<std::array<std::shared_ptr<TEndpoint>, 10>, 10> endpoints{};
+    constexpr std::array<uint32_t, 4> members{2, 7, 8, 9};
+    states[2] = std::make_shared<TDurableState>(path, 2);
+    for (auto id : active) {
+        states[id] = std::make_shared<TDurableState>(path, id);
+        states[id]->BindVoters(original);
+        states[id]->CurrentTerm = 3;
+        states[id]->Commit();
+        states[id]->InstallSnapshot(verified);
+    }
+    for (auto from : members) {
+        for (auto to : members)
+            if (from != to) endpoints[from][to] = std::make_shared<TEndpoint>();
+    }
+    for (auto id : members) {
+        TNodeDict peers;
+        for (auto peer : members)
+            if (peer != id) peers.emplace(peer, endpoints[id][peer]);
+        rafts[id] = std::make_shared<TRaft>(states[id], id, peers,
+            id == 2 ? std::vector<uint32_t>{} : std::vector<uint32_t>{2});
+        applications[id] = std::make_shared<TSnapshotRsm>();
+        processors[id] = std::make_shared<TRequestProcessor>(rafts[id], applications[id], peers);
+    }
+    ITimeSource::Time now{};
+    for (auto from : members) {
+        for (auto to : members) {
+            if (from == to) continue;
+            endpoints[from][to]->Route = [&, to](auto message) {
+                rafts[to]->Process(now, std::move(message));
+                processors[to]->ProcessCommitted();
+            };
+        }
+    }
+    assert_true(states[2]->GetBoundVoters() == original);
+    assert_true(rafts[2]->GetVoterIds() == active);
+    assert_true(rafts[2]->GetLearnerIds() == (std::vector<uint32_t>{2}));
+    assert_false(rafts[2]->IsVoter(2));
+    assert_int_equal(applications[2]->LastAppliedIndex, verified.Index);
+    for (auto id : active) assert_true(rafts[id]->GetVoterIds() == active);
+
+    // Catch up the recovered learner under the imported disjoint baseline,
+    // then use the normal joint protocol to add it back as a voter.
+    const_cast<TVolatileState*>(rafts[7]->GetVolatileState())->SetElectionDue(now);
+    rafts[7]->ProcessTimeout(now);
+    rafts[7]->ProcessTimeout(now); // Consume the synchronous vote responses.
+    assert_true(rafts[7]->CurrentStateName() == EState::LEADER);
+    auto tick = [&] {
+        now += std::chrono::seconds(1);
+        for (auto id : members) rafts[id]->ProcessTimeout(now);
+        for (auto id : members) processors[id]->ProcessCommitted();
+    };
+    for (unsigned i = 0; i < 16 && !rafts[7]->IsLearnerCommitAcknowledged(2); ++i) tick();
+    assert_true(rafts[7]->IsLearnerCommitAcknowledged(2));
+    const auto jointIndex = rafts[7]->ProposeJointConfiguration({2, 7, 8, 9});
+    for (unsigned i = 0; i < 16 && rafts[7]->GetVolatileState()->CommitIndex < jointIndex; ++i) tick();
+    assert_int_equal(rafts[7]->GetVolatileState()->CommitIndex, jointIndex);
+    assert_true(rafts[2]->IsVoter(2));
+    const auto stableIndex = rafts[7]->FinalizeConfiguration();
+    for (unsigned i = 0; i < 16; ++i) {
+        bool caughtUp = true;
+        for (auto id : members) caughtUp = caughtUp && states[id]->CommitIndex >= stableIndex;
+        if (caughtUp) break;
+        tick();
+    }
+    for (auto id : members) {
+        assert_true(rafts[id]->GetVoterIds() == (std::vector<uint32_t>{2, 7, 8, 9}));
+        assert_true(rafts[id]->IsVoter(id));
+        assert_true(states[id]->GetBoundVoters() == original);
+        assert_true(states[id]->CommitIndex >= stableIndex);
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+}
+void test_stale_snapshot_missing_new_voter_target_is_rejected_before_install(void**) {
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-snapshot-missing-voter-target-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const std::vector<uint32_t> oldVoters{1, 2, 3};
+    const std::vector<uint32_t> newVoters{1, 2, 4};
+
+    auto history = TConfigurationHistory::Stable(oldVoters, 0, 0, 0, 0)
+        .Observe(1, Ordinary(1));
+    const TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0, oldVoters, newVoters};
+    history = history.Advance(2, EncodeConfigurationEntry(joint));
+    auto stable = joint;
+    stable.Phase = EConfigurationPhase::Stable;
+    stable.PreviousIndex = 2;
+    stable.PreviousTerm = 2;
+    history = history.Advance(3, EncodeConfigurationEntry(stable)).Observe(4, Ordinary(2));
+    const auto snapshot = history.MakeSnapshot("4");
+
+    auto state = std::make_shared<TDurableState>((dir / "stale").string(), 3);
+    state->BindVoters(oldVoters);
+    state->CurrentTerm = 2;
+    state->Append(Ordinary(1));
+    state->CommitIndex = 1;
+    state->Commit();
+    auto toOne = std::make_shared<TEndpoint>();
+    auto toLeader = std::make_shared<TEndpoint>();
+    TNodeDict peers{{1, toOne}, {2, toLeader}}; // Voter 4 is not provisioned yet.
+    auto raft = std::make_shared<TRaft>(state, 3, peers);
+    auto application = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor processor(raft, application, peers);
+
+    const auto encoded = EncodeSnapshot(snapshot);
+    auto install = [&](uint64_t term) {
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(
+            sizeof(TInstallSnapshotRequest) + encoded.size());
+        request->Src = 2;
+        request->Dst = 3;
+        request->Term = term;
+        request->SnapshotIndex = snapshot.Index;
+        request->SnapshotTerm = snapshot.Term;
+        request->Offset = 0;
+        request->TotalBytes = encoded.size();
+        request->Done = 1;
+        request->LeaderId = 2;
+        memcpy(request->Data, encoded.data(), encoded.size());
+        raft->Process({}, std::move(request));
+    };
+
+    install(3);
+    assert_int_equal(state->CurrentTerm, 3); // Recognized leader term is recorded.
+    assert_int_equal(state->SnapshotIndex, 0);
+    assert_int_equal(state->LastLogIndex, 1);
+    assert_true(!state->GetSnapshot());
+    assert_int_equal(application->LastAppliedIndex, 0);
+    assert_int_equal(toLeader->Messages.size(), 1);
+    auto rejected = toLeader->Messages.back().Cast<TInstallSnapshotResponse>();
+    assert_false(rejected->Success);
+    assert_false(rejected->Installed);
+
+    raft->RegisterPeerTarget(4, std::make_shared<TEndpoint>());
+    install(3);
+    assert_int_equal(state->SnapshotIndex, snapshot.Index);
+    assert_true(*state->GetSnapshot() == snapshot);
+    assert_true(raft->GetVoterIds() == newVoters);
+    assert_int_equal(application->LastAppliedIndex, snapshot.Index);
+    assert_int_equal(toLeader->Messages.size(), 2);
+    auto installed = toLeader->Messages.back().Cast<TInstallSnapshotResponse>();
+    assert_true(installed->Success);
+    assert_true(installed->Installed);
+
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+}
+
+void test_high_term_snapshot_metadata_spanning_chunks_progresses(void**) {
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-large-snapshot-metadata-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    std::vector<uint32_t> oldVoters, newVoters;
+    for (uint32_t id = 1; id <= TSnapshot::MaxVoters; ++id) oldVoters.push_back(id);
+    newVoters = oldVoters;
+    newVoters.back() = TSnapshot::MaxVoters + 1;
+
+    auto history = TConfigurationHistory::Stable(oldVoters, 0, 0, 0, 0)
+        .Observe(1, Ordinary(1));
+    const TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0, oldVoters, newVoters};
+    history = history.Advance(2, EncodeConfigurationEntry(joint));
+    auto stable = joint;
+    stable.Phase = EConfigurationPhase::Stable;
+    stable.PreviousIndex = 2;
+    stable.PreviousTerm = 2;
+    history = history.Advance(3, EncodeConfigurationEntry(stable)).Observe(4, Ordinary(2));
+    const auto snapshot = history.MakeSnapshot("4");
+    const auto encoded = EncodeSnapshot(snapshot);
+    assert_true(encoded.size() > TInstallSnapshotRequest::MaxChunkBytes);
+
+    auto state = std::make_shared<TDurableState>((dir / "stale").string(), 1);
+    state->BindVoters(oldVoters);
+    state->CurrentTerm = 2;
+    state->Append(Ordinary(1));
+    state->CommitIndex = 1;
+    state->Commit();
+    TNodeDict peers;
+    std::shared_ptr<TEndpoint> toLeader;
+    for (uint32_t id = 2; id <= TSnapshot::MaxVoters; ++id) {
+        auto endpoint = std::make_shared<TEndpoint>();
+        if (id == 2) toLeader = endpoint;
+        peers.emplace(id, std::move(endpoint));
+    }
+    auto raft = std::make_shared<TRaft>(state, 1, peers);
+    auto application = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor processor(raft, application, peers);
+    raft->RegisterPeerTarget(TSnapshot::MaxVoters + 1, std::make_shared<TEndpoint>());
+
+    auto sendChunk = [&](size_t offset, size_t count) {
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
+        request->Src = 2;
+        request->Dst = 1;
+        request->Term = 3;
+        request->SnapshotIndex = snapshot.Index;
+        request->SnapshotTerm = snapshot.Term;
+        request->Offset = offset;
+        request->TotalBytes = encoded.size();
+        request->Done = uint32_t(offset + count == encoded.size());
+        request->LeaderId = 2;
+        memcpy(request->Data, encoded.data() + offset, count);
+        raft->Process({}, std::move(request));
+    };
+
+    const auto firstChunk = size_t(TInstallSnapshotRequest::MaxChunkBytes);
+    sendChunk(0, firstChunk);
+    assert_int_equal(state->CurrentTerm, 3);
+    assert_int_equal(toLeader->Messages.size(), 1);
+    auto partial = toLeader->Messages.back().Cast<TInstallSnapshotResponse>();
+    assert_true(partial->Success);
+    assert_false(partial->Installed);
+    assert_int_equal(partial->NextOffset, firstChunk);
+    assert_int_equal(state->SnapshotIndex, 0);
+    assert_int_equal(application->LastAppliedIndex, 0);
+    assert_int_equal(raft->GetLeaderId(), 0); // Incomplete lineage is not leader contact.
+
+    sendChunk(firstChunk, encoded.size() - firstChunk);
+    assert_int_equal(state->SnapshotIndex, snapshot.Index);
+    assert_true(*state->GetSnapshot() == snapshot);
+    assert_true(raft->GetVoterIds() == newVoters);
+    assert_int_equal(raft->GetLeaderId(), 2);
+    assert_int_equal(application->LastAppliedIndex, snapshot.Index);
+    assert_int_equal(toLeader->Messages.size(), 2);
+    auto installed = toLeader->Messages.back().Cast<TInstallSnapshotResponse>();
+    assert_true(installed->Success);
+    assert_true(installed->Installed);
+
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+}
+
+void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-overlap-multihop-recovery-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const auto path = (dir / "stale").string();
+    const std::vector<uint32_t> original{1, 2, 3};
+    const std::vector<uint32_t> intermediate{2, 3, 4};
+    const std::vector<uint32_t> active{1, 2, 4};
+
+    auto history = TConfigurationHistory::Stable(original, 0, 0, 0, 0);
+    history = history.Observe(1, Ordinary(1));
+    const TConfigurationRecord firstJoint{EConfigurationPhase::Joint, 2, 0, 0, original, intermediate};
+    history = history.Advance(2, EncodeConfigurationEntry(firstJoint));
+    auto firstStable = firstJoint;
+    firstStable.Phase = EConfigurationPhase::Stable;
+    firstStable.PreviousIndex = 2;
+    firstStable.PreviousTerm = 2;
+    history = history.Advance(3, EncodeConfigurationEntry(firstStable));
+    const auto intermediateImage = history.MakeSnapshot("3");
+    history = history.Observe(4, Ordinary(2));
+    const TConfigurationRecord secondJoint{EConfigurationPhase::Joint, 3, 3, 2, intermediate, active};
+    history = history.Advance(5, EncodeConfigurationEntry(secondJoint));
+    auto secondStable = secondJoint;
+    secondStable.Phase = EConfigurationPhase::Stable;
+    secondStable.PreviousIndex = 5;
+    secondStable.PreviousTerm = 3;
+    history = history.Advance(6, EncodeConfigurationEntry(secondStable));
+    history = history.Observe(7, Ordinary(3));
+    const auto image = history.MakeSnapshot("7");
+    assert_true(image.ConfigurationTransitions.size() == 2);
+    assert_true(EncodeSnapshot(image).substr(0, 8) == "MRFTS006");
+
+    auto staleState = std::make_shared<TDurableState>(path, 3);
+    staleState->BindVoters(original);
+    staleState->CurrentTerm = 3;
+    staleState->Append(Ordinary(1));
+    staleState->CommitIndex = 1;
+    staleState->Commit();
+    TNodeDict peers;
+    std::array<std::shared_ptr<TEndpoint>, 6> endpoints{};
+    for (auto peer : {1u, 2u, 4u, 5u}) {
+        endpoints[peer] = std::make_shared<TEndpoint>();
+        peers.emplace(peer, endpoints[peer]);
+    }
+    auto stale = std::make_shared<TRaft>(staleState, 3, peers, std::vector<uint32_t>{4, 5});
+    auto application = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor processor(stale, application, peers);
+    auto sendSnapshot = [&](const TSnapshot& snapshot, uint32_t leaderId, uint64_t rpcTerm = 5) {
+        const auto encoded = EncodeSnapshot(snapshot);
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + encoded.size());
+        request->Src = leaderId; request->Dst = 3; request->Term = rpcTerm;
+        request->SnapshotIndex = snapshot.Index; request->SnapshotTerm = snapshot.Term;
+        request->Offset = 0; request->TotalBytes = encoded.size(); request->Done = 1;
+        request->LeaderId = leaderId;
+        memcpy(request->Data, encoded.data(), encoded.size());
+        stale->Process({}, request);
+    };
+    auto badAnchor = image;
+    badAnchor.ConfigurationTransitions.front().OldVoters = {1, 3};
+    sendSnapshot(badAnchor, 2);
+    assert_int_equal(staleState->CurrentTerm, 3);
+    assert_true(!staleState->GetSnapshot());
+    assert_true(endpoints[2]->Messages.empty());
+    // A sender absent from the intermediate voter set cannot authorize the
+    // history, even though it belongs to both endpoint configurations.
+    sendSnapshot(image, 1);
+    assert_int_equal(staleState->CurrentTerm, 3);
+    assert_true(!staleState->GetSnapshot());
+    assert_true(endpoints[1]->Messages.empty());
+    sendSnapshot(image, 2);
+
+    assert_int_equal(staleState->CurrentTerm, 5);
+    assert_true(*staleState->GetSnapshot() == image);
+    assert_true(staleState->GetBoundVoters() == original);
+    assert_true(application->LastAppliedIndex == image.Index);
+    assert_false(stale->IsVoter(3));
+    assert_true(stale->GetVoterIds() == active);
+    assert_int_equal(endpoints[2]->Messages.size(), 1);
+    assert_true(endpoints[2]->Messages.back().Cast<TInstallSnapshotResponse>()->Installed);
+
+    // A receiver anchored at an intermediate stable configuration may match
+    // the corresponding suffix of a longer retained chain.
+    const auto middlePath = (dir / "middle-stale").string();
+    auto middleState = std::make_shared<TDurableState>(middlePath, 3);
+    middleState->BindVoters(original);
+    middleState->CurrentTerm = 3;
+    middleState->InstallSnapshot(intermediateImage);
+    TNodeDict middlePeers{{1, std::make_shared<TEndpoint>()},
+        {2, std::make_shared<TEndpoint>()}, {4, std::make_shared<TEndpoint>()}};
+    auto middleRaft = std::make_shared<TRaft>(middleState, 3, middlePeers, std::vector<uint32_t>{1});
+    auto middleApplication = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor middleProcessor(middleRaft, middleApplication, middlePeers);
+    const auto middleBytes = EncodeSnapshot(image);
+    auto middleRequest = NewHoldedMessage<TInstallSnapshotRequest>(
+        sizeof(TInstallSnapshotRequest) + middleBytes.size());
+    middleRequest->Src = 2; middleRequest->Dst = 3; middleRequest->Term = 5;
+    middleRequest->SnapshotIndex = image.Index; middleRequest->SnapshotTerm = image.Term;
+    middleRequest->Offset = 0; middleRequest->TotalBytes = middleBytes.size(); middleRequest->Done = 1;
+    middleRequest->LeaderId = 2;
+    memcpy(middleRequest->Data, middleBytes.data(), middleBytes.size());
+    middleRaft->Process({}, middleRequest);
+    assert_int_equal(middleState->CurrentTerm, 5);
+    assert_true(*middleState->GetSnapshot() == image);
+    assert_true(middleState->GetBoundVoters() == original);
+    assert_false(middleRaft->IsVoter(3));
+    assert_true(middleRaft->GetVoterIds() == active);
+    assert_int_equal(middleApplication->LastAppliedIndex, image.Index);
+
+    // A matching snapshot with only the final retained transition must not
+    // discard the receiver's longer, already trusted history suffix.
+    auto refreshedHistory = history.Observe(8, Ordinary(3));
+    auto shorterHistoryImage = refreshedHistory.MakeSnapshot("8");
+    shorterHistoryImage.ConfigurationTransitions.erase(
+        shorterHistoryImage.ConfigurationTransitions.begin());
+    const auto shorterHistoryBytes = EncodeSnapshot(shorterHistoryImage);
+    auto shorterHistoryRequest = NewHoldedMessage<TInstallSnapshotRequest>(
+        sizeof(TInstallSnapshotRequest) + shorterHistoryBytes.size());
+    shorterHistoryRequest->Src = 2; shorterHistoryRequest->Dst = 3; shorterHistoryRequest->Term = 5;
+    shorterHistoryRequest->SnapshotIndex = shorterHistoryImage.Index;
+    shorterHistoryRequest->SnapshotTerm = shorterHistoryImage.Term;
+    shorterHistoryRequest->Offset = 0; shorterHistoryRequest->TotalBytes = shorterHistoryBytes.size();
+    shorterHistoryRequest->Done = 1; shorterHistoryRequest->LeaderId = 2;
+    memcpy(shorterHistoryRequest->Data, shorterHistoryBytes.data(), shorterHistoryBytes.size());
+    middleRaft->Process({}, shorterHistoryRequest);
+    assert_true(middleState->GetSnapshot()->ConfigurationTransitions == image.ConfigurationTransitions);
+    assert_int_equal(middleApplication->LastAppliedIndex, shorterHistoryImage.Index);
+
+    // A same-configuration refresh may not import older lineage that the
+    // receiver cannot verify. Model a store that retained only the immediate
+    // predecessor in MRFTS004, then send a longer chain with a forged prefix.
+    auto predecessorOnlyImage = image;
+    predecessorOnlyImage.ConfigurationTransitions.clear();
+    assert_true(EncodeSnapshot(predecessorOnlyImage).substr(0, 8) == "MRFTS004");
+    auto forgedHistoryImage = history.Observe(8, Ordinary(3)).MakeSnapshot("8");
+    assert_true(forgedHistoryImage.ConfigurationTransitions.size() == 2);
+    forgedHistoryImage.ConfigurationTransitions.front().OldVoters = {7, 8, 9};
+    const auto forgedHistoryBytes = EncodeSnapshot(forgedHistoryImage);
+    {
+        auto lineageState = std::make_shared<TDurableState>((dir / "history-refresh").string(), 1);
+        lineageState->BindVoters(original);
+        lineageState->CurrentTerm = 3;
+        lineageState->InstallSnapshot(predecessorOnlyImage);
+        auto lineageEndpoint = std::make_shared<TEndpoint>();
+        auto anotherEndpoint = std::make_shared<TEndpoint>();
+        TNodeDict lineagePeers{{2, lineageEndpoint}, {4, anotherEndpoint}};
+        auto lineageRaft = std::make_shared<TRaft>(lineageState, 1, lineagePeers);
+        auto lineageApplication = std::make_shared<TSnapshotRsm>();
+        TRequestProcessor lineageProcessor(lineageRaft, lineageApplication, lineagePeers);
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(
+            sizeof(TInstallSnapshotRequest) + forgedHistoryBytes.size());
+        request->Src = 2; request->Dst = 1; request->Term = 4;
+        request->SnapshotIndex = forgedHistoryImage.Index; request->SnapshotTerm = forgedHistoryImage.Term;
+        request->Offset = 0; request->TotalBytes = forgedHistoryBytes.size(); request->Done = 1;
+        request->LeaderId = 2;
+        memcpy(request->Data, forgedHistoryBytes.data(), forgedHistoryBytes.size());
+        lineageRaft->Process({}, request);
+        const auto installed = lineageState->GetSnapshot();
+        assert_true(installed && installed->ConfigurationTransitions.size() == 1);
+        assert_true(installed->ConfigurationTransitions.front() == image.ConfigurationTransitions.back());
+        assert_true(lineageState->GetBoundVoters() == original);
+        assert_int_equal(lineageApplication->LastAppliedIndex, forgedHistoryImage.Index);
+        assert_true(lineageEndpoint->Messages.size() == 1);
+        assert_true(lineageEndpoint->Messages.back().Cast<TInstallSnapshotResponse>()->Installed);
+    }
+
+    const TConfigurationRecord nextJoint{EConfigurationPhase::Joint, 4, 6, 3,
+        active, {4, 5}};
+    auto jointHistory = history.Advance(8, EncodeConfigurationEntry(nextJoint))
+        .Observe(9, Ordinary(4));
+    const auto jointImage = jointHistory.MakeSnapshot("9");
+    assert_true(jointImage.IsJoint());
+    assert_true(jointImage.ConfigurationTransitions.size() == 3);
+    assert_true(EncodeSnapshot(jointImage).substr(0, 8) == "MRFTS007");
+    // The trusted baseline is the active stable configuration, so its
+    // old-only leader may finish installing the joint-phase snapshot.
+    sendSnapshot(jointImage, 1, 6);
+    assert_int_equal(staleState->CurrentTerm, 6);
+    assert_true(*staleState->GetSnapshot() == jointImage);
+    assert_true(staleState->GetBoundVoters() == original);
+    assert_false(stale->IsVoter(3));
+    assert_true(stale->GetVoterIds() == (std::vector<uint32_t>{1, 2, 4, 5}));
+    assert_int_equal(application->LastAppliedIndex, jointImage.Index);
+    assert_int_equal(endpoints[1]->Messages.size(), 1);
+    assert_true(endpoints[1]->Messages.back().Cast<TInstallSnapshotResponse>()->Installed);
+
+    // Exercise the same joint image from its older trusted baseline. The
+    // sender must survive every completed transition before it can authorize
+    // the active joint tail and a higher term.
+    const auto jointStalePath = (dir / "joint-stale").string();
+    auto jointStaleState = std::make_shared<TDurableState>(jointStalePath, 3);
+    jointStaleState->BindVoters(original);
+    jointStaleState->CurrentTerm = 3;
+    jointStaleState->Append(Ordinary(1));
+    jointStaleState->CommitIndex = 1;
+    jointStaleState->Commit();
+    TNodeDict jointPeers;
+    std::array<std::shared_ptr<TEndpoint>, 6> jointEndpoints{};
+    for (auto peer : {1u, 2u, 4u, 5u}) {
+        jointEndpoints[peer] = std::make_shared<TEndpoint>();
+        jointPeers.emplace(peer, jointEndpoints[peer]);
+    }
+    auto jointStale = std::make_shared<TRaft>(jointStaleState, 3, jointPeers,
+        std::vector<uint32_t>{4, 5});
+    auto jointApplication = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor jointProcessor(jointStale, jointApplication, jointPeers);
+    auto sendJointSnapshot = [&](uint32_t leaderId) {
+        const auto encoded = EncodeSnapshot(jointImage);
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(
+            sizeof(TInstallSnapshotRequest) + encoded.size());
+        request->Src = leaderId; request->Dst = 3; request->Term = 6;
+        request->SnapshotIndex = jointImage.Index; request->SnapshotTerm = jointImage.Term;
+        request->Offset = 0; request->TotalBytes = encoded.size(); request->Done = 1;
+        request->LeaderId = leaderId;
+        memcpy(request->Data, encoded.data(), encoded.size());
+        jointStale->Process({}, request);
+    };
+    sendJointSnapshot(1);
+    assert_int_equal(jointStaleState->CurrentTerm, 3);
+    assert_true(!jointStaleState->GetSnapshot());
+    assert_true(jointEndpoints[1]->Messages.empty());
+    sendJointSnapshot(2);
+    assert_int_equal(jointStaleState->CurrentTerm, 6);
+    assert_true(*jointStaleState->GetSnapshot() == jointImage);
+    assert_true(jointStaleState->GetBoundVoters() == original);
+    assert_false(jointStale->IsVoter(3));
+    assert_true(jointStale->GetVoterIds() == (std::vector<uint32_t>{1, 2, 4, 5}));
+    assert_int_equal(jointApplication->LastAppliedIndex, jointImage.Index);
+    assert_int_equal(jointEndpoints[2]->Messages.size(), 1);
+    assert_true(jointEndpoints[2]->Messages.back().Cast<TInstallSnapshotResponse>()->Installed);
+
+    // A stable successor may retain only the transition that completes the
+    // receiver's committed joint configuration. Preserve and complete the
+    // receiver's trusted earlier transition history during installation.
+    auto nextStable = nextJoint;
+    nextStable.Phase = EConfigurationPhase::Stable;
+    nextStable.Term = 5;
+    nextStable.PreviousIndex = 8;
+    nextStable.PreviousTerm = 4;
+    auto stableHistory = jointHistory.Advance(10, EncodeConfigurationEntry(nextStable))
+        .Observe(11, Ordinary(5));
+    const auto stableSuccessorImage = stableHistory.MakeSnapshot("11");
+    assert_true(!stableSuccessorImage.IsJoint());
+    auto shorterSuccessorImage = stableSuccessorImage;
+    shorterSuccessorImage.ConfigurationTransitions = {stableSuccessorImage.ConfigurationTransitions.back()};
+    const auto shorterSuccessorBytes = EncodeSnapshot(shorterSuccessorImage);
+    auto stableSuccessorRequest = NewHoldedMessage<TInstallSnapshotRequest>(
+        sizeof(TInstallSnapshotRequest) + shorterSuccessorBytes.size());
+    stableSuccessorRequest->Src = 4; stableSuccessorRequest->Dst = 3; stableSuccessorRequest->Term = 7;
+    stableSuccessorRequest->SnapshotIndex = shorterSuccessorImage.Index;
+    stableSuccessorRequest->SnapshotTerm = shorterSuccessorImage.Term;
+    stableSuccessorRequest->Offset = 0; stableSuccessorRequest->TotalBytes = shorterSuccessorBytes.size();
+    stableSuccessorRequest->Done = 1; stableSuccessorRequest->LeaderId = 4;
+    memcpy(stableSuccessorRequest->Data, shorterSuccessorBytes.data(), shorterSuccessorBytes.size());
+    jointStale->Process({}, stableSuccessorRequest);
+    assert_int_equal(jointStaleState->CurrentTerm, 7);
+    assert_true(*jointStaleState->GetSnapshot() == stableSuccessorImage);
+    assert_true(jointStaleState->GetBoundVoters() == original);
+    assert_true(jointStale->GetVoterIds() == (std::vector<uint32_t>{4, 5}));
+    assert_int_equal(jointApplication->LastAppliedIndex, stableSuccessorImage.Index);
+    assert_int_equal(jointEndpoints[4]->Messages.size(), 1);
+    assert_true(jointEndpoints[4]->Messages.back().Cast<TInstallSnapshotResponse>()->Installed);
+
+    // Middle-anchor stale recovery must retain its trusted local tail and append
+    // only transitions after that anchor, not older unverified image history.
+    auto forgedStaleImage = stableSuccessorImage;
+    forgedStaleImage.ConfigurationTransitions.front().OldVoters = {7, 8, 9};
+    const auto forgedStaleBytes = EncodeSnapshot(forgedStaleImage);
+    {
+        auto staleLineageState = std::make_shared<TDurableState>((dir / "stale-lineage").string(), 3);
+        staleLineageState->BindVoters(original);
+        staleLineageState->CurrentTerm = 3;
+        staleLineageState->InstallSnapshot(predecessorOnlyImage);
+        TNodeDict staleLineagePeers;
+        auto fromFour = std::make_shared<TEndpoint>();
+        for (auto peer : {1u, 2u, 5u}) staleLineagePeers.emplace(peer, std::make_shared<TEndpoint>());
+        staleLineagePeers.emplace(4, fromFour);
+        auto staleLineageRaft = std::make_shared<TRaft>(staleLineageState, 3, staleLineagePeers,
+            std::vector<uint32_t>{3});
+        auto staleLineageApplication = std::make_shared<TSnapshotRsm>();
+        TRequestProcessor staleLineageProcessor(staleLineageRaft, staleLineageApplication, staleLineagePeers);
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(
+            sizeof(TInstallSnapshotRequest) + forgedStaleBytes.size());
+        request->Src = 4; request->Dst = 3; request->Term = 6;
+        request->SnapshotIndex = forgedStaleImage.Index; request->SnapshotTerm = forgedStaleImage.Term;
+        request->Offset = 0; request->TotalBytes = forgedStaleBytes.size(); request->Done = 1;
+        request->LeaderId = 4;
+        memcpy(request->Data, forgedStaleBytes.data(), forgedStaleBytes.size());
+        staleLineageRaft->Process({}, request);
+        const auto installed = staleLineageState->GetSnapshot();
+        assert_true(installed && installed->ConfigurationTransitions.size() == 2);
+        assert_true(installed->ConfigurationTransitions[0] == image.ConfigurationTransitions.back());
+        assert_true(installed->ConfigurationTransitions[1] == stableSuccessorImage.ConfigurationTransitions.back());
+        assert_true(staleLineageState->GetBoundVoters() == original);
+        assert_int_equal(staleLineageApplication->LastAppliedIndex, forgedStaleImage.Index);
+        assert_true(fromFour->Messages.size() == 1);
+        assert_true(fromFour->Messages.back().Cast<TInstallSnapshotResponse>()->Installed);
+    }
+
+    auto forgedJointStaleImage = jointImage;
+    forgedJointStaleImage.ConfigurationTransitions.front().OldVoters = {7, 8, 9};
+    const auto forgedJointStaleBytes = EncodeSnapshot(forgedJointStaleImage);
+    {
+        auto staleJointLineageState = std::make_shared<TDurableState>((dir / "stale-joint-lineage").string(), 3);
+        staleJointLineageState->BindVoters(original);
+        staleJointLineageState->CurrentTerm = 3;
+        staleJointLineageState->InstallSnapshot(predecessorOnlyImage);
+        TNodeDict staleJointLineagePeers;
+        auto fromTwo = std::make_shared<TEndpoint>();
+        for (auto peer : {1u, 4u, 5u}) staleJointLineagePeers.emplace(peer, std::make_shared<TEndpoint>());
+        staleJointLineagePeers.emplace(2, fromTwo);
+        auto staleJointLineageRaft = std::make_shared<TRaft>(staleJointLineageState, 3,
+            staleJointLineagePeers, std::vector<uint32_t>{3});
+        auto staleJointLineageApplication = std::make_shared<TSnapshotRsm>();
+        TRequestProcessor staleJointLineageProcessor(staleJointLineageRaft,
+            staleJointLineageApplication, staleJointLineagePeers);
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(
+            sizeof(TInstallSnapshotRequest) + forgedJointStaleBytes.size());
+        request->Src = 2; request->Dst = 3; request->Term = 6;
+        request->SnapshotIndex = forgedJointStaleImage.Index; request->SnapshotTerm = forgedJointStaleImage.Term;
+        request->Offset = 0; request->TotalBytes = forgedJointStaleBytes.size(); request->Done = 1;
+        request->LeaderId = 2;
+        memcpy(request->Data, forgedJointStaleBytes.data(), forgedJointStaleBytes.size());
+        staleJointLineageRaft->Process({}, request);
+        const auto installed = staleJointLineageState->GetSnapshot();
+        assert_true(installed && installed->ConfigurationTransitions.size() == 2);
+        assert_true(installed->ConfigurationTransitions[0] == image.ConfigurationTransitions.back());
+        assert_true(installed->ConfigurationTransitions[1] == jointImage.ConfigurationTransitions.back());
+        assert_true(staleJointLineageState->GetBoundVoters() == original);
+        assert_int_equal(staleJointLineageApplication->LastAppliedIndex, forgedJointStaleImage.Index);
+        assert_true(fromTwo->Messages.size() == 1);
+        assert_true(fromTwo->Messages.back().Cast<TInstallSnapshotResponse>()->Installed);
+    }
+
+    // A joint receiver with only MRFTS005 lineage must not adopt unverified
+    // earlier transitions from a longer stable successor chain either.
+    auto sparseJointImage = jointImage;
+    sparseJointImage.ConfigurationTransitions.clear();
+    assert_true(EncodeSnapshot(sparseJointImage).substr(0, 8) == "MRFTS005");
+    auto forgedSuccessorImage = stableSuccessorImage;
+    forgedSuccessorImage.ConfigurationTransitions.front().OldVoters = {7, 8, 9};
+    const auto forgedSuccessorBytes = EncodeSnapshot(forgedSuccessorImage);
+    {
+        auto sparseJointState = std::make_shared<TDurableState>((dir / "sparse-joint").string(), 3);
+        sparseJointState->BindVoters(original);
+        sparseJointState->CurrentTerm = 6;
+        sparseJointState->InstallSnapshot(sparseJointImage);
+        TNodeDict sparseJointPeers;
+        std::array<std::shared_ptr<TEndpoint>, 6> sparseJointEndpoints{};
+        for (auto peer : {1u, 2u, 4u, 5u}) {
+            sparseJointEndpoints[peer] = std::make_shared<TEndpoint>();
+            sparseJointPeers.emplace(peer, sparseJointEndpoints[peer]);
+        }
+        auto sparseJointRaft = std::make_shared<TRaft>(sparseJointState, 3, sparseJointPeers,
+            std::vector<uint32_t>{4, 5});
+        auto sparseJointApplication = std::make_shared<TSnapshotRsm>();
+        TRequestProcessor sparseJointProcessor(sparseJointRaft, sparseJointApplication, sparseJointPeers);
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(
+            sizeof(TInstallSnapshotRequest) + forgedSuccessorBytes.size());
+        request->Src = 4; request->Dst = 3; request->Term = 7;
+        request->SnapshotIndex = forgedSuccessorImage.Index; request->SnapshotTerm = forgedSuccessorImage.Term;
+        request->Offset = 0; request->TotalBytes = forgedSuccessorBytes.size(); request->Done = 1;
+        request->LeaderId = 4;
+        memcpy(request->Data, forgedSuccessorBytes.data(), forgedSuccessorBytes.size());
+        sparseJointRaft->Process({}, request);
+        const auto installed = sparseJointState->GetSnapshot();
+        assert_true(installed && installed->ConfigurationTransitions.size() == 1);
+        assert_true(installed->ConfigurationTransitions.front() ==
+            stableSuccessorImage.ConfigurationTransitions.back());
+        assert_true(sparseJointState->GetBoundVoters() == original);
+        assert_int_equal(sparseJointApplication->LastAppliedIndex, forgedSuccessorImage.Index);
+        assert_true(sparseJointEndpoints[4]->Messages.size() == 1);
+        assert_true(sparseJointEndpoints[4]->Messages.back().Cast<TInstallSnapshotResponse>()->Installed);
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+}
 #endif
 }
 int main() {
     const CMUnitTest tests[] = {
+        cmocka_unit_test(test_raft_accepts_full_width_voter_ids),
         cmocka_unit_test(test_configuration_snapshot_projection_and_history_resume),
+        cmocka_unit_test(test_configuration_history_rolls_bounded_transition_suffix_and_resumes),
         cmocka_unit_test(test_history_validates_joint_stable_chain_and_independent_rollback),
         cmocka_unit_test(test_configuration_scan_compares_full_configuration_state),
         cmocka_unit_test(test_history_from_joint_snapshot_requires_a_consistent_identity),
@@ -1930,19 +4060,30 @@ int main() {
         cmocka_unit_test(test_configuration_rejects_invalid_fields_and_valid_crc_corruption),
         cmocka_unit_test(test_configuration_rpc_and_proposal_are_rejected_before_mutation),
         cmocka_unit_test(test_follower_can_register_future_voter_endpoint_before_joint_entry),
+        cmocka_unit_test(test_new_voter_leader_can_forward_prior_term_joint_entry),
+        cmocka_unit_test(test_new_side_election_replays_joint_entry_to_old_peer),
+        cmocka_unit_test(test_new_stable_leader_replays_transition_to_lagging_joiner),
         cmocka_unit_test(test_runtime_peer_provisioning_commits_joint_membership_across_replicas),
+        cmocka_unit_test(test_removed_member_rejoins_from_fresh_snapshot_after_compaction),
+        cmocka_unit_test(test_removed_member_rejoins_through_fresh_joint_snapshot_bootstrap),
+        cmocka_unit_test(test_fresh_joint_snapshot_rejoin_recovers_voter_role_after_restart),
         cmocka_unit_test(test_joint_membership_addition_and_finalization_replicate_deterministically),
         cmocka_unit_test(test_live_joint_transition_waits_for_both_nontrivial_majorities),
+        cmocka_unit_test(test_disjoint_membership_change_transfers_finalizes_and_restarts),
+        cmocka_unit_test(test_live_disjoint_joint_entry_waits_for_old_majority_over_network),
+        cmocka_unit_test(test_joint_strong_read_waits_for_both_disjoint_majorities),
         cmocka_unit_test(test_timeout_now_retries_and_falls_back_under_joint_quorum),
-        cmocka_unit_test(test_old_side_leader_can_transfer_with_pending_stable_successor),
+        cmocka_unit_test(test_old_side_leader_can_transfer_after_joint_snapshot_with_pending_stable_successor),
         cmocka_unit_test(test_stable_membership_compaction_recovers_active_voters),
         cmocka_unit_test(test_snapshot_install_validates_and_advances_committed_membership_history),
         cmocka_unit_test(test_snapshot_transfer_before_uncommitted_configuration_preserves_suffix),
         cmocka_unit_test(test_joint_snapshot_install_requires_matching_joint_history_and_recovers),
+        cmocka_unit_test(test_committed_joint_snapshot_can_install_its_stable_successor),
         cmocka_unit_test(test_uncommitted_joint_suffix_replacement_restores_old_voters),
         cmocka_unit_test(test_configuration_application_advances_without_calling_state_machine),
 #ifdef __linux__
         cmocka_unit_test(test_durable_restart_recovers_stable_membership_roles),
+        cmocka_unit_test(test_stable_snapshot_restart_accepts_persisted_vote_for_removed_voter),
         cmocka_unit_test(test_restart_after_membership_removal_needs_only_active_endpoints),
         cmocka_unit_test(test_durable_restart_rejects_reserved_entry_without_rewriting),
         cmocka_unit_test(test_legacy_restart_uses_safe_flag_lookup_and_preserves_files),
@@ -1952,6 +4093,10 @@ int main() {
         cmocka_unit_test(test_raft_rejects_snapshot_when_configured_bootstrap_binding_mismatches),
         cmocka_unit_test(test_persisted_commit_boundary_drives_committed_configuration_scan),
         cmocka_unit_test(test_configuration_snapshots_preserve_original_binding_across_transitions),
+        cmocka_unit_test(test_verified_multihop_disjoint_snapshot_recovers_and_readds_stale_voter),
+        cmocka_unit_test(test_stale_snapshot_missing_new_voter_target_is_rejected_before_install),
+        cmocka_unit_test(test_high_term_snapshot_metadata_spanning_chunks_progresses),
+        cmocka_unit_test(test_overlapping_multihop_snapshot_recovers_stale_store_online),
 #endif
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);

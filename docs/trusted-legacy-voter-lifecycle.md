@@ -13,10 +13,12 @@ rejects trusted legacy migration from then on, before modifying or publishing
 the durable file. The marker is process-local: after restart, recovery creates a
 new state object and the operator can migrate it before constructing Raft.
 
-The guard does not infer or prove the original voter set, and it does not add
-live voter reconfiguration. Tests verify that a post-start migration to a
-different set is rejected without changing the binding or file; existing tests
-continue to cover migration before startup and recovered restart behavior.
+The guard does not infer or prove the original voter set. At alpha.51, live
+voter reconfiguration was not yet implemented; it is now available through the
+[bounded durable transition path](configuration-entries.md). Tests verify that
+a post-start migration to a different set is rejected without changing the
+binding or file; existing tests continue to cover migration before startup and
+recovered restart behavior.
 
 The [alpha.52 follow-up](legacy-voter-proof-startup.md) closes the remaining
 startup gap: recovered log-only durable stores without a voter binding now fail

@@ -26,9 +26,23 @@ These checks run in both storage backends and application snapshot recovery. The
 check continuity with locally stored metadata, but they do not prove that a
 configuration entry was committed or authenticate the sender. Callers that use
 the offline install APIs must still provide a trusted snapshot and history
-baseline. Live configuration entries, joint quorum activation and
-membership-aware network installation remain disabled.
+baseline. This alpha.59 milestone predates the live joint-consensus path and
+matching-history network installation. Those are now available through the
+[live membership](configuration-entries.md) and
+[joint snapshot runtime](joint-snapshot-runtime.md) paths; snapshot metadata
+still cannot introduce an uncommitted configuration.
 
 Deterministic memory and durable tests cover conflicting same-identity voter
 sets, stale legacy membership, stable-to-joint and joint-to-stable transitions,
 rejected phase downgrades and durable recovery of the original binding.
+
+The lineage follow-up extends continuity to MRFTS004 stable and MRFTS005 joint
+snapshots. A known lineage cannot be replaced by a different predecessor claim;
+an older image without lineage retains locally known lineage during refresh.
+The live runtime can install a new lineage only after matching it against its
+committed or validated pending configuration history. When a matching MRFTS002
+joint image omits lineage, runtime fills it from that validated history before
+storage; the lower-level storage API does not infer a missing configuration
+history on its own. A same-configuration refresh must share its known history
+tail, and the receiver retains only the lineage it already trusts; a longer
+incoming chain cannot add unverified older transitions.

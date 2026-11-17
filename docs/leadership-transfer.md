@@ -36,6 +36,12 @@ durable-store coverage drops the first request and confirms the retry starts the
 new-set voter before timeout, then drops every request and confirms the old
 leader can still win again with a vote from that voter. Another test rejects a
 malformed higher-term request without changing the receiver's durable state.
+The transfer path also works after both peers restart from the same committed
+joint snapshot, with only an uncommitted stable successor retained in the log;
+the target campaigns under the recovered joint quorum and can complete that
+successor after election. This recovery test uses disjoint old and new voter
+sets, so neither the outgoing leader nor the target can supply both majorities
+alone.
 
 `TIMEOUT_NOW_REQUEST` is a new Raft wire message. Upgrade all voters to a
 compatible build before using a transition that removes its leader; older

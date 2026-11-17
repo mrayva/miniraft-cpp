@@ -127,10 +127,9 @@ std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::RemoveLearnerTarget(uint32
 template<typename TSocket>
 void TRaftServer<TSocket>::ReconcilePeerReaders() {
     if (!Serving) return;
-    NNet::TDetail::ReconcilePeerResponseReaders(PeerNodes,
-        [this](uint32_t id) { return Raft->IsVoter(id); }, PeerResponseReaders,
+    NNet::TDetail::ReconcilePeerResponseReaders(PeerNodes, PeerResponseReaders,
         [this](uint32_t, const auto& node) {
-            // Run readers for newly promoted voters without restarting Serve.
+            // Learners need replies to prove catch-up before promotion.
             node->MarkResponseReaderStarted();
             OutboundServe(node);
         });

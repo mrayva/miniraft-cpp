@@ -1,8 +1,9 @@
 # Durable configuration snapshot metadata: v0.1.0-alpha.45
 
-Bound `TState` and `TDurableState` instances can install and recover MRFTS002
-joint and MRFTS003 stable snapshots so offline tools can validate configuration
-history after restart. A store must already have a voter binding. For a
+Bound `TState` and `TDurableState` instances can install and recover MRFTS002,
+MRFTS005, or MRFTS007 joint snapshots and MRFTS003, MRFTS004, or MRFTS006 stable snapshots so
+offline tools can validate configuration history after restart. A store must
+already have a voter binding. For a
 configuration-bearing snapshot, `snapshot.Voters` describes the active set at
 the snapshot boundary and may differ from that original binding. Durable
 recovery preserves the original binding and exposes the active snapshot set
@@ -50,7 +51,15 @@ across a committed transition when the receiver's committed history proves the
 same active set and configuration identity. Since alpha.71, joint snapshot
 installation also works when the receiver has committed the same joint
 configuration. Uncommitted transitions remain unsupported; the storage API
-also serves offline history validation and trusted inputs.
+also serves offline history validation and trusted inputs. The lineage follow-up
+adds MRFTS005 joint and MRFTS004 stable images, which retain one preceding
+stable configuration and the joint entry that follows it. A live receiver with
+a matching committed predecessor can install one stable snapshot across that
+compacted transition when the sender belongs to both voter sets. The preflight
+validates the predecessor link before accepting a higher term; a mismatched
+link, outsider sender, disjoint transition, or multiple missed transitions
+remains rejected. Direct storage APIs continue to enforce local snapshot
+continuity and are not a substitute for runtime membership validation.
 The [alpha.59 follow-up](configuration-snapshot-continuity.md) checks that a
 replacement configuration snapshot extends the previously stored phase,
 identity, and active voter sets.

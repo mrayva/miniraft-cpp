@@ -10,8 +10,9 @@ This milestone separates replication targets from the fixed voting set. Learners
 receive log entries, install snapshots and apply committed commands, but never
 campaign, vote, lead, propose entries or contribute to election, commit or strong
 read quorums. It implements the catch-up phase described in
-[Raft section 6](https://raft.github.io/raft.pdf). Promotion, voter removal and
-joint-consensus configuration entries remain the next milestone.
+[Raft section 6](https://raft.github.io/raft.pdf). Online promotion and voter
+removal use the separate live joint-membership procedure; changing static
+learner flags is not a membership change.
 
 ## Configure a learner
 
@@ -58,6 +59,9 @@ only for explicit voter IDs. Election RPCs are sent only to voters, learner vote
 responses are ignored, and strong-read confirmation collects only voter ACKs.
 One voter with multiple learners can still commit/read alone; a voter minority
 cannot make decisions merely because learners are available.
+The serving layer reads responses from every registered replication target,
+including staged learners. Their correlated append acknowledgements prove the
+learner has matched the leader's log and committed boundary before promotion.
 
 A learner acknowledges vote requests with a denial and never records a vote.
 It follows legitimate voter terms but cannot advance its own term by election
@@ -94,9 +98,9 @@ Never delete voter state or edit votes/terms to work around this validation.
 
 Current durable images use `MRFTD004` and retain the 20-byte header. The payload
 stores CurrentTerm[8], VotedFor[4], retained-log count[8], CommitIndex[8], voter
-count[4], sorted voter IDs[4 each], snapshot length[8], optional MRFTS001,
-MRFTS002, or MRFTS003 image, then retained log records. The CRC covers version
-magic plus payload. Recovery bounds and validates the voter list, commit
+count[4], sorted voter IDs[4 each], snapshot length[8], optional MRFTS001
+through MRFTS007 image, then retained log records.
+The CRC covers version magic plus payload. Recovery bounds and validates the voter list, commit
 boundary. Legacy snapshots must name the original bound voters; configuration-
 bearing snapshots can describe a later active set while retaining that original
 binding for offline history scans. Raft startup still requires the runtime voter

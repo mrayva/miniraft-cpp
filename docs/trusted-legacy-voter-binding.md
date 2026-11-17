@@ -13,6 +13,29 @@ has no configuration metadata, retained terms are valid, and no reserved
 configuration entries are present. It then atomically republishes the durable
 state with its voter binding before the store is passed to `TRaft`.
 
+Startup tooling can call `CanBindVotersFromTrustedBaseline(voters, &reason)`
+first to check whether the recovered bytes are internally consistent with that
+baseline. A typical sequence is:
+
+```cpp
+// At a controlled startup boundary, before constructing TRaft:
+// 1. Stop this replica and preserve a backup of its durable files.
+// 2. Obtain the complete original voter set from a separately verified record.
+auto state = std::make_shared<TDurableState>(path, nodeId);
+std::string reason;
+if (!state->CanBindVotersFromTrustedBaseline(originalVoters, &reason))
+    throw std::runtime_error("Legacy voter migration refused: " + reason);
+state->BindVotersFromTrustedBaseline(originalVoters);
+TRaft raft(state, nodeId, peers);
+```
+
+The dry run does not write state. It reports the same consistency checks that
+the mutating call will apply, including vote, snapshot, and retained-log checks.
+It cannot establish that `originalVoters` is complete or historically correct;
+that proof remains an operator responsibility. Complete the migration before
+serving traffic, and construct Raft only after the binding has been durably
+published. Do not infer a baseline from current peer endpoints.
+
 This API records the caller's assertion; it cannot prove the assertion is
 correct, discover prior membership transitions hidden by a legacy snapshot, or
 authorize a membership change. Existing `BindVoters` behavior is unchanged.
@@ -24,6 +47,8 @@ stores with no binding, so this migration must be completed before startup.
 Tests cover MRFTD001, MRFTD002 and MRFTD003 recovery, rejection
 of inconsistent vote/snapshot baselines and configuration log entries without
 rewriting the source file, and the current MRFTD004 binding after publication
-and restart. Legacy formats recover their commit floor at the snapshot boundary.
+and restart. Dry-run tests verify both successful and rejected checks preserve
+the source bytes, and that diagnostics are cleared on success. Legacy formats
+recover their commit floor at the snapshot boundary.
 
 Self-review completed. No independent reviewer approval is claimed.

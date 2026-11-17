@@ -25,5 +25,8 @@ until the fresh image completes.
 Self-review checked both receiving paths, duplicate chunk handling, role
 independence and restart-from-zero behavior. This bounds the lifetime of one
 partial in-memory image; it does not impose a cluster-wide memory quota or stream
-snapshot content to disk. Live voter reconfiguration and joint snapshot adoption
-remain separate open features.
+snapshot content to disk. At alpha.42, live voter reconfiguration and joint
+snapshot adoption were still open. They are now covered by [live membership](configuration-entries.md)
+and [matching-history joint snapshot installation](joint-snapshot-runtime.md).
+Snapshot installation still requires the receiver's committed or validated
+pending history to match; an image cannot introduce an unknown transition.

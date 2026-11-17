@@ -28,8 +28,10 @@ heap usage. Current application/log state, snapshot capture and installation,
 transport buffers and other allocations remain outside this limit; a global byte
 quota and disk-streamed snapshot transfer remain open. Voter membership changes
 are available through [live membership](configuration-entries.md), with leader
-removal supported by [leadership transfer](leadership-transfer.md). Joint
-snapshot installation remains unsupported.
+removal supported by [leadership transfer](leadership-transfer.md). This alpha.43
+milestone predates joint snapshot installation, which is now supported when the
+receiver has matching committed or validated pending history; see
+[joint snapshot runtime](joint-snapshot-runtime.md).
 
 Self-review checked the two-generation accounting, exception ordering before
 state mutation, cache ownership and retry path. No independent reviewer approval

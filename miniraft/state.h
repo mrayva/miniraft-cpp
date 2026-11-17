@@ -43,6 +43,11 @@ struct IState: TStateFields {
     virtual bool SupportsSnapshots() const { return false; }
     virtual std::shared_ptr<const TSnapshot> GetSnapshot() const { return {}; }
     virtual void InstallSnapshot(const TSnapshot&) { throw std::logic_error("Storage snapshots are unsupported"); }
+    // Raft calls this only after validating the sender and complete membership
+    // lineage. Backends may then rely on that proof for a stable-set transition
+    // that snapshot-only continuity cannot establish.
+    virtual void InstallRaftSnapshot(const TSnapshot& snapshot,
+            const class TRaftInstallSnapshotPermit&) { InstallSnapshot(snapshot); }
     virtual bool SupportsVoterBinding() const { return false; }
     // True when this backend recovered a persistent image without a stored
     // voter identity; Raft must obtain proof before serving this state.
@@ -67,6 +72,12 @@ struct IState: TStateFields {
             return RetainedLogTerm(index);
         }
     }
+};
+
+class TRaftInstallSnapshotPermit {
+private:
+    TRaftInstallSnapshotPermit() = default;
+    friend class TRaft;
 };
 
 inline void ValidateFixedVoters(const std::vector<uint32_t>& voters) {
@@ -176,10 +187,14 @@ struct TState: IState {
         BoundVoters = voters;
     }
     std::shared_ptr<const TSnapshot> GetSnapshot() const override { return Snapshot; }
-    void InstallSnapshot(const TSnapshot& snapshot) override {
+    void InstallSnapshot(const TSnapshot& snapshot) override { InstallSnapshotImpl(snapshot, false); }
+    void InstallRaftSnapshot(const TSnapshot& snapshot,
+            const TRaftInstallSnapshotPermit&) override { InstallSnapshotImpl(snapshot, true); }
+private:
+    void InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated) {
         ValidateSnapshot(snapshot);
         TSnapshot image = snapshot;
-        PreserveStableSnapshotIdentity(Snapshot.get(), image);
+        if (!configurationHistoryValidated) PreserveStableSnapshotIdentity(Snapshot.get(), image);
         ValidateSnapshot(image); // Validate before changing any state.
         if (!SnapshotCompatibleWithVoterBinding(image, BoundVoters))
             throw std::invalid_argument("Snapshot is incompatible with the persisted voter binding");
@@ -200,7 +215,7 @@ struct TState: IState {
         LastLogTerm = Log.empty() ? SnapshotTerm : Log.back()->Term;
         CommitIndex = std::max(CommitIndex, SnapshotIndex);
     }
-
+public:
     void Commit() override { }
 };
 

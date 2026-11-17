@@ -1,6 +1,8 @@
 # Live joint membership
 
 The runtime accepts membership changes through a joint-consensus log sequence.
+Node IDs are nonzero 32-bit unsigned values across the local Raft API, voter
+configuration records and RPC messages.
 `TRaft::ProposeJointConfiguration(newVoters)` appends the joint entry, which
 activates both the old and new voter majorities. After the joint entry commits,
 `TRaft::FinalizeConfiguration()` appends its stable successor. The stable set
@@ -27,12 +29,20 @@ transition. The embedding application can provision them locally with
 joint entry; this endpoint registration does not itself change quorum
 membership. Endpoint discovery and configuration distribution remain
 responsibilities of the embedding application.
+`GetConfigurationState()` returns a copy of the validated committed and latest
+configurations. During a pending joint entry, `Latest` is joint and `Committed`
+remains stable. After the joint entry commits but before its stable successor
+commits, `Committed` is joint and `Latest` is stable; `GetVoterIds()` continues
+to report the joint voter union until finalization commits.
 On restart, the durable original voter binding and retained membership history
 are distinct from the active replication endpoints. When a configuration entry
 or configuration-bearing snapshot proves that membership changed, the binding
 restores the original set while committed history restores active roles; only
 active voters need replication endpoints. Without retained configuration
-history, configured voters must still reproduce the original binding.
+history, configured voters must still reproduce the original binding. A stable
+snapshot retains that membership proof after compaction, so restart accepts a
+persisted vote for a voter removed by the compacted transition and preserves
+the vote through the current term.
 
 These are `TRaft` APIs. `TRaftServer` reconciles outbound client-response readers
 after Raft messages and on its timer loop, so a promoted voter can receive
@@ -53,6 +63,23 @@ match byte for byte. Replacing an uncommitted configuration suffix recomputes
 the active roles and quorum from the surviving log; committed entries cannot be
 truncated. A malformed or semantically invalid candidate suffix is rejected
 without changing the term, commit index, log or response state.
+The new-side-only leader forwarding exception is narrower: its prior-term joint
+entry must extend the receiver's exact locally committed stable voter set and
+configuration identity, even when the request's log predecessor is not yet
+matched and the receiver needs to return a conflict hint.
+An old-set leader originates each joint entry. After a later-term election under
+the joint quorum, a new-set-only leader may forward that prior-term entry to a
+lagging peer; it cannot originate a joint entry in its own term. A new-set
+leader originates the stable successor. If leadership later moves to an
+old-set-only voter while that successor is pending, it may forward the
+prior-term successor to a transfer target, but cannot create one in its own
+term.
+After election, a new-set-only leader starts catch-up replication at the
+retained joint entry when that entry is still in the log. Once the stable
+successor is committed, it uses the retained predecessor joint identity for
+lagging peers. Bounded append batches may send the joint and stable records in
+separate rounds; this lets a peer validate the leader before it receives the
+successor.
 
 The record payload remains MRFTC001: magic[8], phase[4] (joint=1, stable=2),
 entry term[8], previous configuration index[8], previous configuration
@@ -80,9 +107,30 @@ successor is pending. Stable snapshots across completed transitions still
 require matching stable voter set and configuration index/term. MRFTS002
 snapshots for existing members require exact joint metadata before a higher
 term is accepted.
+If a receiver's exact committed baseline is a joint snapshot, it may also
+install that joint configuration's stable successor: the stable image must name
+the joint new voter set, carry a later configuration identity, and come from a
+voter in the stable set. This path is validated before a higher term is
+persisted and cannot bridge from an older stable baseline that lacks the joint
+history.
 Joint snapshot compaction waits until every active voter has acknowledged that
 committed joint boundary. Do not remove or edit committed state to bypass these
 limits.
+
+When local history contains the predecessor identity, MRFTS005 joint snapshots
+preserve the preceding stable voter set and joint entry identity; MRFTS004 stable
+snapshots carry that link through the stable successor. MRFTS006 and MRFTS007
+also carry up to 32 contiguous transitions. A node with a nonempty stale store
+can recover across multiple compacted transitions when a transition in the
+chain matches its exact committed stable configuration. For a stable snapshot,
+the sender must belong to both voter sets in every transition after that
+anchor. For a joint snapshot, completed transitions have the same requirement;
+the sender for the active joint phase may belong to either side, allowing the
+old leader to finish that phase. The chain is checked before a higher term is
+accepted. Disjoint transitions and senders absent from a required set remain
+unsupported for online stale-store recovery; use a fresh learner or
+independently verified history. Snapshot metadata does not prove commitment by
+itself. Upgrade every voter before using MRFTS004 through MRFTS007.
 
 Deterministic durable-store tests cover learner catch-up, voter addition and
 removal, leadership transfer and fallback when its request is dropped,
@@ -96,6 +144,12 @@ finalization from the snapshot baseline, and a dropped/retried all-voter
 compaction barrier that enables follower-local snapshots. Restart coverage also
 verifies that a compacted stable membership can recover with the removed voter
 endpoint omitted while preserving the original binding.
-The live transition path also tests both one-sided quorum schedules for the
-overlapping sets `{1, 2, 3}` and `{3, 4, 5}`: neither majority alone commits the
-joint entry, and the entry commits after both majorities acknowledge it.
+The live transition path also tests both one-sided quorum schedules for
+overlapping sets `{1, 2, 3}` to `{3, 4, 5}` and disjoint sets `{1, 2, 3}` to
+`{4, 5, 6}`: neither majority alone commits the joint entry, and the entry
+commits only after both majorities acknowledge it. Persisted-joint election
+recovery covers both shapes too; the candidate remains unelected with only one
+side's votes, and its current-term entry commits only after both replication
+majorities acknowledge it. A runtime strong-read regression on disjoint sets
+also checks both response orders and keeps the read pending until both voter
+majorities have acknowledged its barrier.

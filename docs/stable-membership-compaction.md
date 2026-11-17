@@ -30,9 +30,23 @@ compaction. A lagging receiver can
 also install MRFTS003 across a stable transition after it has committed the
 matching stable voter set and identity.
 
+The predecessor-lineage follow-up adds MRFTS005 joint snapshots and MRFTS004
+stable snapshots. They preserve the immediately preceding stable voter set,
+configuration identity, and joint entry identity across a joint-snapshot
+restart. A nonempty store with that exact stable predecessor may install one
+later stable snapshot after compaction when the sender belonged to both voter
+sets. Mismatched lineage and an outsider sender are rejected before a higher
+term is accepted. Stores that missed multiple transitions, or a transition
+whose old and new sets have no common voter, still need fresh learner
+provisioning or independently verified history.
+
 The deterministic durable tests wait for configuration ACKs before compaction,
 compact committed joint and stable states, and restart from the original
 binding while recovering active voter sets. They also install a matching
-stable snapshot at a lagging receiver, reject an unproven configuration
-identity before a higher term is accepted, and append a later transition to
+stable snapshot at a lagging stable receiver, install the stable successor from
+an exact committed joint snapshot, reject unproven voter sets and configuration
+identities before a higher term is accepted, and append a later transition to
 verify that snapshot installation advanced the receiver's history baseline.
+They also preserve lineage across joint compaction and restart, recover one
+transition into a stale nonempty store, and reject forged predecessor metadata
+and an outsider snapshot sender before term mutation.
