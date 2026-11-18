@@ -9,6 +9,7 @@
 #include <fstream>
 #include <chrono>
 #include <iterator>
+#include <utility>
 #ifdef __linux__
 #include <sys/wait.h>
 #include <unistd.h>
@@ -74,6 +75,9 @@ void test_snapshot_codec_roundtrip_and_all_byte_corruption(void**) {
     const auto original = Sample();
     const auto encoded = EncodeSnapshot(original);
     assert_true(DecodeSnapshot(encoded) == original);
+    auto ownedBytes = encoded;
+    assert_true(DecodeSnapshotOwned(std::move(ownedBytes)) == original);
+    assert_true(ownedBytes.empty());
     for (size_t i = 0; i < encoded.size(); ++i) {
         auto damaged = encoded;
         damaged[i] ^= 1;

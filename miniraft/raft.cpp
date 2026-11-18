@@ -2697,7 +2697,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     if (bytes.size() < request->TotalBytes) { reply(true, false, bytes.size()); return; }
     TSnapshot snapshot;
     try {
-        snapshot = DecodeSnapshot(bytes);
+        snapshot = DecodeSnapshotOwned(std::move(IncomingSnapshot->Bytes));
+        IncomingSnapshot.reset();
         auto inheritTrustedLineage = [&](const TConfigurationHistory& history) {
             if (snapshot.HasConfigurationMetadata() && history.IsJoint() &&
                 !history.PreviousVoters().empty() &&

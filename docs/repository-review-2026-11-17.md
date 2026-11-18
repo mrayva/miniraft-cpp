@@ -90,8 +90,11 @@ callers must still handle capacity changes before proposing.
   (`snapshot.h`). Outbound transfer now encodes each chunk directly from the
   pinned snapshot, avoiding a second full encoded image at the sender. Capture,
   durable storage encoding and receiver installation still materialize full
-  images. Large databases need streaming or logical object snapshots and
-  resource accounting.
+  images. The receiver reuses its completed wire buffer for decoded application
+  data, avoiding another full payload allocation during validation. It still
+  buffers the complete transfer and storage/application installation may make
+  further copies. Large databases need end-to-end streaming or logical object
+  snapshots and resource accounting.
 - Recovery history is now bounded to 256 transitions (MRFTS008/MRFTS009); the
   legacy MRFTS006/MRFTS007 formats remain capped at 32. Automatic stale-store
   recovery requires a locally anchored history and the sender membership

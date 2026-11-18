@@ -54,6 +54,9 @@ struct TSnapshot {
 };
 std::string EncodeSnapshot(const TSnapshot& snapshot);
 TSnapshot DecodeSnapshot(std::string_view bytes);
+// Reuses the input allocation for application data after the image checksum
+// and metadata validate, avoiding another full-size copy during installation.
+TSnapshot DecodeSnapshotOwned(std::string&& bytes);
 struct TSnapshotEncoding;
 // Keeps only serialized metadata and the image checksum. The snapshot must
 // remain immutable while ranges are copied from this prepared encoding.

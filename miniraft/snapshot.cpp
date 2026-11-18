@@ -24,7 +24,7 @@ constexpr std::string_view StableHistoryMagic = "MRFTS006";
 constexpr std::string_view JointHistoryMagic = "MRFTS007";
 constexpr std::string_view StableExtendedHistoryMagic = "MRFTS008";
 constexpr std::string_view JointExtendedHistoryMagic = "MRFTS009";
-void Validate(const TSnapshot& snapshot) {
+void Validate(const TSnapshot& snapshot, size_t dataSize) {
     size_t historyBytes = snapshot.ConfigurationTransitions.empty() ? 0 : 4;
     for (const auto& transition : snapshot.ConfigurationTransitions) {
         if (transition.OldVoters.size() > TSnapshot::MaxVoters ||
@@ -46,7 +46,7 @@ void Validate(const TSnapshot& snapshot) {
         snapshot.ConfigurationTransitions.size() > TSnapshot::MaxConfigurationTransitions ||
         baseBytes > TSnapshot::MaxBytes || voterBytes > TSnapshot::MaxBytes - baseBytes ||
         historyBytes > TSnapshot::MaxBytes - baseBytes - voterBytes ||
-        snapshot.Data.size() > TSnapshot::MaxBytes - baseBytes - voterBytes - historyBytes)
+        dataSize > TSnapshot::MaxBytes - baseBytes - voterBytes - historyBytes)
         throw std::runtime_error("Invalid snapshot metadata/size");
     const auto validateVoters = [](const auto& voters) {
         uint32_t previous = 0;
@@ -135,6 +135,7 @@ void Validate(const TSnapshot& snapshot) {
         validateVoters(snapshot.JointVoters);
     }
 }
+void Validate(const TSnapshot& snapshot) { Validate(snapshot, snapshot.Data.size()); }
 void CheckSnapshotConfigurationContinuity(const TSnapshot* current, const TSnapshot& incoming) {
     if (!current || !current->HasConfigurationMetadata()) return;
     if (!incoming.ConfigurationTransitions.empty() && !current->ConfigurationTransitions.empty()) {
@@ -437,9 +438,12 @@ void CopySnapshotEncodingRange(const TSnapshot& snapshot, const TSnapshotEncodin
     if (written != length) throw std::logic_error("Incomplete snapshot encoding range");
 }
 
-TSnapshot DecodeSnapshot(std::string_view bytes) {
+namespace {
+TSnapshot DecodeSnapshotImpl(std::string_view bytes, std::string* reusableStorage) {
     if (bytes.size() < 44 || bytes.size() > TSnapshot::MaxBytes)
         throw std::runtime_error("Invalid snapshot size");
+    if (reusableStorage && bytes.data() != reusableStorage->data())
+        throw std::invalid_argument("Snapshot decode buffer does not match its input");
     TReader trailer{bytes.substr(bytes.size() - 4)};
     if (Checksum(bytes.substr(0, bytes.size() - 4)) != trailer.Take(4))
         throw std::runtime_error("Snapshot checksum mismatch");
@@ -505,10 +509,27 @@ TSnapshot DecodeSnapshot(std::string_view bytes) {
     }
     if (joint && !snapshot.IsJoint()) throw std::runtime_error("Empty joint snapshot configuration");
     if (length > reader.Input.size()) throw std::runtime_error("Invalid snapshot data length");
-    snapshot.Data = reader.Read(size_t(length));
+    const auto dataOffset = bytes.size() - 4 - reader.Input.size();
+    const auto data = reader.Read(size_t(length));
     if (!reader.Input.empty()) throw std::runtime_error("Trailing snapshot data");
-    Validate(snapshot);
+    Validate(snapshot, size_t(length));
+    if (reusableStorage) {
+        reusableStorage->erase(0, dataOffset);
+        reusableStorage->resize(size_t(length));
+        snapshot.Data = std::move(*reusableStorage);
+    } else {
+        snapshot.Data = data;
+    }
     return snapshot;
+}
+}
+
+TSnapshot DecodeSnapshot(std::string_view bytes) {
+    return DecodeSnapshotImpl(bytes, nullptr);
+}
+
+TSnapshot DecodeSnapshotOwned(std::string&& bytes) {
+    return DecodeSnapshotImpl(bytes, &bytes);
 }
 
 TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm) {
