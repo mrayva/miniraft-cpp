@@ -1,7 +1,8 @@
 # Durable configuration snapshot metadata: v0.1.0-alpha.45
 
 Bound `TState` and `TDurableState` instances can install and recover MRFTS002,
-MRFTS005, or MRFTS007 joint snapshots and MRFTS003, MRFTS004, or MRFTS006 stable snapshots so
+MRFTS005, MRFTS007, or MRFTS009 joint snapshots and MRFTS003, MRFTS004,
+MRFTS006, or MRFTS008 stable snapshots so
 offline tools can validate configuration history after restart. A store must
 already have a voter binding. For a
 configuration-bearing snapshot, `snapshot.Voters` describes the active set at
@@ -63,6 +64,11 @@ continuity and are not a substitute for runtime membership validation.
 The [alpha.59 follow-up](configuration-snapshot-continuity.md) checks that a
 replacement configuration snapshot extends the previously stored phase,
 identity, and active voter sets.
+
+MRFTS006/MRFTS007 history snapshots retain at most 32 configuration transitions.
+MRFTS008/MRFTS009 retain at most 256; the distinct magic makes older binaries
+reject the extended history instead of misreading a longer payload. Every voter
+must support the format before it is used.
 
 Tests cover in-memory installation, durable joint and stable round-trips,
 rejection of unbound configuration snapshots and mismatched legacy snapshots,

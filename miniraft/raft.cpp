@@ -39,11 +39,15 @@ bool IsSupportedSnapshotMagicPrefix(std::string_view prefix) {
     constexpr std::string_view jointLineage = "MRFTS005";
     constexpr std::string_view stableHistory = "MRFTS006";
     constexpr std::string_view jointHistory = "MRFTS007";
+    constexpr std::string_view stableExtendedHistory = "MRFTS008";
+    constexpr std::string_view jointExtendedHistory = "MRFTS009";
     const auto bytes = prefix.substr(0, std::min(prefix.size(), legacy.size()));
     return legacy.substr(0, bytes.size()) == bytes || joint.substr(0, bytes.size()) == bytes ||
         stable.substr(0, bytes.size()) == bytes || stableLineage.substr(0, bytes.size()) == bytes ||
         jointLineage.substr(0, bytes.size()) == bytes ||
-        stableHistory.substr(0, bytes.size()) == bytes || jointHistory.substr(0, bytes.size()) == bytes;
+        stableHistory.substr(0, bytes.size()) == bytes || jointHistory.substr(0, bytes.size()) == bytes ||
+        stableExtendedHistory.substr(0, bytes.size()) == bytes ||
+        jointExtendedHistory.substr(0, bytes.size()) == bytes;
 }
 
 bool ReadSnapshotInteger(std::string_view bytes, size_t offset, unsigned width, uint64_t& value) {
@@ -426,13 +430,14 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
     if (prefix.size() < 8) return {false, false, 8};
     const auto magic = prefix.substr(0, 8);
     const bool stable = magic == "MRFTS003";
-    const bool stableHistory = magic == "MRFTS006";
+    const bool stableHistory = magic == "MRFTS006" || magic == "MRFTS008";
     const bool stableLineage = magic == "MRFTS004" || stableHistory;
     const bool stableImage = stable || stableLineage;
-    const bool jointHistory = magic == "MRFTS007";
+    const bool jointHistory = magic == "MRFTS007" || magic == "MRFTS009";
     const bool jointLineage = magic == "MRFTS005" || jointHistory;
     const bool joint = magic == "MRFTS002" || jointLineage;
     const bool configurationHistory = stableHistory || jointHistory;
+    const bool extendedHistory = magic == "MRFTS008" || magic == "MRFTS009";
     if (!stableImage && !joint && magic != "MRFTS001") return {true, false, 0};
     const bool freshLearnerBootstrap = allowFreshLearnerBootstrap && (stableImage || joint);
     const bool pendingConfigurationBoundary = pendingConfiguration && committedConfiguration &&
@@ -572,7 +577,9 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
         uint64_t transitionCount = 0;
         if (!ReadSnapshotInteger(prefix, size_t(headerBytes), 4, transitionCount))
             return {false, false, size_t(headerBytes + 4)};
-        if (!transitionCount || transitionCount > TSnapshot::MaxConfigurationTransitions)
+        const auto transitionLimit = extendedHistory ? TSnapshot::MaxConfigurationTransitions :
+            TSnapshot::MaxLegacyConfigurationTransitions;
+        if (!transitionCount || transitionCount > transitionLimit)
             return {true, false, 0};
         headerBytes += 4;
         for (uint64_t i = 0; i < transitionCount; ++i) {

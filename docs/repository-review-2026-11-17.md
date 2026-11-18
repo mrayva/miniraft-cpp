@@ -90,9 +90,10 @@ callers must still handle capacity changes before proposing.
   (`snapshot.h`). Transfer is chunked, but capture, encoding and installation
   still materialize the whole image. Large databases need streaming or logical
   object snapshots and resource accounting.
-- Recovery history is bounded to 32 transitions. Automatic stale-store recovery
-  requires a locally anchored history and the sender membership conditions
-  documented in README and configuration-entries.md. Disjoint or out-of-window
+- Recovery history is now bounded to 256 transitions (MRFTS008/MRFTS009); the
+  legacy MRFTS006/MRFTS007 formats remain capped at 32. Automatic stale-store
+  recovery requires a locally anchored history and the sender membership
+  conditions documented in README and configuration-entries.md. Disjoint or out-of-window
   histories can require a fresh learner baseline or independently verified
   recovery history. Joint consensus itself is implemented, including disjoint
   transitions; unrestricted automatic stale recovery is a separate capability.

@@ -94,7 +94,7 @@ checks the boundary, fixed voters, and stable identity before that term update.
 The [configuration entry support](docs/configuration-entries.md) describes the
 live joint-to-stable transition API and snapshot catch-up across committed
 transitions. Joint snapshot transfer requires matching committed history.
-Upgrade every voter to support MRFTS002 through MRFTS007 before using the
+Upgrade every voter to support MRFTS002 through MRFTS009 before using the
 corresponding snapshot transfers.
 The [stable snapshot membership follow-up](docs/stable-snapshot-membership-install.md)
 documents the committed-history checks for snapshot transfer after a voter
@@ -134,17 +134,20 @@ and a voter in that stable set sends it. See the
 MRFTS004 stable and MRFTS005 joint snapshots retain the immediately preceding
 stable voter set, its configuration identity, and the joint entry identity.
 MRFTS006 stable and MRFTS007 joint snapshots add a bounded chain of up to 32
-membership transitions. A nonempty stale store can recover across multiple
-compacted transitions when a transition in the chain matches its exact trusted
-stable configuration and the sender belongs to every old and new voter set in
-the suffix from that anchor. For a joint snapshot, the sender must belong to
+membership transitions. MRFTS008 stable and MRFTS009 joint snapshots extend
+that limit to 256 transitions. A nonempty stale store can recover across
+multiple compacted transitions when a transition in the chain matches its
+exact trusted stable configuration and the sender belongs to every old and new
+voter set in the suffix from that anchor. For a joint snapshot, the sender must belong to
 both sets in each completed transition and to at least one side of the active
 joint configuration. The runtime checks this metadata before persisting a
 higher term. A disjoint transition, a chain that exceeds the bound, or a sender
 missing from a required set still needs a fresh learner baseline or
 independently verified history. Snapshot metadata and CRC do not authenticate
-a peer or prove commitment by themselves. All voters must understand MRFTS002
-through MRFTS007 before using these snapshot formats.
+a peer or prove commitment by themselves. MRFTS006/MRFTS007 remain capped at 32
+transitions; MRFTS008/MRFTS009 use the same payload with an explicit format
+version and a 256-transition cap. All voters must understand MRFTS002 through
+MRFTS009 before using these snapshot formats.
 The [durable configuration snapshot follow-up](docs/durable-configuration-snapshots.md)
 documents its voter-binding requirement and recovery boundary.
 The [trusted legacy voter binding follow-up](docs/trusted-legacy-voter-binding.md)

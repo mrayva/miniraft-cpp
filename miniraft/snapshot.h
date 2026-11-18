@@ -26,7 +26,8 @@ struct TSnapshotConfigurationTransition {
 struct TSnapshot {
     static constexpr size_t MaxBytes = 64 * 1024 * 1024;
     static constexpr uint32_t MaxVoters = 4096;
-    static constexpr size_t MaxConfigurationTransitions = 32;
+    static constexpr size_t MaxLegacyConfigurationTransitions = 32;
+    static constexpr size_t MaxConfigurationTransitions = 256;
     uint64_t Index = 0, Term = 0;
     std::vector<uint32_t> Voters;
     std::string Data;

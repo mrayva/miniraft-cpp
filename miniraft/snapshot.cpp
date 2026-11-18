@@ -21,6 +21,8 @@ constexpr std::string_view StableLineageMagic = "MRFTS004";
 constexpr std::string_view JointLineageMagic = "MRFTS005";
 constexpr std::string_view StableHistoryMagic = "MRFTS006";
 constexpr std::string_view JointHistoryMagic = "MRFTS007";
+constexpr std::string_view StableExtendedHistoryMagic = "MRFTS008";
+constexpr std::string_view JointExtendedHistoryMagic = "MRFTS009";
 void Validate(const TSnapshot& snapshot) {
     size_t historyBytes = snapshot.ConfigurationTransitions.empty() ? 0 : 4;
     for (const auto& transition : snapshot.ConfigurationTransitions) {
@@ -335,8 +337,12 @@ void PreserveStableSnapshotIdentity(const TSnapshot* current, TSnapshot& incomin
 
 std::string EncodeSnapshot(const TSnapshot& snapshot) {
     Validate(snapshot);
+    const bool extendedHistory = snapshot.ConfigurationTransitions.size() >
+        TSnapshot::MaxLegacyConfigurationTransitions;
     std::string out(!snapshot.ConfigurationTransitions.empty()
-        ? (snapshot.StableConfiguration ? StableHistoryMagic : JointHistoryMagic)
+        ? (snapshot.StableConfiguration
+            ? (extendedHistory ? StableExtendedHistoryMagic : StableHistoryMagic)
+            : (extendedHistory ? JointExtendedHistoryMagic : JointHistoryMagic))
         : snapshot.HasStablePredecessor() ? StableLineageMagic :
         snapshot.HasConfigurationLineage() ? JointLineageMagic :
         snapshot.StableConfiguration ? StableMagic : snapshot.IsJoint() ? JointMagic : Magic);
@@ -387,11 +393,14 @@ TSnapshot DecodeSnapshot(std::string_view bytes) {
         throw std::runtime_error("Snapshot checksum mismatch");
     TReader reader{bytes.substr(0, bytes.size() - 4)};
     const auto magic = reader.Read(Magic.size());
-    const bool jointLineage = magic == JointLineageMagic || magic == JointHistoryMagic;
+    const bool jointHistory = magic == JointHistoryMagic || magic == JointExtendedHistoryMagic;
+    const bool stableHistory = magic == StableHistoryMagic || magic == StableExtendedHistoryMagic;
+    const bool extendedHistory = magic == StableExtendedHistoryMagic || magic == JointExtendedHistoryMagic;
+    const bool jointLineage = magic == JointLineageMagic || jointHistory;
     const bool joint = magic == JointMagic || jointLineage;
-    const bool stableLineage = magic == StableLineageMagic || magic == StableHistoryMagic;
+    const bool stableLineage = magic == StableLineageMagic || stableHistory;
     const bool stable = magic == StableMagic || stableLineage;
-    const bool configurationHistory = magic == StableHistoryMagic || magic == JointHistoryMagic;
+    const bool configurationHistory = stableHistory || jointHistory;
     if (!joint && !stable && magic != Magic) throw std::runtime_error("Unknown snapshot format");
     TSnapshot snapshot;
     snapshot.StableConfiguration = stable;
@@ -421,7 +430,9 @@ TSnapshot DecodeSnapshot(std::string_view bytes) {
     for (uint32_t i = 0; i < previousCount; ++i) snapshot.PreviousVoters.push_back(reader.Take(4));
     if (configurationHistory) {
         const auto transitions = reader.Take(4);
-        if (!transitions || transitions > TSnapshot::MaxConfigurationTransitions)
+        const auto transitionLimit = extendedHistory ? TSnapshot::MaxConfigurationTransitions :
+            TSnapshot::MaxLegacyConfigurationTransitions;
+        if (!transitions || transitions > transitionLimit)
             throw std::runtime_error("Invalid snapshot configuration history count");
         for (uint32_t i = 0; i < transitions; ++i) {
             TSnapshotConfigurationTransition transition;

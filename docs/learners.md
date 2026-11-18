@@ -99,7 +99,7 @@ Never delete voter state or edit votes/terms to work around this validation.
 Current durable images use `MRFTD004` and retain the 20-byte header. The payload
 stores CurrentTerm[8], VotedFor[4], retained-log count[8], CommitIndex[8], voter
 count[4], sorted voter IDs[4 each], snapshot length[8], optional MRFTS001
-through MRFTS007 image, then retained log records.
+through MRFTS009 image, then retained log records.
 The CRC covers version magic plus payload. Recovery bounds and validates the voter list, commit
 boundary. Legacy snapshots must name the original bound voters; configuration-
 bearing snapshots can describe a later active set while retaining that original

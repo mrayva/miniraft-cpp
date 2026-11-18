@@ -171,8 +171,16 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
     assert_true(retained.back().StableIndex == history.ConfigurationIndex());
     assert_true(retained.back().StableTerm == history.ConfigurationTerm());
     const auto stableImage = history.MakeSnapshot(std::to_string(history.ThroughIndex()));
-    assert_true(EncodeSnapshot(stableImage).substr(0, 8) == "MRFTS006");
-    assert_true(DecodeSnapshot(EncodeSnapshot(stableImage)) == stableImage);
+    const auto encodedStableImage = EncodeSnapshot(stableImage);
+    assert_true(encodedStableImage.substr(0, 8) == "MRFTS008");
+    assert_true(DecodeSnapshot(encodedStableImage) == stableImage);
+    auto legacyHistoryImage = encodedStableImage;
+    memcpy(legacyHistoryImage.data(), "MRFTS006", 8);
+    const auto legacyChecksum = NSnapshotCodec::Checksum(
+        std::string_view(legacyHistoryImage.data(), legacyHistoryImage.size() - 4));
+    for (size_t i = 0; i < 4; ++i)
+        legacyHistoryImage[legacyHistoryImage.size() - 4 + i] = char(legacyChecksum >> (8 * i));
+    Reject([&] { DecodeSnapshot(legacyHistoryImage); });
 
 #ifdef __linux__
     // Once the trusted baseline falls outside the retained suffix, a current
@@ -199,7 +207,7 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
     const auto bytes = EncodeSnapshot(stableImage);
 
     // The stable identity at the oldest retained suffix boundary still
-    // authorizes recovery through the full 32-transition window.
+    // authorizes recovery through the full 256-transition window.
     auto retainedState = std::make_shared<TDurableState>((dir / "retained-stale").string(), 4);
     retainedState->BindVoters(firstSet);
     retainedState->CurrentTerm = oldestRetainedAnchor.Term;
@@ -245,7 +253,7 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
         resumed.OldVoters() == firstSet ? secondSet : firstSet};
     resumed = resumed.Advance(nextJointIndex, EncodeConfigurationEntry(nextJoint));
     const auto jointImage = resumed.MakeSnapshot("bounded joint history");
-    assert_true(EncodeSnapshot(jointImage).substr(0, 8) == "MRFTS007");
+    assert_true(EncodeSnapshot(jointImage).substr(0, 8) == "MRFTS009");
     assert_int_equal(jointImage.ConfigurationTransitions.size(), TSnapshot::MaxConfigurationTransitions);
     assert_true(DecodeSnapshot(EncodeSnapshot(jointImage)) == jointImage);
 }
