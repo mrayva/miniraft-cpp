@@ -86,8 +86,9 @@ capacity changes before proposing.
   compaction although a quorum can continue committing; the retained log grows.
   A deterministic end-to-end regression now covers the safe operational path:
   remove the unreachable voter using joint consensus, compact under the new
-  stable set, then install the anchored snapshot on return as a learner. The
-  guard remains necessary while that node is still an active voter.
+  stable set, restart the stale durable voter before it reconnects, then install
+  the anchored snapshot and restart it again as a learner. The guard remains
+  necessary while that node is still an active voter.
 - Snapshots are complete in-memory images, capped at 64 MiB including metadata
   (`snapshot.h`). Outbound transfer now encodes each chunk directly from the
   pinned snapshot, avoiding a second full encoded image at the sender. Capture,

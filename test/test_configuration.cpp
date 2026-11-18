@@ -1382,6 +1382,17 @@ void test_quorum_retires_offline_voter_before_compaction_and_snapshot_rejoin(voi
         rafts[1]->ProcessTimeout(now);
         for (uint32_t id = 1; id <= 3; ++id) processors[id]->ProcessCommitted();
     };
+    auto restartRetired = [&] {
+        processors[3].reset();
+        rafts[3].reset();
+        applications[3].reset();
+        states[3].reset();
+        states[3] = std::make_shared<TDurableState>((dir / "raft").string(), 3);
+        TNodeDict peers{{1, endpoints[3][1]}, {2, endpoints[3][2]}};
+        rafts[3] = std::make_shared<TRaft>(states[3], 3, peers);
+        applications[3] = std::make_shared<TSnapshotRsm>();
+        processors[3] = std::make_shared<TRequestProcessor>(rafts[3], applications[3], peers);
+    };
 
     now += std::chrono::seconds(20);
     rafts[1]->ProcessTimeout(now); // Pre-vote campaign reaches voter 2 only.
@@ -1400,6 +1411,9 @@ void test_quorum_retires_offline_voter_before_compaction_and_snapshot_rejoin(voi
     const auto beforeBlockedCompaction = states[1]->SnapshotIndex;
     Reject([&] { rafts[1]->Compact(); }); // The offline active voter cannot be skipped safely.
     assert_int_equal(states[1]->SnapshotIndex, beforeBlockedCompaction);
+    restartRetired(); // Recover the stale durable voter before it receives the transition snapshot.
+    assert_true(rafts[3]->IsVoter(3));
+    assert_true(rafts[3]->GetVoterIds() == originalVoters);
 
     const auto stableIndex = rafts[1]->FinalizeConfiguration();
     for (unsigned i = 0; i < 8 && rafts[1]->GetVolatileState()->CommitIndex < stableIndex; ++i) tick();
@@ -1433,6 +1447,13 @@ void test_quorum_retires_offline_voter_before_compaction_and_snapshot_rejoin(voi
     assert_true(rafts[3]->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
     assert_true(states[3]->GetBoundVoters() == originalVoters);
     assert_true(*states[3]->GetSnapshot() == snapshot);
+
+    restartRetired(); // The installed membership and learner role must also survive a crash.
+    assert_false(rafts[3]->IsVoter(3));
+    assert_true(rafts[3]->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+    assert_true(states[3]->GetBoundVoters() == originalVoters);
+    assert_true(*states[3]->GetSnapshot() == snapshot);
+    assert_int_equal(applications[3]->LastAppliedIndex, snapshot.Index);
 
     std::error_code ignored;
     std::filesystem::remove_all(dir, ignored);
