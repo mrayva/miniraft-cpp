@@ -98,6 +98,8 @@ TBytes ReadAll(int fd) {
 struct TDurableState::TImpl {
     std::vector<TMessageHolder<TLogEntry>> Log;
     std::shared_ptr<const TSnapshot> Snapshot;
+    std::shared_ptr<const TSnapshot> EncodedSnapshotSource;
+    std::shared_ptr<const TSnapshotEncoding> SnapshotEncoding;
     // Original trusted voter set; configuration snapshots can carry a later
     // active set without rewriting this binding.
     std::vector<uint32_t> Voters;
@@ -267,8 +269,13 @@ void TDurableState::Publish()
     }
     if (Impl->Snapshot && !SnapshotCompatibleWithVoterBinding(*Impl->Snapshot, Impl->Voters))
         throw std::runtime_error("Durable snapshot is incompatible with the persisted voter binding");
-    std::shared_ptr<const TSnapshotEncoding> snapshotEncoding;
-    if (Impl->Snapshot) snapshotEncoding = PrepareSnapshotEncoding(*Impl->Snapshot);
+    if (Impl->EncodedSnapshotSource != Impl->Snapshot) {
+        auto encoding = Impl->Snapshot ? PrepareSnapshotEncoding(*Impl->Snapshot) :
+            std::shared_ptr<const TSnapshotEncoding>{};
+        Impl->SnapshotEncoding = std::move(encoding);
+        Impl->EncodedSnapshotSource = Impl->Snapshot;
+    }
+    const auto& snapshotEncoding = Impl->SnapshotEncoding;
     const auto imageBytes = snapshotEncoding ? SnapshotEncodingSize(*snapshotEncoding) : 0;
     Put(bytes, imageBytes, 8);
     if (snapshotEncoding) {
