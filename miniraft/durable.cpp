@@ -265,9 +265,18 @@ void TDurableState::Publish()
     }
     if (Impl->Snapshot && !SnapshotCompatibleWithVoterBinding(*Impl->Snapshot, Impl->Voters))
         throw std::runtime_error("Durable snapshot is incompatible with the persisted voter binding");
-    const auto image = Impl->Snapshot ? EncodeSnapshot(*Impl->Snapshot) : std::string{};
-    Put(payload, image.size(), 8);
-    payload.insert(payload.end(), image.begin(), image.end());
+    std::shared_ptr<const TSnapshotEncoding> snapshotEncoding;
+    if (Impl->Snapshot) snapshotEncoding = PrepareSnapshotEncoding(*Impl->Snapshot);
+    const auto imageBytes = snapshotEncoding ? SnapshotEncodingSize(*snapshotEncoding) : 0;
+    Put(payload, imageBytes, 8);
+    if (snapshotEncoding) {
+        if (imageBytes > payload.max_size() - payload.size())
+            throw std::length_error("Durable snapshot exceeds platform size limit");
+        const auto imageOffset = payload.size();
+        payload.resize(imageOffset + size_t(imageBytes));
+        CopySnapshotEncodingRange(*Impl->Snapshot, *snapshotEncoding, 0,
+            reinterpret_cast<char*>(payload.data() + imageOffset), size_t(imageBytes));
+    }
     uint64_t previousTerm = SnapshotTerm;
     for (auto entry : Impl->Log) {
         if (!entry->Term || entry->Term < previousTerm || entry->Term > CurrentTerm)
