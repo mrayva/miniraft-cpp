@@ -8,9 +8,11 @@
 #include <stdexcept>
 #include <exception>
 #include <iostream>
+#include <span>
 #ifdef __linux__
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cerrno>
@@ -18,22 +20,19 @@
 #endif
 
 namespace {
-using TBytes = std::vector<uint8_t>;
 constexpr std::array<uint8_t, 8> Magic{'M','R','F','T','D','0','0','1'};
 constexpr std::array<uint8_t, 8> SnapshotMagic{'M','R','F','T','D','0','0','2'};
 constexpr std::array<uint8_t, 8> ConfigurationMagic{'M','R','F','T','D','0','0','3'};
 constexpr std::array<uint8_t, 8> CommitMagic{'M','R','F','T','D','0','0','4'};
-void Put(TBytes& bytes, uint64_t value, unsigned width) {
-    for (unsigned i = 0; i < width; ++i) bytes.push_back(uint8_t(value >> (8 * i)));
-}
-uint64_t Take(const TBytes& bytes, size_t& position, unsigned width) {
+uint64_t Take(std::span<const uint8_t> bytes, size_t& position, unsigned width) {
     if (position > bytes.size() || width > bytes.size() - position)
         throw std::runtime_error("Truncated durable state");
     uint64_t value = 0;
     for (unsigned i = 0; i < width; ++i) value |= uint64_t(bytes[position++]) << (8 * i);
     return value;
 }
-uint32_t Checksum(const TBytes& bytes, size_t start, const std::array<uint8_t, 8>* version = nullptr) {
+uint32_t Checksum(std::span<const uint8_t> bytes, size_t start,
+        const std::array<uint8_t, 8>* version = nullptr) {
     uint32_t crc = UINT32_MAX;
     const auto update = [&](uint8_t byte) {
         crc ^= byte;
@@ -87,22 +86,32 @@ void WriteAtAll(int fd, const void* data, size_t size, off_t offset) {
         done += size_t(n);
     }
 }
-TBytes ReadAll(int fd) {
-    struct stat info;
-    Require(fstat(fd, &info) == 0, "stat durable state");
-    if (!S_ISREG(info.st_mode) || info.st_size < 20 || uint64_t(info.st_size) > SIZE_MAX)
-        throw std::runtime_error("Invalid durable state file size/type");
-    TBytes bytes(size_t(info.st_size));
-    size_t done = 0;
-    while (done < bytes.size()) {
-        auto n = read(fd, bytes.data() + done, bytes.size() - done);
-        if (n < 0 && errno == EINTR) continue;
-        if (n == 0) throw std::runtime_error("Truncated durable state file");
-        Require(n > 0, "read durable state");
-        done += size_t(n);
+class TReadOnlyMap {
+public:
+    explicit TReadOnlyMap(int fd) {
+        struct stat info;
+        Require(fstat(fd, &info) == 0, "stat durable state");
+        if (!S_ISREG(info.st_mode) || info.st_size < 20 || uint64_t(info.st_size) > SIZE_MAX)
+            throw std::runtime_error("Invalid durable state file size/type");
+        Size = size_t(info.st_size);
+        Address = mmap(nullptr, Size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (Address == MAP_FAILED) Require(false, "map durable state");
+        if (!Address) {
+            munmap(Address, Size);
+            Address = MAP_FAILED;
+            throw std::runtime_error("Invalid durable state mapping address");
+        }
     }
-    return bytes;
-}
+    ~TReadOnlyMap() { if (Address != MAP_FAILED) munmap(Address, Size); }
+    TReadOnlyMap(const TReadOnlyMap&) = delete;
+    TReadOnlyMap& operator=(const TReadOnlyMap&) = delete;
+    std::span<const uint8_t> Bytes() const {
+        return {static_cast<const uint8_t*>(Address), Size};
+    }
+private:
+    void* Address = MAP_FAILED;
+    size_t Size = 0;
+};
 #endif
 }
 
@@ -158,7 +167,8 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
         Publish();
         return;
     }
-    const auto bytes = ReadAll(file.Value);
+    TReadOnlyMap mapped(file.Value);
+    const auto bytes = mapped.Bytes();
     const bool commitAware = std::equal(CommitMagic.begin(), CommitMagic.end(), bytes.begin());
     const bool configured = std::equal(ConfigurationMagic.begin(), ConfigurationMagic.end(), bytes.begin());
     const bool compacted = std::equal(SnapshotMagic.begin(), SnapshotMagic.end(), bytes.begin());
