@@ -658,7 +658,7 @@ std::optional<TSnapshot> TSnapshotStore::Load() {
         Require(n > 0, "read snapshot");
         done += size_t(n);
     }
-    auto snapshot = DecodeSnapshot(bytes);
+    auto snapshot = DecodeSnapshotOwned(std::move(bytes));
     Sync(file.Value);
     Sync(Impl->Directory.Value);
     return snapshot;
