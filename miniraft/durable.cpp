@@ -253,45 +253,47 @@ void TDurableState::Publish()
         (Impl->Snapshot ? (Impl->Snapshot->Index != SnapshotIndex || Impl->Snapshot->Term != SnapshotTerm ||
             SnapshotTerm > CurrentTerm) : (SnapshotIndex != 0 || SnapshotTerm != 0)))
         throw std::runtime_error("Invalid durable state fields");
-    TBytes payload;
-    Put(payload, CurrentTerm, 8);
-    Put(payload, VotedFor, 4);
-    Put(payload, Impl->Log.size(), 8);
-    Put(payload, CommitIndex, 8);
-    Put(payload, Impl->Voters.size(), 4);
+    constexpr size_t PayloadOffset = CommitMagic.size() + 8 + 4;
+    TBytes bytes(CommitMagic.begin(), CommitMagic.end());
+    bytes.resize(PayloadOffset, 0); // Header length and checksum are filled after the payload.
+    Put(bytes, CurrentTerm, 8);
+    Put(bytes, VotedFor, 4);
+    Put(bytes, Impl->Log.size(), 8);
+    Put(bytes, CommitIndex, 8);
+    Put(bytes, Impl->Voters.size(), 4);
     if (!Impl->Voters.empty()) {
         ValidateFixedVoters(Impl->Voters);
-        for (auto id : Impl->Voters) Put(payload, id, 4);
+        for (auto id : Impl->Voters) Put(bytes, id, 4);
     }
     if (Impl->Snapshot && !SnapshotCompatibleWithVoterBinding(*Impl->Snapshot, Impl->Voters))
         throw std::runtime_error("Durable snapshot is incompatible with the persisted voter binding");
     std::shared_ptr<const TSnapshotEncoding> snapshotEncoding;
     if (Impl->Snapshot) snapshotEncoding = PrepareSnapshotEncoding(*Impl->Snapshot);
     const auto imageBytes = snapshotEncoding ? SnapshotEncodingSize(*snapshotEncoding) : 0;
-    Put(payload, imageBytes, 8);
+    Put(bytes, imageBytes, 8);
     if (snapshotEncoding) {
-        if (imageBytes > payload.max_size() - payload.size())
+        if (imageBytes > bytes.max_size() - bytes.size())
             throw std::length_error("Durable snapshot exceeds platform size limit");
-        const auto imageOffset = payload.size();
-        payload.resize(imageOffset + size_t(imageBytes));
+        const auto imageOffset = bytes.size();
+        bytes.resize(imageOffset + size_t(imageBytes));
         CopySnapshotEncodingRange(*Impl->Snapshot, *snapshotEncoding, 0,
-            reinterpret_cast<char*>(payload.data() + imageOffset), size_t(imageBytes));
+            reinterpret_cast<char*>(bytes.data() + imageOffset), size_t(imageBytes));
     }
     uint64_t previousTerm = SnapshotTerm;
     for (auto entry : Impl->Log) {
         if (!entry->Term || entry->Term < previousTerm || entry->Term > CurrentTerm)
             throw std::runtime_error("Invalid durable log term");
         previousTerm = entry->Term;
-        Put(payload, entry->Term, 8);
-        Put(payload, entry->Flags, 8);
-        Put(payload, entry->Len - sizeof(TLogEntry), 4);
-        payload.insert(payload.end(), entry->Data, entry->Data + entry->Len - sizeof(TLogEntry));
+        Put(bytes, entry->Term, 8);
+        Put(bytes, entry->Flags, 8);
+        Put(bytes, entry->Len - sizeof(TLogEntry), 4);
+        bytes.insert(bytes.end(), entry->Data, entry->Data + entry->Len - sizeof(TLogEntry));
     }
-    const auto& magic = CommitMagic;
-    TBytes bytes(magic.begin(), magic.end());
-    Put(bytes, payload.size(), 8);
-    Put(bytes, Checksum(payload, 0, &CommitMagic), 4);
-    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    const auto payloadBytes = bytes.size() - PayloadOffset;
+    const auto payloadLength = uint64_t(payloadBytes);
+    for (unsigned i = 0; i < 8; ++i) bytes[CommitMagic.size() + i] = uint8_t(payloadLength >> (8 * i));
+    const auto checksum = Checksum(bytes, PayloadOffset, &CommitMagic);
+    for (unsigned i = 0; i < 4; ++i) bytes[CommitMagic.size() + 8 + i] = uint8_t(checksum >> (8 * i));
     TFd temp(openat(Impl->Directory.Value, Impl->Temp.c_str(),
                     O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600));
     Require(temp.Value >= 0, "create durable temporary image");
