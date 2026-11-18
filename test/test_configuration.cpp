@@ -252,10 +252,49 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
         resumed.ConfigurationIndex(), resumed.ConfigurationTerm(), resumed.OldVoters(),
         resumed.OldVoters() == firstSet ? secondSet : firstSet};
     resumed = resumed.Advance(nextJointIndex, EncodeConfigurationEntry(nextJoint));
-    const auto jointImage = resumed.MakeSnapshot("bounded joint history");
-    assert_true(EncodeSnapshot(jointImage).substr(0, 8) == "MRFTS009");
+    const auto jointImage = resumed.MakeSnapshot(std::to_string(resumed.ThroughIndex()));
+    const auto encodedJointImage = EncodeSnapshot(jointImage);
+    assert_true(encodedJointImage.substr(0, 8) == "MRFTS009");
     assert_int_equal(jointImage.ConfigurationTransitions.size(), TSnapshot::MaxConfigurationTransitions);
-    assert_true(DecodeSnapshot(EncodeSnapshot(jointImage)) == jointImage);
+    assert_true(DecodeSnapshot(encodedJointImage) == jointImage);
+
+    // Exercise MRFTS009 through the runtime metadata probe and fresh-learner
+    // install path, not only through the standalone codec.
+    auto bootstrapVoters = jointImage.Voters;
+    bootstrapVoters.insert(bootstrapVoters.end(), jointImage.JointVoters.begin(), jointImage.JointVoters.end());
+    std::sort(bootstrapVoters.begin(), bootstrapVoters.end());
+    bootstrapVoters.erase(std::unique(bootstrapVoters.begin(), bootstrapVoters.end()), bootstrapVoters.end());
+    constexpr uint32_t learnerId = 5;
+    const auto leaderId = jointImage.Voters.front();
+    std::vector<TMessageHolder<TMessage>> bootstrapResponses;
+    TNodeDict bootstrapPeers;
+    for (auto voter : bootstrapVoters) {
+        auto peer = std::make_shared<TEndpoint>();
+        peer->Route = [&](auto message) { bootstrapResponses.push_back(std::move(message)); };
+        bootstrapPeers.emplace(voter, std::move(peer));
+    }
+    auto learnerState = std::make_shared<TState>();
+    auto learnerRaft = std::make_shared<TRaft>(learnerState, learnerId, bootstrapPeers,
+        std::vector<uint32_t>{learnerId});
+    auto learnerApplication = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor learnerProcessor(learnerRaft, learnerApplication, bootstrapPeers);
+    auto install = NewHoldedMessage<TInstallSnapshotRequest>(
+        sizeof(TInstallSnapshotRequest) + encodedJointImage.size());
+    install->Src = leaderId; install->Dst = learnerId; install->Term = jointImage.Term + 1;
+    install->SnapshotIndex = jointImage.Index; install->SnapshotTerm = jointImage.Term;
+    install->Offset = 0; install->TotalBytes = encodedJointImage.size(); install->Done = 1;
+    install->LeaderId = leaderId;
+    memcpy(install->Data, encodedJointImage.data(), encodedJointImage.size());
+    learnerRaft->Process({}, install);
+    assert_int_equal(bootstrapResponses.size(), 1);
+    auto response = bootstrapResponses.back().Cast<TInstallSnapshotResponse>();
+    assert_true(response->Success); assert_true(response->Installed);
+    assert_true(*learnerState->GetSnapshot() == jointImage);
+    assert_int_equal(learnerState->CurrentTerm, jointImage.Term + 1);
+    assert_true(learnerRaft->GetVoterIds() == bootstrapVoters);
+    assert_true(learnerRaft->GetLearnerIds() == (std::vector<uint32_t>{learnerId}));
+    assert_true(learnerState->GetBoundVoters() == bootstrapVoters);
+    assert_int_equal(learnerApplication->LastAppliedIndex, jointImage.Index);
 }
 void test_history_validates_joint_stable_chain_and_independent_rollback(void**) {
     auto initial = TConfigurationHistory::Stable({1, 2, 3}, 0, 0, 0, 0);

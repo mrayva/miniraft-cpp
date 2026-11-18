@@ -62,7 +62,9 @@ invalid baseline identities, skipped entries, stale terms, wrong sets and
 predecessors, malformed entries, index exhaustion and CRC-valid snapshot metadata
 corruption. A durable test scans configuration entries after a fixed snapshot and
 restart, confirms the fixture's known bootstrap baseline, and verifies that Raft
-still rejects the unsupported entries without rewriting storage. Full tests also
+still rejects the unsupported entries without rewriting storage. Runtime tests
+install a maximum-length stable history from an anchored stale store and a
+maximum-length joint history through fresh-learner bootstrap. Full tests also
 cover existing snapshot installation and learner catch-up.
 
 Snapshots retain at most 256 contiguous membership transitions. The legacy
