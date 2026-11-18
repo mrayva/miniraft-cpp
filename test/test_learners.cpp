@@ -572,7 +572,8 @@ void test_legacy_recovered_vote_outside_voters_preserves_storage(void**) {
 }
 void test_durable_voter_binding_is_atomic_before_first_vote(void**) {
     using TStage = TDurableState::EStage;
-    for (auto stage : {TStage::TempCreated, TStage::Written, TStage::FileSynced, TStage::Renamed, TStage::DirectorySynced}) {
+    for (auto stage : {TStage::TempCreated, TStage::PayloadStarted, TStage::Written,
+                       TStage::FileSynced, TStage::Renamed, TStage::DirectorySynced}) {
         TFiles files;
         auto child = fork(); assert_true(child >= 0);
         if (!child) {
@@ -756,8 +757,8 @@ void test_trusted_legacy_voter_baseline_must_precede_raft_startup(void**) {
 }
 void test_trusted_legacy_voter_binding_is_atomic_at_each_publish_stage(void**) {
     using TStage = TDurableState::EStage;
-    const std::vector<TStage> stages = {TStage::TempCreated, TStage::Written, TStage::FileSynced,
-        TStage::Renamed, TStage::DirectorySynced};
+    const std::vector<TStage> stages = {TStage::TempCreated, TStage::PayloadStarted, TStage::Written,
+        TStage::FileSynced, TStage::Renamed, TStage::DirectorySynced};
     for (bool withSnapshot : {false, true}) {
         for (auto stage : stages) {
             TFiles files;

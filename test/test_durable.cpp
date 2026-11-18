@@ -232,7 +232,7 @@ void Wait(pid_t child, int expected) {
 
 void test_crash_at_every_publication_boundary(void**) {
     for (auto operation : {EOperation::Append, EOperation::Truncate, EOperation::Vote, EOperation::Replace, EOperation::CommitIndex}) {
-        for (auto stage : {TStage::TempCreated, TStage::Written, TStage::FileSynced,
+        for (auto stage : {TStage::TempCreated, TStage::PayloadStarted, TStage::Written, TStage::FileSynced,
                            TStage::Renamed, TStage::DirectorySynced}) {
             TFiles files;
             files.Seed();
@@ -326,8 +326,8 @@ void test_publication_order(void**) {
     TDurableState state(files.Name, 1, [&](auto stage) { stages.push_back(stage); });
     state.CurrentTerm = 4;
     state.Commit();
-    const std::vector<TStage> expected{TStage::TempCreated, TStage::Written, TStage::FileSynced,
-                                      TStage::Renamed, TStage::DirectorySynced};
+    const std::vector<TStage> expected{TStage::TempCreated, TStage::PayloadStarted, TStage::Written,
+                                      TStage::FileSynced, TStage::Renamed, TStage::DirectorySynced};
     assert_true(stages == expected);
 }
 
@@ -341,6 +341,28 @@ void test_live_publication_failure_is_fatal(void**) {
         try {
             TDurableState state(files.Name, 1, [](auto stage) {
                 if (stage == TStage::FileSynced) throw std::runtime_error("injected failure");
+            });
+            state.CurrentTerm = 4;
+            state.Commit();
+        } catch (...) { _exit(74); }
+        _exit(75);
+    }
+    Wait(child, 73);
+    TDurableState recovered(files.Name, 1);
+    assert_int_equal(recovered.CurrentTerm, 3);
+    assert_int_equal(recovered.VotedFor, 2);
+}
+
+void test_mid_payload_failure_is_fatal_and_preserves_image(void**) {
+    TFiles files;
+    files.Seed();
+    const auto child = fork();
+    assert_true(child >= 0);
+    if (child == 0) {
+        std::set_terminate([] { _exit(73); });
+        try {
+            TDurableState state(files.Name, 1, [](auto stage) {
+                if (stage == TStage::PayloadStarted) throw std::runtime_error("injected failure");
             });
             state.CurrentTerm = 4;
             state.Commit();
@@ -377,7 +399,7 @@ void test_write_error_is_fatal_and_preserves_image(void**) {
 }
 
 void test_interrupted_initialization_is_not_reset(void**) {
-    for (auto stage : {TStage::TempCreated, TStage::Written, TStage::FileSynced,
+    for (auto stage : {TStage::TempCreated, TStage::PayloadStarted, TStage::Written, TStage::FileSynced,
                        TStage::Renamed, TStage::DirectorySynced}) {
         TFiles files;
         const auto child = fork();
@@ -607,6 +629,7 @@ int main() {
         cmocka_unit_test(test_publication_order),
         cmocka_unit_test(test_v1_v2_v3_images_recover_conservatively_and_upgrade_on_publish),
         cmocka_unit_test(test_live_publication_failure_is_fatal),
+        cmocka_unit_test(test_mid_payload_failure_is_fatal_and_preserves_image),
         cmocka_unit_test(test_write_error_is_fatal_and_preserves_image),
         cmocka_unit_test(test_interrupted_initialization_is_not_reset),
         cmocka_unit_test(test_corrupt_images_are_rejected),

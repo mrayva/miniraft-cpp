@@ -29,7 +29,7 @@ TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(
 // fsync. O(snapshot + retained log size) per update: a durability baseline.
 class TDurableState : public IState {
 public:
-    enum class EStage { TempCreated, Written, FileSynced, Renamed, DirectorySynced };
+    enum class EStage { TempCreated, PayloadStarted, Written, FileSynced, Renamed, DirectorySynced };
     // Diagnostics/fault injection. Throwing from this hook during a live
     // operation is fatal, just like an I/O failure.
     using THook = std::function<void(EStage)>;

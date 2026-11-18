@@ -315,12 +315,17 @@ void TDurableState::Publish()
     };
     updateChecksum(CommitMagic.data(), CommitMagic.size());
     uint64_t payloadLength = 0;
+    bool payloadStarted = false;
     auto writePayload = [&](const void* data, size_t size) {
         if (size > UINT64_MAX - payloadLength)
             throw std::length_error("Durable state image exceeds format size limit");
         WriteAll(temp.Value, data, size);
         updateChecksum(static_cast<const uint8_t*>(data), size);
         payloadLength += size;
+        if (!payloadStarted && size) {
+            payloadStarted = true;
+            Impl->Stage(EStage::PayloadStarted);
+        }
     };
     auto writeInteger = [&](uint64_t value, unsigned width) {
         uint8_t encoded[8];
