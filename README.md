@@ -4,6 +4,8 @@ This fork's first milestone fixes strict-majority commit selection and FIFO
 request completion, and adds deterministic consensus failure tests.
 See the [correctness baseline and review](docs/correctness-baseline.md) for
 validation, build instructions and remaining production release gates.
+The core library installs a CMake package for downstream `find_package`
+consumers; see the [CMake package guide](docs/cmake-package.md).
 The milestone is experimental; durable crash recovery is not established.
 The [persistence recovery follow-up](docs/persistence-recovery.md) rejects
 incomplete or structurally corrupt storage and fixes truncation/restart behavior.

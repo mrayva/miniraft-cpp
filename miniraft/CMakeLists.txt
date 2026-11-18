@@ -7,5 +7,38 @@ add_library(miniraft
     configuration.cpp
 )
 
-target_include_directories(miniraft PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_include_directories(miniraft PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
 target_compile_features(miniraft PUBLIC cxx_std_20)
+
+set_target_properties(miniraft PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR}
+)
+
+install(TARGETS miniraft EXPORT miniraftTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+install(FILES
+    messages.h
+    persist.h
+    durable.h
+    state.h
+    timesource.h
+    quorum.h
+    snapshot.h
+    snapshot_codec.h
+    configuration.h
+    raft.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/miniraft
+)
+install(EXPORT miniraftTargets
+    FILE miniraftTargets.cmake
+    NAMESPACE miniraft::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/miniraft
+)
