@@ -2511,8 +2511,8 @@ TSnapshot TRaft::Compact() {
             ? TConfigurationHistory::FromJointSnapshot(snapshot)
             : TConfigurationHistory::Stable(Voters, 0, 0, snapshot.Index, snapshot.Term);
     RefreshConfiguration(VolatileState->CommitIndex);
-    // Outstanding transfers own their immutable encoded bytes; discard any
-    // otherwise-retained encoding of the old local snapshot.
+    // Outstanding transfers own their immutable encoding metadata; discard any
+    // otherwise-retained metadata for the old local snapshot.
     EncodedSnapshot.reset();
     EncodedSnapshotIndex = 0;
     return snapshot;
@@ -2527,7 +2527,7 @@ TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t no
         auto snapshot = State->GetSnapshot();
         if (!snapshot) throw std::logic_error("Missing snapshot for compacted log");
         if (EncodedSnapshotIndex != snapshot->Index) {
-            EncodedSnapshot = std::make_shared<const std::string>(EncodeSnapshot(*snapshot));
+            EncodedSnapshot = PrepareSnapshotEncoding(*snapshot);
             EncodedSnapshotIndex = snapshot->Index;
         }
         rpc = TVolatileState::TSnapshotRpc{snapshot, EncodedSnapshot};
@@ -2537,7 +2537,8 @@ TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t no
     // must not restart every chunk; after completion a still-lagging peer can
     // start a separate transfer of the newest image.
     const auto& snapshot = rpc.Snapshot;
-    const auto count = std::min<uint64_t>(TInstallSnapshotRequest::MaxChunkBytes, rpc.Bytes->size() - rpc.Offset);
+    const auto totalBytes = SnapshotEncodingSize(*rpc.Encoding);
+    const auto count = std::min<uint64_t>(TInstallSnapshotRequest::MaxChunkBytes, totalBytes - rpc.Offset);
     auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
     request->Src = Id; request->Dst = nodeId; request->Term = State->CurrentTerm;
     // A retry sends the same immutable chunk. Keep its identity until a reply
@@ -2547,10 +2548,10 @@ TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t no
     if (!rpc.Seqno) rpc.Seqno = NextSeqno();
     request->Seqno = rpc.Seqno;
     request->SnapshotIndex = snapshot->Index; request->SnapshotTerm = snapshot->Term;
-    request->Offset = rpc.Offset; request->TotalBytes = rpc.Bytes->size();
+    request->Offset = rpc.Offset; request->TotalBytes = totalBytes;
     rpc.SentEnd = rpc.Offset + count;
-    request->Done = rpc.SentEnd == rpc.Bytes->size(); request->LeaderId = Id;
-    memcpy(request->Data, rpc.Bytes->data() + rpc.Offset, count);
+    request->Done = rpc.SentEnd == totalBytes; request->LeaderId = Id;
+    CopySnapshotEncodingRange(*snapshot, *rpc.Encoding, rpc.Offset, request->Data, size_t(count));
     return request;
 }
 
@@ -2560,8 +2561,9 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     if (found == VolatileState->SnapshotRpcs.end()) return;
     auto& rpc = found->second;
     if (!rpc.Seqno || response->Seqno != rpc.Seqno || response->SnapshotIndex != rpc.Snapshot->Index) return;
-    if (response->Success && ((response->Installed && response->NextOffset != rpc.Bytes->size()) ||
-        (!response->Installed && (response->NextOffset != rpc.SentEnd || response->NextOffset >= rpc.Bytes->size()))))
+    const auto totalBytes = SnapshotEncodingSize(*rpc.Encoding);
+    if (response->Success && ((response->Installed && response->NextOffset != totalBytes) ||
+        (!response->Installed && (response->NextOffset != rpc.SentEnd || response->NextOffset >= totalBytes))))
         return;
     RecordLeadershipResponse(now, response->Src);
     if (!response->Success) {

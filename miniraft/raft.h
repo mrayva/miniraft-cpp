@@ -101,7 +101,7 @@ struct TVolatileState {
     struct TSnapshotRpc {
         // Pinned for this transfer even if the local store compacts again.
         std::shared_ptr<const TSnapshot> Snapshot;
-        std::shared_ptr<const std::string> Bytes;
+        std::shared_ptr<const TSnapshotEncoding> Encoding;
         // Seqno identifies the outstanding chunk across retries; zero means
         // its reply was consumed and the next send needs a fresh identity.
         uint64_t Offset = 0, Seqno = 0, SentEnd = 0;
@@ -383,7 +383,7 @@ private:
         std::string Bytes;
     };
     std::optional<TIncomingSnapshot> IncomingSnapshot;
-    std::shared_ptr<const std::string> EncodedSnapshot;
+    std::shared_ptr<const TSnapshotEncoding> EncodedSnapshot;
     uint64_t EncodedSnapshotIndex = 0;
 
     EState StateName;

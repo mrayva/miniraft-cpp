@@ -4,6 +4,7 @@
 #include <miniraft/durable.h>
 #include "../examples/kv.h"
 #include "../examples/kv_messages.h"
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <chrono>
@@ -78,6 +79,26 @@ void test_snapshot_codec_roundtrip_and_all_byte_corruption(void**) {
         damaged[i] ^= 1;
         Reject([&] { DecodeSnapshot(damaged); });
         Reject([&] { DecodeSnapshot(std::string_view(encoded).substr(0, i)); });
+    }
+}
+void test_snapshot_encoding_ranges_match_complete_wire_image(void**) {
+    auto stable = Sample();
+    stable.StableConfiguration = true;
+    stable.ConfigurationIndex = 1;
+    stable.ConfigurationTerm = 1;
+    for (const auto& snapshot : {Sample(), JointSample(), stable}) {
+        const auto expected = EncodeSnapshot(snapshot);
+        const auto encoding = PrepareSnapshotEncoding(snapshot);
+        assert_true(SnapshotEncodingSize(*encoding) == expected.size());
+        std::string streamed(expected.size(), '\0');
+        for (size_t offset = 0; offset < streamed.size(); offset += 7) {
+            const auto count = std::min<size_t>(7, streamed.size() - offset);
+            CopySnapshotEncodingRange(snapshot, *encoding, offset, streamed.data() + offset, count);
+        }
+        assert_true(streamed == expected);
+        Reject([&] {
+            CopySnapshotEncodingRange(snapshot, *encoding, expected.size(), streamed.data(), 1);
+        });
     }
 }
 void test_joint_snapshot_codec_roundtrip_and_corruption(void**) {
@@ -809,6 +830,7 @@ void test_durable_kv_restart_restores_checkpoint_and_replays_only_tail(void**) {
 int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_snapshot_codec_roundtrip_and_all_byte_corruption),
+        cmocka_unit_test(test_snapshot_encoding_ranges_match_complete_wire_image),
         cmocka_unit_test(test_joint_snapshot_codec_roundtrip_and_corruption),
         cmocka_unit_test(test_stable_configuration_snapshot_codec_and_runtime_guards),
         cmocka_unit_test(test_transition_lineage_snapshot_codecs_and_stable_identity_guard),

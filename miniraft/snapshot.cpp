@@ -3,6 +3,7 @@
 #include "raft.h"
 #include <algorithm>
 #include <climits>
+#include <cstring>
 #include <filesystem>
 #include <system_error>
 #ifdef __linux__
@@ -268,6 +269,53 @@ void CheckLocalLog(const TSnapshot& snapshot, const TRaft& raft,
         raft.GetState()->LogTerm(snapshot.Index) != snapshot.Term)
         throw std::runtime_error("Snapshot does not match retained log and active configuration");
 }
+
+std::string EncodeSnapshotMetadata(const TSnapshot& snapshot) {
+    const bool extendedHistory = snapshot.ConfigurationTransitions.size() >
+        TSnapshot::MaxLegacyConfigurationTransitions;
+    std::string out(!snapshot.ConfigurationTransitions.empty()
+        ? (snapshot.StableConfiguration
+            ? (extendedHistory ? StableExtendedHistoryMagic : StableHistoryMagic)
+            : (extendedHistory ? JointExtendedHistoryMagic : JointHistoryMagic))
+        : snapshot.HasStablePredecessor() ? StableLineageMagic :
+        snapshot.HasConfigurationLineage() ? JointLineageMagic :
+        snapshot.StableConfiguration ? StableMagic : snapshot.IsJoint() ? JointMagic : Magic);
+    Put(out, snapshot.Index, 8);
+    Put(out, snapshot.Term, 8);
+    Put(out, snapshot.Voters.size(), 4);
+    Put(out, snapshot.Data.size(), 8);
+    if (snapshot.HasConfigurationMetadata()) {
+        Put(out, snapshot.ConfigurationIndex, 8);
+        Put(out, snapshot.ConfigurationTerm, 8);
+        if (!snapshot.StableConfiguration) Put(out, snapshot.JointVoters.size(), 4);
+        if (snapshot.HasConfigurationLineage()) {
+            Put(out, snapshot.PreviousConfigurationIndex, 8);
+            Put(out, snapshot.PreviousConfigurationTerm, 8);
+            Put(out, snapshot.PreviousJointIndex, 8);
+            Put(out, snapshot.PreviousJointTerm, 8);
+            Put(out, snapshot.PreviousVoters.size(), 4);
+        }
+    }
+    for (auto voter : snapshot.Voters) Put(out, voter, 4);
+    for (auto voter : snapshot.JointVoters) Put(out, voter, 4);
+    for (auto voter : snapshot.PreviousVoters) Put(out, voter, 4);
+    if (!snapshot.ConfigurationTransitions.empty()) {
+        Put(out, snapshot.ConfigurationTransitions.size(), 4);
+        for (const auto& transition : snapshot.ConfigurationTransitions) {
+            Put(out, transition.PreviousConfigurationIndex, 8);
+            Put(out, transition.PreviousConfigurationTerm, 8);
+            Put(out, transition.JointIndex, 8);
+            Put(out, transition.JointTerm, 8);
+            Put(out, transition.StableIndex, 8);
+            Put(out, transition.StableTerm, 8);
+            Put(out, transition.OldVoters.size(), 4);
+            Put(out, transition.NewVoters.size(), 4);
+            for (auto voter : transition.OldVoters) Put(out, voter, 4);
+            for (auto voter : transition.NewVoters) Put(out, voter, 4);
+        }
+    }
+    return out;
+}
 #ifdef __linux__
 struct TFd {
     int Value = -1;
@@ -286,6 +334,12 @@ void Sync(int fd) {
 }
 #endif
 }
+
+struct TSnapshotEncoding {
+    std::string Metadata;
+    uint32_t Checksum = 0;
+    uint64_t TotalBytes = 0;
+};
 
 void ValidateSnapshot(const TSnapshot& snapshot) { Validate(snapshot); }
 
@@ -336,53 +390,51 @@ void PreserveStableSnapshotIdentity(const TSnapshot* current, TSnapshot& incomin
 }
 
 std::string EncodeSnapshot(const TSnapshot& snapshot) {
-    Validate(snapshot);
-    const bool extendedHistory = snapshot.ConfigurationTransitions.size() >
-        TSnapshot::MaxLegacyConfigurationTransitions;
-    std::string out(!snapshot.ConfigurationTransitions.empty()
-        ? (snapshot.StableConfiguration
-            ? (extendedHistory ? StableExtendedHistoryMagic : StableHistoryMagic)
-            : (extendedHistory ? JointExtendedHistoryMagic : JointHistoryMagic))
-        : snapshot.HasStablePredecessor() ? StableLineageMagic :
-        snapshot.HasConfigurationLineage() ? JointLineageMagic :
-        snapshot.StableConfiguration ? StableMagic : snapshot.IsJoint() ? JointMagic : Magic);
-    Put(out, snapshot.Index, 8);
-    Put(out, snapshot.Term, 8);
-    Put(out, snapshot.Voters.size(), 4);
-    Put(out, snapshot.Data.size(), 8);
-    if (snapshot.HasConfigurationMetadata()) {
-        Put(out, snapshot.ConfigurationIndex, 8);
-        Put(out, snapshot.ConfigurationTerm, 8);
-        if (!snapshot.StableConfiguration) Put(out, snapshot.JointVoters.size(), 4);
-        if (snapshot.HasConfigurationLineage()) {
-            Put(out, snapshot.PreviousConfigurationIndex, 8);
-            Put(out, snapshot.PreviousConfigurationTerm, 8);
-            Put(out, snapshot.PreviousJointIndex, 8);
-            Put(out, snapshot.PreviousJointTerm, 8);
-            Put(out, snapshot.PreviousVoters.size(), 4);
-        }
-    }
-    for (auto voter : snapshot.Voters) Put(out, voter, 4);
-    for (auto voter : snapshot.JointVoters) Put(out, voter, 4);
-    for (auto voter : snapshot.PreviousVoters) Put(out, voter, 4);
-    if (!snapshot.ConfigurationTransitions.empty()) {
-        Put(out, snapshot.ConfigurationTransitions.size(), 4);
-        for (const auto& transition : snapshot.ConfigurationTransitions) {
-            Put(out, transition.PreviousConfigurationIndex, 8);
-            Put(out, transition.PreviousConfigurationTerm, 8);
-            Put(out, transition.JointIndex, 8);
-            Put(out, transition.JointTerm, 8);
-            Put(out, transition.StableIndex, 8);
-            Put(out, transition.StableTerm, 8);
-            Put(out, transition.OldVoters.size(), 4);
-            Put(out, transition.NewVoters.size(), 4);
-            for (auto voter : transition.OldVoters) Put(out, voter, 4);
-            for (auto voter : transition.NewVoters) Put(out, voter, 4);
-        }
-    }
-    Append(out, snapshot.Data);
-    Put(out, Checksum(out), 4);
+    const auto encoding = PrepareSnapshotEncoding(snapshot);
+    std::string out(size_t(SnapshotEncodingSize(*encoding)), '\0');
+    CopySnapshotEncodingRange(snapshot, *encoding, 0, out.data(), out.size());
     return out;
+}
+
+std::shared_ptr<const TSnapshotEncoding> PrepareSnapshotEncoding(const TSnapshot& snapshot) {
+    Validate(snapshot);
+    auto encoding = std::make_shared<TSnapshotEncoding>();
+    encoding->Metadata = EncodeSnapshotMetadata(snapshot);
+    encoding->TotalBytes = encoding->Metadata.size() + snapshot.Data.size() + 4;
+    if (encoding->TotalBytes > TSnapshot::MaxBytes)
+        throw std::runtime_error("Snapshot exceeds size limit");
+    TChecksum checksum;
+    checksum.Update(encoding->Metadata);
+    checksum.Update(snapshot.Data);
+    encoding->Checksum = checksum.Finish();
+    return encoding;
+}
+
+uint64_t SnapshotEncodingSize(const TSnapshotEncoding& encoding) {
+    return encoding.TotalBytes;
+}
+
+void CopySnapshotEncodingRange(const TSnapshot& snapshot, const TSnapshotEncoding& encoding,
+        uint64_t offset, char* destination, size_t length) {
+    if (offset > encoding.TotalBytes || length > encoding.TotalBytes - offset ||
+        (length && !destination) || encoding.TotalBytes != encoding.Metadata.size() + snapshot.Data.size() + 4)
+        throw std::invalid_argument("Invalid snapshot encoding range");
+    char checksumBytes[4];
+    for (unsigned i = 0; i < 4; ++i) checksumBytes[i] = char(encoding.Checksum >> (8 * i));
+    const std::string_view checksum(checksumBytes, sizeof(checksumBytes));
+    size_t written = 0;
+    auto copyPart = [&](std::string_view part, uint64_t partOffset) {
+        if (written == length || offset >= partOffset + part.size()) return;
+        const auto begin = offset > partOffset ? size_t(offset - partOffset) : 0;
+        const auto count = std::min(length - written, part.size() - begin);
+        if (count) memcpy(destination + written, part.data() + begin, count);
+        written += count;
+        offset += count;
+    };
+    copyPart(encoding.Metadata, 0);
+    copyPart(snapshot.Data, encoding.Metadata.size());
+    copyPart(checksum, encoding.Metadata.size() + snapshot.Data.size());
+    if (written != length) throw std::logic_error("Incomplete snapshot encoding range");
 }
 
 TSnapshot DecodeSnapshot(std::string_view bytes) {

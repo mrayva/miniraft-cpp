@@ -29,12 +29,20 @@ struct TReader {
         return value;
     }
 };
-inline uint32_t Checksum(std::string_view bytes) {
-    uint32_t crc = UINT32_MAX;
-    for (uint8_t byte : bytes) {
-        crc ^= byte;
-        for (int i = 0; i < 8; ++i) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+struct TChecksum {
+    uint32_t State = UINT32_MAX;
+    void Update(std::string_view bytes) {
+        auto& crc = State;
+        for (uint8_t byte : bytes) {
+            crc ^= byte;
+            for (int i = 0; i < 8; ++i) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+        }
     }
-    return ~crc;
+    uint32_t Finish() const { return ~State; }
+};
+inline uint32_t Checksum(std::string_view bytes) {
+    TChecksum checksum;
+    checksum.Update(bytes);
+    return checksum.Finish();
 }
 }

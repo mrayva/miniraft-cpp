@@ -54,6 +54,13 @@ struct TSnapshot {
 };
 std::string EncodeSnapshot(const TSnapshot& snapshot);
 TSnapshot DecodeSnapshot(std::string_view bytes);
+struct TSnapshotEncoding;
+// Keeps only serialized metadata and the image checksum. The snapshot must
+// remain immutable while ranges are copied from this prepared encoding.
+std::shared_ptr<const TSnapshotEncoding> PrepareSnapshotEncoding(const TSnapshot& snapshot);
+uint64_t SnapshotEncodingSize(const TSnapshotEncoding& encoding);
+void CopySnapshotEncodingRange(const TSnapshot& snapshot, const TSnapshotEncoding& encoding,
+    uint64_t offset, char* destination, size_t length);
 // Validate metadata and size without copying the application image.
 void ValidateSnapshot(const TSnapshot& snapshot);
 // Preserve a trusted stable identity on legacy refresh and validate snapshot

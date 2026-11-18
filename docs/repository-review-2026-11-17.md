@@ -87,9 +87,11 @@ callers must still handle capacity changes before proposing.
   stable set, then install the anchored snapshot on return as a learner. The
   guard remains necessary while that node is still an active voter.
 - Snapshots are complete in-memory images, capped at 64 MiB including metadata
-  (`snapshot.h`). Transfer is chunked, but capture, encoding and installation
-  still materialize the whole image. Large databases need streaming or logical
-  object snapshots and resource accounting.
+  (`snapshot.h`). Outbound transfer now encodes each chunk directly from the
+  pinned snapshot, avoiding a second full encoded image at the sender. Capture,
+  durable storage encoding and receiver installation still materialize full
+  images. Large databases need streaming or logical object snapshots and
+  resource accounting.
 - Recovery history is now bounded to 256 transitions (MRFTS008/MRFTS009); the
   legacy MRFTS006/MRFTS007 formats remain capped at 32. Automatic stale-store
   recovery requires a locally anchored history and the sender membership
