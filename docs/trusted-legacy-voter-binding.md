@@ -40,6 +40,17 @@ This API records the caller's assertion; it cannot prove the assertion is
 correct, discover prior membership transitions hidden by a legacy snapshot, or
 authorize a membership change. Existing `BindVoters` behavior is unchanged.
 Do not call the migration API when the original complete voter set is unknown.
+
+For an unbound MRFTD002 image whose snapshot contains configuration metadata,
+use `CanBindVotersFromTrustedHistory(voters, commitIndex, &reason)` and
+`BindVotersFromTrustedHistory(voters, commitIndex)`. This path requires the
+snapshot's complete retained transition chain to begin at configuration index
+zero with `voters` as its original set. It validates retained suffix entries
+against that snapshot baseline, preserves the supplied commit boundary, and
+publishes the binding before startup. Histories truncated before the original
+transition remain unprovable and are rejected. The commit boundary and the
+completeness of `voters` still require independent records.
+
 The migration applies to `TDurableState`; legacy `TDiskState` remains unable to
 persist voter bindings. For un-compacted split `TDiskState` files, the separate
 Linux [offline converter](legacy-disk-state-migration.md) copies the log to a
@@ -47,11 +58,12 @@ new durable base and additionally requires an independently known commit
 index. Since alpha.52, Raft rejects recovered log-only durable stores with no
 binding, so either migration must be completed before startup.
 
-Tests cover MRFTD001, MRFTD002 and MRFTD003 recovery, rejection
-of inconsistent vote/snapshot baselines and configuration log entries without
-rewriting the source file, and the current MRFTD004 binding after publication
-and restart. Dry-run tests verify both successful and rejected checks preserve
-the source bytes, and that diagnostics are cleared on success. Legacy formats
-recover their commit floor at the snapshot boundary.
+Tests cover MRFTD001, MRFTD002 and MRFTD003 recovery, rejection of inconsistent
+vote/snapshot baselines and unanchored configuration history without rewriting
+the source file, and the current MRFTD004 binding after publication and restart.
+Dry-run tests verify both successful and rejected checks preserve the source
+bytes, and that diagnostics are cleared on success. Legacy formats recover
+their commit floor at the snapshot boundary; the explicit history API accepts a
+separately supplied commit boundary.
 
 Self-review completed. No independent reviewer approval is claimed.

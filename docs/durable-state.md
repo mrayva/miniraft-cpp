@@ -18,6 +18,11 @@ optional encoded snapshot, then retained log records. The CRC covers the v4 magi
 and payload. MRFTD001, MRFTD002 and MRFTD003 remain readable; their commit floor
 is conservatively initialized to SnapshotIndex, since those formats did not
 record commit progress. Their next successful publication writes MRFTD004.
+Recovered unbound MRFTD002 snapshots with configuration metadata remain offline
+until explicitly bound. `BindVotersFromTrustedHistory` accepts them only when
+their complete retained membership chain starts from the independently trusted
+original voter set; it also requires an independently supplied commit boundary.
+Incomplete or truncated history remains unavailable for automatic recovery.
 
 At alpha.3, this closed commit-boundary recovery for `TDurableState`; live
 membership changes and joint consensus were added in later milestones. The

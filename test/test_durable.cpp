@@ -47,7 +47,8 @@ uint32_t Crc32(std::string_view bytes) {
     }
     return ~crc;
 }
-std::string LegacyImage(std::string_view magic, bool hasSnapshot, bool configured) {
+std::string LegacyImage(std::string_view magic, bool hasSnapshot, bool configured,
+        const TSnapshot* replacementSnapshot = nullptr) {
     std::string payload;
     Put(payload, 3, 8); // current term
     Put(payload, 1, 4); // vote
@@ -56,7 +57,8 @@ std::string LegacyImage(std::string_view magic, bool hasSnapshot, bool configure
         Put(payload, 2, 4); Put(payload, 1, 4); Put(payload, 2, 4);
     }
     if (hasSnapshot) {
-        const auto image = EncodeSnapshot(TSnapshot{1, 2, {1, 2}, "legacy snapshot"});
+        const auto image = EncodeSnapshot(replacementSnapshot ? *replacementSnapshot :
+            TSnapshot{1, 2, {1, 2}, "legacy snapshot"});
         Put(payload, image.size(), 8); payload.append(image);
     }
     Put(payload, 3, 8); Put(payload, 0, 8); Put(payload, 4, 4); payload.append("tail");
@@ -100,6 +102,84 @@ void test_v1_v2_v3_images_recover_conservatively_and_upgrade_on_publish(void**) 
         std::ifstream upgraded(files.Image(), std::ios::binary);
         std::string published(8, '\0'); upgraded.read(published.data(), published.size());
         assert_true(published == "MRFTD004");
+    }
+}
+void test_legacy_configuration_snapshot_migration_requires_complete_trusted_history(void**) {
+    const std::vector<uint32_t> originalVoters{1, 2, 3};
+    const std::vector<uint32_t> newVoters{2, 3, 4};
+    auto history = TConfigurationHistory::Stable(originalVoters, 0, 0, 0, 0);
+    history = history.Advance(1, EncodeConfigurationEntry({
+        EConfigurationPhase::Joint, 2, 0, 0, originalVoters, newVoters}));
+    auto snapshot = history.MakeSnapshot("legacy snapshot");
+
+    TFiles files;
+    const auto legacy = LegacyImage("MRFTD002", true, false, &snapshot);
+    { std::ofstream output(files.Image(), std::ios::binary); output.write(legacy.data(), legacy.size()); }
+    {
+        TDurableState state(files.Name, 1);
+        assert_true(state.HasUnboundRecoveredState());
+        assert_true(state.GetSnapshot()->IsJoint());
+        std::string reason;
+        assert_false(state.CanBindVotersFromTrustedBaseline(originalVoters, &reason));
+        assert_true(!reason.empty());
+        assert_false(state.CanBindVotersFromTrustedHistory({1, 2, 4}, 2, &reason));
+        assert_true(!reason.empty());
+        assert_true(state.CanBindVotersFromTrustedHistory(originalVoters, 2, &reason));
+        assert_true(reason.empty());
+        state.BindVotersFromTrustedHistory(originalVoters, 2);
+        assert_false(state.HasUnboundRecoveredState());
+        assert_int_equal(state.CommitIndex, 2);
+    }
+    {
+        TDurableState recovered(files.Name, 1);
+        assert_true(recovered.GetBoundVoters() == originalVoters);
+        const auto scan = ScanCommittedConfigurationHistory(recovered,
+            TConfigurationHistory::FromJointSnapshot(*recovered.GetSnapshot()));
+        assert_true(scan.Committed.IsJoint());
+        assert_true(scan.Committed.NewVoters() == newVoters);
+        assert_false(scan.HasUncommittedConfiguration());
+    }
+
+    auto stableHistory = TConfigurationHistory::Stable(originalVoters, 0, 0, 0, 0);
+    stableHistory = stableHistory.Advance(1, EncodeConfigurationEntry({
+        EConfigurationPhase::Joint, 2, 0, 0, originalVoters, newVoters}));
+    stableHistory = stableHistory.Advance(2, EncodeConfigurationEntry({
+        EConfigurationPhase::Stable, 3, 1, 2, originalVoters, newVoters}));
+    auto stableSnapshot = stableHistory.MakeSnapshot("stable legacy snapshot");
+    TFiles stableFiles;
+    const auto stableLegacy = LegacyImage("MRFTD002", true, false, &stableSnapshot);
+    { std::ofstream output(stableFiles.Image(), std::ios::binary); output.write(stableLegacy.data(), stableLegacy.size()); }
+    {
+        TDurableState state(stableFiles.Name, 1);
+        state.BindVotersFromTrustedHistory(originalVoters, 3);
+    }
+    {
+        TDurableState recovered(stableFiles.Name, 1);
+        const auto scan = ScanCommittedConfigurationHistory(recovered,
+            TConfigurationHistory::FromStableSnapshot(*recovered.GetSnapshot()));
+        assert_false(scan.Committed.IsJoint());
+        assert_true(scan.Committed.OldVoters() == newVoters);
+        assert_int_equal(scan.Committed.ConfigurationIndex(), 2);
+        assert_false(scan.HasUncommittedConfiguration());
+    }
+
+    auto unanchored = TSnapshot{1, 2, newVoters, "legacy snapshot"};
+    unanchored.JointVoters = {3, 4};
+    unanchored.ConfigurationIndex = 1;
+    unanchored.ConfigurationTerm = 2;
+    TFiles untrustedFiles;
+    const auto untrusted = LegacyImage("MRFTD002", true, false, &unanchored);
+    { std::ofstream output(untrustedFiles.Image(), std::ios::binary); output.write(untrusted.data(), untrusted.size()); }
+    {
+        TDurableState state(untrustedFiles.Name, 1);
+        std::string reason;
+        assert_false(state.CanBindVotersFromTrustedHistory(originalVoters, 2, &reason));
+        assert_true(!reason.empty());
+        bool rejected = false;
+        try { state.BindVotersFromTrustedHistory(originalVoters, 2); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        assert_true(rejected);
+        assert_true(state.HasUnboundRecoveredState());
     }
 }
 void TFiles::Seed() {
@@ -534,6 +614,7 @@ int main() {
         cmocka_unit_test(test_missing_image_is_not_recreated),
         cmocka_unit_test(test_legacy_store_is_not_silently_migrated),
         cmocka_unit_test(test_split_legacy_disk_state_migration_requires_trusted_baselines),
+        cmocka_unit_test(test_legacy_configuration_snapshot_migration_requires_complete_trusted_history),
         cmocka_unit_test(test_get_and_append_do_not_share_mutable_entries),
         cmocka_unit_test(test_raft_election_and_application_replay_after_restart),
     };

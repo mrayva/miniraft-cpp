@@ -183,7 +183,7 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
             throw std::runtime_error("Invalid embedded snapshot size");
         if (length) {
             auto snapshot = DecodeSnapshot(std::string_view(reinterpret_cast<const char*>(bytes.data() + position), size_t(length)));
-            if (!SnapshotCompatibleWithVoterBinding(snapshot, Impl->Voters))
+            if (!Impl->Voters.empty() && !SnapshotCompatibleWithVoterBinding(snapshot, Impl->Voters))
                 throw std::runtime_error("Durable snapshot is incompatible with the persisted voter binding");
             if (snapshot.Term > CurrentTerm) throw std::runtime_error("Future durable snapshot term");
             position += size_t(length);
@@ -199,8 +199,6 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
         if (!length && compacted) throw std::runtime_error("Missing embedded snapshot");
         if (length) {
             auto snapshot = DecodeSnapshot(std::string_view(reinterpret_cast<const char*>(bytes.data() + position), size_t(length)));
-            if (snapshot.HasConfigurationMetadata() && !configured)
-                throw std::runtime_error("Configuration snapshot recovery requires a bound voter set");
             if (snapshot.Term > CurrentTerm) throw std::runtime_error("Future durable snapshot term");
             if (configured && !SnapshotCompatibleWithVoterBinding(snapshot, Impl->Voters))
                 throw std::runtime_error("Durable snapshot is incompatible with the persisted voter binding");
@@ -459,6 +457,112 @@ void TDurableState::BindVotersFromTrustedBaseline(const std::vector<uint32_t>& v
     // Persist the operator-supplied baseline before Raft can serve votes or
     // install configuration snapshots against it.
     Impl->Voters = voters;
+    Commit();
+}
+
+namespace {
+TConfigurationHistory TrustedSnapshotHistory(const TSnapshot& snapshot,
+        const std::vector<uint32_t>& voters) {
+    if (!snapshot.HasConfigurationMetadata()) {
+        if (snapshot.Voters != voters)
+            throw std::invalid_argument("Legacy snapshot does not match the trusted voter baseline");
+        return TConfigurationHistory::Stable(voters, 0, 0, snapshot.Index, snapshot.Term);
+    }
+
+    auto history = snapshot.IsJoint()
+        ? TConfigurationHistory::FromJointSnapshot(snapshot)
+        : TConfigurationHistory::FromStableSnapshot(snapshot);
+    const auto& transitions = history.ConfigurationTransitions();
+    if (transitions.empty() || transitions.front().PreviousConfigurationIndex != 0 ||
+        transitions.front().PreviousConfigurationTerm != 0 || transitions.front().OldVoters != voters)
+        throw std::invalid_argument("Snapshot membership history is not anchored to the trusted original voter set");
+    return history;
+}
+
+void AddSnapshotVoters(const TConfigurationHistory& history, std::vector<uint32_t>& voters) {
+    for (const auto& transition : history.ConfigurationTransitions()) {
+        voters.insert(voters.end(), transition.OldVoters.begin(), transition.OldVoters.end());
+        voters.insert(voters.end(), transition.NewVoters.begin(), transition.NewVoters.end());
+    }
+    voters.insert(voters.end(), history.OldVoters().begin(), history.OldVoters().end());
+    voters.insert(voters.end(), history.NewVoters().begin(), history.NewVoters().end());
+}
+}
+
+void TDurableState::ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex) const {
+    ValidateFixedVoters(voters);
+    if (Impl->RaftStarted)
+        throw std::invalid_argument("Trusted legacy history migration must happen before Raft startup");
+    if (!Impl->Voters.empty())
+        throw std::invalid_argument("Trusted legacy history migration requires an unbound store");
+    if (!Impl->Recovered)
+        throw std::invalid_argument("Trusted legacy history migration is only for recovered state");
+    if (!CurrentTerm || LastLogIndex > uint64_t(INT64_MAX) || SnapshotIndex > LastLogIndex ||
+        LastLogIndex - SnapshotIndex != Impl->Log.size() || commitIndex < SnapshotIndex ||
+        commitIndex > LastLogIndex || commitIndex < CommitIndex)
+        throw std::invalid_argument("Invalid trusted history migration boundaries");
+
+    TConfigurationHistory baseline = TConfigurationHistory::Stable(
+        voters, 0, 0, SnapshotIndex, SnapshotTerm);
+    std::vector<uint32_t> historicalVoters = voters;
+    if (Impl->Snapshot) {
+        const auto& snapshot = *Impl->Snapshot;
+        ValidateSnapshot(snapshot);
+        if (snapshot.Index != SnapshotIndex || snapshot.Term != SnapshotTerm || snapshot.Term > CurrentTerm)
+            throw std::invalid_argument("Legacy snapshot boundary mismatch");
+        baseline = TrustedSnapshotHistory(snapshot, voters);
+        AddSnapshotVoters(baseline, historicalVoters);
+    } else if (SnapshotIndex || SnapshotTerm) {
+        throw std::invalid_argument("Legacy compacted state is missing its snapshot");
+    }
+
+    auto previousTerm = SnapshotTerm;
+    for (uint64_t index = SnapshotIndex + 1; index <= LastLogIndex; ++index) {
+        const auto entry = Get(static_cast<int64_t>(index));
+        if (!entry) throw std::invalid_argument("Missing retained legacy log entry");
+        ValidateMessageTree(entry);
+        if (entry->Flags == TLogEntry::EConfiguration) {
+            const auto record = DecodeConfigurationEntry(entry);
+            historicalVoters.insert(historicalVoters.end(), record.OldVoters.begin(), record.OldVoters.end());
+            historicalVoters.insert(historicalVoters.end(), record.NewVoters.begin(), record.NewVoters.end());
+        } else if (entry->Flags != TLogEntry::ENone && entry->Flags != TLogEntry::EStub) {
+            throw std::invalid_argument("Legacy log contains unsupported entry flags");
+        }
+        if (!entry->Term || entry->Term < previousTerm || entry->Term > CurrentTerm)
+            throw std::invalid_argument("Invalid legacy log term sequence");
+        previousTerm = entry->Term;
+    }
+    if (LastLogTerm != previousTerm)
+        throw std::invalid_argument("Legacy log last term mismatch");
+
+    (void)ScanConfigurationHistory(*this, baseline, commitIndex);
+    std::sort(historicalVoters.begin(), historicalVoters.end());
+    historicalVoters.erase(std::unique(historicalVoters.begin(), historicalVoters.end()), historicalVoters.end());
+    if (VotedFor && !std::binary_search(historicalVoters.begin(), historicalVoters.end(), VotedFor))
+        throw std::invalid_argument("Stored vote is outside the validated membership history");
+}
+
+bool TDurableState::CanBindVotersFromTrustedHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex, std::string* reason) const {
+    if (reason) reason->clear();
+    try {
+        ValidateTrustedLegacyVoterHistory(voters, commitIndex);
+        return true;
+    } catch (const std::exception& error) {
+        if (reason) *reason = error.what();
+        return false;
+    } catch (...) {
+        if (reason) *reason = "Unknown trusted legacy history validation failure";
+        return false;
+    }
+}
+
+void TDurableState::BindVotersFromTrustedHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex) {
+    ValidateTrustedLegacyVoterHistory(voters, commitIndex);
+    Impl->Voters = voters;
+    CommitIndex = commitIndex;
     Commit();
 }
 

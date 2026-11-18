@@ -687,7 +687,15 @@ void test_unbound_durable_configuration_snapshot_recovery_fails_closed(void**) {
     const auto crc = NSnapshotCodec::Checksum(bytes.substr(0, 8) + bytes.substr(20));
     for (int i = 0; i < 4; ++i) bytes[16 + i] = char(crc >> (8 * i));
     { std::ofstream output(path, std::ios::binary | std::ios::trunc); output.write(bytes.data(), bytes.size()); }
-    Reject([&] { TDurableState state(files.Name, 1); });
+    {
+        auto state = std::make_shared<TDurableState>(files.Name, 1);
+        assert_true(state->HasUnboundRecoveredState());
+        std::string reason;
+        assert_false(state->CanBindVotersFromTrustedBaseline({1, 2, 3}, &reason));
+        assert_false(state->CanBindVotersFromTrustedHistory({1, 2, 3}, 2, &reason));
+        Reject([&] { TRaft raft(state, 1,
+            TNodeDict{{2, std::make_shared<TSink>()}, {3, std::make_shared<TSink>()}}); });
+    }
     std::ifstream after(path, std::ios::binary);
     assert_true(std::string(std::istreambuf_iterator<char>(after), {}) == bytes);
 }

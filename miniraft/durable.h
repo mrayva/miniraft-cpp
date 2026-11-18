@@ -64,11 +64,20 @@ public:
     bool CanBindVotersFromTrustedBaseline(const std::vector<uint32_t>& voters,
         std::string* reason = nullptr) const;
     void BindVotersFromTrustedBaseline(const std::vector<uint32_t>& voters);
+    // Migrates a recovered unbound image when its snapshot carries complete
+    // membership lineage from the trusted original set. commitIndex must come
+    // from an independent application/deployment record.
+    bool CanBindVotersFromTrustedHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex, std::string* reason = nullptr) const;
+    void BindVotersFromTrustedHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex);
 private:
     friend TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(
         const std::string&, const std::string&, uint32_t,
         const std::vector<uint32_t>&, uint64_t);
     void ValidateTrustedLegacyVoterBaseline(const std::vector<uint32_t>& voters) const;
+    void ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex) const;
     void InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated);
     struct TImpl;
     std::unique_ptr<TImpl> Impl;
