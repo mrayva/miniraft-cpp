@@ -387,6 +387,8 @@ private:
     uint32_t Seed = 31337;
 };
 
+struct TRequestProcessorTestAccess;
+
 class TRequestProcessor {
 public:
     struct TAdmissionLimits {
@@ -407,8 +409,12 @@ public:
 
     void CheckStateChange();
     void OnCommandRequest(TMessageHolder<TCommandRequest> message, const std::shared_ptr<INode>& replyTo);
+    void OnForwardedCommandRequest(TMessageHolder<TForwardedCommandRequest> message,
+                                   const std::shared_ptr<INode>& peer);
     // Unattributed responses are ignored; pass the configured outbound peer.
     void OnCommandResponse(TMessageHolder<TCommandResponse> message, const std::shared_ptr<INode>& peer = {});
+    void OnForwardedCommandResponse(TMessageHolder<TForwardedCommandResponse> message,
+                                    const std::shared_ptr<INode>& peer);
     void OnPeerDisconnected(const std::shared_ptr<INode>& peer);
     // Keep command forwarding aligned with runtime peer endpoint changes.
     void AddPeerEndpoint(uint32_t id, std::shared_ptr<INode> peer);
@@ -418,6 +424,8 @@ public:
     void CleanUp(const std::shared_ptr<INode>& replyTo);
 
 private:
+    // Test seam for exercising the wire-cookie boundary without billions of requests.
+    friend struct TRequestProcessorTestAccess;
     bool TryAdmit(const TMessageHolder<TCommandRequest>& message, const std::shared_ptr<INode>& replyTo,
                   uint64_t& admissionId);
     bool AdmissionExpired(uint64_t admissionId, ITimeSource::Time now) const;
@@ -476,8 +484,9 @@ private:
         uint64_t Term;
         uint64_t AdmissionId;
     };
-    // Never reuse a wire cookie within this processor, including after failure.
-    uint64_t NextForwardCookie = 1;
-    std::unordered_map<uint32_t, TForwarded> Forwarded;
+    // Never reuse a wire correlation ID within this processor, including after
+    // failure. IDs above uint32 use the extended forwarded-command envelope.
+    uint64_t NextForwardId = 1;
+    std::unordered_map<uint64_t, TForwarded> Forwarded;
 };
 

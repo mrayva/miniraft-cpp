@@ -36,6 +36,8 @@ enum class EMessageType : uint32_t {
     CONFIGURATION_BARRIER_RESPONSE = 12,
     PRE_VOTE_REQUEST = 13,
     PRE_VOTE_RESPONSE = 14,
+    FORWARDED_COMMAND_REQUEST = 15,
+    FORWARDED_COMMAND_RESPONSE = 16,
 };
 
 struct TMessage {
@@ -209,6 +211,30 @@ struct TCommandResponse: public TMessage {
 };
 
 static_assert(sizeof(TCommandResponse) == sizeof(TMessage) + 16);
+
+// Internal forwarding envelope used after the legacy 32-bit command cookie
+// range is exhausted. Its opaque payload is the original TCommandRequest data.
+struct TForwardedCommandRequest: public TMessage {
+    static constexpr EMessageType MessageType = EMessageType::FORWARDED_COMMAND_REQUEST;
+    uint64_t ForwardCookie = 0;
+    uint32_t Flags = TCommandRequest::ENone;
+    uint32_t ClientCookie = 0;
+    char Data[0];
+};
+static_assert(sizeof(TForwardedCommandRequest) == sizeof(TMessage) + 16);
+
+// Response fields are carried directly, replacing the 32-bit client cookie
+// slot with the 64-bit forwarding correlation while preserving the response
+// index, application error and data.
+struct TForwardedCommandResponse: public TMessage {
+    static constexpr EMessageType MessageType = EMessageType::FORWARDED_COMMAND_RESPONSE;
+    uint64_t ForwardCookie = 0;
+    uint64_t Index = 0;
+    uint32_t ClientCookie = 0;
+    uint32_t ErrorCode = 0;
+    char Data[0];
+};
+static_assert(sizeof(TForwardedCommandResponse) == sizeof(TMessage) + 24);
 
 struct TTimeout {
     static constexpr std::chrono::milliseconds Election = std::chrono::milliseconds(5000);

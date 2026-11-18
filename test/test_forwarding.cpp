@@ -8,6 +8,12 @@ extern "C" {
 #include <cmocka.h>
 }
 
+struct TRequestProcessorTestAccess {
+    static void StartForwardIdAt(TRequestProcessor& processor, uint64_t next) {
+        processor.NextForwardId = next;
+    }
+};
+
 namespace {
 struct TEndpoint : INode {
     std::function<void(TMessageHolder<TMessage>)> Callback;
@@ -37,9 +43,12 @@ struct TClient {
 };
 struct TFollower {
     std::vector<TMessageHolder<TCommandRequest>> Sent;
+    std::vector<TMessageHolder<TForwardedCommandRequest>> ExtendedSent;
     std::shared_ptr<TEndpoint> Leader = std::make_shared<TEndpoint>([this](auto message) {
         if (message->Type == uint32_t(EMessageType::COMMAND_REQUEST))
             Sent.push_back(message.template Cast<TCommandRequest>());
+        else if (message->Type == uint32_t(EMessageType::FORWARDED_COMMAND_REQUEST))
+            ExtendedSent.push_back(message.template Cast<TForwardedCommandRequest>());
     });
     std::shared_ptr<TEndpoint> Other = std::make_shared<TEndpoint>([this](auto message) {
         if (message->Type == uint32_t(EMessageType::COMMAND_REQUEST))
@@ -198,6 +207,96 @@ void test_forwarding_copies_request_and_marks_one_hop(void**) {
     assert_int_equal(original->Flags, TCommandRequest::EWrite);
     assert_true(follower.Sent[0]->Flags & TCommandRequest::EForwarded);
     assert_true(follower.Sent[0].RawData != original.RawData);
+}
+void test_forwarding_extends_correlation_past_32_bit_cookie_range(void**) {
+    TFollower follower;
+    TRequestProcessorTestAccess::StartForwardIdAt(follower.Processor, UINT32_MAX);
+    TClient client;
+    follower.Request(client, 51);
+    follower.Request(client, 52);
+
+    assert_int_equal(follower.Sent.size(), 1);
+    assert_int_equal(follower.Sent[0]->Cookie, UINT32_MAX);
+    assert_int_equal(follower.ExtendedSent.size(), 1);
+    const auto extendedCookie = uint64_t(UINT32_MAX) + 1;
+    assert_true(follower.ExtendedSent[0]->ForwardCookie == extendedCookie);
+    assert_int_equal(follower.ExtendedSent[0]->ClientCookie, 52);
+    assert_true(follower.ExtendedSent[0]->Flags & TCommandRequest::EForwarded);
+    assert_memory_equal(follower.ExtendedSent[0]->Data, "value", 5);
+
+    auto nested = NewHoldedMessage<TCommandResponse>(sizeof(TCommandResponse) + 6);
+    nested->Cookie = 52;
+    nested->Index = 77;
+    memcpy(nested->Data, "answer", 6);
+    auto extendedReply = NewHoldedMessage<TForwardedCommandResponse>(
+        sizeof(TForwardedCommandResponse) + 6);
+    extendedReply->ForwardCookie = extendedCookie;
+    extendedReply->Index = nested->Index;
+    extendedReply->ClientCookie = nested->Cookie;
+    extendedReply->ErrorCode = nested->ErrorCode;
+    memcpy(extendedReply->Data, nested->Data, 6);
+    follower.Processor.OnForwardedCommandResponse(extendedReply, follower.Leader);
+    assert_int_equal(client.Replies.size(), 1);
+    assert_int_equal(client.Replies[0].Cookie, 52);
+    assert_string_equal(client.Replies[0].Data.c_str(), "answer");
+
+    follower.Reply(0);
+    assert_int_equal(client.Replies.size(), 2);
+    assert_int_equal(client.Replies[1].Cookie, 51);
+}
+void test_forwarding_cookie_exhaustion_never_wraps_or_reuses(void**) {
+    TFollower follower;
+    TRequestProcessorTestAccess::StartForwardIdAt(follower.Processor, UINT64_MAX);
+    TClient client;
+    follower.Request(client, 61);
+    follower.Request(client, 62);
+
+    assert_int_equal(follower.ExtendedSent.size(), 1);
+    assert_true(follower.ExtendedSent[0]->ForwardCookie == UINT64_MAX);
+    assert_int_equal(client.Replies.size(), 1);
+    assert_int_equal(client.Replies[0].Cookie, 62);
+    assert_int_equal(client.Replies[0].Error, TCommandResponse::Failed);
+
+    auto response = NewHoldedMessage<TForwardedCommandResponse>(sizeof(TForwardedCommandResponse) + 6);
+    response->ForwardCookie = UINT64_MAX;
+    memcpy(response->Data, "answer", 6);
+    follower.Processor.OnForwardedCommandResponse(response, follower.Leader);
+    assert_int_equal(client.Replies.size(), 2);
+    assert_int_equal(client.Replies[1].Cookie, 61);
+    assert_string_equal(client.Replies[1].Data.c_str(), "answer");
+}
+void test_oversized_extended_forwarding_fails_without_sending(void**) {
+    TFollower follower;
+    TRequestProcessorTestAccess::StartForwardIdAt(
+        follower.Processor, uint64_t(UINT32_MAX) + 1);
+    TClient client;
+    auto request = NewHoldedMessage<TCommandRequest>(TMessageLimits{}.MaxFrameBytes);
+    request->Cookie = 63;
+    request->Flags = TCommandRequest::EWrite;
+    follower.Processor.OnCommandRequest(request, client.Endpoint);
+
+    assert_true(follower.Sent.empty());
+    assert_true(follower.ExtendedSent.empty());
+    assert_int_equal(client.Replies.size(), 1);
+    assert_int_equal(client.Replies[0].Cookie, 63);
+    assert_int_equal(client.Replies[0].Error, TCommandResponse::Overloaded);
+}
+void test_extended_forwarded_request_returns_extended_response(void**) {
+    TFollower follower;
+    std::vector<TMessageHolder<TMessage>> replies;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) { replies.push_back(std::move(message)); });
+    auto request = NewHoldedMessage<TForwardedCommandRequest>(sizeof(TForwardedCommandRequest) + 5);
+    request->ForwardCookie = uint64_t(UINT32_MAX) + 1;
+    request->Flags = TCommandRequest::EWrite | TCommandRequest::EForwarded;
+    request->ClientCookie = 91;
+    memcpy(request->Data, "value", 5);
+    follower.Processor.OnForwardedCommandRequest(request, peer);
+
+    assert_int_equal(replies.size(), 1);
+    auto response = replies.back().Cast<TForwardedCommandResponse>();
+    assert_true(response->ForwardCookie == request->ForwardCookie);
+    assert_int_equal(response->ClientCookie, 91);
+    assert_int_equal(response->ErrorCode, TCommandResponse::Failed);
 }
 void test_out_of_order_and_duplicate_replies_preserve_client_routes(void**) {
     TFollower follower;
@@ -375,6 +474,10 @@ int main() {
         cmocka_unit_test(test_nonzero_client_cookies_are_forwarded),
         cmocka_unit_test(test_zero_client_cookie_is_restored),
         cmocka_unit_test(test_forwarding_copies_request_and_marks_one_hop),
+        cmocka_unit_test(test_forwarding_extends_correlation_past_32_bit_cookie_range),
+        cmocka_unit_test(test_forwarding_cookie_exhaustion_never_wraps_or_reuses),
+        cmocka_unit_test(test_oversized_extended_forwarding_fails_without_sending),
+        cmocka_unit_test(test_extended_forwarded_request_returns_extended_response),
         cmocka_unit_test(test_out_of_order_and_duplicate_replies_preserve_client_routes),
         cmocka_unit_test(test_forwarded_request_is_rejected_on_term_change),
         cmocka_unit_test(test_candidate_transition_rejects_forwarded_requests),

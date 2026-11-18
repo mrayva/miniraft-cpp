@@ -17,6 +17,48 @@
 
 namespace {
 
+class TForwardedCommandReplyNode final : public INode {
+public:
+    TForwardedCommandReplyNode(std::shared_ptr<INode> peer, uint64_t forwardCookie)
+        : Peer(std::move(peer)), ForwardCookie(forwardCookie) { }
+
+    void Send(TMessageHolder<TMessage> message) override {
+        Peer->Send(Wrap(std::move(message)));
+    }
+
+    bool TrySend(TMessageHolder<TMessage> message) override {
+        return Peer->TrySend(Wrap(std::move(message)));
+    }
+
+    void Drain() override { Peer->Drain(); }
+
+private:
+    TMessageHolder<TMessage> Wrap(TMessageHolder<TMessage> message) const {
+        if (!message || message->Type != uint32_t(EMessageType::COMMAND_RESPONSE))
+            throw TMessageError("Forwarded command produced a non-response message");
+        ValidateMessageTree(message);
+        auto response = message.Cast<TCommandResponse>();
+        const auto dataBytes = response->Len - sizeof(TCommandResponse);
+        constexpr size_t ExtendedResponseOverhead =
+            sizeof(TForwardedCommandResponse) - sizeof(TCommandResponse);
+        const bool responseTooLarge = response->Len >
+            TMessageLimits{}.MaxFrameBytes - ExtendedResponseOverhead;
+        auto forwarded = NewHoldedMessage<TForwardedCommandResponse>(
+            responseTooLarge ? sizeof(TForwardedCommandResponse) :
+                sizeof(TForwardedCommandResponse) + dataBytes);
+        forwarded->ForwardCookie = ForwardCookie;
+        forwarded->Index = response->Index;
+        forwarded->ClientCookie = response->Cookie;
+        forwarded->ErrorCode = responseTooLarge ? TCommandResponse::Failed : response->ErrorCode;
+        if (!responseTooLarge && dataBytes) memcpy(forwarded->Data, response->Data, dataBytes);
+        ValidateMessageTree(forwarded);
+        return forwarded;
+    }
+
+    std::shared_ptr<INode> Peer;
+    uint64_t ForwardCookie;
+};
+
 static uint32_t rand_(uint32_t* seed) {
     *seed ^= *seed << 13;
     *seed ^= *seed >> 17;
@@ -3023,29 +3065,50 @@ void TRequestProcessor::Forward(TMessageHolder<TCommandRequest> command,
     }
 
     if (stateName == EState::FOLLOWER) {
-        if (NextForwardCookie > UINT32_MAX) {
+        if (!NextForwardId) {
             ReleaseAdmission(admissionId);
             replyTo->Send(NewHoldedMessage(TCommandResponse{.Cookie = command->Cookie,
                 .ErrorCode = TCommandResponse::Failed}));
             return;
         }
-        const auto cookie = uint32_t(NextForwardCookie++);
-        auto forwarded = NewHoldedMessage<TCommandRequest>(command->Len);
-        memcpy(forwarded.Mes, command.Mes, command->Len);
-        forwarded->Cookie = cookie;
-        forwarded->Flags |= TCommandRequest::EForwarded;
+        constexpr size_t ExtendedRequestOverhead =
+            sizeof(TForwardedCommandRequest) - sizeof(TCommandRequest);
+        if (NextForwardId > UINT32_MAX &&
+            command->Len > TMessageLimits{}.MaxFrameBytes - ExtendedRequestOverhead) {
+            ReleaseAdmission(admissionId);
+            replyTo->Send(NewHoldedMessage(TCommandResponse{.Cookie = command->Cookie,
+                .ErrorCode = TCommandResponse::Overloaded}));
+            return;
+        }
+        const auto forwardId = NextForwardId;
+        NextForwardId = forwardId == UINT64_MAX ? 0 : forwardId + 1;
         auto peer = Nodes.at(leaderId);
-        Forwarded.emplace(cookie, TForwarded{replyTo, peer, command->Cookie,
-                                            leaderId, Raft->GetState()->CurrentTerm, admissionId});
+        Forwarded.emplace(forwardId, TForwarded{replyTo, peer, command->Cookie,
+                                                leaderId, Raft->GetState()->CurrentTerm, admissionId});
         bool accepted = false;
         try {
-            accepted = peer->TrySend(std::move(forwarded));
+            if (forwardId <= UINT32_MAX) {
+                auto forwarded = NewHoldedMessage<TCommandRequest>(command->Len);
+                memcpy(forwarded.Mes, command.Mes, command->Len);
+                forwarded->Cookie = uint32_t(forwardId);
+                forwarded->Flags |= TCommandRequest::EForwarded;
+                accepted = peer->TrySend(std::move(forwarded));
+            } else {
+                const auto payloadBytes = command->Len - sizeof(TCommandRequest);
+                auto forwarded = NewHoldedMessage<TForwardedCommandRequest>(
+                    sizeof(TForwardedCommandRequest) + payloadBytes);
+                forwarded->ForwardCookie = forwardId;
+                forwarded->Flags = command->Flags | TCommandRequest::EForwarded;
+                forwarded->ClientCookie = command->Cookie;
+                if (payloadBytes) memcpy(forwarded->Data, command->Data, payloadBytes);
+                accepted = peer->TrySend(std::move(forwarded));
+            }
         } catch (...) {
-            Forwarded.erase(cookie);
+            Forwarded.erase(forwardId);
             throw;
         }
         if (!accepted) {
-            Forwarded.erase(cookie);
+            Forwarded.erase(forwardId);
             ReleaseAdmission(admissionId);
             replyTo->Send(NewHoldedMessage(TCommandResponse{.Cookie = command->Cookie,
                 .ErrorCode = TCommandResponse::Overloaded}));
@@ -3250,6 +3313,25 @@ void TRequestProcessor::OnCommandRequest(TMessageHolder<TCommandRequest> command
     }
 }
 
+void TRequestProcessor::OnForwardedCommandRequest(TMessageHolder<TForwardedCommandRequest> message,
+        const std::shared_ptr<INode>& peer) {
+    if (!message.HasValidExtent() || message->Type != uint32_t(EMessageType::FORWARDED_COMMAND_REQUEST))
+        throw TMessageError("Invalid extended forwarded command request");
+    ValidateMessageTree(message);
+    if (!peer || message->ForwardCookie <= UINT32_MAX ||
+        !(message->Flags & TCommandRequest::EForwarded) ||
+        (message->Flags & ~(TCommandRequest::EWrite | TCommandRequest::EStale |
+            TCommandRequest::EConsistent | TCommandRequest::EForwarded)))
+        throw TMessageError("Invalid extended forwarded command metadata");
+    const auto payloadBytes = message->Len - sizeof(TForwardedCommandRequest);
+    auto command = NewHoldedMessage<TCommandRequest>(sizeof(TCommandRequest) + payloadBytes);
+    command->Flags = message->Flags;
+    command->Cookie = message->ClientCookie;
+    if (payloadBytes) memcpy(command->Data, message->Data, payloadBytes);
+    auto reply = std::make_shared<TForwardedCommandReplyNode>(peer, message->ForwardCookie);
+    OnCommandRequest(std::move(command), reply);
+}
+
 void TRequestProcessor::OnCommandResponse(TMessageHolder<TCommandResponse> command,
                                          const std::shared_ptr<INode>& peer) {
     if (!command.HasValidExtent() || command->Type != uint32_t(EMessageType::COMMAND_RESPONSE))
@@ -3265,6 +3347,28 @@ void TRequestProcessor::OnCommandResponse(TMessageHolder<TCommandResponse> comma
     memcpy(reply.Mes, command.Mes, command->Len);
     reply->Cookie = pending.OriginalCookie;
     pending.Client->Send(std::move(reply));
+}
+
+void TRequestProcessor::OnForwardedCommandResponse(TMessageHolder<TForwardedCommandResponse> message,
+        const std::shared_ptr<INode>& peer) {
+    if (!message.HasValidExtent() || message->Type != uint32_t(EMessageType::FORWARDED_COMMAND_RESPONSE))
+        throw TMessageError("Invalid extended forwarded command response");
+    ValidateMessageTree(message);
+    const auto dataBytes = message->Len - sizeof(TForwardedCommandResponse);
+    if (!peer || message->ForwardCookie <= UINT32_MAX)
+        throw TMessageError("Invalid extended forwarded response metadata");
+    PruneRequests();
+    auto it = Forwarded.find(message->ForwardCookie);
+    if (it == Forwarded.end() || it->second.Peer != peer) return;
+    auto pending = std::move(it->second);
+    Forwarded.erase(it);
+    ReleaseAdmission(pending.AdmissionId);
+    auto response = NewHoldedMessage<TCommandResponse>(sizeof(TCommandResponse) + dataBytes);
+    response->Index = message->Index;
+    response->Cookie = pending.OriginalCookie;
+    response->ErrorCode = message->ErrorCode;
+    if (dataBytes) memcpy(response->Data, message->Data, dataBytes);
+    pending.Client->Send(std::move(response));
 }
 
 void TRequestProcessor::OnPeerDisconnected(const std::shared_ptr<INode>& peer) {

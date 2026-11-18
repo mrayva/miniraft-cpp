@@ -20,7 +20,11 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(TSocket socket) {
         while (true) {
             auto mes = co_await TMessageReader(client->Sock()).Read();
             // client request
-            if (auto maybeCommandRequest = mes.template Maybe<TCommandRequest>()) {
+            if (auto maybeForwardedRequest = mes.template Maybe<TForwardedCommandRequest>()) {
+                RequestProcessor->OnForwardedCommandRequest(std::move(maybeForwardedRequest.Cast()), client);
+            } else if (auto maybeForwardedResponse = mes.template Maybe<TForwardedCommandResponse>()) {
+                RequestProcessor->OnForwardedCommandResponse(std::move(maybeForwardedResponse.Cast()), client);
+            } else if (auto maybeCommandRequest = mes.template Maybe<TCommandRequest>()) {
                 RequestProcessor->OnCommandRequest(std::move(maybeCommandRequest.Cast()), client);
             } else if (auto maybeCommandResponse = mes.template Maybe<TCommandResponse>()) {
                 RequestProcessor->OnCommandResponse(std::move(maybeCommandResponse.Cast()), client);
@@ -163,7 +167,10 @@ NNet::TVoidTask TRaftServer<TSocket>::OutboundServe(std::shared_ptr<TNode<TSocke
                 throw std::runtime_error("Not connected");
             }
             auto mes = co_await TMessageReader(node->Sock()).Read();
-            if (auto maybeCommandResponse = mes.template Maybe<TCommandResponse>()) {
+            if (auto maybeForwardedResponse = mes.template Maybe<TForwardedCommandResponse>()) {
+                RequestProcessor->OnForwardedCommandResponse(std::move(maybeForwardedResponse.Cast()), node);
+                DrainNodes();
+            } else if (auto maybeCommandResponse = mes.template Maybe<TCommandResponse>()) {
                 RequestProcessor->OnCommandResponse(std::move(maybeCommandResponse.Cast()), node);
                 DrainNodes();
             } else {

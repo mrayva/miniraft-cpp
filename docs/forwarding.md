@@ -15,9 +15,12 @@ complete obsolete attempts.
 ## Routing contract
 
 EForwarded is a dedicated internal request flag. Clients may use any uint32_t
-cookie, including zero and UINT32_MAX. A follower copies a request, sets this
-one-hop flag and assigns a distinct nonzero routing cookie. A forwarded request
-that reaches another follower fails instead of being relayed again.
+cookie, including zero and UINT32_MAX. A follower copies a request and sets
+this one-hop flag. Its internal correlation IDs are monotonic uint64_t values
+and are never reused within a processor. IDs through UINT32_MAX use the legacy
+command message; larger IDs use the extended forwarded-command request and
+response types. A forwarded request that reaches another follower fails
+instead of being relayed again.
 
 The routing record holds the original cookie, client endpoint, target peer,
 leader ID and origin term. Responses are accepted only from that configured
@@ -29,10 +32,10 @@ complete another attempt.
 Routes are rejected with ErrorCode=1 and their original cookie when the origin
 changes term, leaves follower state, observes a different leader, or receives a
 peer-unavailable notification. Client disconnect removes only that client's
-routes silently. Late responses for removed routes are ignored. Routing cookies
+routes silently. Late responses for removed routes are ignored. Correlation IDs
 are never reused within a processor, even after success, cancellation or peer
-reconnection. Exhausting the 32-bit wire space rejects further forwarding rather
-than wrapping; a larger session/correlation protocol remains future work.
+reconnection. Forwarding fails safely only after the full 64-bit sequence is
+exhausted.
 
 Cancellation is local bookkeeping. A write already sent or buffered by the
 transport may still execute. No automatic retry, rollback or exactly-once
@@ -54,11 +57,16 @@ the outbound peer that owns a response. Write-side failure notification timing
 still depends on the transport detecting/reporting connection loss; blackholed
 connections without such notification have no deadline here.
 
-Construct a new processor only with fresh transport sessions: the cookie counter
-is per processor, and this milestone does not provide a durable cross-processor
-session generation. Message struct sizes are unchanged, but EForwarded reserves
-flag value 0x08. Upgrade custom adapters and all cluster nodes together; mixed-version
-operation is not validated.
+Construct a new processor only with fresh transport sessions: the correlation
+counter is per processor, and this milestone does not provide a durable
+cross-processor session generation. Existing client and Raft message layouts
+are unchanged; internal message types 15 and 16 carry extended forwarding
+correlations. Since the extended request and response headers each add 8 bytes,
+requests that fit only at the legacy frame limit are rejected as overloaded,
+and responses that cannot fit the extended frame are returned as failed. There
+is no protocol negotiation, so upgrade every node and custom transport adapter
+before a processor crosses the 32-bit boundary. Mixed-version use of the
+extended types is not supported. EForwarded reserves flag value 0x08.
 
 ## Validation and self-review
 
@@ -83,7 +91,7 @@ claimed. Access remains serialized; callbacks must not re-enter the processor.
 
 ## Remaining gaps
 
-Durable request IDs/deduplication, deadlines, admission limits, a larger
-session/correlation namespace, broader transport validation and generated
+Durable request IDs/deduplication, deadlines, admission limits, a durable
+cross-processor session generation, broader transport validation and generated
 history/linearizability testing remain open. This change does not prove
 library-wide linearizability or guarantee completion during quorum loss.

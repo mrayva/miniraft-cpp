@@ -124,8 +124,10 @@ callers must still handle capacity changes before proposing.
   design; enabling encryption alone does not establish that binding.
 - No replicated client deduplication/session protocol. Retrying a write after
   an uncertain outcome can execute it again. Correlation cookies do not provide
-  durable operation identity. Forwarding cookies also stop being allocated
-  after UINT32_MAX during a processor's lifetime.
+  durable operation identity. Forwarding now uses monotonic 64-bit correlation
+  IDs; IDs beyond the legacy range require the extended internal message types
+  and all nodes to be upgraded together because the wire protocol has no
+  general version negotiation.
 - Server lifecycle lacks a general stop/cancel/join API for its detached
   accept, timer and connection coroutines. Peer retirement addresses a narrower
   lifecycle. Reusable embedding needs explicit shutdown ownership.
