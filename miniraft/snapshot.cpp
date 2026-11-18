@@ -666,10 +666,11 @@ std::optional<TSnapshot> TSnapshotStore::Load() {
 }
 
 void TSnapshotStore::Save(const TSnapshot& snapshot) {
-    const auto bytes = EncodeSnapshot(snapshot);
 #ifndef __linux__
     throw std::runtime_error("Snapshot store currently requires Linux");
 #else
+    const auto encoding = PrepareSnapshotEncoding(snapshot);
+    const auto totalBytes = SnapshotEncodingSize(*encoding);
     TFd file(openat(Impl->Directory.Value, Impl->Temp.c_str(),
         O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600));
     Require(file.Value >= 0, "create snapshot temporary image");
@@ -677,12 +678,19 @@ void TSnapshotStore::Save(const TSnapshot& snapshot) {
     Require(fstat(file.Value, &info) == 0, "stat snapshot temporary image");
     if (!S_ISREG(info.st_mode)) throw std::runtime_error("Invalid snapshot temporary image type");
     Impl->Stage(EStage::TempCreated);
-    size_t done = 0;
-    while (done < bytes.size()) {
-        const auto n = write(file.Value, bytes.data() + done, bytes.size() - done);
-        if (n < 0 && errno == EINTR) continue;
-        Require(n > 0, "write snapshot");
-        done += size_t(n);
+    std::string buffer(size_t(std::min<uint64_t>(64 * 1024, totalBytes)), '\0');
+    uint64_t offset = 0;
+    while (offset < totalBytes) {
+        const auto count = size_t(std::min<uint64_t>(buffer.size(), totalBytes - offset));
+        CopySnapshotEncodingRange(snapshot, *encoding, offset, buffer.data(), count);
+        size_t written = 0;
+        while (written < count) {
+            const auto n = write(file.Value, buffer.data() + written, count - written);
+            if (n < 0 && errno == EINTR) continue;
+            Require(n > 0, "write snapshot");
+            written += size_t(n);
+        }
+        offset += count;
     }
     Impl->Stage(EStage::Written);
     Sync(file.Value);
