@@ -6,6 +6,7 @@
 #include <iostream>
 #include <algorithm>
 #include <iterator>
+#include <atomic>
 
 #include <string.h>
 #include <assert.h>
@@ -17,10 +18,22 @@
 
 namespace {
 
+uint64_t AllocateForwardingSession() {
+    static std::atomic<uint64_t> next{1};
+    auto current = next.load(std::memory_order_relaxed);
+    while (current && current != UINT64_MAX) {
+        if (next.compare_exchange_weak(current, current + 1,
+                std::memory_order_relaxed, std::memory_order_relaxed))
+            return current;
+    }
+    throw std::overflow_error("Forwarding session IDs exhausted");
+}
+
 class TForwardedCommandReplyNode final : public INode {
 public:
-    TForwardedCommandReplyNode(std::shared_ptr<INode> peer, uint64_t forwardCookie)
-        : Peer(std::move(peer)), ForwardCookie(forwardCookie) { }
+    TForwardedCommandReplyNode(std::shared_ptr<INode> peer, uint64_t forwardCookie,
+            uint64_t sessionId = 0)
+        : Peer(std::move(peer)), ForwardCookie(forwardCookie), SessionId(sessionId) { }
 
     void Send(TMessageHolder<TMessage> message) override {
         Peer->Send(Wrap(std::move(message)));
@@ -39,10 +52,26 @@ private:
         ValidateMessageTree(message);
         auto response = message.Cast<TCommandResponse>();
         const auto dataBytes = response->Len - sizeof(TCommandResponse);
-        constexpr size_t ExtendedResponseOverhead =
+        constexpr size_t V1ResponseOverhead =
             sizeof(TForwardedCommandResponse) - sizeof(TCommandResponse);
+        constexpr size_t SessionResponseOverhead =
+            sizeof(TSessionForwardedCommandResponse) - sizeof(TCommandResponse);
+        const auto responseOverhead = SessionId ? SessionResponseOverhead : V1ResponseOverhead;
         const bool responseTooLarge = response->Len >
-            TMessageLimits{}.MaxFrameBytes - ExtendedResponseOverhead;
+            TMessageLimits{}.MaxFrameBytes - responseOverhead;
+        if (SessionId) {
+            auto forwarded = NewHoldedMessage<TSessionForwardedCommandResponse>(
+                responseTooLarge ? sizeof(TSessionForwardedCommandResponse) :
+                    sizeof(TSessionForwardedCommandResponse) + dataBytes);
+            forwarded->SessionId = SessionId;
+            forwarded->ForwardCookie = ForwardCookie;
+            forwarded->Index = response->Index;
+            forwarded->ClientCookie = response->Cookie;
+            forwarded->ErrorCode = responseTooLarge ? TCommandResponse::Failed : response->ErrorCode;
+            if (!responseTooLarge && dataBytes) memcpy(forwarded->Data, response->Data, dataBytes);
+            ValidateMessageTree(forwarded);
+            return forwarded;
+        }
         auto forwarded = NewHoldedMessage<TForwardedCommandResponse>(
             responseTooLarge ? sizeof(TForwardedCommandResponse) :
                 sizeof(TForwardedCommandResponse) + dataBytes);
@@ -57,6 +86,7 @@ private:
 
     std::shared_ptr<INode> Peer;
     uint64_t ForwardCookie;
+    uint64_t SessionId;
 };
 
 static uint32_t rand_(uint32_t* seed) {
@@ -2946,6 +2976,7 @@ TRequestProcessor::TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_pt
     if (!Raft || !Rsm) throw std::invalid_argument("Request processor requires Raft and application state");
     if (AdmissionLimits.RequestTimeout <= ITimeSource::Time::duration::zero())
         throw std::invalid_argument("Request timeout must be positive");
+    ForwardingSession = AllocateForwardingSession();
     if (auto snapshot = Raft->GetState()->GetSnapshot(); snapshot && Rsm->LastAppliedIndex < snapshot->Index)
         RestoreSnapshot(*snapshot, *Raft, *Rsm);
     if (Rsm->LastAppliedIndex < Raft->GetState()->SnapshotIndex)
@@ -3072,16 +3103,20 @@ void TRequestProcessor::Forward(TMessageHolder<TCommandRequest> command,
             return;
         }
         auto peer = Nodes.at(leaderId);
-        if (NextForwardId > UINT32_MAX && !peer->SupportsExtendedForwarding()) {
+        const bool sessionized = peer->SupportsSessionizedForwarding();
+        if (!sessionized && NextForwardId > UINT32_MAX && !peer->SupportsExtendedForwarding()) {
             ReleaseAdmission(admissionId);
             replyTo->Send(NewHoldedMessage(TCommandResponse{.Cookie = command->Cookie,
                 .ErrorCode = TCommandResponse::Failed}));
             return;
         }
-        constexpr size_t ExtendedRequestOverhead =
+        constexpr size_t V1RequestOverhead =
             sizeof(TForwardedCommandRequest) - sizeof(TCommandRequest);
-        if (NextForwardId > UINT32_MAX &&
-            command->Len > TMessageLimits{}.MaxFrameBytes - ExtendedRequestOverhead) {
+        constexpr size_t SessionRequestOverhead =
+            sizeof(TSessionForwardedCommandRequest) - sizeof(TCommandRequest);
+        const auto requestOverhead = sessionized ? SessionRequestOverhead :
+            NextForwardId > UINT32_MAX ? V1RequestOverhead : 0;
+        if (requestOverhead && command->Len > TMessageLimits{}.MaxFrameBytes - requestOverhead) {
             ReleaseAdmission(admissionId);
             replyTo->Send(NewHoldedMessage(TCommandResponse{.Cookie = command->Cookie,
                 .ErrorCode = TCommandResponse::Overloaded}));
@@ -3090,10 +3125,21 @@ void TRequestProcessor::Forward(TMessageHolder<TCommandRequest> command,
         const auto forwardId = NextForwardId;
         NextForwardId = forwardId == UINT64_MAX ? 0 : forwardId + 1;
         Forwarded.emplace(forwardId, TForwarded{replyTo, peer, command->Cookie,
-                                                leaderId, Raft->GetState()->CurrentTerm, admissionId});
+                                                leaderId, Raft->GetState()->CurrentTerm, admissionId,
+                                                sessionized});
         bool accepted = false;
         try {
-            if (forwardId <= UINT32_MAX) {
+            if (sessionized) {
+                const auto payloadBytes = command->Len - sizeof(TCommandRequest);
+                auto forwarded = NewHoldedMessage<TSessionForwardedCommandRequest>(
+                    sizeof(TSessionForwardedCommandRequest) + payloadBytes);
+                forwarded->SessionId = ForwardingSession;
+                forwarded->ForwardCookie = forwardId;
+                forwarded->Flags = command->Flags | TCommandRequest::EForwarded;
+                forwarded->ClientCookie = command->Cookie;
+                if (payloadBytes) memcpy(forwarded->Data, command->Data, payloadBytes);
+                accepted = peer->TrySend(std::move(forwarded));
+            } else if (forwardId <= UINT32_MAX) {
                 auto forwarded = NewHoldedMessage<TCommandRequest>(command->Len);
                 memcpy(forwarded.Mes, command.Mes, command->Len);
                 forwarded->Cookie = uint32_t(forwardId);
@@ -3338,6 +3384,28 @@ void TRequestProcessor::OnForwardedCommandRequest(TMessageHolder<TForwardedComma
     OnCommandRequest(std::move(command), reply);
 }
 
+void TRequestProcessor::OnSessionForwardedCommandRequest(
+        TMessageHolder<TSessionForwardedCommandRequest> message,
+        const std::shared_ptr<INode>& peer) {
+    if (!message.HasValidExtent() ||
+        message->Type != uint32_t(EMessageType::SESSION_FORWARDED_COMMAND_REQUEST))
+        throw TMessageError("Invalid sessionized forwarded command request");
+    ValidateMessageTree(message);
+    if (!peer || !message->SessionId || !message->ForwardCookie ||
+        !(message->Flags & TCommandRequest::EForwarded) ||
+        (message->Flags & ~(TCommandRequest::EWrite | TCommandRequest::EStale |
+            TCommandRequest::EConsistent | TCommandRequest::EForwarded)))
+        throw TMessageError("Invalid sessionized forwarded command metadata");
+    const auto payloadBytes = message->Len - sizeof(TSessionForwardedCommandRequest);
+    auto command = NewHoldedMessage<TCommandRequest>(sizeof(TCommandRequest) + payloadBytes);
+    command->Flags = message->Flags;
+    command->Cookie = message->ClientCookie;
+    if (payloadBytes) memcpy(command->Data, message->Data, payloadBytes);
+    auto reply = std::make_shared<TForwardedCommandReplyNode>(
+        peer, message->ForwardCookie, message->SessionId);
+    OnCommandRequest(std::move(command), reply);
+}
+
 void TRequestProcessor::OnCommandResponse(TMessageHolder<TCommandResponse> command,
                                          const std::shared_ptr<INode>& peer) {
     if (!command.HasValidExtent() || command->Type != uint32_t(EMessageType::COMMAND_RESPONSE))
@@ -3345,7 +3413,7 @@ void TRequestProcessor::OnCommandResponse(TMessageHolder<TCommandResponse> comma
     ValidateMessageTree(command);
     PruneRequests();
     auto it = Forwarded.find(command->Cookie);
-    if (it == Forwarded.end() || !peer || it->second.Peer != peer) return;
+    if (it == Forwarded.end() || it->second.Sessionized || !peer || it->second.Peer != peer) return;
     auto pending = std::move(it->second);
     Forwarded.erase(it);
     ReleaseAdmission(pending.AdmissionId);
@@ -3365,7 +3433,32 @@ void TRequestProcessor::OnForwardedCommandResponse(TMessageHolder<TForwardedComm
         throw TMessageError("Invalid extended forwarded response metadata");
     PruneRequests();
     auto it = Forwarded.find(message->ForwardCookie);
-    if (it == Forwarded.end() || it->second.Peer != peer) return;
+    if (it == Forwarded.end() || it->second.Sessionized || it->second.Peer != peer) return;
+    auto pending = std::move(it->second);
+    Forwarded.erase(it);
+    ReleaseAdmission(pending.AdmissionId);
+    auto response = NewHoldedMessage<TCommandResponse>(sizeof(TCommandResponse) + dataBytes);
+    response->Index = message->Index;
+    response->Cookie = pending.OriginalCookie;
+    response->ErrorCode = message->ErrorCode;
+    if (dataBytes) memcpy(response->Data, message->Data, dataBytes);
+    pending.Client->Send(std::move(response));
+}
+
+void TRequestProcessor::OnSessionForwardedCommandResponse(
+        TMessageHolder<TSessionForwardedCommandResponse> message,
+        const std::shared_ptr<INode>& peer) {
+    if (!message.HasValidExtent() ||
+        message->Type != uint32_t(EMessageType::SESSION_FORWARDED_COMMAND_RESPONSE))
+        throw TMessageError("Invalid sessionized forwarded command response");
+    ValidateMessageTree(message);
+    const auto dataBytes = message->Len - sizeof(TSessionForwardedCommandResponse);
+    if (!peer || !message->SessionId || !message->ForwardCookie)
+        throw TMessageError("Invalid sessionized forwarded response metadata");
+    PruneRequests();
+    if (message->SessionId != ForwardingSession) return;
+    auto it = Forwarded.find(message->ForwardCookie);
+    if (it == Forwarded.end() || !it->second.Sessionized || it->second.Peer != peer) return;
     auto pending = std::move(it->second);
     Forwarded.erase(it);
     ReleaseAdmission(pending.AdmissionId);

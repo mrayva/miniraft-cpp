@@ -96,6 +96,7 @@ struct TSocket {
 struct TCapabilitySocketState {
     TPoller* Owner = nullptr;
     size_t ProbeWrites = 0;
+    size_t SessionForwardWrites = 0;
 };
 struct TCapabilitySocket {
     struct TConnectAwaiter {
@@ -109,8 +110,11 @@ struct TCapabilitySocket {
     explicit TCapabilitySocket(std::shared_ptr<TCapabilitySocketState> state) : State(std::move(state)) { }
     TConnectAwaiter Connect() { return {State->Owner}; }
     TPoller* Poller() { return State->Owner; }
-    NNet::TValueTask<ssize_t> WriteSome(const void*, size_t size) {
-        ++State->ProbeWrites;
+    NNet::TValueTask<ssize_t> WriteSome(const void* data, size_t size) {
+        const auto type = static_cast<const TMessage*>(data)->Type;
+        if (type == uint32_t(EMessageType::PEER_CAPABILITIES_REQUEST)) ++State->ProbeWrites;
+        if (type == uint32_t(EMessageType::SESSION_FORWARDED_COMMAND_REQUEST))
+            ++State->SessionForwardWrites;
         co_return ssize_t(size);
     }
     NNet::TValueTask<ssize_t> ReadSome(void*, size_t) { co_return 0; }
@@ -137,22 +141,26 @@ void test_peer_capability_probe_and_legacy_fallback(void**) {
     assert_true(node.IsCapabilityNegotiating());
     assert_int_equal(state->ProbeWrites, 1);
     auto response = NewHoldedMessage<TPeerCapabilitiesResponse>();
-    response->Features = TPeerCapabilitiesRequest::ExtendedForwarding;
+    response->Features = TPeerCapabilitiesRequest::ExtendedForwarding |
+        TPeerCapabilitiesRequest::SessionizedForwarding;
     response->ConnectionId = node.GetConnectionGeneration() - 1;
     assert_false(node.CompleteCapabilityNegotiation(response, node.GetConnectionGeneration()));
     assert_true(node.IsCapabilityNegotiating());
     response->ConnectionId = node.GetConnectionGeneration();
-    response->Features = uint64_t(1) << 1;
+    response->Features = uint64_t(1) << 2;
     assert_false(node.CompleteCapabilityNegotiation(response, node.GetConnectionGeneration()));
     assert_true(node.IsCapabilityNegotiating());
-    response->Features = TPeerCapabilitiesRequest::ExtendedForwarding;
+    response->Features = TPeerCapabilitiesRequest::ExtendedForwarding |
+        TPeerCapabilitiesRequest::SessionizedForwarding;
     response->ConnectionId = node.GetConnectionGeneration();
     assert_true(node.CompleteCapabilityNegotiation(response, node.GetConnectionGeneration()));
     assert_true(node.SupportsExtendedForwarding());
+    assert_true(node.SupportsSessionizedForwarding());
 
     auto generation = node.GetConnectionGeneration();
     node.Disconnect(generation);
     assert_false(node.SupportsExtendedForwarding());
+    assert_false(node.SupportsSessionizedForwarding());
     node.Drain(); poller.Tick();
     generation = node.GetConnectionGeneration();
     assert_true(node.IsCapabilityNegotiating());
@@ -167,12 +175,39 @@ void test_peer_capability_probe_and_legacy_fallback(void**) {
     assert_true(node.IsConnected());
     assert_false(node.IsCapabilityNegotiating());
     assert_false(node.SupportsExtendedForwarding());
+    assert_false(node.SupportsSessionizedForwarding());
     assert_int_equal(state->ProbeWrites, 2);
 
     node.Disconnect(generation);
     node.Drain(); poller.Tick();
     assert_true(node.IsCapabilityNegotiating());
     assert_int_equal(state->ProbeWrites, 3);
+    node.Disconnect();
+}
+void test_queued_sessionized_request_is_dropped_on_legacy_fallback(void**) {
+    TPoller poller;
+    auto state = std::make_shared<TCapabilitySocketState>();
+    state->Owner = &poller;
+    TNode<TCapabilitySocket> node([&](const auto&) { return TCapabilitySocket{state}; }, "peer",
+        NNet::TAddress("127.0.0.1", 1), std::make_shared<TTimeSource>());
+    node.Drain(); poller.Tick();
+    assert_true(node.IsCapabilityNegotiating());
+
+    auto request = NewHoldedMessage<TSessionForwardedCommandRequest>();
+    request->SessionId = 1;
+    request->ForwardCookie = 1;
+    request->Flags = TCommandRequest::EWrite | TCommandRequest::EForwarded;
+    assert_true(node.TrySend(request));
+    node.Drain(); // Queue remains held while the peer capability is unknown.
+    assert_int_equal(state->SessionForwardWrites, 0);
+
+    const auto generation = node.GetConnectionGeneration();
+    node.FailCapabilityNegotiation(generation);
+    node.Disconnect(generation);
+    node.Drain(); poller.Tick(); // Legacy retry must not replay the v2 request.
+    node.Drain();
+    assert_true(node.IsConnected());
+    assert_int_equal(state->SessionForwardWrites, 0);
     node.Disconnect();
 }
 void test_old_reader_failure_cannot_disconnect_writer_reconnect(void**) {
@@ -355,6 +390,7 @@ int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_disconnect_during_pending_connect_does_not_destroy_timer_target),
         cmocka_unit_test(test_peer_capability_probe_and_legacy_fallback),
+        cmocka_unit_test(test_queued_sessionized_request_is_dropped_on_legacy_fallback),
         cmocka_unit_test(test_old_reader_failure_cannot_disconnect_writer_reconnect),
         cmocka_unit_test(test_connect_cannot_leave_a_second_deadline_wakeup_after_completion),
         cmocka_unit_test(test_peer_response_readers_start_once_for_replication_targets),

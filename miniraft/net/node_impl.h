@@ -188,6 +188,7 @@ void TNode<TSocket>::Disconnect(uint64_t generation) {
     // still be registered with the poller; never destroy that live coroutine
     // because an older reader failed. Established connectors are done here.
     if (CapabilityNegotiating) FailCapabilityNegotiation(generation);
+    DiscardForwardedCommands();
     Connected = false;
     PeerFeatures = 0;
     if (Drainer) { Drainer.destroy(); Drainer = {}; }
@@ -233,7 +234,8 @@ NNet::TVoidSuspendedTask TNode<TSocket>::DoConnect() {
                 if (!skipProbe) {
                     CapabilityNegotiating = true;
                     auto probe = NewHoldedMessage<TPeerCapabilitiesRequest>();
-                    probe->Features = TPeerCapabilitiesRequest::ExtendedForwarding;
+                    probe->Features = TPeerCapabilitiesRequest::ExtendedForwarding |
+                        TPeerCapabilitiesRequest::SessionizedForwarding;
                     probe->ConnectionId = ConnectionGeneration;
                     co_await TMessageWriter(Socket).Write(std::move(probe));
                 }

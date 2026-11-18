@@ -17,10 +17,11 @@ complete obsolete attempts.
 EForwarded is a dedicated internal request flag. Clients may use any uint32_t
 cookie, including zero and UINT32_MAX. A follower copies a request and sets
 this one-hop flag. Its internal correlation IDs are monotonic uint64_t values
-and are never reused within a processor. IDs through UINT32_MAX use the legacy
-command message; larger IDs use the extended forwarded-command request and
-response types. A forwarded request that reaches another follower fails
-instead of being relayed again.
+and are never reused within a processor. Peers that negotiated sessionized
+forwarding use message types 19 and 20 for every correlation. Otherwise, IDs
+through UINT32_MAX use the legacy command message and larger IDs use the
+extended forwarded-command request and response types. A forwarded request
+that reaches another follower fails instead of being relayed again.
 
 The routing record holds the original cookie, client endpoint, target peer,
 leader ID and origin term. Responses are accepted only from that configured
@@ -57,24 +58,31 @@ the outbound peer that owns a response. Write-side failure notification timing
 still depends on the transport detecting/reporting connection loss; blackholed
 connections without such notification have no deadline here.
 
-Construct a new processor only with fresh transport sessions: the correlation
-counter is per processor, and this milestone does not provide a durable
-cross-processor session generation. Existing client and Raft message layouts
-are unchanged. New outbound peer connections negotiate version 1 and advertise
-support for extended correlations before message queues are drained. Internal
-message types 15 and 16 are sent only when the target peer advertises that
-feature. A legacy peer rejects the initial capability probe; the connector
-retries once without a probe and keeps using the legacy wire format for that
-connection. The next reconnect probes again. Requests queued during the rejected
-probe connection may receive Failed and must be retried; no forwarded command is
-written on that probe connection. Correlations beyond UINT32_MAX fail safely
-when the active leader has not advertised support.
+Existing client and Raft message layouts are unchanged. New outbound peer
+connections negotiate forwarding features before message queues are drained.
+Peers advertising sessionized-forwarding support use message types 19 and 20
+from the first forwarded request; each reply carries a process-wide monotonic
+processor-session ID as well as its correlation ID. This prevents delayed
+sessionized and legacy-format replies from a previous processor in the same
+process from matching a new request after its correlation counter restarts.
+Peers advertising only the earlier extended-forwarding feature use message
+types 15 and 16 after UINT32_MAX. Legacy peers use the original command
+messages through UINT32_MAX.
 
-Custom transports must implement the peer-capability exchange and report
-extended-forwarding support through INode only after a successful negotiation.
-Since the extended request and response headers each add 8 bytes, requests
-that fit only at the legacy frame limit are rejected as overloaded, and
-responses that cannot fit the extended frame are returned as failed.
+A legacy peer rejects the initial capability probe; the connector retries once
+without a probe and keeps using the legacy wire format for that connection. The
+next reconnect probes again. Requests queued during the rejected probe
+connection may receive Failed and must be retried; no forwarded command is
+written on that probe connection. Correlations beyond UINT32_MAX fail safely
+when the active leader has not advertised extended-forwarding support.
+
+Custom transports must implement the peer-capability exchange and report the
+negotiated forwarding features through INode. Sessionized generations are
+process-local; built-in peer connections are recreated after process restart,
+and custom transports must use fresh sessions across restarts. Sessionized
+request and response headers add 16 bytes; the earlier extended headers add 8
+bytes. Requests that cannot fit the selected envelope are rejected as
+overloaded, and responses that cannot fit are returned as failed.
 EForwarded reserves flag value 0x08.
 
 ## Validation and self-review
@@ -100,7 +108,7 @@ claimed. Access remains serialized; callbacks must not re-enter the processor.
 
 ## Remaining gaps
 
-Durable request IDs/deduplication, deadlines, admission limits, a durable
-cross-processor session generation, broader transport validation and generated
-history/linearizability testing remain open. This change does not prove
-library-wide linearizability or guarantee completion during quorum loss.
+Durable client operation IDs/deduplication, transport-session identity across
+process restarts for custom adapters, broader transport validation and
+generated history/linearizability testing remain open. This change does not
+prove library-wide linearizability or guarantee completion during quorum loss.

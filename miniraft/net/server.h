@@ -215,6 +215,10 @@ public:
         return Connected && !CapabilityNegotiating &&
             (PeerFeatures & TPeerCapabilitiesRequest::ExtendedForwarding);
     }
+    bool SupportsSessionizedForwarding() const override {
+        return Connected && !CapabilityNegotiating &&
+            (PeerFeatures & TPeerCapabilitiesRequest::SessionizedForwarding);
+    }
     bool IsCapabilityNegotiating() const { return CapabilityNegotiating; }
     bool CompleteCapabilityNegotiation(
             const TMessageHolder<TPeerCapabilitiesResponse>& response, uint64_t generation) {
@@ -222,18 +226,21 @@ public:
             response->ConnectionId != generation || response->Reserved != 0 ||
             response->Version > TPeerCapabilitiesRequest::CurrentVersion ||
             (!response->Version && response->Features) ||
-            (response->Features & ~TPeerCapabilitiesRequest::ExtendedForwarding))
+            (response->Features & ~(TPeerCapabilitiesRequest::ExtendedForwarding |
+                TPeerCapabilitiesRequest::SessionizedForwarding)))
             return false;
         PeerFeatures = response->Version == TPeerCapabilitiesRequest::CurrentVersion
             ? response->Features : 0;
         CapabilityNegotiating = false;
+        DropUnsupportedForwardingMessages();
         return true;
     }
-    void FailCapabilityNegotiation(uint64_t generation) noexcept {
+    void FailCapabilityNegotiation(uint64_t generation) {
         if (!CapabilityNegotiating || generation != ConnectionGeneration) return;
         CapabilityNegotiating = false;
         PeerFeatures = 0;
         SkipNextCapabilityProbe = true;
+        DiscardForwardedCommands();
     }
     TSocket& Sock() {
         return Socket;
@@ -248,6 +255,44 @@ private:
 
     void Connect();
     void ShutdownSocket() noexcept;
+    void DropUnsupportedForwardingMessages() {
+        bool removed = false;
+        for (auto it = Messages.begin(); it != Messages.end();) {
+            const auto type = EMessageType((*it)->Type);
+            const bool unsupportedV1 =
+                (type == EMessageType::FORWARDED_COMMAND_REQUEST ||
+                 type == EMessageType::FORWARDED_COMMAND_RESPONSE) &&
+                !(PeerFeatures & TPeerCapabilitiesRequest::ExtendedForwarding);
+            const bool unsupportedSessionized =
+                (type == EMessageType::SESSION_FORWARDED_COMMAND_REQUEST ||
+                 type == EMessageType::SESSION_FORWARDED_COMMAND_RESPONSE) &&
+                !(PeerFeatures & TPeerCapabilitiesRequest::SessionizedForwarding);
+            if (unsupportedV1 || unsupportedSessionized) {
+                it = Messages.erase(it);
+                removed = true;
+            } else {
+                ++it;
+            }
+        }
+        if (removed) RecountPendingMessages();
+    }
+    void DiscardForwardedCommands() {
+        bool removed = false;
+        for (auto it = Messages.begin(); it != Messages.end();) {
+            const auto type = EMessageType((*it)->Type);
+            const bool forwardedClientRequest = type == EMessageType::COMMAND_REQUEST &&
+                (it->Cast<TCommandRequest>()->Flags & TCommandRequest::EForwarded);
+            const bool forwardedInternalRequest = type == EMessageType::FORWARDED_COMMAND_REQUEST ||
+                type == EMessageType::SESSION_FORWARDED_COMMAND_REQUEST;
+            if (forwardedClientRequest || forwardedInternalRequest) {
+                it = Messages.erase(it);
+                removed = true;
+            } else {
+                ++it;
+            }
+        }
+        if (removed) RecountPendingMessages();
+    }
 
     NNet::TVoidSuspendedTask DoDrain();
     NNet::TVoidSuspendedTask DoConnect();

@@ -124,10 +124,10 @@ callers must still handle capacity changes before proposing.
   design; enabling encryption alone does not establish that binding.
 - No replicated client deduplication/session protocol. Retrying a write after
   an uncertain outcome can execute it again. Correlation cookies do not provide
-  durable operation identity. Forwarding now uses monotonic 64-bit correlation
-  IDs. The network transport negotiates support before using extended internal
-  message types and falls back to legacy framing for older peers. Durable
-  cross-processor request identity remains unsupported.
+  durable operation identity. Forwarding uses negotiated sessionized
+  correlation IDs to reject delayed replies across processor instances within
+  one process; these IDs do not deduplicate retried writes. Custom adapters
+  still need fresh transport sessions across process restarts.
 - Server lifecycle lacks a general stop/cancel/join API for its detached
   accept, timer and connection coroutines. Peer retirement addresses a narrower
   lifecycle. Reusable embedding needs explicit shutdown ownership.

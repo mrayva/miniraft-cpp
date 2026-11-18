@@ -20,10 +20,12 @@ struct TEndpoint : INode {
     std::vector<TMessageHolder<TMessage>> Rejected;
     bool Accept = true;
     bool ExtendedForwarding = false;
+    bool SessionizedForwarding = false;
     explicit TEndpoint(std::function<void(TMessageHolder<TMessage>)> cb, bool extendedForwarding = false)
         : Callback(std::move(cb)), ExtendedForwarding(extendedForwarding) {}
     void Send(TMessageHolder<TMessage> message) override { Callback(std::move(message)); }
     bool SupportsExtendedForwarding() const override { return ExtendedForwarding; }
+    bool SupportsSessionizedForwarding() const override { return SessionizedForwarding; }
     bool TrySend(TMessageHolder<TMessage> message) override {
         if (!Accept) { Rejected.push_back(std::move(message)); return false; }
         Send(std::move(message));
@@ -47,11 +49,14 @@ struct TClient {
 struct TFollower {
     std::vector<TMessageHolder<TCommandRequest>> Sent;
     std::vector<TMessageHolder<TForwardedCommandRequest>> ExtendedSent;
+    std::vector<TMessageHolder<TSessionForwardedCommandRequest>> SessionSent;
     std::shared_ptr<TEndpoint> Leader = std::make_shared<TEndpoint>([this](auto message) {
         if (message->Type == uint32_t(EMessageType::COMMAND_REQUEST))
             Sent.push_back(message.template Cast<TCommandRequest>());
         else if (message->Type == uint32_t(EMessageType::FORWARDED_COMMAND_REQUEST))
             ExtendedSent.push_back(message.template Cast<TForwardedCommandRequest>());
+        else if (message->Type == uint32_t(EMessageType::SESSION_FORWARDED_COMMAND_REQUEST))
+            SessionSent.push_back(message.template Cast<TSessionForwardedCommandRequest>());
     }, true);
     std::shared_ptr<TEndpoint> Other = std::make_shared<TEndpoint>([this](auto message) {
         if (message->Type == uint32_t(EMessageType::COMMAND_REQUEST))
@@ -72,13 +77,17 @@ struct TFollower {
                                        TAppendEntriesRequest{.LeaderId = id});
         Raft->Process(ITimeSource::Time{}, message);
     }
-    TMessageHolder<TCommandRequest> Request(TClient& client, uint32_t cookie, uint32_t extra = 0) {
+    TMessageHolder<TCommandRequest> Request(TRequestProcessor& processor, TClient& client,
+            uint32_t cookie, uint32_t extra = 0) {
         auto request = NewHoldedMessage<TCommandRequest>(sizeof(TCommandRequest) + 5);
         request->Cookie = cookie;
         request->Flags = TCommandRequest::EWrite | extra;
         memcpy(request->Data, "value", 5);
-        Processor.OnCommandRequest(request, client.Endpoint);
+        processor.OnCommandRequest(request, client.Endpoint);
         return request;
+    }
+    TMessageHolder<TCommandRequest> Request(TClient& client, uint32_t cookie, uint32_t extra = 0) {
+        return Request(Processor, client, cookie, extra);
     }
     TMessageHolder<TCommandResponse> Response(size_t sent, uint32_t error = 0) {
         auto response = NewHoldedMessage<TCommandResponse>(sizeof(TCommandResponse) + 6);
@@ -282,6 +291,51 @@ void test_extended_forwarding_is_disabled_without_peer_capability(void**) {
     assert_int_equal(client.Replies[0].Cookie, 64);
     assert_int_equal(client.Replies[0].Error, TCommandResponse::Failed);
 }
+void test_sessionized_forwarding_rejects_stale_processor_reply(void**) {
+    TFollower follower;
+    follower.Leader->SessionizedForwarding = true;
+    TClient oldClient, currentClient;
+    auto oldProcessor = std::make_unique<TRequestProcessor>(
+        follower.Raft, follower.Rsm, follower.Peers);
+    follower.Request(*oldProcessor, oldClient, 71);
+    assert_int_equal(follower.SessionSent.size(), 1);
+    const auto oldSession = follower.SessionSent[0]->SessionId;
+    const auto oldId = follower.SessionSent[0]->ForwardCookie;
+    assert_true(oldSession != 0);
+    oldProcessor.reset();
+
+    TRequestProcessor currentProcessor{follower.Raft, follower.Rsm, follower.Peers};
+    follower.Request(currentProcessor, currentClient, 72);
+    assert_int_equal(follower.SessionSent.size(), 2);
+    const auto currentSession = follower.SessionSent[1]->SessionId;
+    const auto currentId = follower.SessionSent[1]->ForwardCookie;
+    assert_true(currentSession != oldSession);
+    assert_true(currentId == oldId);
+
+    // A response from a pre-sessionized processor can still arrive in the
+    // legacy COMMAND_RESPONSE shape on this retained peer connection.
+    auto staleLegacy = NewHoldedMessage(TCommandResponse{.Cookie = uint32_t(oldId)});
+    currentProcessor.OnCommandResponse(staleLegacy, follower.Leader);
+    assert_true(currentClient.Replies.empty());
+
+    auto stale = NewHoldedMessage<TSessionForwardedCommandResponse>(
+        sizeof(TSessionForwardedCommandResponse) + 3);
+    stale->SessionId = oldSession;
+    stale->ForwardCookie = oldId;
+    memcpy(stale->Data, "old", 3);
+    currentProcessor.OnSessionForwardedCommandResponse(stale, follower.Leader);
+    assert_true(currentClient.Replies.empty());
+
+    auto current = NewHoldedMessage<TSessionForwardedCommandResponse>(
+        sizeof(TSessionForwardedCommandResponse) + 3);
+    current->SessionId = currentSession;
+    current->ForwardCookie = currentId;
+    memcpy(current->Data, "new", 3);
+    currentProcessor.OnSessionForwardedCommandResponse(current, follower.Leader);
+    assert_int_equal(currentClient.Replies.size(), 1);
+    assert_int_equal(currentClient.Replies[0].Cookie, 72);
+    assert_string_equal(currentClient.Replies[0].Data.c_str(), "new");
+}
 void test_oversized_extended_forwarding_fails_without_sending(void**) {
     TFollower follower;
     TRequestProcessorTestAccess::StartForwardIdAt(
@@ -311,6 +365,26 @@ void test_extended_forwarded_request_returns_extended_response(void**) {
 
     assert_int_equal(replies.size(), 1);
     auto response = replies.back().Cast<TForwardedCommandResponse>();
+    assert_true(response->ForwardCookie == request->ForwardCookie);
+    assert_int_equal(response->ClientCookie, 91);
+    assert_int_equal(response->ErrorCode, TCommandResponse::Failed);
+}
+void test_sessionized_forwarded_request_returns_sessionized_response(void**) {
+    TFollower follower;
+    std::vector<TMessageHolder<TMessage>> replies;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) { replies.push_back(std::move(message)); });
+    auto request = NewHoldedMessage<TSessionForwardedCommandRequest>(
+        sizeof(TSessionForwardedCommandRequest) + 5);
+    request->SessionId = 912;
+    request->ForwardCookie = 44;
+    request->Flags = TCommandRequest::EWrite | TCommandRequest::EForwarded;
+    request->ClientCookie = 91;
+    memcpy(request->Data, "value", 5);
+    follower.Processor.OnSessionForwardedCommandRequest(request, peer);
+
+    assert_int_equal(replies.size(), 1);
+    auto response = replies.back().Cast<TSessionForwardedCommandResponse>();
+    assert_true(response->SessionId == request->SessionId);
     assert_true(response->ForwardCookie == request->ForwardCookie);
     assert_int_equal(response->ClientCookie, 91);
     assert_int_equal(response->ErrorCode, TCommandResponse::Failed);
@@ -494,8 +568,10 @@ int main() {
         cmocka_unit_test(test_forwarding_extends_correlation_past_32_bit_cookie_range),
         cmocka_unit_test(test_forwarding_cookie_exhaustion_never_wraps_or_reuses),
         cmocka_unit_test(test_extended_forwarding_is_disabled_without_peer_capability),
+        cmocka_unit_test(test_sessionized_forwarding_rejects_stale_processor_reply),
         cmocka_unit_test(test_oversized_extended_forwarding_fails_without_sending),
         cmocka_unit_test(test_extended_forwarded_request_returns_extended_response),
+        cmocka_unit_test(test_sessionized_forwarded_request_returns_sessionized_response),
         cmocka_unit_test(test_out_of_order_and_duplicate_replies_preserve_client_routes),
         cmocka_unit_test(test_forwarded_request_is_rejected_on_term_change),
         cmocka_unit_test(test_candidate_transition_rejects_forwarded_requests),

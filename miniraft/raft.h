@@ -29,6 +29,7 @@ struct INode {
     virtual void Drain() = 0;
     // False until the transport has positively negotiated the extended route.
     virtual bool SupportsExtendedForwarding() const { return false; }
+    virtual bool SupportsSessionizedForwarding() const { return false; }
 };
 
 // CommandRequest -> Write? -> LogEntry -> Append -> Committed As Index -> Applied As Index (Same) -> Index -> CommandResponse
@@ -413,10 +414,14 @@ public:
     void OnCommandRequest(TMessageHolder<TCommandRequest> message, const std::shared_ptr<INode>& replyTo);
     void OnForwardedCommandRequest(TMessageHolder<TForwardedCommandRequest> message,
                                    const std::shared_ptr<INode>& peer);
+    void OnSessionForwardedCommandRequest(TMessageHolder<TSessionForwardedCommandRequest> message,
+                                          const std::shared_ptr<INode>& peer);
     // Unattributed responses are ignored; pass the configured outbound peer.
     void OnCommandResponse(TMessageHolder<TCommandResponse> message, const std::shared_ptr<INode>& peer = {});
     void OnForwardedCommandResponse(TMessageHolder<TForwardedCommandResponse> message,
                                     const std::shared_ptr<INode>& peer);
+    void OnSessionForwardedCommandResponse(TMessageHolder<TSessionForwardedCommandResponse> message,
+                                          const std::shared_ptr<INode>& peer);
     void OnPeerDisconnected(const std::shared_ptr<INode>& peer);
     // Keep command forwarding aligned with runtime peer endpoint changes.
     void AddPeerEndpoint(uint32_t id, std::shared_ptr<INode> peer);
@@ -485,10 +490,12 @@ private:
         uint32_t OriginalCookie, LeaderId;
         uint64_t Term;
         uint64_t AdmissionId;
+        bool Sessionized;
     };
     // Never reuse a wire correlation ID within this processor, including after
     // failure. IDs above uint32 use the extended forwarded-command envelope.
     uint64_t NextForwardId = 1;
+    uint64_t ForwardingSession = 0;
     std::unordered_map<uint64_t, TForwarded> Forwarded;
 };
 

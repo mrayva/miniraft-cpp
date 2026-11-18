@@ -30,9 +30,16 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(TSocket socket) {
                 auto response = NewHoldedMessage<TPeerCapabilitiesResponse>();
                 response->Version = compatible ? TPeerCapabilitiesRequest::CurrentVersion : 0;
                 response->Features = compatible
-                    ? request->Features & TPeerCapabilitiesRequest::ExtendedForwarding : 0;
+                    ? request->Features & (TPeerCapabilitiesRequest::ExtendedForwarding |
+                        TPeerCapabilitiesRequest::SessionizedForwarding) : 0;
                 response->ConnectionId = request->ConnectionId;
                 client->Send(std::move(response));
+            } else if (auto maybeSessionForwardedRequest = mes.template Maybe<TSessionForwardedCommandRequest>()) {
+                RequestProcessor->OnSessionForwardedCommandRequest(
+                    std::move(maybeSessionForwardedRequest.Cast()), client);
+            } else if (auto maybeSessionForwardedResponse = mes.template Maybe<TSessionForwardedCommandResponse>()) {
+                RequestProcessor->OnSessionForwardedCommandResponse(
+                    std::move(maybeSessionForwardedResponse.Cast()), client);
             } else if (auto maybeForwardedRequest = mes.template Maybe<TForwardedCommandRequest>()) {
                 RequestProcessor->OnForwardedCommandRequest(std::move(maybeForwardedRequest.Cast()), client);
             } else if (auto maybeForwardedResponse = mes.template Maybe<TForwardedCommandResponse>()) {
@@ -184,6 +191,10 @@ NNet::TVoidTask TRaftServer<TSocket>::OutboundServe(std::shared_ptr<TNode<TSocke
                 if (!node->CompleteCapabilityNegotiation(
                         maybeCapabilities.Cast(), generation))
                     throw TMessageError("Invalid peer capability response");
+                DrainNodes();
+            } else if (auto maybeSessionForwardedResponse = mes.template Maybe<TSessionForwardedCommandResponse>()) {
+                RequestProcessor->OnSessionForwardedCommandResponse(
+                    std::move(maybeSessionForwardedResponse.Cast()), node);
                 DrainNodes();
             } else if (auto maybeForwardedResponse = mes.template Maybe<TForwardedCommandResponse>()) {
                 RequestProcessor->OnForwardedCommandResponse(std::move(maybeForwardedResponse.Cast()), node);

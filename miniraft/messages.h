@@ -40,6 +40,8 @@ enum class EMessageType : uint32_t {
     FORWARDED_COMMAND_RESPONSE = 16,
     PEER_CAPABILITIES_REQUEST = 17,
     PEER_CAPABILITIES_RESPONSE = 18,
+    SESSION_FORWARDED_COMMAND_REQUEST = 19,
+    SESSION_FORWARDED_COMMAND_RESPONSE = 20,
 };
 
 struct TMessage {
@@ -238,12 +240,36 @@ struct TForwardedCommandResponse: public TMessage {
 };
 static_assert(sizeof(TForwardedCommandResponse) == sizeof(TMessage) + 24);
 
+// Sessionized forwarding prevents a delayed reply from an earlier processor
+// instance matching a reused 64-bit correlation ID on a live peer connection.
+struct TSessionForwardedCommandRequest: public TMessage {
+    static constexpr EMessageType MessageType = EMessageType::SESSION_FORWARDED_COMMAND_REQUEST;
+    uint64_t SessionId = 0;
+    uint64_t ForwardCookie = 0;
+    uint32_t Flags = TCommandRequest::ENone;
+    uint32_t ClientCookie = 0;
+    char Data[0];
+};
+static_assert(sizeof(TSessionForwardedCommandRequest) == sizeof(TMessage) + 24);
+
+struct TSessionForwardedCommandResponse: public TMessage {
+    static constexpr EMessageType MessageType = EMessageType::SESSION_FORWARDED_COMMAND_RESPONSE;
+    uint64_t SessionId = 0;
+    uint64_t ForwardCookie = 0;
+    uint64_t Index = 0;
+    uint32_t ClientCookie = 0;
+    uint32_t ErrorCode = 0;
+    char Data[0];
+};
+static_assert(sizeof(TSessionForwardedCommandResponse) == sizeof(TMessage) + 32);
+
 // Connection-level compatibility probe. Unknown message types are rejected by
 // older nodes, which close the probe connection and allow a legacy reconnect.
 struct TPeerCapabilitiesRequest: public TMessage {
     static constexpr EMessageType MessageType = EMessageType::PEER_CAPABILITIES_REQUEST;
     static constexpr uint32_t CurrentVersion = 1;
     static constexpr uint64_t ExtendedForwarding = uint64_t(1) << 0;
+    static constexpr uint64_t SessionizedForwarding = uint64_t(1) << 1;
     uint32_t MinVersion = CurrentVersion;
     uint32_t MaxVersion = CurrentVersion;
     uint64_t Features = 0;
