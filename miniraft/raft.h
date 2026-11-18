@@ -71,6 +71,7 @@ struct TJointConfigurationReadiness {
     bool HasStableConfiguration = false;
     bool HasCommittedCurrentTermEntry = false;
     bool ChangesVoterSet = false;
+    // The joint entry, its stable successor and reserved control entries fit.
     bool HasLogCapacity = false;
     std::vector<uint32_t> MissingPeerTargets;
     std::vector<uint32_t> AddedVotersWithoutCommitAck;
@@ -186,8 +187,9 @@ enum class EState: int {
 class TRaft {
 public:
     // Per-node proposal and failure-detection settings. The log limits reserve
-    // room for a current-term leader no-op; repeated uncommitted terms may
-    // consume the finite reserve and require operator recovery to restore progress.
+    // room for a current-term leader no-op and, during joint membership, its
+    // stable successor. Repeated uncommitted terms may consume the finite
+    // control reserve and require operator recovery to restore progress.
     struct TLogLimits {
         uint64_t MaxUncommittedBytes = 256ull * 1024 * 1024;
         size_t MaxUncommittedEntries = 65536;
@@ -352,8 +354,10 @@ private:
     void RemoveUncommittedLogSuffix(uint64_t firstIndex);
     void RecordUncommittedLogEntry(uint64_t index, uint32_t bytes);
     bool FitsUncommittedLog(uint64_t bytes, size_t entries) const;
-    bool FitsProposalLog(uint64_t bytes, size_t entries) const;
-    void EnsureProposalLogCapacity(uint64_t bytes, size_t entries) const;
+    bool FitsProposalLog(uint64_t bytes, size_t entries,
+        bool preserveStableSuccessor = true) const;
+    void EnsureProposalLogCapacity(uint64_t bytes, size_t entries,
+        bool preserveStableSuccessor = true) const;
 
     uint32_t Id;
     TNodeDict Nodes;

@@ -23,6 +23,13 @@ void Validate(const TConfigurationRecord& record) {
 }
 }
 
+size_t ConfigurationEntrySize(size_t oldVoterCount, size_t newVoterCount) {
+    if (oldVoterCount > TSnapshot::MaxVoters || newVoterCount > TSnapshot::MaxVoters)
+        throw std::invalid_argument("Invalid configuration voter count");
+    // MRFTC001 has 48 fixed payload bytes plus each 32-bit voter ID.
+    return sizeof(TLogEntry) + 48 + 4 * (oldVoterCount + newVoterCount);
+}
+
 TMessageHolder<TLogEntry> EncodeConfigurationEntry(const TConfigurationRecord& record) {
     Validate(record);
     std::string bytes(Magic);
@@ -35,7 +42,10 @@ TMessageHolder<TLogEntry> EncodeConfigurationEntry(const TConfigurationRecord& r
     for (auto id : record.OldVoters) Put(bytes, id, 4);
     for (auto id : record.NewVoters) Put(bytes, id, 4);
     Put(bytes, Checksum(bytes), 4);
-    auto entry = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + bytes.size());
+    const auto frameSize = ConfigurationEntrySize(record.OldVoters.size(), record.NewVoters.size());
+    if (frameSize - sizeof(TLogEntry) != bytes.size())
+        throw std::logic_error("Configuration record size calculation mismatch");
+    auto entry = NewHoldedMessage<TLogEntry>(frameSize);
     entry->Term = record.Term; entry->Flags = TLogEntry::EConfiguration;
     memcpy(entry->Data, bytes.data(), bytes.size());
     return entry;

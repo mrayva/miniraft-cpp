@@ -678,7 +678,7 @@ void test_joint_configuration_readiness_reports_log_and_index_capacity(void**) {
         state->CommitIndex = 1;
         state->Commit();
         const TRaft::TLogLimits limits{
-            .MaxUncommittedBytes = sizeof(TLogEntry) + jointEntry->Len - 1,
+            .MaxUncommittedBytes = sizeof(TLogEntry) + uint64_t(jointEntry->Len) * 2 - 1,
             .MaxUncommittedEntries = 2,
         };
         TRaft raft(state, 1, {{2, std::make_shared<TEndpoint>()}}, {2}, limits);
@@ -706,7 +706,7 @@ void test_joint_configuration_readiness_reports_log_and_index_capacity(void**) {
         state->BindVoters({1});
         state->Commit();
         TSnapshot snapshot;
-        snapshot.Index = uint64_t(INT64_MAX);
+        snapshot.Index = uint64_t(INT64_MAX) - 2;
         snapshot.Term = 1;
         snapshot.Voters = {1};
         state->InstallSnapshot(snapshot);
@@ -727,6 +727,33 @@ void test_joint_configuration_readiness_reports_log_and_index_capacity(void**) {
         assert_true(readiness.AddedVotersWithoutCommitAck.empty());
         assert_false(readiness.HasLogCapacity);
         assert_false(readiness.Ready());
+    }
+    {
+        auto state = std::make_shared<TDurableState>((dir / "reserve-stable").string(), 1);
+        state->BindVoters({1});
+        state->Commit();
+        const auto joint = EncodeConfigurationEntry(TConfigurationRecord{
+            EConfigurationPhase::Joint, 1, 0, 0, {1}, {1, 2}});
+        const auto stable = EncodeConfigurationEntry(TConfigurationRecord{
+            EConfigurationPhase::Stable, 1, 1, 1, {1}, {1, 2}});
+        assert_int_equal(joint->Len, stable->Len);
+        state->Append(joint);
+        state->CommitIndex = state->LastLogIndex;
+        state->Commit();
+
+        TRaft raft(state, 1, {{2, std::make_shared<TEndpoint>()}}, {},
+            TRaft::TLogLimits{
+                .MaxUncommittedBytes = sizeof(TLogEntry) + stable->Len,
+                .MaxUncommittedEntries = 2,
+            });
+        raft.Become(EState::LEADER);
+
+        auto applicationEntry = NewHoldedMessage<TLogEntry>(stable->Len);
+        Reject([&] { raft.Append(applicationEntry); }); // Preserve room for the stable successor.
+        assert_int_equal(state->LastLogIndex, 1);
+        const auto stableIndex = raft.FinalizeConfiguration();
+        assert_int_equal(stableIndex, 2);
+        assert_true(DecodeConfigurationEntry(state->Get(2)).Phase == EConfigurationPhase::Stable);
     }
     std::error_code ignored;
     std::filesystem::remove_all(dir, ignored);

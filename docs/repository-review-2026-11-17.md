@@ -68,11 +68,13 @@ saturated log. A timed-out or cancelled write still has an unknown outcome.
 ### P2: readiness omitted exhausted log capacity — fixed
 
 `TJointConfigurationReadiness` now reports `HasLogCapacity`, and `Ready()`
-requires it. The check accounts for both `INT64_MAX` and the encoded joint entry
-against the configured uncommitted-log proposal budget. Deterministic tests
-cover an exhausted snapshot index and a full proposal-entry budget while all
-other readiness prerequisites are satisfied. The report remains point-in-time;
-callers must still handle capacity changes before proposing.
+requires it. The check accounts for the joint entry, stable successor, control
+reserve, configured log budget and available indices. While a joint transition
+is pending, normal proposals and a leader no-op preserve the stable successor's
+capacity; finalization consumes it. Deterministic tests cover exhausted index
+space, insufficient transition budget and successful finalization under an
+exact reservation. The report remains point-in-time; callers must still handle
+capacity changes before proposing.
 
 ## Membership and snapshot limits still present
 

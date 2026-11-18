@@ -2122,6 +2122,12 @@ uint64_t TRaft::Append(TMessageHolder<TLogEntry> entry) {
     if (!IsVoter(Id)) throw std::logic_error("A learner cannot propose log entries");
     if (StateName != EState::LEADER) throw std::logic_error("Only a leader can propose log entries");
     if (State->LastLogIndex >= uint64_t(INT64_MAX)) throw std::overflow_error("Raft log index exhausted");
+    if (Configuration && Configuration->Latest.IsJoint()) {
+        const auto remainingIndexes = uint64_t(INT64_MAX) - State->LastLogIndex;
+        if (LogLimits.ReservedControlEntries > remainingIndexes ||
+            remainingIndexes - LogLimits.ReservedControlEntries < 2)
+            throw TRaftLogCapacityExceeded(); // Keep one index for finalization and control progress.
+    }
     if (!entry.HasValidExtent() || entry->Type != uint32_t(EMessageType::LOG_ENTRY))
         throw TMessageError("Invalid proposed log entry");
     ValidateMessageTree(entry);
@@ -2154,7 +2160,9 @@ TJointConfigurationReadiness TRaft::CheckJointConfigurationReadiness(
         !Configuration->Committed.IsJoint();
     readiness.HasCommittedCurrentTermEntry = VolatileState->CommitIndex &&
         State->LogTerm(VolatileState->CommitIndex) == State->CurrentTerm;
-    readiness.HasLogCapacity = State->LastLogIndex < uint64_t(INT64_MAX);
+    constexpr uint64_t maxIndex = uint64_t(INT64_MAX);
+    readiness.HasLogCapacity = State->LastLogIndex <= maxIndex - 2 &&
+        LogLimits.ReservedControlEntries <= maxIndex - State->LastLogIndex - 2;
 
     if (readiness.HasStableConfiguration) {
         const auto& oldVoters = Configuration->Committed.OldVoters();
@@ -2164,7 +2172,9 @@ TJointConfigurationReadiness TRaft::CheckJointConfigurationReadiness(
             auto proposed = EncodeConfigurationEntry(TConfigurationRecord{
                 EConfigurationPhase::Joint, State->CurrentTerm,
                 latest.ConfigurationIndex(), latest.ConfigurationTerm(), oldVoters, newVoters});
-            readiness.HasLogCapacity = FitsProposalLog(proposed->Len, 1);
+            // The joint and stable records have identical fixed-width layouts.
+            // Reserve both records and leave the configured control budget.
+            readiness.HasLogCapacity = FitsProposalLog(uint64_t(proposed->Len) * 2, 2);
         }
         if (readiness.IsLeader) {
             for (auto id : newVoters) {
@@ -2198,6 +2208,7 @@ uint64_t TRaft::ProposeJointConfiguration(std::vector<uint32_t> newVoters) {
     const auto readiness = CheckJointConfigurationReadiness(newVoters);
     if (!readiness.ChangesVoterSet)
         throw std::invalid_argument("The new voter set must change membership");
+    if (!readiness.HasLogCapacity) throw TRaftLogCapacityExceeded();
     if (!readiness.MissingPeerTargets.empty())
         throw std::invalid_argument("Every active and proposed voter must have a configured replication target");
     if (!readiness.AddedVotersWithoutCommitAck.empty())
@@ -2230,7 +2241,7 @@ uint64_t TRaft::FinalizeConfiguration() {
     TConfigurationRecord record{EConfigurationPhase::Stable, State->CurrentTerm,
         joint.ConfigurationIndex(), joint.ConfigurationTerm(), joint.OldVoters(), joint.NewVoters()};
     auto entry = EncodeConfigurationEntry(record);
-    EnsureProposalLogCapacity(entry->Len, 1);
+    EnsureProposalLogCapacity(entry->Len, 1, false);
     const auto bytes = entry->Len;
     State->Append(std::move(entry));
     RecordUncommittedLogEntry(State->LastLogIndex, bytes);
@@ -2921,21 +2932,42 @@ void TRaft::RecordUncommittedLogEntry(uint64_t index, uint32_t bytes) {
 }
 
 bool TRaft::FitsUncommittedLog(uint64_t bytes, size_t entries) const {
-    return UncommittedLogBytes <= LogLimits.MaxUncommittedBytes &&
-        bytes <= LogLimits.MaxUncommittedBytes - UncommittedLogBytes &&
-        UncommittedLog.size() <= LogLimits.MaxUncommittedEntries &&
-        entries <= LogLimits.MaxUncommittedEntries - UncommittedLog.size();
+    uint64_t stableSuccessorBytes = 0;
+    size_t stableSuccessorEntries = 0;
+    if (Configuration && Configuration->Latest.IsJoint()) {
+        const auto& joint = Configuration->Latest;
+        stableSuccessorBytes = ConfigurationEntrySize(joint.OldVoters().size(), joint.NewVoters().size());
+        stableSuccessorEntries = 1;
+    }
+    if (stableSuccessorBytes > LogLimits.MaxUncommittedBytes ||
+        stableSuccessorEntries > LogLimits.MaxUncommittedEntries ||
+        State->LastLogIndex > uint64_t(INT64_MAX))
+        return false;
+    const auto availableIndexes = uint64_t(INT64_MAX) - State->LastLogIndex;
+    if (entries > availableIndexes || stableSuccessorEntries > availableIndexes - entries)
+        return false;
+    const auto maxBytes = LogLimits.MaxUncommittedBytes - stableSuccessorBytes;
+    const auto maxEntries = LogLimits.MaxUncommittedEntries - stableSuccessorEntries;
+    return UncommittedLogBytes <= maxBytes && bytes <= maxBytes - UncommittedLogBytes &&
+        UncommittedLog.size() <= maxEntries && entries <= maxEntries - UncommittedLog.size();
 }
 
-bool TRaft::FitsProposalLog(uint64_t bytes, size_t entries) const {
-    const auto proposalBytes = LogLimits.MaxUncommittedBytes - LogLimits.ReservedControlBytes;
-    const auto proposalEntries = LogLimits.MaxUncommittedEntries - LogLimits.ReservedControlEntries;
+bool TRaft::FitsProposalLog(uint64_t bytes, size_t entries, bool preserveStableSuccessor) const {
+    auto proposalBytes = LogLimits.MaxUncommittedBytes - LogLimits.ReservedControlBytes;
+    auto proposalEntries = LogLimits.MaxUncommittedEntries - LogLimits.ReservedControlEntries;
+    if (preserveStableSuccessor && Configuration && Configuration->Latest.IsJoint()) {
+        const auto& joint = Configuration->Latest;
+        const auto stableBytes = ConfigurationEntrySize(joint.OldVoters().size(), joint.NewVoters().size());
+        if (stableBytes > proposalBytes || !proposalEntries) return false;
+        proposalBytes -= stableBytes;
+        --proposalEntries;
+    }
     return UncommittedLogBytes <= proposalBytes && bytes <= proposalBytes - UncommittedLogBytes &&
         UncommittedLog.size() <= proposalEntries && entries <= proposalEntries - UncommittedLog.size();
 }
 
-void TRaft::EnsureProposalLogCapacity(uint64_t bytes, size_t entries) const {
-    if (!FitsProposalLog(bytes, entries)) throw TRaftLogCapacityExceeded();
+void TRaft::EnsureProposalLogCapacity(uint64_t bytes, size_t entries, bool preserveStableSuccessor) const {
+    if (!FitsProposalLog(bytes, entries, preserveStableSuccessor)) throw TRaftLogCapacityExceeded();
 }
 
 void TRaft::AdvanceCommitIndex(uint64_t index) {

@@ -2,6 +2,7 @@
 
 #include "messages.h"
 #include "snapshot.h"
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -17,6 +18,7 @@ struct TConfigurationRecord {
 };
 
 TMessageHolder<TLogEntry> EncodeConfigurationEntry(const TConfigurationRecord& record);
+size_t ConfigurationEntrySize(size_t oldVoterCount, size_t newVoterCount);
 TConfigurationRecord DecodeConfigurationEntry(TMessageHolder<TLogEntry> entry);
 
 // Validates transition ordering and derives configuration identity from a

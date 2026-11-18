@@ -38,9 +38,12 @@ configured replication target. The report from the prospective leader also
 lists `AddedVotersWithoutCommitAck`; only that
 leader has the correlated replication evidence required to promote a learner.
 `Ready()` is true only on a leader whose local prerequisites are satisfied.
-`HasLogCapacity` accounts for both the next log index and the encoded joint
-entry under that node's configured proposal budget. Recheck it immediately
-before proposing; a readiness report is a point-in-time observation.
+`HasLogCapacity` accounts for the joint entry, its stable successor, the
+configured control reserve, and the available log indices. Once a joint entry
+is pending, ordinary proposals and a leader no-op preserve capacity for its
+stable successor; `FinalizeConfiguration()` consumes that reservation.
+Recheck readiness immediately before proposing; the report is a point-in-time
+observation.
 This check does not distribute endpoints, so provision each replica's targets
 through the server's normal endpoint registration path first.
 
