@@ -31,10 +31,12 @@ untouched; point the node at the new durable base only after success.
 
 The converter validates the source log and stored vote, preserves the term,
 vote and every entry, records the supplied commit index and voter binding, and
-publishes the new image through the durable backend. It refuses compacted
-stores, configuration entries, unknown entry flags, malformed terms and commit
-indices beyond the log. Configuration-bearing history needs a separately
-verified migration procedure.
+publishes the new image through the durable backend. It validates retained
+configuration entries in order from the supplied original voter set, including
+their transition predecessor and the commit boundary. It refuses compacted
+stores, unknown entry flags, malformed terms and commit indices beyond the log.
+The active configuration is still reconstructed from the preserved log when
+Raft starts.
 
 The dry run proves only that the files are internally consistent with the
 values supplied. It cannot prove that the voter set is historically complete

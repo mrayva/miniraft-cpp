@@ -1,5 +1,6 @@
 #include "durable.h"
 #include "persist.h"
+#include "configuration.h"
 #include <array>
 #include <climits>
 #include <algorithm>
@@ -484,24 +485,35 @@ TLegacyDiskStateMigrationInfo InspectLegacyDiskState(const IState& source, uint3
         throw std::invalid_argument("Source already persists its commit boundary");
     if (commitIndex > source.LastLogIndex)
         throw std::invalid_argument("Supplied commit index exceeds the legacy log");
-    if (source.VotedFor && !std::binary_search(voters.begin(), voters.end(), source.VotedFor))
-        throw std::invalid_argument("Stored vote is outside the trusted voter set");
-
+    std::vector<uint32_t> historicalVoters = voters;
     uint64_t previousTerm = 0;
     for (uint64_t index = 1; index <= source.LastLogIndex; ++index) {
         const auto entry = source.Get(static_cast<int64_t>(index));
         if (!entry) throw std::invalid_argument("Missing legacy log entry");
         ValidateMessageTree(entry);
-        if (entry->Flags == TLogEntry::EConfiguration)
-            throw std::invalid_argument("Legacy configuration entries need an independently verified history");
-        if (entry->Flags != TLogEntry::ENone && entry->Flags != TLogEntry::EStub)
+        if (entry->Flags == TLogEntry::EConfiguration) {
+            const auto record = DecodeConfigurationEntry(entry);
+            historicalVoters.insert(historicalVoters.end(), record.OldVoters.begin(), record.OldVoters.end());
+            historicalVoters.insert(historicalVoters.end(), record.NewVoters.begin(), record.NewVoters.end());
+        } else if (entry->Flags != TLogEntry::ENone && entry->Flags != TLogEntry::EStub) {
             throw std::invalid_argument("Legacy log contains unsupported entry flags");
+        }
         if (!entry->Term || entry->Term < previousTerm || entry->Term > source.CurrentTerm)
             throw std::invalid_argument("Invalid legacy log term sequence");
         previousTerm = entry->Term;
     }
     if (source.LastLogTerm != previousTerm)
         throw std::invalid_argument("Legacy last-log term does not match its entries");
+
+    // A vote can name a voter introduced or removed by a retained membership
+    // transition; the original bound set alone is not the complete valid set.
+    std::sort(historicalVoters.begin(), historicalVoters.end());
+    historicalVoters.erase(std::unique(historicalVoters.begin(), historicalVoters.end()), historicalVoters.end());
+    if (source.VotedFor && !std::binary_search(historicalVoters.begin(), historicalVoters.end(), source.VotedFor))
+        throw std::invalid_argument("Stored vote is outside the validated membership history");
+
+    const auto baseline = TConfigurationHistory::Stable(voters, 0, 0, 0, 0);
+    (void)ScanConfigurationHistory(source, baseline, commitIndex);
     return {source.CurrentTerm, source.VotedFor, source.LastLogIndex, source.LastLogTerm, commitIndex};
 }
 

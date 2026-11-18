@@ -15,8 +15,8 @@ void Usage(std::ostream& out) {
            "--node-id ID --voters ID,ID,... --commit-index INDEX [--dry-run]\n"
         << "The complete original voter set and commit index must come from "
            "independently trusted records.\n"
-        << "Only offline, un-compacted TDiskState logs without configuration entries "
-           "can be migrated.\n";
+        << "Only offline, un-compacted TDiskState logs with valid retained membership "
+           "history can be migrated.\n";
 }
 
 uint64_t ParseUnsigned(std::string_view text, const char* name) {

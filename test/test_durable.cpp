@@ -1,4 +1,5 @@
 #include <miniraft/durable.h>
+#include <miniraft/configuration.h>
 #include <miniraft/persist.h>
 #include <miniraft/raft.h>
 #include <miniraft/snapshot_codec.h>
@@ -427,16 +428,47 @@ void test_split_legacy_disk_state_migration_requires_trusted_baselines(void**) {
     assert_false(std::filesystem::exists(rejectedOutput + ".durable.2"));
 
     const auto configuredLegacy = (files.Directory / "configured-legacy").string();
+    const std::vector<uint32_t> newVoters{2, 3, 4};
     {
         TDiskState source(configuredLegacy, 2);
-        auto entry = Entry(1, "configuration");
-        entry->Flags = TLogEntry::EConfiguration;
-        source.Append(entry);
+        source.CurrentTerm = 5;
+        source.VotedFor = 4; // A valid vote for a voter introduced by the history.
+        source.Commit();
+        source.Append(Entry(2, "before joint"));
+        source.Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Joint, 3, 0, 0, voters, newVoters}));
+        source.Append(Entry(3, "in joint"));
+        source.Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Stable, 4, 2, 3, voters, newVoters}));
     }
-    bool configRejected = false;
-    try { CheckLegacyDiskStateMigration(configuredLegacy, 2, voters, 1); }
-    catch (const std::exception&) { configRejected = true; }
-    assert_true(configRejected);
+    const auto configDurable = (files.Directory / "configured-durable").string();
+    const auto configInfo = MigrateLegacyDiskState(configuredLegacy, configDurable, 2, voters, 2);
+    assert_int_equal(configInfo.CommitIndex, 2);
+    {
+        TDurableState state(configDurable, 2);
+        assert_int_equal(state.VotedFor, 4);
+        assert_true(state.GetBoundVoters() == voters);
+        const auto history = ScanCommittedConfigurationHistory(
+            state, TConfigurationHistory::Stable(voters, 0, 0, 0, 0));
+        assert_true(history.Committed.IsJoint());
+        assert_true(history.Committed.OldVoters() == voters);
+        assert_true(history.Committed.NewVoters() == newVoters);
+        assert_false(history.Latest.IsJoint());
+        assert_true(history.Latest.OldVoters() == newVoters);
+    }
+
+    const auto invalidConfig = (files.Directory / "invalid-config").string();
+    {
+        TDiskState source(invalidConfig, 2);
+        source.CurrentTerm = 2;
+        source.Commit();
+        source.Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Joint, 1, 0, 0, {7, 8}, {8, 9}}));
+    }
+    bool configHistoryRejected = false;
+    try { CheckLegacyDiskStateMigration(invalidConfig, 2, voters, 1); }
+    catch (const std::exception&) { configHistoryRejected = true; }
+    assert_true(configHistoryRejected);
 
     const auto missingLegacy = (files.Directory / "missing-legacy").string();
     bool missingRejected = false;

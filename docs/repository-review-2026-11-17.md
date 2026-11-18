@@ -109,7 +109,8 @@ capacity changes before proposing.
   boundary. The new offline converter handles un-compacted split `TDiskState`
   logs and preserves the source files; its dry run checks consistency, not
   historical voter-set completeness or the application's commit boundary.
-  Snapshots and legacy configuration entries still need separate verification.
+  Retained configuration entries are checked against the supplied baseline;
+  snapshots still need a separate history migration.
 
 ## General production gaps
 
