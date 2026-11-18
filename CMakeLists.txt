@@ -9,6 +9,7 @@ include(CTest)
 option(MINIRAFT_BUILD_NETWORK "Build coroio networking and examples" ON)
 
 add_subdirectory(miniraft)
+add_subdirectory(tools)
 if(MINIRAFT_BUILD_NETWORK)
   add_subdirectory(coroio/coroio)
   add_subdirectory(miniraft/net)

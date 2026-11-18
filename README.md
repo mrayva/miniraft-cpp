@@ -156,6 +156,8 @@ The [migration lifecycle follow-up](docs/trusted-legacy-voter-lifecycle.md)
 enforces that migration happens before Raft attaches to an unbound legacy store.
 The [legacy voter startup proof follow-up](docs/legacy-voter-proof-startup.md)
 requires recovered durable stores to provide voter proof before Raft can start.
+The [legacy disk-state migration guide](docs/legacy-disk-state-migration.md)
+documents the offline converter from split `TDiskState` files to a new durable base.
 The [stable snapshot runtime follow-up](docs/stable-configuration-snapshot-runtime.md)
 carries that identity through restore, InstallSnapshot, and later compaction.
 The [stable membership compaction follow-up](docs/stable-membership-compaction.md)

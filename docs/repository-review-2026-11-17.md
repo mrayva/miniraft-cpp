@@ -105,9 +105,11 @@ capacity changes before proposing.
   histories can require a fresh learner baseline or independently verified
   recovery history. Joint consensus itself is implemented, including disjoint
   transitions; unrestricted automatic stale recovery is a separate capability.
-- Legacy migration still requires a trusted complete original voter set. The
-  dry run validates consistency, not historical completeness. Split legacy
-  TDiskState files have no general offline conversion tool.
+- Legacy migration requires a trusted complete original voter set and commit
+  boundary. The new offline converter handles un-compacted split `TDiskState`
+  logs and preserves the source files; its dry run checks consistency, not
+  historical voter-set completeness or the application's commit boundary.
+  Snapshots and legacy configuration entries still need separate verification.
 
 ## General production gaps
 

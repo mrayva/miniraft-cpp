@@ -41,8 +41,11 @@ correct, discover prior membership transitions hidden by a legacy snapshot, or
 authorize a membership change. Existing `BindVoters` behavior is unchanged.
 Do not call the migration API when the original complete voter set is unknown.
 The migration applies to `TDurableState`; legacy `TDiskState` remains unable to
-persist voter bindings. Since alpha.52, Raft rejects recovered log-only durable
-stores with no binding, so this migration must be completed before startup.
+persist voter bindings. For un-compacted split `TDiskState` files, the separate
+Linux [offline converter](legacy-disk-state-migration.md) copies the log to a
+new durable base and additionally requires an independently known commit
+index. Since alpha.52, Raft rejects recovered log-only durable stores with no
+binding, so either migration must be completed before startup.
 
 Tests cover MRFTD001, MRFTD002 and MRFTD003 recovery, rejection
 of inconsistent vote/snapshot baselines and configuration log entries without

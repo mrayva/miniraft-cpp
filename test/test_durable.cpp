@@ -371,6 +371,82 @@ void test_legacy_store_is_not_silently_migrated(void**) {
     Reject(files);
     assert_false(fs::exists(files.Image()));
 }
+void test_split_legacy_disk_state_migration_requires_trusted_baselines(void**) {
+    TFiles files;
+    const auto legacy = (files.Directory / "legacy").string();
+    const auto durable = (files.Directory / "durable").string();
+    const std::vector<uint32_t> voters{1, 2, 3};
+    {
+        TDiskState source(legacy, 2);
+        source.CurrentTerm = 4;
+        source.VotedFor = 3;
+        source.Commit();
+        source.Append(Entry(2, "committed"));
+        source.Append(Entry(4, "tail"));
+    }
+    const auto bytesBefore = [&](const std::string& suffix) {
+        std::ifstream input(legacy + suffix + ".2", std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    };
+    const auto entriesBefore = bytesBefore(".entries");
+    const auto indexBefore = bytesBefore(".index");
+    const auto stateBefore = bytesBefore(".state");
+
+    const auto checked = CheckLegacyDiskStateMigration(legacy, 2, voters, 1);
+    assert_int_equal(checked.CurrentTerm, 4);
+    assert_int_equal(checked.VotedFor, 3);
+    assert_int_equal(checked.LastLogIndex, 2);
+    assert_int_equal(checked.LastLogTerm, 4);
+    assert_int_equal(checked.CommitIndex, 1);
+    assert_true(bytesBefore(".entries") == entriesBefore);
+    assert_true(bytesBefore(".index") == indexBefore);
+    assert_true(bytesBefore(".state") == stateBefore);
+
+    const auto migrated = MigrateLegacyDiskState(legacy, durable, 2, voters, 1);
+    assert_int_equal(migrated.LastLogIndex, 2);
+    {
+        TDurableState state(durable, 2);
+        assert_int_equal(state.CurrentTerm, 4);
+        assert_int_equal(state.VotedFor, 3);
+        assert_int_equal(state.LastLogIndex, 2);
+        assert_int_equal(state.LastLogTerm, 4);
+        assert_int_equal(state.CommitIndex, 1);
+        assert_true(state.GetBoundVoters() == voters);
+        assert_string_equal(Data(state, 1).c_str(), "committed");
+        assert_string_equal(Data(state, 2).c_str(), "tail");
+    }
+    assert_true(bytesBefore(".entries") == entriesBefore);
+    assert_true(bytesBefore(".index") == indexBefore);
+    assert_true(bytesBefore(".state") == stateBefore);
+
+    const auto rejectedOutput = (files.Directory / "rejected").string();
+    bool invalidCommitRejected = false;
+    try { MigrateLegacyDiskState(legacy, rejectedOutput, 2, voters, 3); }
+    catch (const std::exception&) { invalidCommitRejected = true; }
+    assert_true(invalidCommitRejected);
+    assert_false(std::filesystem::exists(rejectedOutput + ".durable.2"));
+
+    const auto configuredLegacy = (files.Directory / "configured-legacy").string();
+    {
+        TDiskState source(configuredLegacy, 2);
+        auto entry = Entry(1, "configuration");
+        entry->Flags = TLogEntry::EConfiguration;
+        source.Append(entry);
+    }
+    bool configRejected = false;
+    try { CheckLegacyDiskStateMigration(configuredLegacy, 2, voters, 1); }
+    catch (const std::exception&) { configRejected = true; }
+    assert_true(configRejected);
+
+    const auto missingLegacy = (files.Directory / "missing-legacy").string();
+    bool missingRejected = false;
+    try { CheckLegacyDiskStateMigration(missingLegacy, 2, voters, 0); }
+    catch (const std::exception&) { missingRejected = true; }
+    assert_true(missingRejected);
+    assert_false(fs::exists(missingLegacy + ".entries.2"));
+    assert_false(fs::exists(missingLegacy + ".index.2"));
+    assert_false(fs::exists(missingLegacy + ".state.2"));
+}
 void test_get_and_append_do_not_share_mutable_entries(void**) {
     TFiles files;
     {
@@ -425,6 +501,7 @@ int main() {
         cmocka_unit_test(test_single_writer_lock),
         cmocka_unit_test(test_missing_image_is_not_recreated),
         cmocka_unit_test(test_legacy_store_is_not_silently_migrated),
+        cmocka_unit_test(test_split_legacy_disk_state_migration_requires_trusted_baselines),
         cmocka_unit_test(test_get_and_append_do_not_share_mutable_entries),
         cmocka_unit_test(test_raft_election_and_application_replay_after_restart),
     };

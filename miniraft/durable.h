@@ -1,8 +1,28 @@
 #pragma once
 #include "state.h"
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
+
+struct TLegacyDiskStateMigrationInfo {
+    uint64_t CurrentTerm = 0;
+    uint32_t VotedFor = 0;
+    uint64_t LastLogIndex = 0;
+    uint64_t LastLogTerm = 0;
+    uint64_t CommitIndex = 0;
+};
+
+// Check or migrate an offline, un-compacted TDiskState store. The caller must
+// supply the independently verified original voter set and commit boundary.
+// Configuration entries and snapshots are not supported by this conversion.
+TLegacyDiskStateMigrationInfo CheckLegacyDiskStateMigration(
+    const std::string& legacyBase, uint32_t nodeId,
+    const std::vector<uint32_t>& trustedVoters, uint64_t commitIndex);
+TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(
+    const std::string& legacyBase, const std::string& durableBase, uint32_t nodeId,
+    const std::vector<uint32_t>& trustedVoters, uint64_t commitIndex);
 
 // Linux: atomic hard-state + snapshot + suffix replacement, with file/directory
 // fsync. O(snapshot + retained log size) per update: a durability baseline.
@@ -44,6 +64,9 @@ public:
         std::string* reason = nullptr) const;
     void BindVotersFromTrustedBaseline(const std::vector<uint32_t>& voters);
 private:
+    friend TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(
+        const std::string&, const std::string&, uint32_t,
+        const std::vector<uint32_t>&, uint64_t);
     void ValidateTrustedLegacyVoterBaseline(const std::vector<uint32_t>& voters) const;
     void InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated);
     struct TImpl;
