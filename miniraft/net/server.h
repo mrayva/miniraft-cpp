@@ -211,6 +211,30 @@ public:
     bool RetirementComplete() const { return Retired && RetiredCleaned; }
     uint64_t GetConnectionGeneration() const { return ConnectionGeneration; }
     bool IsConnected() { return Connected; }
+    bool SupportsExtendedForwarding() const override {
+        return Connected && !CapabilityNegotiating &&
+            (PeerFeatures & TPeerCapabilitiesRequest::ExtendedForwarding);
+    }
+    bool IsCapabilityNegotiating() const { return CapabilityNegotiating; }
+    bool CompleteCapabilityNegotiation(
+            const TMessageHolder<TPeerCapabilitiesResponse>& response, uint64_t generation) {
+        if (!CapabilityNegotiating || generation != ConnectionGeneration ||
+            response->ConnectionId != generation || response->Reserved != 0 ||
+            response->Version > TPeerCapabilitiesRequest::CurrentVersion ||
+            (!response->Version && response->Features) ||
+            (response->Features & ~TPeerCapabilitiesRequest::ExtendedForwarding))
+            return false;
+        PeerFeatures = response->Version == TPeerCapabilitiesRequest::CurrentVersion
+            ? response->Features : 0;
+        CapabilityNegotiating = false;
+        return true;
+    }
+    void FailCapabilityNegotiation(uint64_t generation) noexcept {
+        if (!CapabilityNegotiating || generation != ConnectionGeneration) return;
+        CapabilityNegotiating = false;
+        PeerFeatures = 0;
+        SkipNextCapabilityProbe = true;
+    }
     TSocket& Sock() {
         return Socket;
     }
@@ -235,6 +259,9 @@ private:
     TSocket Socket;
     bool Connected = false;
     bool Retired = false;
+    bool CapabilityNegotiating = false;
+    bool SkipNextCapabilityProbe = false;
+    uint64_t PeerFeatures = 0;
     bool ResponseReaderActive = false;
     bool RetiredCleaned = false;
     uint64_t ConnectionGeneration = 0;

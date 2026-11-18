@@ -20,7 +20,20 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(TSocket socket) {
         while (true) {
             auto mes = co_await TMessageReader(client->Sock()).Read();
             // client request
-            if (auto maybeForwardedRequest = mes.template Maybe<TForwardedCommandRequest>()) {
+            if (auto maybeCapabilities = mes.template Maybe<TPeerCapabilitiesRequest>()) {
+                auto request = maybeCapabilities.Cast();
+                if (!request->ConnectionId || !request->MinVersion ||
+                    request->MinVersion > request->MaxVersion)
+                    throw TMessageError("Invalid peer capability request");
+                const bool compatible = request->MinVersion <= TPeerCapabilitiesRequest::CurrentVersion &&
+                    request->MaxVersion >= TPeerCapabilitiesRequest::CurrentVersion;
+                auto response = NewHoldedMessage<TPeerCapabilitiesResponse>();
+                response->Version = compatible ? TPeerCapabilitiesRequest::CurrentVersion : 0;
+                response->Features = compatible
+                    ? request->Features & TPeerCapabilitiesRequest::ExtendedForwarding : 0;
+                response->ConnectionId = request->ConnectionId;
+                client->Send(std::move(response));
+            } else if (auto maybeForwardedRequest = mes.template Maybe<TForwardedCommandRequest>()) {
                 RequestProcessor->OnForwardedCommandRequest(std::move(maybeForwardedRequest.Cast()), client);
             } else if (auto maybeForwardedResponse = mes.template Maybe<TForwardedCommandResponse>()) {
                 RequestProcessor->OnForwardedCommandResponse(std::move(maybeForwardedResponse.Cast()), client);
@@ -167,7 +180,12 @@ NNet::TVoidTask TRaftServer<TSocket>::OutboundServe(std::shared_ptr<TNode<TSocke
                 throw std::runtime_error("Not connected");
             }
             auto mes = co_await TMessageReader(node->Sock()).Read();
-            if (auto maybeForwardedResponse = mes.template Maybe<TForwardedCommandResponse>()) {
+            if (auto maybeCapabilities = mes.template Maybe<TPeerCapabilitiesResponse>()) {
+                if (!node->CompleteCapabilityNegotiation(
+                        maybeCapabilities.Cast(), generation))
+                    throw TMessageError("Invalid peer capability response");
+                DrainNodes();
+            } else if (auto maybeForwardedResponse = mes.template Maybe<TForwardedCommandResponse>()) {
                 RequestProcessor->OnForwardedCommandResponse(std::move(maybeForwardedResponse.Cast()), node);
                 DrainNodes();
             } else if (auto maybeCommandResponse = mes.template Maybe<TCommandResponse>()) {
@@ -183,10 +201,13 @@ NNet::TVoidTask TRaftServer<TSocket>::OutboundServe(std::shared_ptr<TNode<TSocke
         }
         if (error) {
             if (node->IsRetired()) break;
+            if (wasConnected && node->IsCapabilityNegotiating())
+                node->FailCapabilityNegotiation(generation);
             RequestProcessor->OnPeerDisconnected(node);
             if (wasConnected) node->Disconnect(generation);
             DrainNodes();
             co_await Poller.Sleep(std::chrono::milliseconds(1000));
+            if (!node->IsRetired()) DrainNodes();
         }
     }
     if (node->IsRetired()) {

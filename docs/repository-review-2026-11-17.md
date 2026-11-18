@@ -125,9 +125,9 @@ callers must still handle capacity changes before proposing.
 - No replicated client deduplication/session protocol. Retrying a write after
   an uncertain outcome can execute it again. Correlation cookies do not provide
   durable operation identity. Forwarding now uses monotonic 64-bit correlation
-  IDs; IDs beyond the legacy range require the extended internal message types
-  and all nodes to be upgraded together because the wire protocol has no
-  general version negotiation.
+  IDs. The network transport negotiates support before using extended internal
+  message types and falls back to legacy framing for older peers. Durable
+  cross-processor request identity remains unsupported.
 - Server lifecycle lacks a general stop/cancel/join API for its detached
   accept, timer and connection coroutines. Peer retirement addresses a narrower
   lifecycle. Reusable embedding needs explicit shutdown ownership.

@@ -31,6 +31,8 @@ void ValidateMessageHeader(uint32_t type, uint32_t length, const TMessageLimits&
         minimum = sizeof(TForwardedCommandRequest); fixed = false; break;
     case EMessageType::FORWARDED_COMMAND_RESPONSE:
         minimum = sizeof(TForwardedCommandResponse); fixed = false; break;
+    case EMessageType::PEER_CAPABILITIES_REQUEST: minimum = sizeof(TPeerCapabilitiesRequest); break;
+    case EMessageType::PEER_CAPABILITIES_RESPONSE: minimum = sizeof(TPeerCapabilitiesResponse); break;
     default: throw TMessageError("Unknown or unsupported message type");
     }
     if (length < minimum || (fixed && length != minimum) || length > limits.MaxFrameBytes)

@@ -3071,6 +3071,13 @@ void TRequestProcessor::Forward(TMessageHolder<TCommandRequest> command,
                 .ErrorCode = TCommandResponse::Failed}));
             return;
         }
+        auto peer = Nodes.at(leaderId);
+        if (NextForwardId > UINT32_MAX && !peer->SupportsExtendedForwarding()) {
+            ReleaseAdmission(admissionId);
+            replyTo->Send(NewHoldedMessage(TCommandResponse{.Cookie = command->Cookie,
+                .ErrorCode = TCommandResponse::Failed}));
+            return;
+        }
         constexpr size_t ExtendedRequestOverhead =
             sizeof(TForwardedCommandRequest) - sizeof(TCommandRequest);
         if (NextForwardId > UINT32_MAX &&
@@ -3082,7 +3089,6 @@ void TRequestProcessor::Forward(TMessageHolder<TCommandRequest> command,
         }
         const auto forwardId = NextForwardId;
         NextForwardId = forwardId == UINT64_MAX ? 0 : forwardId + 1;
-        auto peer = Nodes.at(leaderId);
         Forwarded.emplace(forwardId, TForwarded{replyTo, peer, command->Cookie,
                                                 leaderId, Raft->GetState()->CurrentTerm, admissionId});
         bool accepted = false;

@@ -38,6 +38,8 @@ enum class EMessageType : uint32_t {
     PRE_VOTE_RESPONSE = 14,
     FORWARDED_COMMAND_REQUEST = 15,
     FORWARDED_COMMAND_RESPONSE = 16,
+    PEER_CAPABILITIES_REQUEST = 17,
+    PEER_CAPABILITIES_RESPONSE = 18,
 };
 
 struct TMessage {
@@ -235,6 +237,28 @@ struct TForwardedCommandResponse: public TMessage {
     char Data[0];
 };
 static_assert(sizeof(TForwardedCommandResponse) == sizeof(TMessage) + 24);
+
+// Connection-level compatibility probe. Unknown message types are rejected by
+// older nodes, which close the probe connection and allow a legacy reconnect.
+struct TPeerCapabilitiesRequest: public TMessage {
+    static constexpr EMessageType MessageType = EMessageType::PEER_CAPABILITIES_REQUEST;
+    static constexpr uint32_t CurrentVersion = 1;
+    static constexpr uint64_t ExtendedForwarding = uint64_t(1) << 0;
+    uint32_t MinVersion = CurrentVersion;
+    uint32_t MaxVersion = CurrentVersion;
+    uint64_t Features = 0;
+    uint64_t ConnectionId = 0;
+};
+static_assert(sizeof(TPeerCapabilitiesRequest) == sizeof(TMessage) + 24);
+
+struct TPeerCapabilitiesResponse: public TMessage {
+    static constexpr EMessageType MessageType = EMessageType::PEER_CAPABILITIES_RESPONSE;
+    uint32_t Version = TPeerCapabilitiesRequest::CurrentVersion;
+    uint32_t Reserved = 0;
+    uint64_t Features = 0;
+    uint64_t ConnectionId = 0;
+};
+static_assert(sizeof(TPeerCapabilitiesResponse) == sizeof(TMessage) + 24);
 
 struct TTimeout {
     static constexpr std::chrono::milliseconds Election = std::chrono::milliseconds(5000);

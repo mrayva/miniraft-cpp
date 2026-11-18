@@ -60,13 +60,22 @@ connections without such notification have no deadline here.
 Construct a new processor only with fresh transport sessions: the correlation
 counter is per processor, and this milestone does not provide a durable
 cross-processor session generation. Existing client and Raft message layouts
-are unchanged; internal message types 15 and 16 carry extended forwarding
-correlations. Since the extended request and response headers each add 8 bytes,
-requests that fit only at the legacy frame limit are rejected as overloaded,
-and responses that cannot fit the extended frame are returned as failed. There
-is no protocol negotiation, so upgrade every node and custom transport adapter
-before a processor crosses the 32-bit boundary. Mixed-version use of the
-extended types is not supported. EForwarded reserves flag value 0x08.
+are unchanged. New outbound peer connections negotiate version 1 and advertise
+support for extended correlations before message queues are drained. Internal
+message types 15 and 16 are sent only when the target peer advertises that
+feature. A legacy peer rejects the initial capability probe; the connector
+retries once without a probe and keeps using the legacy wire format for that
+connection. The next reconnect probes again. Requests queued during the rejected
+probe connection may receive Failed and must be retried; no forwarded command is
+written on that probe connection. Correlations beyond UINT32_MAX fail safely
+when the active leader has not advertised support.
+
+Custom transports must implement the peer-capability exchange and report
+extended-forwarding support through INode only after a successful negotiation.
+Since the extended request and response headers each add 8 bytes, requests
+that fit only at the legacy frame limit are rejected as overloaded, and
+responses that cannot fit the extended frame are returned as failed.
+EForwarded reserves flag value 0x08.
 
 ## Validation and self-review
 

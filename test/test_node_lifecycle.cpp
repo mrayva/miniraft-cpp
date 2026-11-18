@@ -93,6 +93,28 @@ struct TSocket {
         co_return length;
     }
 };
+struct TCapabilitySocketState {
+    TPoller* Owner = nullptr;
+    size_t ProbeWrites = 0;
+};
+struct TCapabilitySocket {
+    struct TConnectAwaiter {
+        TPoller* Owner;
+        bool await_ready() const { return false; }
+        void await_suspend(std::coroutine_handle<> handle) { Owner->AddTimer({}, handle); }
+        void await_resume() { }
+    };
+    std::shared_ptr<TCapabilitySocketState> State;
+    TCapabilitySocket() = default;
+    explicit TCapabilitySocket(std::shared_ptr<TCapabilitySocketState> state) : State(std::move(state)) { }
+    TConnectAwaiter Connect() { return {State->Owner}; }
+    TPoller* Poller() { return State->Owner; }
+    NNet::TValueTask<ssize_t> WriteSome(const void*, size_t size) {
+        ++State->ProbeWrites;
+        co_return ssize_t(size);
+    }
+    NNet::TValueTask<ssize_t> ReadSome(void*, size_t) { co_return 0; }
+};
 void test_disconnect_during_pending_connect_does_not_destroy_timer_target(void**) {
     TPoller poller;
     TNode<TSocket> node([&](const auto&) { return TSocket{&poller}; }, "peer",
@@ -102,6 +124,56 @@ void test_disconnect_during_pending_connect_does_not_destroy_timer_target(void**
     poller.Tick();
     assert_true(node.IsConnected());
     node.Disconnect(); assert_false(node.IsConnected());
+}
+void test_peer_capability_probe_and_legacy_fallback(void**) {
+    TPoller poller;
+    auto state = std::make_shared<TCapabilitySocketState>();
+    state->Owner = &poller;
+    TNode<TCapabilitySocket> node([&](const auto&) { return TCapabilitySocket{state}; }, "peer",
+        NNet::TAddress("127.0.0.1", 1), std::make_shared<TTimeSource>());
+
+    node.Drain(); poller.Tick();
+    assert_true(node.IsConnected());
+    assert_true(node.IsCapabilityNegotiating());
+    assert_int_equal(state->ProbeWrites, 1);
+    auto response = NewHoldedMessage<TPeerCapabilitiesResponse>();
+    response->Features = TPeerCapabilitiesRequest::ExtendedForwarding;
+    response->ConnectionId = node.GetConnectionGeneration() - 1;
+    assert_false(node.CompleteCapabilityNegotiation(response, node.GetConnectionGeneration()));
+    assert_true(node.IsCapabilityNegotiating());
+    response->ConnectionId = node.GetConnectionGeneration();
+    response->Features = uint64_t(1) << 1;
+    assert_false(node.CompleteCapabilityNegotiation(response, node.GetConnectionGeneration()));
+    assert_true(node.IsCapabilityNegotiating());
+    response->Features = TPeerCapabilitiesRequest::ExtendedForwarding;
+    response->ConnectionId = node.GetConnectionGeneration();
+    assert_true(node.CompleteCapabilityNegotiation(response, node.GetConnectionGeneration()));
+    assert_true(node.SupportsExtendedForwarding());
+
+    auto generation = node.GetConnectionGeneration();
+    node.Disconnect(generation);
+    assert_false(node.SupportsExtendedForwarding());
+    node.Drain(); poller.Tick();
+    generation = node.GetConnectionGeneration();
+    assert_true(node.IsCapabilityNegotiating());
+    assert_int_equal(state->ProbeWrites, 2);
+
+    // A missing response causes one legacy reconnect. A later reconnect probes
+    // again so peer upgrades and downgrades are observed.
+    node.FailCapabilityNegotiation(generation);
+    node.Disconnect(generation);
+    node.Drain(); poller.Tick();
+    generation = node.GetConnectionGeneration();
+    assert_true(node.IsConnected());
+    assert_false(node.IsCapabilityNegotiating());
+    assert_false(node.SupportsExtendedForwarding());
+    assert_int_equal(state->ProbeWrites, 2);
+
+    node.Disconnect(generation);
+    node.Drain(); poller.Tick();
+    assert_true(node.IsCapabilityNegotiating());
+    assert_int_equal(state->ProbeWrites, 3);
+    node.Disconnect();
 }
 void test_old_reader_failure_cannot_disconnect_writer_reconnect(void**) {
     TPoller poller;
@@ -282,6 +354,7 @@ void test_tls_shutdown_wakes_retired_peer_reader(void**) {
 int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_disconnect_during_pending_connect_does_not_destroy_timer_target),
+        cmocka_unit_test(test_peer_capability_probe_and_legacy_fallback),
         cmocka_unit_test(test_old_reader_failure_cannot_disconnect_writer_reconnect),
         cmocka_unit_test(test_connect_cannot_leave_a_second_deadline_wakeup_after_completion),
         cmocka_unit_test(test_peer_response_readers_start_once_for_replication_targets),

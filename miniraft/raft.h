@@ -27,6 +27,8 @@ struct INode {
         return true;
     }
     virtual void Drain() = 0;
+    // False until the transport has positively negotiated the extended route.
+    virtual bool SupportsExtendedForwarding() const { return false; }
 };
 
 // CommandRequest -> Write? -> LogEntry -> Append -> Committed As Index -> Applied As Index (Same) -> Index -> CommandResponse

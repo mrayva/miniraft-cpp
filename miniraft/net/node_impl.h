@@ -119,6 +119,7 @@ void TNode<TSocket>::Drain() {
         }
         return;
     }
+    if (CapabilityNegotiating) return;
     if (!Connected) {
         Connect();
         return;
@@ -186,7 +187,9 @@ void TNode<TSocket>::Disconnect(uint64_t generation) {
     // DoConnect may already be retrying after a write failure. Its awaiter can
     // still be registered with the poller; never destroy that live coroutine
     // because an older reader failed. Established connectors are done here.
+    if (CapabilityNegotiating) FailCapabilityNegotiation(generation);
     Connected = false;
+    PeerFeatures = 0;
     if (Drainer) { Drainer.destroy(); Drainer = {}; }
     RecountPendingMessages();
     if (Connector) { Connector.destroy(); Connector = {}; }
@@ -210,6 +213,8 @@ template<typename TSocket>
 NNet::TVoidSuspendedTask TNode<TSocket>::DoConnect() {
     std::cout << "Connecting " << Name << "\n";
     Connected = false;
+    PeerFeatures = 0;
+    CapabilityNegotiating = false;
     while (!Connected && !Retired) {
         try {
             Socket = SocketFactory(*Address);
@@ -222,9 +227,21 @@ NNet::TVoidSuspendedTask TNode<TSocket>::DoConnect() {
                 ShutdownSocket();
                 break;
             }
+            if constexpr (requires(TSocket& socket, char* buffer) { socket.ReadSome(buffer, size_t{}); }) {
+                const bool skipProbe = SkipNextCapabilityProbe;
+                SkipNextCapabilityProbe = false;
+                if (!skipProbe) {
+                    CapabilityNegotiating = true;
+                    auto probe = NewHoldedMessage<TPeerCapabilitiesRequest>();
+                    probe->Features = TPeerCapabilitiesRequest::ExtendedForwarding;
+                    probe->ConnectionId = ConnectionGeneration;
+                    co_await TMessageWriter(Socket).Write(std::move(probe));
+                }
+            }
             std::cout << "Connected " << Name << "\n";
             Connected = true;
         } catch (const std::exception& ex) {
+            if (CapabilityNegotiating) FailCapabilityNegotiation(ConnectionGeneration);
             std::cout << "Error on connect: " << Name << " " << ex.what() << "\n";
         }
         if (!Connected && !Retired) {
