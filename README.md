@@ -105,6 +105,9 @@ history feature receives at most 32 transitions in MRFTS006/MRFTS007. Recovery
 may still require a fresh learner if its trusted history anchor predates the
 transferred suffix. Peers older than MRFTS006/MRFTS007 need a compatible
 upgrade before receiving configuration-history snapshots.
+Leader compaction rejects active voters that advertise no storage support for
+InstallSnapshot. Offline peers must still support it when they return;
+application capture and restore callbacks remain a deployment requirement.
 The [stable snapshot membership follow-up](docs/stable-snapshot-membership-install.md)
 documents the committed-history checks for snapshot transfer after a voter
 change.

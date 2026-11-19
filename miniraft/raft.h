@@ -118,6 +118,7 @@ struct TVolatileState {
     struct TPeerCapabilities {
         uint64_t AppendAckSeqno = 0;
         bool ConfigurationBarrier = false, SnapshotHistory256 = false, SnapshotHistory1024 = false;
+        bool InstallSnapshot = false;
     };
     std::unordered_map<uint32_t, TPeerCapabilities> PeerCapabilities;
     struct TLeadershipTransfer {
@@ -342,7 +343,8 @@ private:
     TMessageHolder<TPreVoteRequest> CreatePreVote(uint32_t nodeId);
     void StartPreVote(ITimeSource::Time now);
     void StartElection(ITimeSource::Time now);
-    TMessageHolder<TAppendEntriesRequest> CreateAppendEntries(uint32_t nodeId);
+    TMessageHolder<TAppendEntriesRequest> CreateAppendEntries(
+        uint32_t nodeId, bool snapshotBoundaryProbe = false);
     ITimeSource::Time MakeElection(ITimeSource::Time now);
     uint64_t NextSeqno();
     bool ValidateRpc(TMessageHolder<TMessage> message) const;

@@ -168,12 +168,15 @@ Publication-stage process crashes do not replace hardware power-cut testing.
 Learners, catch-up gates, replicated joint-consensus configuration entries,
 leader removal and corresponding quorum/read changes were added in later
 follow-ups ([live membership](configuration-entries.md) and
-[leadership transfer](leadership-transfer.md)). All participating
-applications/backends must support snapshots before
-compaction is enabled. AppendEntries feature bits negotiate 32-, 256- and
-1,024-transition history encodings; they do not negotiate general snapshot
-support. Asynchronous/COW capture, disk-streamed transfer, bounded
-transport queues, total heap quotas,
+[leadership transfer](leadership-transfer.md)). A leader rejects compaction
+when an active voter has advertised that its storage cannot install snapshots.
+An offline or not-yet-heard-from peer remains an operator-verified compatibility
+requirement. AppendEntries feature bits also negotiate 32-, 256- and
+1,024-transition history encodings. An unsupported learner cannot receive a
+snapshot and must catch up before compaction or be removed and re-added after
+its storage is upgraded. Application capture and restore callbacks remain a
+deployment requirement and are not negotiated. Asynchronous/COW capture, disk-streamed
+transfer, bounded transport queues, total heap quotas,
 cluster/store authentication and independent review remain open.
 The conservative backend still rewrites the entire snapshot and retained suffix
 on each update, and capture/publication runs synchronously on the event loop.

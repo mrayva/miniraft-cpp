@@ -126,7 +126,10 @@ struct TCluster {
         Processors[leader - 1]->OnCommandRequest(Command(key, value), {}); Pump(leader);
     }
     void Prepare() {
-        Elect(1); Pump(1); Isolated = {3};
+        Elect(1); Pump(1);
+        assert_true(Nodes[0]->GetVolatileState()->PeerCapabilities.at(2).InstallSnapshot);
+        assert_true(Nodes[0]->GetVolatileState()->PeerCapabilities.at(3).InstallSnapshot);
+        Isolated = {3};
         for (const std::string key : {"a", "b", "c"}) Write(1, key, std::string(60000, key[0]));
         Nodes[0]->Compact(); Nodes[1]->Compact();
         assert_true(Nodes[0]->GetState()->SnapshotIndex > 1);
@@ -153,7 +156,7 @@ struct TCluster {
     }
 };
 void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
-    const std::vector<uint32_t> stableVoters{1}, addedVoters{1, 2};
+    const std::vector<uint32_t> stableVoters{1, 5}, addedVoters{1, 2, 5};
     auto history = TConfigurationHistory::Stable(stableVoters, 0, 0, 0, 0);
     auto ordinary = NewHoldedMessage<TLogEntry>();
     ordinary->Term = 1;
@@ -184,11 +187,12 @@ void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
     ITimeSource::Time now{};
     std::unordered_map<uint32_t, TMessageHolder<TInstallSnapshotRequest>> sentSnapshots;
     TNodeDict peers;
-    for (const auto id : {2u, 3u, 4u}) {
+    for (const auto id : {2u, 3u, 4u, 5u}) {
         peers.emplace(id, std::make_shared<TEndpoint>([&, id](auto message) {
             if (message->Type == uint32_t(EMessageType::APPEND_ENTRIES_REQUEST)) {
                 auto append = message.template Cast<TAppendEntriesRequest>();
                 uint32_t features = TAppendEntriesResponse::SupportsConfigurationBarrier;
+                if (id != 5) features |= TAppendEntriesResponse::SupportsInstallSnapshot;
                 if (id == 3) features |= TAppendEntriesResponse::SupportsSnapshotHistory256;
                 if (id == 2) features |= TAppendEntriesResponse::SupportsSnapshotHistory1024;
                 auto response = NewHoldedMessage(
@@ -197,6 +201,18 @@ void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
                 raft->Process(now, std::move(response));
             } else if (message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_REQUEST)) {
                 sentSnapshots.try_emplace(id, message.template Cast<TInstallSnapshotRequest>());
+            } else if (id == 5 && message->Type == uint32_t(EMessageType::PRE_VOTE_REQUEST)) {
+                auto request = message.template Cast<TPreVoteRequest>();
+                auto response = NewHoldedMessage(
+                    TMessageEx{.Src = id, .Dst = 1, .Term = request->Term, .Seqno = request->Seqno},
+                    TPreVoteResponse{.ProspectiveTerm = request->ProspectiveTerm, .VoteGranted = 1});
+                raft->Process(now, std::move(response));
+            } else if (id == 5 && message->Type == uint32_t(EMessageType::REQUEST_VOTE_REQUEST)) {
+                auto request = message.template Cast<TRequestVoteRequest>();
+                auto response = NewHoldedMessage(
+                    TMessageEx{.Src = id, .Dst = 1, .Term = request->Term, .Seqno = request->Seqno},
+                    TRequestVoteResponse{.VoteGranted = 1});
+                raft->Process(now, std::move(response));
             }
         }));
     }
@@ -213,8 +229,13 @@ void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
     assert_false(raft->GetVolatileState()->PeerCapabilities.at(3).SnapshotHistory1024);
     assert_false(raft->GetVolatileState()->PeerCapabilities.at(4).SnapshotHistory256);
     assert_false(raft->GetVolatileState()->PeerCapabilities.at(4).SnapshotHistory1024);
+    assert_true(raft->GetVolatileState()->PeerCapabilities.at(2).InstallSnapshot);
+    assert_true(raft->GetVolatileState()->PeerCapabilities.at(3).InstallSnapshot);
+    assert_true(raft->GetVolatileState()->PeerCapabilities.at(4).InstallSnapshot);
+    assert_false(raft->GetVolatileState()->PeerCapabilities.at(5).InstallSnapshot);
     assert_true(sentSnapshots.contains(2));
     assert_true(sentSnapshots.contains(3));
+    assert_false(sentSnapshots.contains(5));
     assert_true(sentSnapshots.contains(4));
     for (const auto id : {2u, 3u, 4u}) {
         auto request = sentSnapshots.at(id);
@@ -236,6 +257,14 @@ void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
                 snapshot.ConfigurationTransitions.end() - 32));
         }
     }
+    std::string compactionError;
+    try {
+        (void)raft->Compact();
+    } catch (const std::logic_error& error) {
+        compactionError = error.what();
+    }
+    assert_string_equal(compactionError.c_str(),
+        "Compaction is unsafe while an active voter lacks snapshot-install support");
 }
 void test_compaction_lagging_follower_installs_snapshot_then_tail(void**) {
     TCluster cluster; cluster.Prepare();

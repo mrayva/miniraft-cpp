@@ -1255,7 +1255,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
                 .Success = false,
                 .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier |
                     TAppendEntriesResponse::SupportsSnapshotHistory256 |
-                    TAppendEntriesResponse::SupportsSnapshotHistory1024,
+                    TAppendEntriesResponse::SupportsSnapshotHistory1024 |
+                    (State->SupportsInstallSnapshot() ? TAppendEntriesResponse::SupportsInstallSnapshot : 0u),
             });
         (void)Nodes[reply->Dst]->TrySend(std::move(reply));
         return;
@@ -1350,7 +1351,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             .Success = success,
             .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier |
                 TAppendEntriesResponse::SupportsSnapshotHistory256 |
-                TAppendEntriesResponse::SupportsSnapshotHistory1024,
+                TAppendEntriesResponse::SupportsSnapshotHistory1024 |
+                (State->SupportsInstallSnapshot() ? TAppendEntriesResponse::SupportsInstallSnapshot : 0u),
         });
 
     AdvanceCommitIndex(commitIndex);
@@ -1392,6 +1394,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             message->Padding & TAppendEntriesResponse::SupportsSnapshotHistory256;
         capabilities.SnapshotHistory1024 =
             message->Padding & TAppendEntriesResponse::SupportsSnapshotHistory1024;
+        capabilities.InstallSnapshot =
+            message->Padding & TAppendEntriesResponse::SupportsInstallSnapshot;
     }
     const auto acknowledgedLeaderCommit = request->LeaderCommit;
     // A newer response supersedes older RPCs. Reordered/duplicate failures
@@ -1454,11 +1458,14 @@ TMessageHolder<TPreVoteRequest> TRaft::CreatePreVote(uint32_t nodeId) {
         });
 }
 
-TMessageHolder<TAppendEntriesRequest> TRaft::CreateAppendEntries(uint32_t nodeId) {
+TMessageHolder<TAppendEntriesRequest> TRaft::CreateAppendEntries(uint32_t nodeId, bool snapshotBoundaryProbe) {
     int batchSize = std::max(1, VolatileState->BatchSize[nodeId]);
-    auto prevIndex = VolatileState->NextIndex[nodeId] - 1;
-    auto lastIndex = std::min<uint64_t>(prevIndex+batchSize, State->LastLogIndex);
-    if (VolatileState->MatchIndex[nodeId]+1 < VolatileState->NextIndex[nodeId]) {
+    // A capability probe uses the local boundary and carries no entries; the
+    // leader no longer has storage for indexes below its snapshot.
+    auto prevIndex = snapshotBoundaryProbe ? State->SnapshotIndex : VolatileState->NextIndex[nodeId] - 1;
+    auto lastIndex = snapshotBoundaryProbe ? prevIndex :
+        std::min<uint64_t>(prevIndex + batchSize, State->LastLogIndex);
+    if (!snapshotBoundaryProbe && VolatileState->MatchIndex[nodeId] + 1 < VolatileState->NextIndex[nodeId]) {
         lastIndex = prevIndex;
     }
 
@@ -1939,8 +1946,15 @@ void TRaft::LeaderTimeout(ITimeSource::Time now) {
         {
             VolatileState->HeartbeatDue[id] = now + TTimeout::Election / 2;
             VolatileState->RpcDue[id] = now + TTimeout::Rpc;
-            if (VolatileState->NextIndex[id] <= State->SnapshotIndex) (void)node->TrySend(CreateInstallSnapshot(id));
-            else (void)node->TrySend(CreateAppendEntries(id));
+            if (VolatileState->NextIndex[id] <= State->SnapshotIndex) {
+                const auto capability = VolatileState->PeerCapabilities.find(id);
+                if (capability != VolatileState->PeerCapabilities.end() && capability->second.InstallSnapshot)
+                    (void)node->TrySend(CreateInstallSnapshot(id));
+                else
+                    (void)node->TrySend(CreateAppendEntries(id, true));
+            } else {
+                (void)node->TrySend(CreateAppendEntries(id));
+            }
         }
     }
 
@@ -2013,8 +2027,15 @@ uint64_t TRaft::ApproveRead() {
     // emitted below is newer than this barrier; old replies cannot satisfy it.
     const uint64_t seqno = NextSeqno();
     for (auto& [id, node] : Nodes) {
-        if (VolatileState->NextIndex[id] <= State->SnapshotIndex) (void)node->TrySend(CreateInstallSnapshot(id));
-        else (void)node->TrySend(CreateAppendEntries(id));
+        if (VolatileState->NextIndex[id] <= State->SnapshotIndex) {
+            const auto capability = VolatileState->PeerCapabilities.find(id);
+            if (capability != VolatileState->PeerCapabilities.end() && capability->second.InstallSnapshot)
+                (void)node->TrySend(CreateInstallSnapshot(id));
+            else
+                (void)node->TrySend(CreateAppendEntries(id, true));
+        } else {
+            (void)node->TrySend(CreateAppendEntries(id));
+        }
     }
     return seqno;
 }
@@ -2507,6 +2528,14 @@ bool TRaft::IsLearnerCommitAcknowledged(uint32_t id) const {
 
 TSnapshot TRaft::Compact() {
     if (!State->SupportsSnapshots()) throw std::logic_error("Storage cannot compact snapshots");
+    if (StateName == EState::LEADER) {
+        for (auto voterId : Voters) {
+            if (voterId == Id) continue;
+            const auto capability = VolatileState->PeerCapabilities.find(voterId);
+            if (capability != VolatileState->PeerCapabilities.end() && !capability->second.InstallSnapshot)
+                throw std::logic_error("Compaction is unsafe while an active voter lacks snapshot-install support");
+        }
+    }
     if (Configuration && Configuration->Committed.ConfigurationIndex()) {
         const auto configurationIndex = Configuration->Committed.ConfigurationIndex();
         if (IsVoter(Id) && StateName == EState::LEADER) {

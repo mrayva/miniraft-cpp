@@ -45,6 +45,7 @@ public:
     void Commit() override;
     bool SupportsCommitIndexPersistence() const override { return true; }
     bool SupportsSnapshots() const override { return true; }
+    bool SupportsInstallSnapshot() const override { return true; }
     std::shared_ptr<const TSnapshot> GetSnapshot() const override;
     void InstallSnapshot(const TSnapshot& snapshot) override;
     void InstallRaftSnapshot(const TSnapshot& snapshot,

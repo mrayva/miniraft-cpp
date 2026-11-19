@@ -250,7 +250,8 @@ void test_configuration_barrier_rpc_roundtrip(void**) {
         TConfigurationBarrierResponse{.ConfigurationIndex = 12, .ConfigurationTerm = 2, .Accepted = 1});
     const auto features = TAppendEntriesResponse::SupportsConfigurationBarrier |
         TAppendEntriesResponse::SupportsSnapshotHistory256 |
-        TAppendEntriesResponse::SupportsSnapshotHistory1024;
+        TAppendEntriesResponse::SupportsSnapshotHistory1024 |
+        TAppendEntriesResponse::SupportsInstallSnapshot;
     auto appendResponse = NewHoldedMessage(
         TMessageEx{.Src = 2, .Dst = 1, .Term = 3, .Seqno = 10},
         TAppendEntriesResponse{.MatchIndex = 12, .Success = 1, .Padding = features});

@@ -41,6 +41,8 @@ struct IState: TStateFields {
     // it. Membership protocols can require this before trusting recovered history.
     virtual bool SupportsCommitIndexPersistence() const { return false; }
     virtual bool SupportsSnapshots() const { return false; }
+    // True when this backend can durably adopt an InstallSnapshot image.
+    virtual bool SupportsInstallSnapshot() const { return false; }
     virtual std::shared_ptr<const TSnapshot> GetSnapshot() const { return {}; }
     virtual void InstallSnapshot(const TSnapshot&) { throw std::logic_error("Storage snapshots are unsupported"); }
     // Raft calls this only after validating the sender and complete membership
@@ -187,6 +189,7 @@ struct TState: IState {
     }
 
     bool SupportsSnapshots() const override { return true; }
+    bool SupportsInstallSnapshot() const override { return true; }
     bool SupportsVoterBinding() const override { return true; }
     std::vector<uint32_t> GetBoundVoters() const override { return BoundVoters; }
     void BindVoters(const std::vector<uint32_t>& voters) override {
