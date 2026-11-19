@@ -1258,7 +1258,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
                     TAppendEntriesResponse::SupportsSnapshotHistory1024 |
                     (State->SupportsInstallSnapshot() ? TAppendEntriesResponse::SupportsInstallSnapshot : 0u) |
                     TAppendEntriesResponse::SupportsSnapshotHistory32 |
-                    TAppendEntriesResponse::SupportsSnapshotLineage,
+                    TAppendEntriesResponse::SupportsSnapshotLineage |
+                    TAppendEntriesResponse::SupportsJointConsensus,
             });
         (void)Nodes[reply->Dst]->TrySend(std::move(reply));
         return;
@@ -1356,7 +1357,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
                 TAppendEntriesResponse::SupportsSnapshotHistory1024 |
                 (State->SupportsInstallSnapshot() ? TAppendEntriesResponse::SupportsInstallSnapshot : 0u) |
                 TAppendEntriesResponse::SupportsSnapshotHistory32 |
-                TAppendEntriesResponse::SupportsSnapshotLineage,
+                TAppendEntriesResponse::SupportsSnapshotLineage |
+                TAppendEntriesResponse::SupportsJointConsensus,
         });
 
     AdvanceCommitIndex(commitIndex);
@@ -1392,6 +1394,7 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
     auto& capabilities = VolatileState->PeerCapabilities[nodeId];
     if (message->Seqno >= capabilities.AppendAckSeqno) {
         capabilities.AppendAckSeqno = message->Seqno;
+        capabilities.Term = message->Term;
         capabilities.ConfigurationBarrier =
             message->Padding & TAppendEntriesResponse::SupportsConfigurationBarrier;
         capabilities.SnapshotLineage =
@@ -1404,6 +1407,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             message->Padding & TAppendEntriesResponse::SupportsSnapshotHistory32;
         capabilities.InstallSnapshot =
             message->Padding & TAppendEntriesResponse::SupportsInstallSnapshot;
+        capabilities.JointConsensus =
+            message->Padding & TAppendEntriesResponse::SupportsJointConsensus;
     }
     const auto acknowledgedLeaderCommit = request->LeaderCommit;
     // A newer response supersedes older RPCs. Reordered/duplicate failures
@@ -2247,7 +2252,13 @@ TJointConfigurationReadiness TRaft::CheckJointConfigurationReadiness(
     std::sort(requiredVoters.begin(), requiredVoters.end());
     requiredVoters.erase(std::unique(requiredVoters.begin(), requiredVoters.end()), requiredVoters.end());
     for (auto id : requiredVoters)
-        if (id != Id && !Nodes.contains(id)) readiness.MissingPeerTargets.push_back(id);
+        if (id != Id) {
+            if (!Nodes.contains(id)) readiness.MissingPeerTargets.push_back(id);
+            const auto capability = VolatileState->PeerCapabilities.find(id);
+            if (capability == VolatileState->PeerCapabilities.end() ||
+                capability->second.Term != State->CurrentTerm || !capability->second.JointConsensus)
+                readiness.VotersWithoutJointConsensusSupport.push_back(id);
+        }
     return readiness;
 }
 
@@ -2272,6 +2283,8 @@ uint64_t TRaft::ProposeJointConfiguration(std::vector<uint32_t> newVoters) {
         throw std::logic_error("Every added voter must be a staged learner with a committed catch-up ACK");
     if (!readiness.AddedVotersWithoutSnapshotInstallSupport.empty())
         throw std::logic_error("Every added voter must support InstallSnapshot before promotion");
+    if (!readiness.VotersWithoutJointConsensusSupport.empty())
+        throw std::logic_error("Every current and proposed voter must advertise joint-consensus support in this term");
 
     const auto& latest = Configuration->Latest;
     TConfigurationRecord record{EConfigurationPhase::Joint, State->CurrentTerm,

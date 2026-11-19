@@ -81,11 +81,14 @@ struct TJointConfigurationReadiness {
     std::vector<uint32_t> AddedVotersWithoutCommitAck;
     // Missing/unknown peer capability advertisements fail closed before promotion.
     std::vector<uint32_t> AddedVotersWithoutSnapshotInstallSupport;
+    // Every current and proposed voter must understand joint-consensus entries.
+    std::vector<uint32_t> VotersWithoutJointConsensusSupport;
 
     bool Ready() const {
         return IsLeader && HasDurableMembershipStorage && HasStableConfiguration &&
             HasCommittedCurrentTermEntry && ChangesVoterSet && HasLogCapacity && MissingPeerTargets.empty() &&
-            AddedVotersWithoutCommitAck.empty() && AddedVotersWithoutSnapshotInstallSupport.empty();
+            AddedVotersWithoutCommitAck.empty() && AddedVotersWithoutSnapshotInstallSupport.empty() &&
+            VotersWithoutJointConsensusSupport.empty();
     }
 };
 
@@ -122,11 +125,12 @@ struct TVolatileState {
     std::unordered_map<uint32_t, uint64_t> ConfigurationBarrierAckIndex;
     std::unordered_map<uint32_t, ITimeSource::Time> ConfigurationBarrierAckDue;
     struct TPeerCapabilities {
-        uint64_t AppendAckSeqno = 0;
+        uint64_t AppendAckSeqno = 0, Term = 0;
         bool ConfigurationBarrier = false, SnapshotLineage = false;
         bool SnapshotHistory32 = false, SnapshotHistory256 = false;
         bool SnapshotHistory1024 = false;
         bool InstallSnapshot = false;
+        bool JointConsensus = false;
     };
     std::unordered_map<uint32_t, TPeerCapabilities> PeerCapabilities;
     struct TLeadershipTransfer {

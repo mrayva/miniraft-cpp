@@ -933,15 +933,29 @@ void test_new_voter_requires_snapshot_install_capability(void**) {
         auto readiness = raft.CheckJointConfigurationReadiness({1, 2});
         assert_true(readiness.AddedVotersWithoutCommitAck.empty());
         assert_true(readiness.AddedVotersWithoutSnapshotInstallSupport == (std::vector<uint32_t>{2}));
+        assert_true(readiness.VotersWithoutJointConsensusSupport == (std::vector<uint32_t>{2}));
         assert_false(readiness.Ready());
         const auto before = static_cast<TStateFields>(*state);
         Reject([&] { raft.ProposeJointConfiguration({1, 2}); });
         assert_true(static_cast<TStateFields>(*state) == before);
 
         volatileState->PeerCapabilities[2].AppendAckSeqno = 5;
+        volatileState->PeerCapabilities[2].Term = state->CurrentTerm;
         volatileState->PeerCapabilities[2].InstallSnapshot = true;
         readiness = raft.CheckJointConfigurationReadiness({1, 2});
         assert_true(readiness.AddedVotersWithoutSnapshotInstallSupport.empty());
+        assert_true(readiness.VotersWithoutJointConsensusSupport == (std::vector<uint32_t>{2}));
+        assert_false(readiness.Ready());
+
+        volatileState->PeerCapabilities[2].JointConsensus = true;
+        volatileState->PeerCapabilities[2].Term = state->CurrentTerm - 1;
+        readiness = raft.CheckJointConfigurationReadiness({1, 2});
+        assert_true(readiness.VotersWithoutJointConsensusSupport == (std::vector<uint32_t>{2}));
+        assert_false(readiness.Ready());
+
+        volatileState->PeerCapabilities[2].Term = state->CurrentTerm;
+        readiness = raft.CheckJointConfigurationReadiness({1, 2});
+        assert_true(readiness.VotersWithoutJointConsensusSupport.empty());
         assert_true(readiness.Ready());
 
         // A newer unacknowledged append makes the previous catch-up and
@@ -960,6 +974,55 @@ void test_new_voter_requires_snapshot_install_capability(void**) {
         assert_true(readiness.AddedVotersWithoutCommitAck.empty());
         assert_true(readiness.Ready());
         assert_int_equal(raft.ProposeJointConfiguration({1, 2}), 2);
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
+void test_existing_voter_must_advertise_joint_consensus_support(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-readiness-existing-voter-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    {
+        auto state = std::make_shared<TDurableState>((dir / "raft").string(), 1);
+        state->BindVoters({1, 3});
+        state->Commit();
+        state->Append(Ordinary(1));
+        state->CommitIndex = 1;
+        state->Commit();
+
+        auto joining = std::make_shared<TEndpoint>();
+        auto existing = std::make_shared<TEndpoint>();
+        TRaft raft(state, 1, {{2, joining}, {3, existing}}, {2});
+        raft.Become(EState::LEADER);
+        auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
+        volatileState->MatchIndex[2] = state->LastLogIndex;
+        volatileState->CommitAckIndex[2] = state->CommitIndex;
+        volatileState->LastSentSeqno[2] = 1;
+        volatileState->ReadAckSeqno[2] = 1;
+        volatileState->PeerCapabilities[2] = {
+            .AppendAckSeqno = 1,
+            .Term = state->CurrentTerm,
+            .InstallSnapshot = true,
+            .JointConsensus = true,
+        };
+
+        auto readiness = raft.CheckJointConfigurationReadiness({1, 2, 3});
+        assert_true(readiness.VotersWithoutJointConsensusSupport == (std::vector<uint32_t>{3}));
+        assert_false(readiness.Ready());
+        const auto before = static_cast<TStateFields>(*state);
+        Reject([&] { raft.ProposeJointConfiguration({1, 2, 3}); });
+        assert_true(static_cast<TStateFields>(*state) == before);
+
+        volatileState->PeerCapabilities[3] = {
+            .AppendAckSeqno = 1,
+            .Term = state->CurrentTerm,
+            .JointConsensus = true,
+        };
+        readiness = raft.CheckJointConfigurationReadiness({1, 2, 3});
+        assert_true(readiness.VotersWithoutJointConsensusSupport.empty());
+        assert_true(readiness.Ready());
     }
     std::error_code ignored;
     std::filesystem::remove_all(dir, ignored);
@@ -1546,7 +1609,7 @@ void test_quorum_retires_offline_voter_before_compaction_and_snapshot_rejoin(voi
     std::array<std::shared_ptr<TRequestProcessor>, 4> processors{};
     std::array<std::array<std::shared_ptr<TEndpoint>, 4>, 4> endpoints{};
     ITimeSource::Time now{};
-    bool offline = true;
+    bool offline = false;
     unsigned snapshotRequestsToRetired = 0;
     unsigned snapshotRepliesFromRetired = 0, successfulSnapshotReplies = 0;
     uint64_t lastSnapshotOffset = 0;
@@ -1602,13 +1665,14 @@ void test_quorum_retires_offline_voter_before_compaction_and_snapshot_rejoin(voi
     };
 
     now += std::chrono::seconds(20);
-    rafts[1]->ProcessTimeout(now); // Pre-vote campaign reaches voter 2 only.
+    rafts[1]->ProcessTimeout(now); // Pre-vote campaign reaches the old voters.
     rafts[1]->ProcessTimeout(now + std::chrono::milliseconds(1)); // Start real election.
     now += std::chrono::milliseconds(2);
     rafts[1]->ProcessTimeout(now); // Voter 2's real grant elects node 1.
     assert_true(rafts[1]->CurrentStateName() == EState::LEADER);
     for (unsigned i = 0; i < 8 && rafts[1]->GetVolatileState()->CommitIndex < 1; ++i) tick();
     assert_int_equal(rafts[1]->GetVolatileState()->CommitIndex, 1);
+    offline = true; // Voter 3 advertised compatible joint-consensus support before isolation.
 
     const auto jointIndex = rafts[1]->ProposeJointConfiguration({1, 2});
     for (unsigned i = 0; i < 8 && rafts[1]->GetVolatileState()->CommitIndex < jointIndex; ++i) tick();
@@ -2108,7 +2172,8 @@ void test_live_joint_transition_waits_for_both_nontrivial_majorities(void**) {
                     NewHoldedMessage(TMessageEx{.Src = source, .Dst = 1, .Term = append->Term,
                         .Seqno = append->Seqno},
                         TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1,
-                            .Padding = TAppendEntriesResponse::SupportsInstallSnapshot}));
+                            .Padding = TAppendEntriesResponse::SupportsInstallSnapshot |
+                                TAppendEntriesResponse::SupportsJointConsensus}));
                 return matchIndex;
             };
             auto latestAppendMatchIndex = [&](uint32_t source) {
@@ -2128,15 +2193,15 @@ void test_live_joint_transition_waits_for_both_nontrivial_majorities(void**) {
                 assert_int_equal(ackLatestAppend(id, std::chrono::milliseconds(4)), 1);
                 assert_true(leader.IsLearnerCommitAcknowledged(id));
             }
+            assert_int_equal(ackLatestAppend(3, std::chrono::milliseconds(5)), 1);
 
             const auto newVoters = disjoint
                 ? std::vector<uint32_t>{4, 5, 6} : std::vector<uint32_t>{3, 4, 5};
             const auto jointIndex = leader.ProposeJointConfiguration(newVoters);
             assert_int_equal(jointIndex, 2);
+            // Send the joint entry to voter 3 but withhold its ACK. It is
+            // shared only in the overlapping case.
             leader.ProcessTimeout(start + std::chrono::seconds(3));
-            // Let voter 3 acknowledge the earlier leader entry, then withhold
-            // its joint-entry ACK. It is shared only in the overlapping case.
-            assert_int_equal(ackLatestAppend(3, std::chrono::seconds(3) + std::chrono::milliseconds(1)), 1);
             leader.ProcessTimeout(start + std::chrono::seconds(3) + std::chrono::milliseconds(2));
             assert_int_equal(latestAppendMatchIndex(3), jointIndex);
             for (auto id : std::vector<uint32_t>{2, 4, 5})
@@ -4824,6 +4889,7 @@ int main() {
         cmocka_unit_test(test_follower_can_register_future_voter_endpoint_before_joint_entry),
         cmocka_unit_test(test_joint_configuration_readiness_reports_log_and_index_capacity),
         cmocka_unit_test(test_new_voter_requires_snapshot_install_capability),
+        cmocka_unit_test(test_existing_voter_must_advertise_joint_consensus_support),
         cmocka_unit_test(test_new_voter_leader_can_forward_prior_term_joint_entry),
         cmocka_unit_test(test_new_side_election_replays_joint_entry_to_old_peer),
         cmocka_unit_test(test_new_stable_leader_replays_transition_to_lagging_joiner),

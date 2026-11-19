@@ -29,6 +29,12 @@ transition. The embedding application can provision them locally with
 joint entry; this endpoint registration does not itself change quorum
 membership. Endpoint discovery and configuration distribution remain
 responsibilities of the embedding application.
+The leader advertises joint-consensus support in AppendEntries responses.
+`CheckJointConfigurationReadiness()` and `ProposeJointConfiguration()` require
+a current-term capability response from every existing and proposed remote
+voter. Older binaries leave the reserved response bits zero and therefore block
+the change. This catches incomplete rolling upgrades before a joint entry can
+reach a voter that would apply fixed-membership quorum rules.
 `GetConfigurationState()` returns a copy of the validated committed and latest
 configurations. During a pending joint entry, `Latest` is joint and `Committed`
 remains stable. After the joint entry commits but before its stable successor
@@ -87,7 +93,9 @@ term[8], old count[4], new count[4], old voter IDs[4 each], new voter IDs[4
 each], and CRC32[4] over the preceding payload. The outer entry term must match
 the encoded term and its flags must equal `EConfiguration`. CRC checks accidental
 corruption; it is not authentication. All voters must run a compatible binary
-before a transition because older versions reject this entry type.
+before a transition because older versions reject this entry type. Readiness
+also checks the new joint-consensus capability bit on a current-term
+AppendEntries response from every remote voter in the old and proposed sets.
 
 After the stable successor commits, local compaction records the active voter
 set and stable configuration identity while preserving the original durable
