@@ -5,6 +5,8 @@ and term into an offline snapshot. With up to 32 retained transitions, it emits
 MRFTS007 for a joint configuration and MRFTS006 for a stable configuration.
 With 33 through 256 transitions, it emits MRFTS009 for joint and MRFTS008 for
 stable configurations.
+With 257 through 1,024 transitions, it emits MRFTS011 for joint and MRFTS010
+for stable configurations.
 Older snapshots without a chain retain the MRFTS002/MRFTS003 formats, and
 MRFTS005/MRFTS004 remain supported for snapshots carrying only their bounded
 predecessor link. The legacy MRFTS001 format is used when the trusted baseline
@@ -67,10 +69,11 @@ install a maximum-length stable history from an anchored stale store and a
 maximum-length joint history through fresh-learner bootstrap. Full tests also
 cover existing snapshot installation and learner catch-up.
 
-Snapshots retain at most 256 contiguous membership transitions. The legacy
-MRFTS006/MRFTS007 formats remain limited to 32; MRFTS008/MRFTS009 carry longer
-chains. The runtime can use this chain for online stale-store recovery when a
-transition predecessor matches the receiver's trusted stable baseline. Stable
+Snapshots retain at most 1,024 contiguous membership transitions. MRFTS006/
+MRFTS007 remain limited to 32; MRFTS008/MRFTS009 carry up to 256, and
+MRFTS010/MRFTS011 carry longer chains. The runtime can use these chains for
+online stale-store recovery when a transition predecessor matches the
+receiver's trusted stable baseline. Stable
 images require the sender in both voter sets for every transition after that
 anchor. A joint image
 requires this for completed transitions and accepts a sender from either side

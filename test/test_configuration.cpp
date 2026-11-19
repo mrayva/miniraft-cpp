@@ -144,6 +144,7 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
     auto history = TConfigurationHistory::Stable(firstSet, 0, 0, 0, 0)
         .Observe(1, Ordinary(1));
     TSnapshot oldestRetainedAnchor;
+    std::optional<TSnapshot> stableAt255, stableAt256, stableAt257;
 
     for (uint64_t transition = 1; transition <= TSnapshot::MaxConfigurationTransitions + 1; ++transition) {
         const auto jointIndex = history.ThroughIndex() + 1;
@@ -161,6 +162,9 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
             oldestRetainedAnchor = history.MakeSnapshot(std::to_string(history.ThroughIndex()));
         assert_true(history.ConfigurationTransitions().size() ==
             std::min<size_t>(transition, TSnapshot::MaxConfigurationTransitions));
+        if (transition == 255) stableAt255 = history.MakeSnapshot(std::to_string(history.ThroughIndex()));
+        if (transition == 256) stableAt256 = history.MakeSnapshot(std::to_string(history.ThroughIndex()));
+        if (transition == 257) stableAt257 = history.MakeSnapshot(std::to_string(history.ThroughIndex()));
     }
 
     const auto& retained = history.ConfigurationTransitions();
@@ -171,9 +175,41 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
     assert_true(retained.front().PreviousConfigurationTerm == 3);
     assert_true(retained.back().StableIndex == history.ConfigurationIndex());
     assert_true(retained.back().StableTerm == history.ConfigurationTerm());
+    const auto encodedAt256 = EncodeSnapshot(*stableAt256);
+    assert_true(encodedAt256.substr(0, 8) == "MRFTS008");
+    assert_true(DecodeSnapshot(encodedAt256) == *stableAt256);
+    const auto encodedAt257 = EncodeSnapshot(*stableAt257);
+    assert_true(encodedAt257.substr(0, 8) == "MRFTS010");
+    assert_true(DecodeSnapshot(encodedAt257) == *stableAt257);
+
+    auto boundaryJointHistory = TConfigurationHistory::FromStableSnapshot(*stableAt255);
+    const auto boundaryJointIndex = boundaryJointHistory.ThroughIndex() + 1;
+    const auto boundaryNewVoters = boundaryJointHistory.OldVoters() == firstSet ? secondSet : firstSet;
+    TConfigurationRecord boundaryJoint{EConfigurationPhase::Joint, boundaryJointIndex,
+        boundaryJointHistory.ConfigurationIndex(), boundaryJointHistory.ConfigurationTerm(),
+        boundaryJointHistory.OldVoters(), boundaryNewVoters};
+    boundaryJointHistory = boundaryJointHistory.Advance(boundaryJointIndex,
+        EncodeConfigurationEntry(boundaryJoint));
+    const auto jointAt256 = boundaryJointHistory.MakeSnapshot("joint boundary");
+    const auto encodedJointAt256 = EncodeSnapshot(jointAt256);
+    assert_true(encodedJointAt256.substr(0, 8) == "MRFTS009");
+    assert_true(DecodeSnapshot(encodedJointAt256) == jointAt256);
+    auto extendedJointHistory = TConfigurationHistory::FromStableSnapshot(*stableAt256);
+    const auto extendedJointIndex = extendedJointHistory.ThroughIndex() + 1;
+    const auto extendedJointVoters = extendedJointHistory.OldVoters() == firstSet ? secondSet : firstSet;
+    TConfigurationRecord extendedJoint{EConfigurationPhase::Joint, extendedJointIndex,
+        extendedJointHistory.ConfigurationIndex(), extendedJointHistory.ConfigurationTerm(),
+        extendedJointHistory.OldVoters(), extendedJointVoters};
+    extendedJointHistory = extendedJointHistory.Advance(extendedJointIndex,
+        EncodeConfigurationEntry(extendedJoint));
+    const auto jointAt257 = extendedJointHistory.MakeSnapshot("joint extended boundary");
+    const auto encodedJointAt257 = EncodeSnapshot(jointAt257);
+    assert_true(encodedJointAt257.substr(0, 8) == "MRFTS011");
+    assert_true(DecodeSnapshot(encodedJointAt257) == jointAt257);
+
     const auto stableImage = history.MakeSnapshot(std::to_string(history.ThroughIndex()));
     const auto encodedStableImage = EncodeSnapshot(stableImage);
-    assert_true(encodedStableImage.substr(0, 8) == "MRFTS008");
+    assert_true(encodedStableImage.substr(0, 8) == "MRFTS010");
     assert_true(DecodeSnapshot(encodedStableImage) == stableImage);
     auto legacyHistoryImage = encodedStableImage;
     memcpy(legacyHistoryImage.data(), "MRFTS006", 8);
@@ -182,6 +218,13 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
     for (size_t i = 0; i < 4; ++i)
         legacyHistoryImage[legacyHistoryImage.size() - 4 + i] = char(legacyChecksum >> (8 * i));
     Reject([&] { DecodeSnapshot(legacyHistoryImage); });
+    auto priorExtendedImage = encodedStableImage;
+    memcpy(priorExtendedImage.data(), "MRFTS008", 8);
+    const auto priorExtendedChecksum = NSnapshotCodec::Checksum(
+        std::string_view(priorExtendedImage.data(), priorExtendedImage.size() - 4));
+    for (size_t i = 0; i < 4; ++i)
+        priorExtendedImage[priorExtendedImage.size() - 4 + i] = char(priorExtendedChecksum >> (8 * i));
+    Reject([&] { DecodeSnapshot(priorExtendedImage); });
 
 #ifdef __linux__
     // Once the trusted baseline falls outside the retained suffix, a current
@@ -208,7 +251,7 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
     const auto bytes = EncodeSnapshot(stableImage);
 
     // The stable identity at the oldest retained suffix boundary still
-    // authorizes recovery through the full 256-transition window.
+    // authorizes recovery through the full 1024-transition window.
     auto retainedState = std::make_shared<TDurableState>((dir / "retained-stale").string(), 4);
     retainedState->BindVoters(firstSet);
     retainedState->CurrentTerm = oldestRetainedAnchor.Term;
@@ -219,26 +262,36 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
     auto retainedApplication = std::make_shared<TSnapshotRsm>();
     retainedApplication->LastAppliedIndex = oldestRetainedAnchor.Index;
     TRequestProcessor retainedProcessor(retainedRaft, retainedApplication, retainedPeers);
-    auto retainedRequest = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + bytes.size());
-    retainedRequest->Src = 2; retainedRequest->Dst = 4; retainedRequest->Term = stableImage.Term + 1;
-    retainedRequest->SnapshotIndex = stableImage.Index; retainedRequest->SnapshotTerm = stableImage.Term;
-    retainedRequest->Offset = 0; retainedRequest->TotalBytes = bytes.size(); retainedRequest->Done = 1;
-    retainedRequest->LeaderId = 2;
-    memcpy(retainedRequest->Data, bytes.data(), bytes.size());
-    retainedRaft->Process({}, retainedRequest);
+    for (size_t offset = 0; offset < bytes.size();) {
+        const auto count = std::min<size_t>(TInstallSnapshotRequest::MaxChunkBytes, bytes.size() - offset);
+        auto retainedRequest = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
+        retainedRequest->Src = 2; retainedRequest->Dst = 4; retainedRequest->Term = stableImage.Term + 1;
+        retainedRequest->SnapshotIndex = stableImage.Index; retainedRequest->SnapshotTerm = stableImage.Term;
+        retainedRequest->Offset = offset; retainedRequest->TotalBytes = bytes.size();
+        retainedRequest->Done = uint32_t(offset + count == bytes.size());
+        retainedRequest->LeaderId = 2;
+        memcpy(retainedRequest->Data, bytes.data() + offset, count);
+        retainedRaft->Process({}, retainedRequest);
+        offset += count;
+    }
     assert_int_equal(retainedState->CurrentTerm, stableImage.Term + 1);
     assert_true(*retainedState->GetSnapshot() == stableImage);
     assert_true(retainedState->GetBoundVoters() == firstSet);
     assert_true(retainedRaft->GetVoterIds() == secondSet);
     assert_int_equal(retainedApplication->LastAppliedIndex, stableImage.Index);
 
-    auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + bytes.size());
-    request->Src = 4; request->Dst = 1; request->Term = stableImage.Term + 1;
-    request->SnapshotIndex = stableImage.Index; request->SnapshotTerm = stableImage.Term;
-    request->Offset = 0; request->TotalBytes = bytes.size(); request->Done = 1;
-    request->LeaderId = 4;
-    memcpy(request->Data, bytes.data(), bytes.size());
-    stale->Process({}, request);
+    for (size_t offset = 0; offset < bytes.size();) {
+        const auto count = std::min<size_t>(TInstallSnapshotRequest::MaxChunkBytes, bytes.size() - offset);
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
+        request->Src = 4; request->Dst = 1; request->Term = stableImage.Term + 1;
+        request->SnapshotIndex = stableImage.Index; request->SnapshotTerm = stableImage.Term;
+        request->Offset = offset; request->TotalBytes = bytes.size();
+        request->Done = uint32_t(offset + count == bytes.size());
+        request->LeaderId = 4;
+        memcpy(request->Data, bytes.data() + offset, count);
+        stale->Process({}, request);
+        offset += count;
+    }
     assert_int_equal(staleState->CurrentTerm, 2);
     assert_true(!staleState->GetSnapshot());
     assert_int_equal(application->LastAppliedIndex, 0);
@@ -255,11 +308,11 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
     resumed = resumed.Advance(nextJointIndex, EncodeConfigurationEntry(nextJoint));
     const auto jointImage = resumed.MakeSnapshot(std::to_string(resumed.ThroughIndex()));
     const auto encodedJointImage = EncodeSnapshot(jointImage);
-    assert_true(encodedJointImage.substr(0, 8) == "MRFTS009");
+    assert_true(encodedJointImage.substr(0, 8) == "MRFTS011");
     assert_int_equal(jointImage.ConfigurationTransitions.size(), TSnapshot::MaxConfigurationTransitions);
     assert_true(DecodeSnapshot(encodedJointImage) == jointImage);
 
-    // Exercise MRFTS009 through the runtime metadata probe and fresh-learner
+    // Exercise MRFTS011 through the runtime metadata probe and fresh-learner
     // install path, not only through the standalone codec.
     auto bootstrapVoters = jointImage.Voters;
     bootstrapVoters.insert(bootstrapVoters.end(), jointImage.JointVoters.begin(), jointImage.JointVoters.end());
@@ -279,15 +332,20 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
         std::vector<uint32_t>{learnerId});
     auto learnerApplication = std::make_shared<TSnapshotRsm>();
     TRequestProcessor learnerProcessor(learnerRaft, learnerApplication, bootstrapPeers);
-    auto install = NewHoldedMessage<TInstallSnapshotRequest>(
-        sizeof(TInstallSnapshotRequest) + encodedJointImage.size());
-    install->Src = leaderId; install->Dst = learnerId; install->Term = jointImage.Term + 1;
-    install->SnapshotIndex = jointImage.Index; install->SnapshotTerm = jointImage.Term;
-    install->Offset = 0; install->TotalBytes = encodedJointImage.size(); install->Done = 1;
-    install->LeaderId = leaderId;
-    memcpy(install->Data, encodedJointImage.data(), encodedJointImage.size());
-    learnerRaft->Process({}, install);
-    assert_int_equal(bootstrapResponses.size(), 1);
+    for (size_t offset = 0; offset < encodedJointImage.size();) {
+        const auto count = std::min<size_t>(TInstallSnapshotRequest::MaxChunkBytes,
+            encodedJointImage.size() - offset);
+        auto install = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
+        install->Src = leaderId; install->Dst = learnerId; install->Term = jointImage.Term + 1;
+        install->SnapshotIndex = jointImage.Index; install->SnapshotTerm = jointImage.Term;
+        install->Offset = offset; install->TotalBytes = encodedJointImage.size();
+        install->Done = uint32_t(offset + count == encodedJointImage.size());
+        install->LeaderId = leaderId;
+        memcpy(install->Data, encodedJointImage.data() + offset, count);
+        learnerRaft->Process({}, install);
+        offset += count;
+    }
+    assert_true(!bootstrapResponses.empty());
     auto response = bootstrapResponses.back().Cast<TInstallSnapshotResponse>();
     assert_true(response->Success); assert_true(response->Installed);
     assert_true(*learnerState->GetSnapshot() == jointImage);

@@ -120,7 +120,8 @@ limits.
 When local history contains the predecessor identity, MRFTS005 joint snapshots
 preserve the preceding stable voter set and joint entry identity; MRFTS004 stable
 snapshots carry that link through the stable successor. MRFTS006 and MRFTS007
-carry up to 32 contiguous transitions; MRFTS008 and MRFTS009 carry up to 256.
+carry up to 32 contiguous transitions; MRFTS008 and MRFTS009 carry up to 256;
+MRFTS010 and MRFTS011 carry up to 1,024.
 A node with a nonempty stale store can recover across multiple compacted
 transitions when a transition in the chain matches its exact committed stable
 configuration. For a stable snapshot,
@@ -131,7 +132,7 @@ old leader to finish that phase. The chain is checked before a higher term is
 accepted. Disjoint transitions and senders absent from a required set remain
 unsupported for online stale-store recovery; use a fresh learner or
 independently verified history. Snapshot metadata does not prove commitment by
-itself. Upgrade every voter before using MRFTS004 through MRFTS009. Older nodes
+itself. Upgrade every voter before using MRFTS004 through MRFTS011. Older nodes
 reject the extended-history formats by their version magic.
 
 Deterministic durable-store tests cover learner catch-up, voter addition and

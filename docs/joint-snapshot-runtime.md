@@ -5,8 +5,9 @@ restore and InstallSnapshot. MRFTS002 remains the compact format when no
 predecessor is known; MRFTS005 also records the immediately preceding stable
 voter set, its configuration identity, and the joint entry identity. MRFTS006
 stable and MRFTS007 joint snapshots retain up to 32 contiguous membership
-transitions; MRFTS008 stable and MRFTS009 joint snapshots retain up to 256.
-Stable successors use MRFTS004, MRFTS006, or MRFTS008 when lineage is
+transitions; MRFTS008 stable and MRFTS009 joint snapshots retain up to 256;
+MRFTS010 stable and MRFTS011 joint snapshots retain up to 1,024.
+Stable successors use MRFTS004, MRFTS006, MRFTS008, or MRFTS010 when lineage is
 available. The persisted voter binding remains the original bootstrap set.
 
 For an existing member, the runtime accepts a joint image only when the receiver
@@ -95,7 +96,7 @@ checked before a higher term is used to accept leader contact or install the
 image. A current voter may
 start buffering a supported snapshot whose bounded metadata spans chunks. A
 sender absent from a required voter set, a disjoint
-completed transition after the anchor, or a chain longer than 256 entries still
+completed transition after the anchor, or a chain longer than 1,024 entries still
 requires fresh learner provisioning or independently verified history
 recovery.
 
@@ -105,9 +106,9 @@ to that configuration, then checks the complete image and CRC before storage or
 application replacement. Metadata does not authenticate a peer or prove each
 historical transition committed; this path retains the Raft trusted-leader and
 crash-fault assumptions. MRFTS006/MRFTS007 are limited to 32 transitions;
-MRFTS008/MRFTS009 carry up to 256. All voters must understand MRFTS004 through
-MRFTS009 before using these lineage snapshots; older versions reject the new
-formats.
+MRFTS008/MRFTS009 carry up to 256; MRFTS010/MRFTS011 carry up to 1,024. All
+voters must understand MRFTS004 through MRFTS011 before using these lineage
+snapshots; older versions reject the new formats.
 
 Before publishing an installed image, the receiver also checks that it has a
 local replication target for every voter in the snapshot's active configuration.
@@ -124,7 +125,7 @@ Same-configuration refresh and joint-to-stable installation also reject
 unverified older prefixes while preserving the receiver's trusted lineage.
 The accepted node installs the active stable snapshot as a learner, catches up,
 and can later rejoin through a new joint transition. A disjoint chain, a chain
-outside the 256-transition bound, or lineage that cannot be anchored to the
+outside the 1,024-transition bound, or lineage that cannot be anchored to the
 store's exact committed configuration still requires a fresh learner or
 independently verified history.
 For an existing durable store that must retain its original binding, the

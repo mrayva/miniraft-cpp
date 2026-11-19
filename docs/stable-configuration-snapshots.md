@@ -19,8 +19,9 @@ not a quorum certificate or cryptographic proof.
 
 MRFTS006 stable and MRFTS007 joint snapshots add a bounded chain of up to 32
 transitions. MRFTS008 stable and MRFTS009 joint snapshots use the same chain
-encoding with a 256-transition limit. The separate magic makes nodes that only
-understand the 32-transition format reject longer chains. Each entry records
+encoding with a 256-transition limit. MRFTS010 stable and MRFTS011 joint
+snapshots extend the limit to 1,024. The separate magic makes older nodes
+reject longer chains. Each entry records
 the predecessor stable configuration identity,
 joint entry identity, stable successor identity (zero only for the final active
 joint phase), and both voter sets. The chain must be contiguous and its tail
@@ -35,12 +36,13 @@ MRFTS005 places them after the joint new-voter count, then stores the old,
 new, and predecessor voter lists. Both formats retain the CRC32 trailer and the
 64 MiB snapshot bound.
 
-MRFTS006 through MRFTS009 keep the corresponding MRFTS004/MRFTS005 header and
+MRFTS006 through MRFTS011 keep the corresponding MRFTS004/MRFTS005 header and
 voter lists, then append transition count[4] and transition records before
 application data. A record stores six 64-bit index/term fields, old and new
 voter counts[4 each], and sorted old and new voter IDs[4 each]. MRFTS006/007
-accept at most 32 records; MRFTS008/009 accept at most 256. All retain the
-CRC32 trailer and the 64 MiB total snapshot bound.
+accept at most 32 records; MRFTS008/009 accept at most 256; MRFTS010/011
+accept at most 1,024. All retain the CRC32 trailer and the 64 MiB total
+snapshot bound.
 
 `TConfigurationHistory::FromStableSnapshot` initializes offline history from
 this identity. The retained-log scanner checks the baseline identity against
