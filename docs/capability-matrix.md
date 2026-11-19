@@ -45,7 +45,8 @@ design notes. This is a capability summary, not a production-readiness claim.
 
 - Cluster-wide endpoint discovery, rollout and administrator workflow.
 - End-to-end streaming or logical-object snapshots with explicit aggregate
-  resource accounting for large application state.
+  resource accounting for large application state. The required staged-image
+  and durable-manifest contract is outlined in [the streaming design](snapshot-streaming-design.md).
 - Automatic recovery when a stale store lacks an allowed history anchor, or
   its transition chain is disjoint from the sender's voter lineage.
 - An efficient WAL or group-commit storage path; `TDurableState` republishes a
