@@ -286,6 +286,20 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
     auto application = std::make_shared<TSnapshotRsm>();
     TRequestProcessor processor(stale, application, peers);
     const auto bytes = EncodeSnapshot(stableImage);
+    auto sendToStale = [&](std::string_view image) {
+        for (size_t offset = 0; offset < image.size();) {
+            const auto count = std::min<size_t>(TInstallSnapshotRequest::MaxChunkBytes, image.size() - offset);
+            auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
+            request->Src = 4; request->Dst = 1; request->Term = stableImage.Term + 1;
+            request->SnapshotIndex = stableImage.Index; request->SnapshotTerm = stableImage.Term;
+            request->Offset = offset; request->TotalBytes = image.size();
+            request->Done = uint32_t(offset + count == image.size());
+            request->LeaderId = 4;
+            memcpy(request->Data, image.data() + offset, count);
+            stale->Process({}, request);
+            offset += count;
+        }
+    };
 
     // The stable identity at the oldest retained suffix boundary still
     // authorizes recovery through the full 1024-transition window.
@@ -317,18 +331,15 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
     assert_true(retainedRaft->GetVoterIds() == secondSet);
     assert_int_equal(retainedApplication->LastAppliedIndex, stableImage.Index);
 
-    for (size_t offset = 0; offset < bytes.size();) {
-        const auto count = std::min<size_t>(TInstallSnapshotRequest::MaxChunkBytes, bytes.size() - offset);
-        auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
-        request->Src = 4; request->Dst = 1; request->Term = stableImage.Term + 1;
-        request->SnapshotIndex = stableImage.Index; request->SnapshotTerm = stableImage.Term;
-        request->Offset = offset; request->TotalBytes = bytes.size();
-        request->Done = uint32_t(offset + count == bytes.size());
-        request->LeaderId = 4;
-        memcpy(request->Data, bytes.data() + offset, count);
-        stale->Process({}, request);
-        offset += count;
-    }
+    sendToStale(bytes);
+    assert_int_equal(staleState->CurrentTerm, 2);
+    assert_true(!staleState->GetSnapshot());
+    assert_int_equal(application->LastAppliedIndex, 0);
+    assert_true(endpoints[4]->Messages.empty());
+
+    // A base-format image without lineage must not bypass the same proof
+    // requirement when it omits the transition history entirely.
+    sendToStale(baseStableImage);
     assert_int_equal(staleState->CurrentTerm, 2);
     assert_true(!staleState->GetSnapshot());
     assert_int_equal(application->LastAppliedIndex, 0);
