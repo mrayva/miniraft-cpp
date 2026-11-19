@@ -144,3 +144,8 @@ normal joint-consensus API. The offline install API does not perform that
 external history verification. A deterministic two-transition regression
 rejects the direct peer image, imports the independently verified checkpoint,
 then catches up and re-adds the stale voter through a joint configuration.
+
+A separate regression starts from a joint snapshot with an earlier completed
+transition and rejects a structurally valid stable successor that changes that
+earlier history. The same schedule installs the successor when its history
+matches the receiver's known transition chain.
