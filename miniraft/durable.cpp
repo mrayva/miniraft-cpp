@@ -1,6 +1,7 @@
 #include "durable.h"
 #include "persist.h"
 #include "configuration.h"
+#include "snapshot_codec.h"
 #include <array>
 #include <climits>
 #include <algorithm>
@@ -33,14 +34,10 @@ uint64_t Take(std::span<const uint8_t> bytes, size_t& position, unsigned width) 
 }
 uint32_t Checksum(std::span<const uint8_t> bytes, size_t start,
         const std::array<uint8_t, 8>* version = nullptr) {
-    uint32_t crc = UINT32_MAX;
-    const auto update = [&](uint8_t byte) {
-        crc ^= byte;
-        for (int bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
-    };
-    if (version) for (auto byte : *version) update(byte);
-    for (size_t i = start; i < bytes.size(); ++i) update(bytes[i]);
-    return ~crc;
+    NSnapshotCodec::TChecksum checksum;
+    if (version) checksum.Update(version->data(), version->size());
+    if (start < bytes.size()) checksum.Update(bytes.data() + start, bytes.size() - start);
+    return checksum.Finish();
 }
 TMessageHolder<TLogEntry> Clone(TMessageHolder<TLogEntry> entry) {
     if (!entry.HasValidExtent() || entry->Len < sizeof(TLogEntry) || entry->Type != uint32_t(EMessageType::LOG_ENTRY))
@@ -305,13 +302,9 @@ void TDurableState::Publish()
     std::copy(CommitMagic.begin(), CommitMagic.end(), header.begin());
     WriteAll(temp.Value, header.data(), header.size());
 
-    uint32_t crc = UINT32_MAX;
+    NSnapshotCodec::TChecksum checksum;
     auto updateChecksum = [&](const uint8_t* data, size_t size) {
-        for (size_t i = 0; i < size; ++i) {
-            crc ^= data[i];
-            for (int bit = 0; bit < 8; ++bit)
-                crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
-        }
+        checksum.Update(data, size);
     };
     updateChecksum(CommitMagic.data(), CommitMagic.size());
     uint64_t payloadLength = 0;
@@ -359,8 +352,8 @@ void TDurableState::Publish()
 
     std::array<uint8_t, 12> encodedHeader{};
     for (unsigned i = 0; i < 8; ++i) encodedHeader[i] = uint8_t(payloadLength >> (8 * i));
-    const auto checksum = ~crc;
-    for (unsigned i = 0; i < 4; ++i) encodedHeader[8 + i] = uint8_t(checksum >> (8 * i));
+    const auto checksumValue = checksum.Finish();
+    for (unsigned i = 0; i < 4; ++i) encodedHeader[8 + i] = uint8_t(checksumValue >> (8 * i));
     WriteAtAll(temp.Value, encodedHeader.data(), encodedHeader.size(), off_t(CommitMagic.size()));
     Impl->Stage(EStage::Written);
     Sync(temp.Value);

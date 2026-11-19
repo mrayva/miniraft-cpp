@@ -1,8 +1,20 @@
 #pragma once
 #include "snapshot.h"
+#include <array>
 #include <stdexcept>
 
 namespace NSnapshotCodec {
+inline constexpr auto Crc32Table = [] {
+    std::array<uint32_t, 256> table{};
+    for (uint32_t i = 0; i < table.size(); ++i) {
+        auto crc = i;
+        for (int bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+        table[i] = crc;
+    }
+    return table;
+}();
+
 inline void Append(std::string& out, std::string_view part) {
     if (out.size() > TSnapshot::MaxBytes || part.size() > TSnapshot::MaxBytes - out.size())
         throw std::runtime_error("Snapshot exceeds size limit");
@@ -32,11 +44,11 @@ struct TReader {
 struct TChecksum {
     uint32_t State = UINT32_MAX;
     void Update(std::string_view bytes) {
-        auto& crc = State;
-        for (uint8_t byte : bytes) {
-            crc ^= byte;
-            for (int i = 0; i < 8; ++i) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
-        }
+        Update(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
+    }
+    void Update(const uint8_t* bytes, size_t size) {
+        for (size_t i = 0; i < size; ++i)
+            State = (State >> 8) ^ Crc32Table[(State ^ bytes[i]) & 0xffu];
     }
     uint32_t Finish() const { return ~State; }
 };

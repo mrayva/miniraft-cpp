@@ -58,6 +58,14 @@ void FixChecksum(std::string& bytes) {
     bytes.resize(bytes.size() - 4);
     NSnapshotCodec::Put(bytes, NSnapshotCodec::Checksum(bytes), 4);
 }
+void test_crc32_ieee_golden_vector_and_incremental_updates(void**) {
+    constexpr uint32_t expected = UINT32_C(0xcbf43926);
+    assert_true(NSnapshotCodec::Checksum("123456789") == expected);
+    NSnapshotCodec::TChecksum incremental;
+    incremental.Update("1234");
+    incremental.Update("56789");
+    assert_true(incremental.Finish() == expected);
+}
 struct TFiles {
     std::filesystem::path Directory;
     std::string Name;
@@ -841,6 +849,7 @@ void test_durable_kv_restart_restores_checkpoint_and_replays_only_tail(void**) {
 }
 int main() {
     const CMUnitTest tests[] = {
+        cmocka_unit_test(test_crc32_ieee_golden_vector_and_incremental_updates),
         cmocka_unit_test(test_snapshot_codec_roundtrip_and_all_byte_corruption),
         cmocka_unit_test(test_snapshot_encoding_ranges_match_complete_wire_image),
         cmocka_unit_test(test_joint_snapshot_codec_roundtrip_and_corruption),
