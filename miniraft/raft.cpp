@@ -2637,6 +2637,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         }
         auto& prefix = IncomingSnapshot->Bytes;
         const auto count = request->Len - sizeof(TInstallSnapshotRequest);
+        const bool advanced = request->Offset == prefix.size();
         if (request->Offset > prefix.size()) { reply(false, false, 0); return; }
         if (request->Offset < prefix.size()) {
             if (count > prefix.size() - request->Offset ||
@@ -2644,7 +2645,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
                 IncomingSnapshot.reset(); reply(false, false, 0); return;
             }
         } else prefix.append(request->Data, count);
-        IncomingSnapshot->LastProgress = now;
+        if (advanced) IncomingSnapshot->LastProgress = now;
         if (!IsSupportedSnapshotMagicPrefix(prefix)) {
             IncomingSnapshot.reset(); reply(false, false, 0); return;
         }
@@ -2678,6 +2679,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     }
     auto& bytes = IncomingSnapshot->Bytes;
     const auto count = request->Len - sizeof(TInstallSnapshotRequest);
+    const bool advanced = request->Offset == bytes.size();
     if (request->Offset > bytes.size()) { reply(false, false, 0); return; }
     if (request->Offset < bytes.size()) {
         if (count > bytes.size() - request->Offset ||
@@ -2685,7 +2687,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             IncomingSnapshot.reset(); reply(false, false, 0); return;
         }
     } else bytes.append(request->Data, count);
-    IncomingSnapshot->LastProgress = now;
+    if (advanced) IncomingSnapshot->LastProgress = now;
     if (!IsSupportedSnapshotMagicPrefix(bytes)) {
         IncomingSnapshot.reset(); reply(false, false, 0); return;
     }

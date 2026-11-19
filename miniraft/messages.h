@@ -294,8 +294,8 @@ struct TTimeout {
     static constexpr std::chrono::milliseconds LeadershipExpiration = Heartbeat * 20;
     static constexpr std::chrono::milliseconds LeadershipTransferRetry = std::chrono::milliseconds(1000);
     static constexpr std::chrono::milliseconds Rpc = std::chrono::milliseconds(10000);
-    // Keep partial snapshot transfers across normal RPC retries, but bound how
-    // long an idle receiver retains the accumulated image.
+    // Keep partial snapshot transfers across normal RPC retries, but only
+    // forward progress refreshes this deadline.
     static constexpr std::chrono::milliseconds SnapshotTransferIdle = std::chrono::seconds(30);
     // Re-advertise configuration-compaction certificates so a restarted
     // follower can reconstruct its volatile certificate without a new term.

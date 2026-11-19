@@ -725,16 +725,20 @@ void test_idle_partial_snapshot_expires_on_learner_despite_heartbeats(void**) {
 
     // Ordinary leader contact keeps Raft's election timer fresh, but must not
     // keep an abandoned multi-chunk snapshot allocation alive.
-    const auto heartbeatAt = ITimeSource::Time{} + std::chrono::seconds(20);
+    const auto heartbeatAt = ITimeSource::Time{} + std::chrono::seconds(10);
     auto heartbeat = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 2, .Term = 3},
         TAppendEntriesRequest{.PrevLogIndex = 1, .PrevLogTerm = 1, .LeaderCommit = 0, .LeaderId = 1});
     raft->Process(heartbeatAt, heartbeat);
-    // A matching retry is valid transfer activity and refreshes the deadline.
+    // Replaying an already-buffered chunk is idempotent, but does not refresh
+    // the deadline for a transfer that has stopped making forward progress.
     raft->Process(heartbeatAt, Chunk(snapshot, bytes, 0, metadataBytes));
     assert_true(replies.back()->Success); assert_int_equal(replies.back()->NextOffset, metadataBytes);
     const auto nextChunkAt = heartbeatAt + std::chrono::seconds(10);
     raft->ProcessTimeout(nextChunkAt);
     raft->Process(nextChunkAt, Chunk(snapshot, bytes, metadataBytes, 8));
+    assert_true(replies.back()->Success); assert_int_equal(replies.back()->NextOffset, metadataBytes + 8);
+    const auto duplicateAt = nextChunkAt + TTimeout::SnapshotTransferIdle / 2;
+    raft->Process(duplicateAt, Chunk(snapshot, bytes, metadataBytes, 8));
     assert_true(replies.back()->Success); assert_int_equal(replies.back()->NextOffset, metadataBytes + 8);
 
     // A continuation after expiry is rejected with offset zero so the leader
