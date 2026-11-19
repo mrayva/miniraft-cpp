@@ -81,6 +81,9 @@ capacity changes before proposing.
 - Endpoints are provisioned separately on every replica. The readiness report
   exposes missing local targets and proposal capacity, but there is no
   cluster-wide endpoint rollout protocol or automated administrator workflow.
+  For newly added voters, leader readiness also requires a successful
+  AppendEntries reply to the latest replication request at the current commit
+  boundary, plus InstallSnapshot capability.
 - `TRaft::Compact` requires every active voter to acknowledge the committed
   configuration (`raft.cpp:2122-2132`). An offline active voter can block
   compaction although a quorum can continue committing; the retained log grows.

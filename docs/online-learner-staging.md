@@ -7,10 +7,11 @@ binding do not change. Staged learners receive the ordinary log or a snapshot
 when needed, but never count toward election, commit, or strong-read quorums.
 `IsLearnerCaughtUp` remains a point-in-time log watermark, not an authorization
 to promote or a guarantee of application health.
-`IsLearnerCommitAcknowledged` separately reports whether a correlated successful
-replication reply confirms the leader's current Raft commit boundary while the
-learner also matches the leader's log. It does not report application-applied
-progress and does not authorize promotion.
+`IsLearnerCommitAcknowledged` separately reports whether a successful reply to
+the latest AppendEntries request confirms the leader's current Raft commit
+boundary while the learner also matches the leader's log. An unanswered newer
+request makes the prior acknowledgement stale. It does not report
+application-applied progress and does not authorize promotion by itself.
 Before promotion, the leader also requires an InstallSnapshot capability
 advertisement from each added voter. A caught-up learner that cannot install
 snapshots is not ready for promotion because it could later block safe log

@@ -229,6 +229,19 @@ void test_learner_commit_ack_waits_for_commit_propagation(void**) {
     assert_true(leader->IsLearnerCommitAcknowledged(4));
     assert_int_equal(cluster.Apps[3]->LastAppliedIndex, index);
 }
+void test_learner_commit_ack_requires_latest_append_success(void**) {
+    TCluster cluster; cluster.Elect(1); cluster.Pump();
+    auto leader = cluster.Nodes[0];
+    assert_true(leader->IsLearnerCommitAcknowledged(4));
+
+    // A successful catch-up reply does not stay current after a newer
+    // replication attempt goes unanswered.
+    cluster.Isolated = {4};
+    cluster.Now += std::chrono::seconds(30);
+    leader->ProcessTimeout(cluster.Now);
+    cluster.Drain();
+    assert_false(leader->IsLearnerCommitAcknowledged(4));
+}
 void test_learner_snapshot_catchup_status_and_restart_preserve_role(void**) {
     TCluster cluster; cluster.Isolated = {4}; cluster.Elect(1);
     for (const std::string key : {"a", "b", "c"}) cluster.Write(key, std::string(60000, key[0]));
@@ -909,6 +922,7 @@ int main() {
         cmocka_unit_test(test_learner_grants_cannot_elect_candidate_and_no_votes_are_solicited),
         cmocka_unit_test(test_learner_replication_cannot_commit_or_satisfy_strong_read),
         cmocka_unit_test(test_learner_commit_ack_waits_for_commit_propagation),
+        cmocka_unit_test(test_learner_commit_ack_requires_latest_append_success),
         cmocka_unit_test(test_learner_snapshot_catchup_status_and_restart_preserve_role),
         cmocka_unit_test(test_fresh_learner_bootstraps_stable_and_joint_membership_snapshots),
         cmocka_unit_test(test_restart_cannot_promote_learner_or_change_voters_but_can_add_transport),

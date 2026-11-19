@@ -2543,8 +2543,13 @@ bool TRaft::IsLearnerCommitAcknowledged(uint32_t id) const {
         return false;
     const auto match = VolatileState->MatchIndex.find(id);
     const auto commitAck = VolatileState->CommitAckIndex.find(id);
+    const auto lastSent = VolatileState->LastSentSeqno.find(id);
+    const auto lastSuccessfulAck = VolatileState->ReadAckSeqno.find(id);
     return match != VolatileState->MatchIndex.end() && match->second >= State->LastLogIndex &&
-        commitAck != VolatileState->CommitAckIndex.end() && commitAck->second >= VolatileState->CommitIndex;
+        commitAck != VolatileState->CommitAckIndex.end() && commitAck->second >= VolatileState->CommitIndex &&
+        lastSent != VolatileState->LastSentSeqno.end() &&
+        lastSuccessfulAck != VolatileState->ReadAckSeqno.end() &&
+        lastSuccessfulAck->second >= lastSent->second;
 }
 
 TSnapshot TRaft::Compact() {

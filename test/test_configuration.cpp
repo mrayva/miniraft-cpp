@@ -800,6 +800,8 @@ void test_joint_configuration_readiness_reports_log_and_index_capacity(void**) {
         auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
         volatileState->MatchIndex[2] = state->LastLogIndex;
         volatileState->CommitAckIndex[2] = state->CommitIndex;
+        volatileState->LastSentSeqno[2] = 1;
+        volatileState->ReadAckSeqno[2] = 1;
 
         const auto readiness = raft.CheckJointConfigurationReadiness({1, 2});
         assert_true(readiness.IsLeader);
@@ -830,6 +832,8 @@ void test_joint_configuration_readiness_reports_log_and_index_capacity(void**) {
         auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
         volatileState->MatchIndex[2] = state->LastLogIndex;
         volatileState->CommitAckIndex[2] = state->CommitIndex;
+        volatileState->LastSentSeqno[2] = 1;
+        volatileState->ReadAckSeqno[2] = 1;
 
         const auto readiness = raft.CheckJointConfigurationReadiness({1, 2});
         assert_true(readiness.IsLeader);
@@ -860,6 +864,8 @@ void test_joint_configuration_readiness_reports_log_and_index_capacity(void**) {
         auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
         volatileState->MatchIndex[2] = state->LastLogIndex;
         volatileState->CommitAckIndex[2] = state->CommitIndex;
+        volatileState->LastSentSeqno[2] = 1;
+        volatileState->ReadAckSeqno[2] = 1;
 
         const auto readiness = raft.CheckJointConfigurationReadiness({1, 2});
         assert_true(readiness.IsLeader);
@@ -921,6 +927,8 @@ void test_new_voter_requires_snapshot_install_capability(void**) {
         auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
         volatileState->MatchIndex[2] = state->LastLogIndex;
         volatileState->CommitAckIndex[2] = state->CommitIndex;
+        volatileState->LastSentSeqno[2] = 5;
+        volatileState->ReadAckSeqno[2] = 5;
 
         auto readiness = raft.CheckJointConfigurationReadiness({1, 2});
         assert_true(readiness.AddedVotersWithoutCommitAck.empty());
@@ -930,9 +938,26 @@ void test_new_voter_requires_snapshot_install_capability(void**) {
         Reject([&] { raft.ProposeJointConfiguration({1, 2}); });
         assert_true(static_cast<TStateFields>(*state) == before);
 
+        volatileState->PeerCapabilities[2].AppendAckSeqno = 5;
         volatileState->PeerCapabilities[2].InstallSnapshot = true;
         readiness = raft.CheckJointConfigurationReadiness({1, 2});
         assert_true(readiness.AddedVotersWithoutSnapshotInstallSupport.empty());
+        assert_true(readiness.Ready());
+
+        // A newer unacknowledged append makes the previous catch-up and
+        // capability response stale for promotion readiness.
+        volatileState->LastSentSeqno[2] = 6;
+        readiness = raft.CheckJointConfigurationReadiness({1, 2});
+        assert_true(readiness.AddedVotersWithoutCommitAck == (std::vector<uint32_t>{2}));
+        assert_false(readiness.Ready());
+        const auto beforeStaleProposal = static_cast<TStateFields>(*state);
+        Reject([&] { raft.ProposeJointConfiguration({1, 2}); });
+        assert_true(static_cast<TStateFields>(*state) == beforeStaleProposal);
+
+        volatileState->ReadAckSeqno[2] = 6;
+        volatileState->PeerCapabilities[2].AppendAckSeqno = 6;
+        readiness = raft.CheckJointConfigurationReadiness({1, 2});
+        assert_true(readiness.AddedVotersWithoutCommitAck.empty());
         assert_true(readiness.Ready());
         assert_int_equal(raft.ProposeJointConfiguration({1, 2}), 2);
     }
