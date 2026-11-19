@@ -188,3 +188,8 @@ transfer, bounded transport queues, total heap quotas,
 cluster/store authentication and independent review remain open.
 The conservative backend still rewrites the entire snapshot and retained suffix
 on each update, and capture/publication runs synchronously on the event loop.
+
+A deterministic Linux subprocess test exits from the application `LoadSnapshot`
+callback immediately after a remote snapshot has been durably installed. Restart
+must restore the embedded image before request processing, covering the crash
+window between Raft publication and application replacement.

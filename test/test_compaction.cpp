@@ -1253,6 +1253,58 @@ void test_snapshot_and_suffix_are_atomic_at_every_publication_stage(void**) {
         if (retain || !updated) assert_int_equal(state.Get(3)->Term, 3);
     }
 }
+void test_remote_snapshot_install_crash_before_application_load_recovers_on_restart(void**) {
+    TFiles files;
+    {
+        TDurableState state(files.Name, 2);
+        state.BindVoters({1, 2});
+    }
+
+    TKv source;
+    source.Write(source.Prepare(Command("crash-window", "durable image")), 1);
+    const TSnapshot snapshot{1, 1, {1, 2}, source.SaveSnapshot()};
+    const auto bytes = EncodeSnapshot(snapshot);
+    assert_true(bytes.size() <= TInstallSnapshotRequest::MaxChunkBytes);
+    auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + bytes.size());
+    request->Src = 1; request->Dst = 2; request->Term = 1; request->Seqno = 1;
+    request->SnapshotIndex = snapshot.Index; request->SnapshotTerm = snapshot.Term;
+    request->Offset = 0; request->TotalBytes = bytes.size(); request->Done = 1; request->LeaderId = 1;
+    memcpy(request->Data, bytes.data(), bytes.size());
+
+    const auto child = fork();
+    assert_true(child >= 0);
+    if (child == 0) {
+        struct TCrashDuringLoad final : TKv {
+            void LoadSnapshot(std::string_view, uint64_t) override { _exit(87); }
+        };
+        try {
+            auto state = std::make_shared<TDurableState>(files.Name, 2);
+            TNodeDict peers{{1, std::make_shared<TEndpoint>([](auto) {})}};
+            auto raft = std::make_shared<TRaft>(state, 2, peers);
+            auto application = std::make_shared<TCrashDuringLoad>();
+            TRequestProcessor processor(raft, application, peers);
+            raft->Process({}, request);
+        } catch (...) { _exit(91); }
+        _exit(92);
+    }
+    int status = 0;
+    assert_int_equal(waitpid(child, &status, 0), child);
+    assert_true(WIFEXITED(status));
+    assert_int_equal(WEXITSTATUS(status), 87);
+
+    {
+        auto state = std::make_shared<TDurableState>(files.Name, 2);
+        assert_int_equal(state->SnapshotIndex, snapshot.Index);
+        assert_int_equal(state->CommitIndex, snapshot.Index);
+        assert_true(state->GetSnapshot() && state->GetSnapshot()->Data == snapshot.Data);
+        auto raft = std::make_shared<TRaft>(state, 2,
+            TNodeDict{{1, std::make_shared<TEndpoint>([](auto) {})}});
+        auto application = std::make_shared<TKv>();
+        TRequestProcessor processor(raft, application, {});
+        assert_int_equal(application->LastAppliedIndex, snapshot.Index);
+        assert_true(Read(*application, "crash-window") == "durable image");
+    }
+}
 void test_compaction_reclaims_durable_prefix_bytes(void**) {
     TFiles files; TDurableState state(files.Name, 1);
     for (int i = 0; i < 30; ++i) {
@@ -1325,6 +1377,7 @@ int main() {
         cmocka_unit_test(test_durable_term_lookup_avoids_payload_copies_across_compaction),
         cmocka_unit_test(test_durable_compacted_boundary_survives_restart),
         cmocka_unit_test(test_snapshot_and_suffix_are_atomic_at_every_publication_stage),
+        cmocka_unit_test(test_remote_snapshot_install_crash_before_application_load_recovers_on_restart),
         cmocka_unit_test(test_compaction_reclaims_durable_prefix_bytes),
         cmocka_unit_test(test_durable_v4_semantic_corruption_rejects_without_rewriting),
 #endif
