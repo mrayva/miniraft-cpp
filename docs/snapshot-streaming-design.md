@@ -4,6 +4,16 @@ This is a proposed design for removing the current 64 MiB complete-image
 limit. It is not implemented. The current snapshot format, storage behavior and
 transfer limits are described in [compaction and InstallSnapshot](compaction.md).
 
+## Current incremental step
+
+`IRsm` now has an optional `SnapshotSizeUpperBound()` callback. Capture checks
+the application's bound against the remaining Raft image budget, including
+membership metadata, before calling `SaveSnapshot()`. The KV example reports
+its encoded size and the SQL example reports its database page-size bound. An
+application that does not implement the callback keeps the legacy post-capture
+size check. This preflight still uses complete in-memory images and does not
+change the 64 MiB limit.
+
 ## Why this needs a storage contract
 
 InstallSnapshot already sends bounded chunks, but the receiver assembles the

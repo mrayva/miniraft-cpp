@@ -608,6 +608,13 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm) {
         }
     }
     CheckLocalLog(snapshot, raft, raft.Configuration->Committed);
+    if (const auto upperBound = rsm.SnapshotSizeUpperBound()) {
+        const auto metadataEncoding = PrepareSnapshotEncoding(snapshot);
+        const auto metadataBytes = SnapshotEncodingSize(*metadataEncoding);
+        if (metadataBytes > TSnapshot::MaxBytes ||
+            *upperBound > TSnapshot::MaxBytes - metadataBytes)
+            throw std::runtime_error("Application snapshot size bound exceeds the Raft snapshot limit");
+    }
     snapshot.Data = rsm.SaveSnapshot();
     Validate(snapshot);
     return snapshot;

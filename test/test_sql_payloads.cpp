@@ -162,6 +162,7 @@ void test_sql_snapshot_roundtrip_and_rejection_are_atomic(void**) {
         Seed(source);
         assert_true(Apply(source, "INSERT INTO t VALUES ('second')", 2).empty());
         image = source.SaveSnapshot();
+        assert_true(source.SnapshotSizeUpperBound().value() >= image.size());
         assert_true(image.substr(0, 16) == std::string("SQLite format 3\0", 16));
         source.ValidateSnapshot(image, 2);
         Reject([&] { source.ValidateSnapshot(image, 3); });

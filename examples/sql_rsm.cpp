@@ -373,13 +373,19 @@ TMessageHolder<TLogEntry> TSql::Prepare(TMessageHolder<TCommandRequest> command)
     return entry;
 }
 
-std::string TSql::SaveSnapshot() const {
+std::optional<uint64_t> TSql::SnapshotSizeUpperBound() const {
     if (!LastAppliedIndex || LastAppliedIndex > uint64_t(INT64_MAX) || !sqlite3_get_autocommit(Db))
         throw TMessageError("SQL snapshot requires committed application progress");
     const auto pages = ReadPragmaInteger(Db, "page_count");
     const auto pageSize = ReadPragmaInteger(Db, "page_size");
     if (pages > MaxSqlSnapshotBytes / pageSize)
         throw TMessageError("SQL snapshot exceeds the maximum image size");
+    return pages * pageSize;
+}
+
+std::string TSql::SaveSnapshot() const {
+    (void)SnapshotSizeUpperBound().value();
+    const auto pageSize = ReadPragmaInteger(Db, "page_size");
     auto consistent = CopyDatabaseToMemory(Db, pageSize);
     sqlite3_int64 size = 0;
     auto* bytes = sqlite3_serialize(consistent.Db.get(), "main", &size, 0);

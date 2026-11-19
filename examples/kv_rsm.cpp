@@ -72,23 +72,29 @@ TMessageHolder<TLogEntry> TKv::Prepare(TMessageHolder<TCommandRequest> command) 
     return entry;
 }
 
-std::string TKv::SaveSnapshot() const {
-    using namespace NSnapshotCodec;
-    std::vector<std::string_view> keys;
-    size_t encodedSize = 16; // magic[8] and entry count[8]
+std::optional<uint64_t> TKv::SnapshotSizeUpperBound() const {
+    uint64_t encodedSize = 16; // magic[8] and entry count[8]
     const auto account = [&](size_t amount) {
         if (amount > TSnapshot::MaxBytes - encodedSize)
             throw std::runtime_error("KV snapshot exceeds size limit");
         encodedSize += amount;
     };
     for (const auto& [key, value] : H) {
-        keys.push_back(key);
         if (key.size() > UINT16_MAX || value.size() > UINT16_MAX)
             throw std::runtime_error("KV snapshot field too large");
         account(8); // key and value lengths
         account(key.size());
         account(value.size());
     }
+    return encodedSize;
+}
+
+std::string TKv::SaveSnapshot() const {
+    using namespace NSnapshotCodec;
+    const auto encodedSize = size_t(SnapshotSizeUpperBound().value());
+    std::vector<std::string_view> keys;
+    keys.reserve(H.size());
+    for (const auto& [key, _] : H) keys.push_back(key);
     std::sort(keys.begin(), keys.end());
     std::string bytes;
     bytes.reserve(encodedSize);

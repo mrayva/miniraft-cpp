@@ -97,8 +97,10 @@ capacity changes before proposing.
   snapshot. Both durable-state and standalone-store publication encode through
   fixed 64 KiB buffers, so neither allocates a second serialized snapshot
   image. Durable state still rewrites the snapshot and retained log on each
-  state update. Application capture,
-  receiver chunk accumulation, and restore retain complete images. The receiver
+  state update. KV and SQL can now preflight an application size bound against
+  the metadata-adjusted limit before capture; legacy applications still receive
+  the post-capture check. Application capture, receiver chunk accumulation,
+  and restore retain complete images. The receiver
   reuses its completed wire buffer for decoded application data, avoiding an
   extra payload allocation during validation. Large databases still need an
   application and storage streaming contract with disk quotas and generation

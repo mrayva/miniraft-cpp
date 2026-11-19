@@ -42,6 +42,10 @@ struct IRsm {
     virtual TMessageHolder<TMessage> Write(TMessageHolder<TLogEntry> message, uint64_t index) = 0;
     virtual TMessageHolder<TLogEntry> Prepare(TMessageHolder<TCommandRequest> message) = 0;
     virtual std::string SaveSnapshot() const { throw std::logic_error("Application snapshots are unsupported"); }
+    // Optional upper bound for SaveSnapshot(). Raft checks it against the
+    // metadata-adjusted image budget before asking the application to allocate
+    // the image. An empty result preserves the legacy post-capture size check.
+    virtual std::optional<uint64_t> SnapshotSizeUpperBound() const { return std::nullopt; }
     virtual void ValidateSnapshot(std::string_view, uint64_t) const { throw std::logic_error("Application snapshots are unsupported"); }
     // Implementations must validate completely before atomically replacing state
     // and LastAppliedIndex. Invoked at startup or during serialized installation;

@@ -49,6 +49,11 @@ struct TApplication : TKv {
     size_t Loads = 0;
     void LoadSnapshot(std::string_view bytes, uint64_t index) override { TKv::LoadSnapshot(bytes, index); ++Loads; }
 };
+struct TOversizedBoundApplication : TKv {
+    mutable size_t SaveCalls = 0;
+    std::optional<uint64_t> SnapshotSizeUpperBound() const override { return TSnapshot::MaxBytes; }
+    std::string SaveSnapshot() const override { ++SaveCalls; return "oversized"; }
+};
 void test_kv_snapshot_precomputes_size_without_changing_encoding(void**) {
     TKv source;
     const std::string binaryKey("a\0", 2), binaryValue("\0v", 2);
@@ -56,6 +61,7 @@ void test_kv_snapshot_precomputes_size_without_changing_encoding(void**) {
     source.Write(source.Prepare(Command(binaryKey, binaryValue)), 2);
 
     const auto bytes = source.SaveSnapshot();
+    assert_int_equal(source.SnapshotSizeUpperBound().value(), bytes.size());
     std::string expected = "MRKV0001";
     NSnapshotCodec::Put(expected, 2, 8);
     NSnapshotCodec::Put(expected, binaryKey.size(), 4);
@@ -72,6 +78,23 @@ void test_kv_snapshot_precomputes_size_without_changing_encoding(void**) {
     restored.LoadSnapshot(bytes, source.LastAppliedIndex);
     assert_true(Read(restored, binaryKey) == binaryValue);
     assert_true(Read(restored, "z") == "last");
+}
+void test_snapshot_capture_preflights_application_size_bound(void**) {
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 1;
+    auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = 1;
+    state->Append(entry);
+    state->CommitIndex = 1;
+
+    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+    auto application = std::make_shared<TOversizedBoundApplication>();
+    application->LastAppliedIndex = 1;
+    TRequestProcessor processor(raft, application, {});
+
+    Reject([&] { raft->Compact(); });
+    assert_int_equal(application->SaveCalls, 0);
+    assert_int_equal(state->SnapshotIndex, 0);
+    assert_int_equal(state->LastLogIndex, 1);
 }
 struct TCluster {
     ITimeSource::Time Now{};
@@ -1267,6 +1290,7 @@ void test_durable_v4_semantic_corruption_rejects_without_rewriting(void**) {
 int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_kv_snapshot_precomputes_size_without_changing_encoding),
+        cmocka_unit_test(test_snapshot_capture_preflights_application_size_bound),
         cmocka_unit_test(test_snapshot_history_encoding_is_negotiated_per_peer),
         cmocka_unit_test(test_snapshot_install_accepts_every_small_fixed_chunk_size),
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),

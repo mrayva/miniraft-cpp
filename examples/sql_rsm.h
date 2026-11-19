@@ -38,6 +38,7 @@ public:
     // convert request to log message
     TMessageHolder<TLogEntry> Prepare(TMessageHolder<TCommandRequest> message) override;
     std::string SaveSnapshot() const override;
+    std::optional<uint64_t> SnapshotSizeUpperBound() const override;
     void ValidateSnapshot(std::string_view bytes, uint64_t index) const override;
     void LoadSnapshot(std::string_view bytes, uint64_t index) override;
 
