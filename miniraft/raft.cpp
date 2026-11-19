@@ -2640,7 +2640,9 @@ TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t no
         } else if (!supportsLineage && (!snapshot->ConfigurationTransitions.empty() ||
                 snapshot->HasConfigurationLineage())) {
             // Base-format peers get the active configuration identity without
-            // predecessor lineage. Their committed baseline must match exactly.
+            // predecessor lineage. Receivers need a matching stable identity,
+            // the exact joint predecessor for a stable successor, or fresh
+            // learner bootstrap; this format cannot bridge unknown transitions.
             if (EncodedSnapshotBaseFormatIndex != snapshot->Index) {
                 EncodedSnapshotBaseFormat = PrepareSnapshotEncoding(*snapshot, 0, false);
                 EncodedSnapshotBaseFormatIndex = snapshot->Index;
