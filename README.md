@@ -7,6 +7,8 @@ validation, build instructions and remaining production release gates.
 The core library installs a CMake package for downstream `find_package`
 consumers; see the [CMake package guide](docs/cmake-package.md).
 The milestone is experimental; durable crash recovery is not established.
+For the current membership, snapshot and recovery capabilities and their
+operational limits, see the [capability matrix](docs/capability-matrix.md).
 The [persistence recovery follow-up](docs/persistence-recovery.md) rejects
 incomplete or structurally corrupt storage and fixes truncation/restart behavior.
 For new Linux stores, the opt-in [durable state backend](docs/durable-state.md)
