@@ -1256,7 +1256,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
                 .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier |
                     TAppendEntriesResponse::SupportsSnapshotHistory256 |
                     TAppendEntriesResponse::SupportsSnapshotHistory1024 |
-                    (State->SupportsInstallSnapshot() ? TAppendEntriesResponse::SupportsInstallSnapshot : 0u),
+                    (State->SupportsInstallSnapshot() ? TAppendEntriesResponse::SupportsInstallSnapshot : 0u) |
+                    TAppendEntriesResponse::SupportsSnapshotHistory32,
             });
         (void)Nodes[reply->Dst]->TrySend(std::move(reply));
         return;
@@ -1352,7 +1353,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier |
                 TAppendEntriesResponse::SupportsSnapshotHistory256 |
                 TAppendEntriesResponse::SupportsSnapshotHistory1024 |
-                (State->SupportsInstallSnapshot() ? TAppendEntriesResponse::SupportsInstallSnapshot : 0u),
+                (State->SupportsInstallSnapshot() ? TAppendEntriesResponse::SupportsInstallSnapshot : 0u) |
+                TAppendEntriesResponse::SupportsSnapshotHistory32,
         });
 
     AdvanceCommitIndex(commitIndex);
@@ -1394,6 +1396,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             message->Padding & TAppendEntriesResponse::SupportsSnapshotHistory256;
         capabilities.SnapshotHistory1024 =
             message->Padding & TAppendEntriesResponse::SupportsSnapshotHistory1024;
+        capabilities.SnapshotHistory32 =
+            message->Padding & TAppendEntriesResponse::SupportsSnapshotHistory32;
         capabilities.InstallSnapshot =
             message->Padding & TAppendEntriesResponse::SupportsInstallSnapshot;
     }
@@ -1590,6 +1594,8 @@ void TRaft::Process(ITimeSource::Time now, TMessageHolder<TMessage> message, con
             EncodedSnapshotExtendedHistoryIndex = 0;
             EncodedSnapshotLegacyHistory.reset();
             EncodedSnapshotLegacyHistoryIndex = 0;
+            EncodedSnapshotLineage.reset();
+            EncodedSnapshotLineageIndex = 0;
             VolatileState->LeaderId = 0;
             if (VolatileState->ElectionDue <= now || VolatileState->ElectionDue == ITimeSource::Max) {
                 VolatileState->ElectionDue = MakeElection(now);
@@ -2573,9 +2579,11 @@ TSnapshot TRaft::Compact() {
     EncodedSnapshot.reset();
     EncodedSnapshotExtendedHistory.reset();
     EncodedSnapshotLegacyHistory.reset();
+    EncodedSnapshotLineage.reset();
     EncodedSnapshotIndex = 0;
     EncodedSnapshotExtendedHistoryIndex = 0;
     EncodedSnapshotLegacyHistoryIndex = 0;
+    EncodedSnapshotLineageIndex = 0;
     return snapshot;
 }
 
@@ -2593,6 +2601,9 @@ TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t no
         const bool supportsExtendedHistory = supportsFullHistory ||
             (capability != VolatileState->PeerCapabilities.end() &&
                 capability->second.SnapshotHistory256);
+        const bool supportsLegacyHistory = supportsExtendedHistory ||
+            (capability != VolatileState->PeerCapabilities.end() &&
+                capability->second.SnapshotHistory32);
         std::shared_ptr<const TSnapshotEncoding> encoding;
         if (!supportsFullHistory && supportsExtendedHistory && snapshot->ConfigurationTransitions.size() >
                 TSnapshot::MaxExtendedConfigurationTransitions) {
@@ -2604,16 +2615,25 @@ TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t no
                 EncodedSnapshotExtendedHistoryIndex = snapshot->Index;
             }
             encoding = EncodedSnapshotExtendedHistory;
-        } else if (!supportsExtendedHistory && snapshot->ConfigurationTransitions.size() >
+        } else if (!supportsExtendedHistory && supportsLegacyHistory &&
+                snapshot->ConfigurationTransitions.size() >
                 TSnapshot::MaxLegacyConfigurationTransitions) {
-            // Peers without a history capability get the original bounded
-            // MRFTS006/MRFTS007 suffix rather than an unreadable newer version.
+            // Peers with only the original history capability get its bounded
+            // MRFTS006/MRFTS007 suffix rather than a newer version.
             if (EncodedSnapshotLegacyHistoryIndex != snapshot->Index) {
                 EncodedSnapshotLegacyHistory = PrepareSnapshotEncoding(
                     *snapshot, TSnapshot::MaxLegacyConfigurationTransitions);
                 EncodedSnapshotLegacyHistoryIndex = snapshot->Index;
             }
             encoding = EncodedSnapshotLegacyHistory;
+        } else if (!supportsLegacyHistory && !snapshot->ConfigurationTransitions.empty()) {
+            // Pre-history peers receive only immediate predecessor lineage in
+            // MRFTS004/MRFTS005.
+            if (EncodedSnapshotLineageIndex != snapshot->Index) {
+                EncodedSnapshotLineage = PrepareSnapshotEncoding(*snapshot, 0);
+                EncodedSnapshotLineageIndex = snapshot->Index;
+            }
+            encoding = EncodedSnapshotLineage;
         } else {
             if (EncodedSnapshotIndex != snapshot->Index) {
                 EncodedSnapshot = PrepareSnapshotEncoding(*snapshot);

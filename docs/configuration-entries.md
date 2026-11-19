@@ -134,11 +134,11 @@ unsupported for online stale-store recovery; use a fresh learner or
 independently verified history. Snapshot metadata does not prove commitment by
 itself. AppendEntries responses advertise support for the 32-, 256- and
 1,024-transition snapshot-history formats. The leader sends the highest
-advertised format and caps its history to that format's limit. A peer without
-a history feature receives at most 32 transitions in MRFTS006/MRFTS007 and
-still needs a trusted anchor within that suffix. Nodes older than MRFTS006/
-MRFTS007 require a compatible upgrade before configuration-history snapshot
-transfer.
+advertised format and caps its history to that format's limit. For a nonempty
+transition chain, a peer without a history feature receives predecessor-only
+MRFTS004/MRFTS005 lineage and can recover only from a matching trusted
+configuration boundary. Every peer must understand the base format selected
+for its snapshot.
 
 Deterministic durable-store tests cover learner catch-up, voter addition and
 removal, leadership transfer and fallback when its request is dropped,

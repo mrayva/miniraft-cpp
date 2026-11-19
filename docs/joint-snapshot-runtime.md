@@ -108,10 +108,10 @@ historical transition committed; this path retains the Raft trusted-leader and
 crash-fault assumptions. MRFTS006/MRFTS007 are limited to 32 transitions;
 MRFTS008/MRFTS009 carry up to 256; MRFTS010/MRFTS011 carry up to 1,024. The
 leader selects the highest history format advertised in an AppendEntries
-response. Peers without a history feature receive at most 32 transitions in
-MRFTS006/MRFTS007; recovery still requires their trusted anchor to appear in
-the transferred suffix. Peers older than MRFTS006/MRFTS007 require a compatible
-upgrade.
+response. Peers without a history feature receive predecessor-only
+MRFTS004/MRFTS005 lineage when the snapshot contains transition history;
+recovery requires their trusted configuration to match that predecessor.
+Every peer must understand the base format selected for its snapshot.
 
 Before publishing an installed image, the receiver also checks that it has a
 local replication target for every voter in the snapshot's active configuration.

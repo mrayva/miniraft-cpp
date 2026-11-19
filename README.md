@@ -100,11 +100,12 @@ live joint-to-stable transition API and snapshot catch-up across committed
 transitions. Joint snapshot transfer requires matching committed history.
 Snapshot peers advertise support for the 32-, 256- and 1,024-transition
 MRFTS006/007, MRFTS008/009 and MRFTS010/011 formats in AppendEntries
-responses. The leader selects the highest advertised level; a peer without a
-history feature receives at most 32 transitions in MRFTS006/MRFTS007. Recovery
-may still require a fresh learner if its trusted history anchor predates the
-transferred suffix. Peers older than MRFTS006/MRFTS007 need a compatible
-upgrade before receiving configuration-history snapshots.
+responses. The leader selects the highest advertised level; when transition
+history exists, a peer without a history feature receives predecessor-only
+MRFTS004/MRFTS005 lineage metadata. That format cannot bridge multiple
+compacted transitions. Recovery may still require a fresh learner if its
+trusted history anchor predates the transferred lineage. A peer must understand
+the base configuration format selected for its snapshot.
 Leader compaction rejects active voters that advertise no storage support for
 InstallSnapshot. Offline peers must still support it when they return;
 application capture and restore callbacks remain a deployment requirement.
@@ -149,8 +150,8 @@ MRFTS006 stable and MRFTS007 joint snapshots add a bounded chain of up to 32
 membership transitions. MRFTS008 stable and MRFTS009 joint snapshots extend
 that limit to 256 transitions; MRFTS010 stable and MRFTS011 joint snapshots
 extend it to 1,024 transitions. The leader selects among these formats from
-the peer's advertised history level, capping an unadvertised peer at 32
-transitions. A nonempty stale store can recover across
+the peer's advertised history level; an unadvertised peer receives only
+predecessor lineage. A nonempty stale store can recover across
 multiple compacted transitions when a transition in the chain matches its
 exact trusted stable configuration and the sender belongs to every old and new
 voter set in the suffix from that anchor. For a joint snapshot, the sender must belong to

@@ -228,6 +228,15 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
     assert_int_equal(decodedOlderStable.ConfigurationTransitions.size(), 32);
     assert_true(std::equal(decodedOlderStable.ConfigurationTransitions.begin(),
         decodedOlderStable.ConfigurationTransitions.end(), stableImage.ConfigurationTransitions.end() - 32));
+    const auto lineageOnlyStableEncoding = PrepareSnapshotEncoding(stableImage, 0);
+    std::string lineageOnlyStableImage(SnapshotEncodingSize(*lineageOnlyStableEncoding), '\0');
+    CopySnapshotEncodingRange(stableImage, *lineageOnlyStableEncoding, 0,
+        lineageOnlyStableImage.data(), lineageOnlyStableImage.size());
+    const auto decodedLineageOnlyStable = DecodeSnapshot(lineageOnlyStableImage);
+    assert_true(lineageOnlyStableImage.substr(0, 8) == "MRFTS004");
+    assert_true(decodedLineageOnlyStable.ConfigurationTransitions.empty());
+    assert_true(decodedLineageOnlyStable.HasStablePredecessor());
+    assert_true(decodedLineageOnlyStable.PreviousVoters == stableImage.PreviousVoters);
     auto legacyHistoryImage = encodedStableImage;
     memcpy(legacyHistoryImage.data(), "MRFTS006", 8);
     const auto legacyChecksum = NSnapshotCodec::Checksum(
@@ -345,6 +354,15 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
     assert_int_equal(decodedOlderJoint.ConfigurationTransitions.size(), 32);
     assert_true(std::equal(decodedOlderJoint.ConfigurationTransitions.begin(),
         decodedOlderJoint.ConfigurationTransitions.end(), jointImage.ConfigurationTransitions.end() - 32));
+    const auto lineageOnlyJointEncoding = PrepareSnapshotEncoding(jointImage, 0);
+    std::string lineageOnlyJointImage(SnapshotEncodingSize(*lineageOnlyJointEncoding), '\0');
+    CopySnapshotEncodingRange(jointImage, *lineageOnlyJointEncoding, 0,
+        lineageOnlyJointImage.data(), lineageOnlyJointImage.size());
+    const auto decodedLineageOnlyJoint = DecodeSnapshot(lineageOnlyJointImage);
+    assert_true(lineageOnlyJointImage.substr(0, 8) == "MRFTS005");
+    assert_true(decodedLineageOnlyJoint.ConfigurationTransitions.empty());
+    assert_true(decodedLineageOnlyJoint.HasConfigurationLineage());
+    assert_true(decodedLineageOnlyJoint.PreviousVoters == jointImage.PreviousVoters);
 
     // Exercise MRFTS011 through the runtime metadata probe and fresh-learner
     // install path, not only through the standalone codec.
