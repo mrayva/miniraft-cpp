@@ -13,6 +13,12 @@ durable Raft image embeds the snapshot payload. Raising `TSnapshot::MaxBytes`
 would therefore raise peak memory and full-image rewrite costs without making
 the path streaming.
 
+The SQL example independently copies the complete image into a zero-padded
+buffer before SQLite deserialization. A Raft-only streaming decoder would
+therefore leave a second full-image allocation in that application path. The
+streaming application API must let SQL validate and stage a file-backed image
+while preserving the current malformed-image bounds.
+
 The replacement needs an immutable application-image reference that Raft can
 publish atomically with the snapshot boundary, commit index, membership
 metadata and retained suffix. Keeping the application payload in a separate
