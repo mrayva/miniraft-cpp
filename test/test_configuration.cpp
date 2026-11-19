@@ -16,6 +16,7 @@
 extern "C" {
 #include <cmocka.h>
 }
+#include <algorithm>
 namespace {
 template<class F> void Reject(F f) {
     bool rejected = false;
@@ -3551,6 +3552,108 @@ void test_raft_recovers_joint_quorum_for_candidate_election(void**) {
     run(false);
     run(true);
 }
+void test_joint_election_generated_reply_orders(void**) {
+#ifdef __linux__
+    auto run = [](std::vector<uint32_t> oldVoters, std::vector<uint32_t> newVoters) {
+        const auto root = std::filesystem::temp_directory_path() / ("miniraft-joint-orders-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        assert_true(std::filesystem::create_directory(root));
+        constexpr uint32_t candidateId = 4;
+        std::vector<uint32_t> peerIds;
+        peerIds.insert(peerIds.end(), oldVoters.begin(), oldVoters.end());
+        peerIds.insert(peerIds.end(), newVoters.begin(), newVoters.end());
+        std::sort(peerIds.begin(), peerIds.end());
+        peerIds.erase(std::unique(peerIds.begin(), peerIds.end()), peerIds.end());
+        peerIds.erase(std::remove(peerIds.begin(), peerIds.end(), candidateId), peerIds.end());
+
+        std::vector<uint32_t> addedVoters;
+        for (auto id : newVoters)
+            if (!std::binary_search(oldVoters.begin(), oldVoters.end(), id)) addedVoters.push_back(id);
+
+        auto hasJointQuorum = [&](const std::vector<uint32_t>& replies) {
+            auto count = [&](const std::vector<uint32_t>& voters) {
+                size_t result = std::binary_search(voters.begin(), voters.end(), candidateId) ? 1 : 0;
+                for (auto id : replies)
+                    if (std::binary_search(voters.begin(), voters.end(), id)) ++result;
+                return result;
+            };
+            return count(oldVoters) > oldVoters.size() / 2 &&
+                count(newVoters) > newVoters.size() / 2;
+        };
+
+        auto order = peerIds;
+        uint64_t schedule = 0;
+        do {
+            const auto name = (root / ("raft-" + std::to_string(schedule++))).string();
+            auto state = std::make_shared<TDurableState>(name, candidateId);
+            state->BindVoters(oldVoters);
+            state->CurrentTerm = 2;
+            state->Commit();
+            TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0, oldVoters, newVoters};
+            state->Append(EncodeConfigurationEntry(joint));
+            state->CommitIndex = 1;
+            state->Commit();
+
+            TNodeDict peers;
+            for (auto id : peerIds) peers.emplace(id, std::make_shared<TEndpoint>());
+            TRaft raft(state, candidateId, peers, addedVoters);
+            const auto start = ITimeSource::Time{};
+            raft.ProcessTimeout(start);
+            assert_true(raft.CurrentStateName() == EState::CANDIDATE);
+            assert_true(raft.GetVolatileState()->PreVoting);
+            const auto preVoteSeqno = raft.GetVolatileState()->PreVoteSeqno;
+            const auto prospectiveTerm = state->CurrentTerm + 1;
+
+            std::vector<uint32_t> preVoteReplies;
+            bool startedElection = false;
+            for (auto source : order) {
+                preVoteReplies.push_back(source);
+                raft.Process(start, NewHoldedMessage(
+                    TMessageEx{.Src = source, .Dst = candidateId, .Term = state->CurrentTerm,
+                        .Seqno = preVoteSeqno},
+                    TPreVoteResponse{.ProspectiveTerm = prospectiveTerm, .VoteGranted = 1}));
+                raft.ProcessTimeout(start + std::chrono::milliseconds(1));
+                const bool expected = hasJointQuorum(preVoteReplies);
+                assert_int_equal(state->CurrentTerm, expected ? prospectiveTerm : prospectiveTerm - 1);
+                if (expected) {
+                    startedElection = true;
+                    assert_false(raft.GetVolatileState()->PreVoting);
+                    break;
+                }
+                assert_true(raft.GetVolatileState()->PreVoting);
+            }
+            assert_true(startedElection);
+
+            std::vector<uint32_t> voteReplies;
+            bool elected = false;
+            for (auto source : order) {
+                voteReplies.push_back(source);
+                raft.Process(start + std::chrono::milliseconds(2), NewHoldedMessage(
+                    TMessageEx{.Src = source, .Dst = candidateId, .Term = state->CurrentTerm},
+                    TRequestVoteResponse{.VoteGranted = 1}));
+                raft.ProcessTimeout(start + std::chrono::milliseconds(2));
+                const bool expected = hasJointQuorum(voteReplies);
+                assert_true((raft.CurrentStateName() == EState::LEADER) == expected);
+                if (expected) {
+                    elected = true;
+                    break;
+                }
+                assert_true(raft.CurrentStateName() == EState::CANDIDATE);
+            }
+            assert_true(elected);
+        } while (std::next_permutation(order.begin(), order.end()));
+
+        uint64_t expectedSchedules = 1;
+        for (size_t i = 2; i <= peerIds.size(); ++i) expectedSchedules *= i;
+        assert_int_equal(schedule, expectedSchedules);
+        std::error_code ignored;
+        std::filesystem::remove_all(root, ignored);
+    };
+
+    run({1, 2, 3}, {3, 4, 5});
+    run({1, 2, 3}, {4, 5, 6});
+#endif
+}
 void test_raft_keeps_joint_quorum_until_stable_successor_commits(void**) {
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-finalize-" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -4462,6 +4565,7 @@ int main() {
         cmocka_unit_test(test_legacy_restart_uses_safe_flag_lookup_and_preserves_files),
         cmocka_unit_test(test_offline_history_scan_after_durable_snapshot_and_restart),
         cmocka_unit_test(test_raft_recovers_joint_quorum_for_candidate_election),
+        cmocka_unit_test(test_joint_election_generated_reply_orders),
         cmocka_unit_test(test_raft_keeps_joint_quorum_until_stable_successor_commits),
         cmocka_unit_test(test_raft_rejects_snapshot_when_configured_bootstrap_binding_mismatches),
         cmocka_unit_test(test_persisted_commit_boundary_drives_committed_configuration_scan),

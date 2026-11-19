@@ -53,5 +53,8 @@ design notes. This is a capability summary, not a production-readiness claim.
   lacks the durable backend's power-loss guarantees.
 
 The membership, compaction and transfer paths have deterministic regression
-coverage described in their design notes. That coverage does not establish
-hardware power-loss behavior, authenticate peers, or replace independent review.
+coverage described in their design notes. Joint-election tests also enumerate
+every reply ordering for overlapping and disjoint voter sets, checking each
+delivery prefix before both majorities are present. This coverage does not
+establish hardware power-loss behavior, authenticate peers, or replace
+independent review.
