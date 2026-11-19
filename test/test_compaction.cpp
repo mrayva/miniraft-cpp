@@ -187,7 +187,7 @@ void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
     ITimeSource::Time now{};
     std::unordered_map<uint32_t, TMessageHolder<TInstallSnapshotRequest>> sentSnapshots;
     TNodeDict peers;
-    for (const auto id : {2u, 3u, 4u, 5u, 6u}) {
+    for (const auto id : {2u, 3u, 4u, 5u, 6u, 7u}) {
         peers.emplace(id, std::make_shared<TEndpoint>([&, id](auto message) {
             if (message->Type == uint32_t(EMessageType::APPEND_ENTRIES_REQUEST)) {
                 auto append = message.template Cast<TAppendEntriesRequest>();
@@ -196,6 +196,7 @@ void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
                 if (id == 3) features |= TAppendEntriesResponse::SupportsSnapshotHistory256;
                 if (id == 4) features |= TAppendEntriesResponse::SupportsSnapshotHistory32;
                 if (id == 2) features |= TAppendEntriesResponse::SupportsSnapshotHistory1024;
+                if (id == 6) features |= TAppendEntriesResponse::SupportsSnapshotLineage;
                 auto response = NewHoldedMessage(
                     TMessageEx{.Src = id, .Dst = 1, .Term = append->Term, .Seqno = append->Seqno},
                     TAppendEntriesResponse{.MatchIndex = 0, .Success = 0, .Padding = features});
@@ -217,8 +218,8 @@ void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
             }
         }));
     }
-    raft = std::make_shared<TRaft>(state, 1, peers, std::vector<uint32_t>{2, 3, 4, 6});
-    for (unsigned attempt = 0; attempt < 30 && sentSnapshots.size() != 4; ++attempt) {
+    raft = std::make_shared<TRaft>(state, 1, peers, std::vector<uint32_t>{2, 3, 4, 6, 7});
+    for (unsigned attempt = 0; attempt < 30 && sentSnapshots.size() != 5; ++attempt) {
         now += std::chrono::seconds(1);
         raft->ProcessTimeout(now);
     }
@@ -239,12 +240,15 @@ void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
     assert_false(raft->GetVolatileState()->PeerCapabilities.at(5).InstallSnapshot);
     assert_true(raft->GetVolatileState()->PeerCapabilities.at(6).InstallSnapshot);
     assert_false(raft->GetVolatileState()->PeerCapabilities.at(6).SnapshotHistory32);
+    assert_true(raft->GetVolatileState()->PeerCapabilities.at(6).SnapshotLineage);
+    assert_false(raft->GetVolatileState()->PeerCapabilities.at(7).SnapshotLineage);
     assert_true(sentSnapshots.contains(2));
     assert_true(sentSnapshots.contains(3));
     assert_false(sentSnapshots.contains(5));
     assert_true(sentSnapshots.contains(4));
     assert_true(sentSnapshots.contains(6));
-    for (const auto id : {2u, 3u, 4u, 6u}) {
+    assert_true(sentSnapshots.contains(7));
+    for (const auto id : {2u, 3u, 4u, 6u, 7u}) {
         auto request = sentSnapshots.at(id);
         assert_true(request->Done);
         const std::string wire(request->Data, request->Len - sizeof(TInstallSnapshotRequest));
@@ -262,11 +266,18 @@ void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
             assert_int_equal(decoded.ConfigurationTransitions.size(), 32);
             assert_true(std::equal(decoded.ConfigurationTransitions.begin(), decoded.ConfigurationTransitions.end(),
                 snapshot.ConfigurationTransitions.end() - 32));
-        } else {
+        } else if (id == 6) {
             assert_true(wire.substr(0, 8) == "MRFTS004");
             assert_true(decoded.ConfigurationTransitions.empty());
             assert_true(decoded.HasStablePredecessor());
             assert_true(decoded.PreviousVoters == snapshot.PreviousVoters);
+        } else {
+            assert_true(wire.substr(0, 8) == "MRFTS003");
+            assert_true(decoded.ConfigurationTransitions.empty());
+            assert_false(decoded.HasConfigurationLineage());
+            assert_true(decoded.StableConfiguration);
+            assert_int_equal(decoded.ConfigurationIndex, snapshot.ConfigurationIndex);
+            assert_int_equal(decoded.ConfigurationTerm, snapshot.ConfigurationTerm);
         }
     }
     std::string compactionError;

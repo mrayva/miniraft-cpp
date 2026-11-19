@@ -64,6 +64,9 @@ struct TSnapshotEncoding;
 std::shared_ptr<const TSnapshotEncoding> PrepareSnapshotEncoding(const TSnapshot& snapshot);
 std::shared_ptr<const TSnapshotEncoding> PrepareSnapshotEncoding(
     const TSnapshot& snapshot, size_t maxConfigurationTransitions);
+// Omitting membership history emits only the active stable/joint identity.
+std::shared_ptr<const TSnapshotEncoding> PrepareSnapshotEncoding(
+    const TSnapshot& snapshot, size_t maxConfigurationTransitions, bool includeMembershipHistory);
 uint64_t SnapshotEncodingSize(const TSnapshotEncoding& encoding);
 void CopySnapshotEncodingRange(const TSnapshot& snapshot, const TSnapshotEncoding& encoding,
     uint64_t offset, char* destination, size_t length);

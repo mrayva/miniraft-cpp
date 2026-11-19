@@ -1257,7 +1257,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
                     TAppendEntriesResponse::SupportsSnapshotHistory256 |
                     TAppendEntriesResponse::SupportsSnapshotHistory1024 |
                     (State->SupportsInstallSnapshot() ? TAppendEntriesResponse::SupportsInstallSnapshot : 0u) |
-                    TAppendEntriesResponse::SupportsSnapshotHistory32,
+                    TAppendEntriesResponse::SupportsSnapshotHistory32 |
+                    TAppendEntriesResponse::SupportsSnapshotLineage,
             });
         (void)Nodes[reply->Dst]->TrySend(std::move(reply));
         return;
@@ -1354,7 +1355,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
                 TAppendEntriesResponse::SupportsSnapshotHistory256 |
                 TAppendEntriesResponse::SupportsSnapshotHistory1024 |
                 (State->SupportsInstallSnapshot() ? TAppendEntriesResponse::SupportsInstallSnapshot : 0u) |
-                TAppendEntriesResponse::SupportsSnapshotHistory32,
+                TAppendEntriesResponse::SupportsSnapshotHistory32 |
+                TAppendEntriesResponse::SupportsSnapshotLineage,
         });
 
     AdvanceCommitIndex(commitIndex);
@@ -1392,6 +1394,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
         capabilities.AppendAckSeqno = message->Seqno;
         capabilities.ConfigurationBarrier =
             message->Padding & TAppendEntriesResponse::SupportsConfigurationBarrier;
+        capabilities.SnapshotLineage =
+            message->Padding & TAppendEntriesResponse::SupportsSnapshotLineage;
         capabilities.SnapshotHistory256 =
             message->Padding & TAppendEntriesResponse::SupportsSnapshotHistory256;
         capabilities.SnapshotHistory1024 =
@@ -1596,6 +1600,8 @@ void TRaft::Process(ITimeSource::Time now, TMessageHolder<TMessage> message, con
             EncodedSnapshotLegacyHistoryIndex = 0;
             EncodedSnapshotLineage.reset();
             EncodedSnapshotLineageIndex = 0;
+            EncodedSnapshotBaseFormat.reset();
+            EncodedSnapshotBaseFormatIndex = 0;
             VolatileState->LeaderId = 0;
             if (VolatileState->ElectionDue <= now || VolatileState->ElectionDue == ITimeSource::Max) {
                 VolatileState->ElectionDue = MakeElection(now);
@@ -2580,10 +2586,12 @@ TSnapshot TRaft::Compact() {
     EncodedSnapshotExtendedHistory.reset();
     EncodedSnapshotLegacyHistory.reset();
     EncodedSnapshotLineage.reset();
+    EncodedSnapshotBaseFormat.reset();
     EncodedSnapshotIndex = 0;
     EncodedSnapshotExtendedHistoryIndex = 0;
     EncodedSnapshotLegacyHistoryIndex = 0;
     EncodedSnapshotLineageIndex = 0;
+    EncodedSnapshotBaseFormatIndex = 0;
     return snapshot;
 }
 
@@ -2604,6 +2612,9 @@ TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t no
         const bool supportsLegacyHistory = supportsExtendedHistory ||
             (capability != VolatileState->PeerCapabilities.end() &&
                 capability->second.SnapshotHistory32);
+        const bool supportsLineage = supportsLegacyHistory ||
+            (capability != VolatileState->PeerCapabilities.end() &&
+                capability->second.SnapshotLineage);
         std::shared_ptr<const TSnapshotEncoding> encoding;
         if (!supportsFullHistory && supportsExtendedHistory && snapshot->ConfigurationTransitions.size() >
                 TSnapshot::MaxExtendedConfigurationTransitions) {
@@ -2626,6 +2637,15 @@ TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t no
                 EncodedSnapshotLegacyHistoryIndex = snapshot->Index;
             }
             encoding = EncodedSnapshotLegacyHistory;
+        } else if (!supportsLineage && (!snapshot->ConfigurationTransitions.empty() ||
+                snapshot->HasConfigurationLineage())) {
+            // Base-format peers get the active configuration identity without
+            // predecessor lineage. Their committed baseline must match exactly.
+            if (EncodedSnapshotBaseFormatIndex != snapshot->Index) {
+                EncodedSnapshotBaseFormat = PrepareSnapshotEncoding(*snapshot, 0, false);
+                EncodedSnapshotBaseFormatIndex = snapshot->Index;
+            }
+            encoding = EncodedSnapshotBaseFormat;
         } else if (!supportsLegacyHistory && !snapshot->ConfigurationTransitions.empty()) {
             // Pre-history peers receive only immediate predecessor lineage in
             // MRFTS004/MRFTS005.

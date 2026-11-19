@@ -135,10 +135,12 @@ independently verified history. Snapshot metadata does not prove commitment by
 itself. AppendEntries responses advertise support for the 32-, 256- and
 1,024-transition snapshot-history formats. The leader sends the highest
 advertised format and caps its history to that format's limit. For a nonempty
-transition chain, a peer without a history feature receives predecessor-only
-MRFTS004/MRFTS005 lineage and can recover only from a matching trusted
-configuration boundary. Every peer must understand the base format selected
-for its snapshot.
+transition chain, a peer advertising lineage support but no history feature
+receives predecessor-only MRFTS004/MRFTS005 lineage and can recover from a
+matching trusted predecessor. A peer without lineage support receives MRFTS003
+stable or MRFTS002 joint configuration metadata without predecessor or
+transition history; installation requires an exact trusted configuration
+match, or a fresh learner bootstrap.
 
 Deterministic durable-store tests cover learner catch-up, voter addition and
 removal, leadership transfer and fallback when its request is dropped,

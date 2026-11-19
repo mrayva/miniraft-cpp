@@ -98,14 +98,15 @@ checks the boundary, fixed voters, and stable identity before that term update.
 The [configuration entry support](docs/configuration-entries.md) describes the
 live joint-to-stable transition API and snapshot catch-up across committed
 transitions. Joint snapshot transfer requires matching committed history.
-Snapshot peers advertise support for the 32-, 256- and 1,024-transition
-MRFTS006/007, MRFTS008/009 and MRFTS010/011 formats in AppendEntries
-responses. The leader selects the highest advertised level; when transition
-history exists, a peer without a history feature receives predecessor-only
-MRFTS004/MRFTS005 lineage metadata. That format cannot bridge multiple
-compacted transitions. Recovery may still require a fresh learner if its
-trusted history anchor predates the transferred lineage. A peer must understand
-the base configuration format selected for its snapshot.
+Snapshot peers advertise configuration-lineage support and support for the
+32-, 256- and 1,024-transition MRFTS006/007, MRFTS008/009 and MRFTS010/011
+formats in AppendEntries responses. The leader selects the highest advertised
+level. A peer that supports lineage but no history receives predecessor-only
+MRFTS004/MRFTS005 metadata; a peer without lineage receives MRFTS003 stable or
+MRFTS002 joint metadata without predecessor or transition history. That fallback
+requires an exact trusted configuration match and cannot recover across a
+membership change. Recovery may require a fresh learner if the trusted history
+anchor predates the metadata the peer supports.
 Leader compaction rejects active voters that advertise no storage support for
 InstallSnapshot. Offline peers must still support it when they return;
 application capture and restore callbacks remain a deployment requirement.

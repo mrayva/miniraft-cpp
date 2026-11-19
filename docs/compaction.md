@@ -171,9 +171,12 @@ follow-ups ([live membership](configuration-entries.md) and
 [leadership transfer](leadership-transfer.md)). A leader rejects compaction
 when an active voter has advertised that its storage cannot install snapshots.
 An offline or not-yet-heard-from peer remains an operator-verified compatibility
-requirement. AppendEntries feature bits negotiate 32-, 256- and 1,024-transition
-history encodings; a peer without a history bit receives predecessor-only
-MRFTS004/MRFTS005 lineage metadata. An unsupported learner cannot receive a
+requirement. AppendEntries feature bits negotiate lineage support and 32-, 256-
+and 1,024-transition history encodings. A lineage-capable peer without a
+history bit receives predecessor-only MRFTS004/MRFTS005 metadata; a peer without
+lineage receives MRFTS003 stable or MRFTS002 joint configuration metadata
+without predecessor history and can install it only with an exact committed
+configuration match or as a fresh learner. An unsupported learner cannot receive a
 snapshot and must catch up before compaction or be removed and re-added after
 its storage is upgraded. Application capture and restore callbacks remain a
 deployment requirement and are not negotiated. Asynchronous/COW capture, disk-streamed

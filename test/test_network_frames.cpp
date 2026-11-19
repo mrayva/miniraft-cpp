@@ -249,6 +249,7 @@ void test_configuration_barrier_rpc_roundtrip(void**) {
         TMessageEx{.Src = 2, .Dst = 1, .Term = 3, .Seqno = 9},
         TConfigurationBarrierResponse{.ConfigurationIndex = 12, .ConfigurationTerm = 2, .Accepted = 1});
     const auto features = TAppendEntriesResponse::SupportsConfigurationBarrier |
+        TAppendEntriesResponse::SupportsSnapshotLineage |
         TAppendEntriesResponse::SupportsSnapshotHistory32 |
         TAppendEntriesResponse::SupportsSnapshotHistory256 |
         TAppendEntriesResponse::SupportsSnapshotHistory1024 |

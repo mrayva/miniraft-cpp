@@ -273,9 +273,13 @@ void CheckLocalLog(const TSnapshot& snapshot, const TRaft& raft,
         throw std::runtime_error("Snapshot does not match retained log and active configuration");
 }
 
-std::string EncodeSnapshotMetadata(const TSnapshot& snapshot, size_t maxConfigurationTransitions) {
-    const auto transitionCount = std::min(snapshot.ConfigurationTransitions.size(), maxConfigurationTransitions);
+std::string EncodeSnapshotMetadata(const TSnapshot& snapshot, size_t maxConfigurationTransitions,
+        bool includeMembershipHistory) {
+    const auto transitionCount = includeMembershipHistory
+        ? std::min(snapshot.ConfigurationTransitions.size(), maxConfigurationTransitions) : 0;
     const auto firstTransition = snapshot.ConfigurationTransitions.size() - transitionCount;
+    const bool hasLineage = includeMembershipHistory && snapshot.HasConfigurationLineage();
+    const bool hasStablePredecessor = includeMembershipHistory && snapshot.HasStablePredecessor();
     const bool extendedHistory = transitionCount >
         TSnapshot::MaxLegacyConfigurationTransitions;
     const bool largeHistory = transitionCount >
@@ -284,8 +288,8 @@ std::string EncodeSnapshotMetadata(const TSnapshot& snapshot, size_t maxConfigur
         ? (snapshot.StableConfiguration
             ? (largeHistory ? StableLargeHistoryMagic : extendedHistory ? StableExtendedHistoryMagic : StableHistoryMagic)
             : (largeHistory ? JointLargeHistoryMagic : extendedHistory ? JointExtendedHistoryMagic : JointHistoryMagic))
-        : snapshot.HasStablePredecessor() ? StableLineageMagic :
-        snapshot.HasConfigurationLineage() ? JointLineageMagic :
+        : hasStablePredecessor ? StableLineageMagic :
+        hasLineage ? JointLineageMagic :
         snapshot.StableConfiguration ? StableMagic : snapshot.IsJoint() ? JointMagic : Magic);
     Put(out, snapshot.Index, 8);
     Put(out, snapshot.Term, 8);
@@ -295,7 +299,7 @@ std::string EncodeSnapshotMetadata(const TSnapshot& snapshot, size_t maxConfigur
         Put(out, snapshot.ConfigurationIndex, 8);
         Put(out, snapshot.ConfigurationTerm, 8);
         if (!snapshot.StableConfiguration) Put(out, snapshot.JointVoters.size(), 4);
-        if (snapshot.HasConfigurationLineage()) {
+        if (hasLineage) {
             Put(out, snapshot.PreviousConfigurationIndex, 8);
             Put(out, snapshot.PreviousConfigurationTerm, 8);
             Put(out, snapshot.PreviousJointIndex, 8);
@@ -305,7 +309,8 @@ std::string EncodeSnapshotMetadata(const TSnapshot& snapshot, size_t maxConfigur
     }
     for (auto voter : snapshot.Voters) Put(out, voter, 4);
     for (auto voter : snapshot.JointVoters) Put(out, voter, 4);
-    for (auto voter : snapshot.PreviousVoters) Put(out, voter, 4);
+    if (hasLineage)
+        for (auto voter : snapshot.PreviousVoters) Put(out, voter, 4);
     if (transitionCount) {
         Put(out, transitionCount, 4);
         for (size_t i = firstTransition; i < snapshot.ConfigurationTransitions.size(); ++i) {
@@ -410,11 +415,16 @@ std::shared_ptr<const TSnapshotEncoding> PrepareSnapshotEncoding(const TSnapshot
 
 std::shared_ptr<const TSnapshotEncoding> PrepareSnapshotEncoding(
         const TSnapshot& snapshot, size_t maxConfigurationTransitions) {
+    return PrepareSnapshotEncoding(snapshot, maxConfigurationTransitions, true);
+}
+
+std::shared_ptr<const TSnapshotEncoding> PrepareSnapshotEncoding(
+        const TSnapshot& snapshot, size_t maxConfigurationTransitions, bool includeMembershipHistory) {
     if (maxConfigurationTransitions > TSnapshot::MaxConfigurationTransitions)
         throw std::invalid_argument("Snapshot history encoding limit exceeds the supported maximum");
     Validate(snapshot);
     auto encoding = std::make_shared<TSnapshotEncoding>();
-    encoding->Metadata = EncodeSnapshotMetadata(snapshot, maxConfigurationTransitions);
+    encoding->Metadata = EncodeSnapshotMetadata(snapshot, maxConfigurationTransitions, includeMembershipHistory);
     encoding->TotalBytes = encoding->Metadata.size() + snapshot.Data.size() + 4;
     if (encoding->TotalBytes > TSnapshot::MaxBytes)
         throw std::runtime_error("Snapshot exceeds size limit");

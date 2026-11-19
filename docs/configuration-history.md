@@ -75,9 +75,12 @@ MRFTS010/MRFTS011 carry longer chains. The runtime can use these chains for
 online stale-store recovery when a transition predecessor matches the
 receiver's trusted stable baseline. AppendEntries responses advertise support
 for 32-, 256- and 1,024-transition history formats; the leader chooses the
-highest advertised level. If a transition chain exists, peers without a
-history feature receive only MRFTS004/MRFTS005 predecessor lineage; their
-trusted baseline must match that predecessor exactly. Stable
+highest advertised level. Peers advertising lineage support without a history
+feature receive only MRFTS004/MRFTS005 predecessor lineage; their trusted
+baseline must match that predecessor exactly. Peers without lineage support
+receive MRFTS003 stable or MRFTS002 joint metadata without predecessor history,
+so they can install only when their configuration already matches exactly.
+Stable
 images require the sender in both voter sets for every transition after that
 anchor. A joint image
 requires this for completed transitions and accepts a sender from either side

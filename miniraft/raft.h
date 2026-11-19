@@ -117,7 +117,8 @@ struct TVolatileState {
     std::unordered_map<uint32_t, ITimeSource::Time> ConfigurationBarrierAckDue;
     struct TPeerCapabilities {
         uint64_t AppendAckSeqno = 0;
-        bool ConfigurationBarrier = false, SnapshotHistory32 = false, SnapshotHistory256 = false;
+        bool ConfigurationBarrier = false, SnapshotLineage = false;
+        bool SnapshotHistory32 = false, SnapshotHistory256 = false;
         bool SnapshotHistory1024 = false;
         bool InstallSnapshot = false;
     };
@@ -398,6 +399,8 @@ private:
     uint64_t EncodedSnapshotLegacyHistoryIndex = 0;
     std::shared_ptr<const TSnapshotEncoding> EncodedSnapshotLineage;
     uint64_t EncodedSnapshotLineageIndex = 0;
+    std::shared_ptr<const TSnapshotEncoding> EncodedSnapshotBaseFormat;
+    uint64_t EncodedSnapshotBaseFormatIndex = 0;
 
     EState StateName;
     uint32_t Seed = 31337;
