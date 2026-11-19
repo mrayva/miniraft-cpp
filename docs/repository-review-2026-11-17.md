@@ -91,9 +91,10 @@ capacity changes before proposing.
   necessary while that node is still an active voter.
 - Snapshots are complete in-memory images, capped at 64 MiB including metadata
   (`snapshot.h`). Outbound transfer encodes each chunk directly from the pinned
-  snapshot. Durable publication also encodes through a fixed 64 KiB buffer, so
-  it does not allocate a second serialized snapshot image; it still rewrites
-  the snapshot and retained log on each state update. Application capture,
+  snapshot. Both durable-state and standalone-store publication encode through
+  fixed 64 KiB buffers, so neither allocates a second serialized snapshot
+  image. Durable state still rewrites the snapshot and retained log on each
+  state update. Application capture,
   receiver chunk accumulation, and restore retain complete images. The receiver
   reuses its completed wire buffer for decoded application data, avoiding an
   extra payload allocation during validation. Large databases still need an
