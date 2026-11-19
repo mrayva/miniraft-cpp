@@ -27,16 +27,19 @@ Incomplete or truncated history remains unavailable for automatic recovery.
 At alpha.3, this closed commit-boundary recovery for `TDurableState`; live
 membership changes and joint consensus were added in later milestones. The
 current bounded transition path is documented in
-[live membership](configuration-entries.md) and requires `TDurableState`.
-The legacy `TDiskState` format does not persist the commit boundary and cannot
-provide the same recovery guarantee.
+[live membership](configuration-entries.md). It accepts `TDurableState` and
+versioned `TDiskState` metadata when the original voter binding and commit
+boundary are durable.
 
 TDurableState is an opt-in storage backend with synchronous durable publication.
 It closes the missing file-sync and atomic-publication gap for new stores, under
 the filesystem assumptions below. Legacy `TDiskState` separately syncs its log
 and index before atomically replacing hard-state metadata. It retains the older
-split-file format and does not persist a commit boundary, checksummed records,
-snapshots or voter bindings.
+split-file format and does not persist checksummed log or index records,
+snapshots or InstallSnapshot support. New `TDiskState` metadata is versioned and
+checksummed and includes the commit boundary and original voter binding. A
+recovered old 20-byte metadata record has neither value; it must be supplied
+through the trusted-baseline API before Raft startup.
 
 ## Publication protocol
 

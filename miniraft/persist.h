@@ -22,9 +22,24 @@ struct TDiskState : IState {
     void Append(TMessageHolder<TLogEntry> entry) override;
     TMessageHolder<TLogEntry> Get(int64_t index) const override;
     void Commit() override;
+    bool SupportsCommitIndexPersistence() const override { return true; }
+    bool HasTrustedCommitIndex() const override { return CommitIndexTrusted; }
+    bool SupportsVoterBinding() const override { return true; }
+    bool HasUnboundRecoveredState() const override;
+    std::vector<uint32_t> GetBoundVoters() const override;
+    void BindVoters(const std::vector<uint32_t>& voters) override;
+    // Recovered split-format stores have no saved commit boundary or voter
+    // binding. This startup-only path requires a trusted operator baseline and
+    // rejects logs that already contain configuration entries.
+    void ValidateTrustedLegacyVoterBaseline(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex);
+    void MarkRaftStarted() override { RaftStarted = true; }
 
 private:
     bool Recovering = true;
+    bool RecoveredStore = false;
+    bool CommitIndexTrusted = true;
+    bool RaftStarted = false;
     [[noreturn]] void Fail(const char* message) const;
     std::fstream Open(const std::string& name, bool create);
     TMessageHolder<TMessage> Read() const;
@@ -34,6 +49,7 @@ private:
     std::string IndexPath;
     std::string StatePath;
     TCommitHook CommitHook;
+    std::vector<uint32_t> Voters;
     mutable std::fstream Entries;
     mutable std::fstream Index;
     std::fstream State;

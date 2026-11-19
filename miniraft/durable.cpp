@@ -666,8 +666,11 @@ TLegacyDiskStateMigrationInfo InspectLegacyDiskState(const IState& source, uint3
     if (!source.CurrentTerm || source.LastLogIndex > uint64_t(INT64_MAX) ||
         source.SnapshotIndex || source.SnapshotTerm || source.GetSnapshot() || source.SupportsSnapshots())
         throw std::invalid_argument("Only un-compacted legacy disk state can be migrated");
-    if (source.SupportsCommitIndexPersistence())
-        throw std::invalid_argument("Source already persists its commit boundary");
+    if (source.HasTrustedCommitIndex() && source.CommitIndex != commitIndex)
+        throw std::invalid_argument("Supplied commit boundary differs from versioned disk metadata");
+    const auto boundVoters = source.GetBoundVoters();
+    if (!boundVoters.empty() && boundVoters != voters)
+        throw std::invalid_argument("Supplied voter baseline differs from versioned disk metadata");
     if (commitIndex > source.LastLogIndex)
         throw std::invalid_argument("Supplied commit index exceeds the legacy log");
     std::vector<uint32_t> historicalVoters = voters;

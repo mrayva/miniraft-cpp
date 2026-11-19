@@ -875,19 +875,24 @@ void test_durable_snapshot_adoption_preserves_vote_log_and_application(void**) {
     assert_true(state.GetSnapshot()->Data == application);
     assert_true(state.GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
 }
-void test_legacy_disk_backend_cannot_enable_learner_roles(void**) {
+void test_versioned_disk_backend_persists_learner_baseline(void**) {
     TFiles files; auto state = std::make_shared<TDiskState>(files.Name, 4);
-    Reject([&] { TRaft raft(state, 4, Peers(4), {4}); });
+    TRaft raft(state, 4, Peers(4), {4});
     assert_int_equal(state->CurrentTerm, 1); assert_int_equal(state->VotedFor, 0);
+    assert_true(state->GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
+    assert_true(raft.GetLearnerIds() == (std::vector<uint32_t>{4}));
 }
-void test_legacy_leader_cannot_stage_online_learner(void**) {
+void test_versioned_disk_leader_stages_learner_but_blocks_promotion_without_snapshot_support(void**) {
     TFiles files; auto state = std::make_shared<TDiskState>(files.Name, 1);
     TRaft raft(state, 1, {}); raft.ProcessTimeout({});
     assert_int_equal(raft.CurrentStateName(), EState::LEADER);
     const auto fields = static_cast<TStateFields>(*state);
-    Reject([&] { raft.AddLearnerTarget(2, std::make_shared<TEndpoint>()); });
+    raft.AddLearnerTarget(2, std::make_shared<TEndpoint>());
     assert_true(static_cast<TStateFields>(*state) == fields);
-    assert_true(raft.GetLearnerIds().empty()); assert_int_equal(raft.GetNpeers(), 0);
+    assert_true(raft.GetLearnerIds() == (std::vector<uint32_t>{2})); assert_int_equal(raft.GetNpeers(), 1);
+    const auto readiness = raft.CheckJointConfigurationReadiness({1, 2});
+    assert_false(readiness.Ready());
+    assert_true(readiness.AddedVotersWithoutSnapshotInstallSupport == (std::vector<uint32_t>{2}));
 }
 void test_online_learner_staging_does_not_change_durable_binding(void**) {
     TFiles files; const auto path = files.Name + ".durable.1";
@@ -944,8 +949,8 @@ int main() {
         cmocka_unit_test(test_trusted_legacy_voter_baseline_refuses_configuration_logs),
         cmocka_unit_test(test_trusted_legacy_voter_baseline_must_precede_raft_startup),
         cmocka_unit_test(test_trusted_legacy_voter_binding_is_atomic_at_each_publish_stage),
-        cmocka_unit_test(test_legacy_disk_backend_cannot_enable_learner_roles),
-        cmocka_unit_test(test_legacy_leader_cannot_stage_online_learner),
+        cmocka_unit_test(test_versioned_disk_backend_persists_learner_baseline),
+        cmocka_unit_test(test_versioned_disk_leader_stages_learner_but_blocks_promotion_without_snapshot_support),
         cmocka_unit_test(test_online_learner_staging_does_not_change_durable_binding),
 #endif
     };

@@ -486,6 +486,8 @@ void test_split_legacy_disk_state_migration_requires_trusted_baselines(void**) {
         source.Commit();
         source.Append(Entry(2, "committed"));
         source.Append(Entry(4, "tail"));
+        source.CommitIndex = 1;
+        source.Commit();
     }
     const auto bytesBefore = [&](const std::string& suffix) {
         std::ifstream input(legacy + suffix + ".2", std::ios::binary);
@@ -542,6 +544,8 @@ void test_split_legacy_disk_state_migration_requires_trusted_baselines(void**) {
         source.Append(Entry(3, "in joint"));
         source.Append(EncodeConfigurationEntry({
             EConfigurationPhase::Stable, 4, 2, 3, voters, newVoters}));
+        source.CommitIndex = 2;
+        source.Commit();
     }
     const auto configDurable = (files.Directory / "configured-durable").string();
     const auto configInfo = MigrateLegacyDiskState(configuredLegacy, configDurable, 2, voters, 2);
@@ -566,6 +570,8 @@ void test_split_legacy_disk_state_migration_requires_trusted_baselines(void**) {
         source.Commit();
         source.Append(EncodeConfigurationEntry({
             EConfigurationPhase::Joint, 1, 0, 0, {7, 8}, {8, 9}}));
+        source.CommitIndex = 1;
+        source.Commit();
     }
     bool configHistoryRejected = false;
     try { CheckLegacyDiskStateMigration(invalidConfig, 2, voters, 1); }

@@ -1,4 +1,5 @@
 #include "persist.h"
+#include "snapshot_codec.h"
 #include <filesystem>
 #include <stdexcept>
 #include <exception>
@@ -7,6 +8,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <string_view>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -19,6 +21,91 @@
 #endif
 
 namespace {
+constexpr std::string_view DiskMetadataMagic = "MRFTL001";
+constexpr uint32_t DiskMetadataVersion = 1;
+constexpr uint32_t DiskMetadataCommitIndexTrusted = 1u << 0;
+constexpr size_t LegacyDiskMetadataSize = sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t);
+constexpr size_t DiskMetadataFixedSize = 52;
+
+struct TDiskMetadata {
+    uint64_t LastLogIndex = 0, CurrentTerm = 1, CommitIndex = 0;
+    uint32_t VotedFor = 0;
+    std::vector<uint32_t> Voters;
+    bool CommitIndexTrusted = false;
+};
+
+TDiskMetadata DecodeDiskMetadata(std::string_view bytes) {
+    TDiskMetadata metadata;
+    if (bytes.size() == LegacyDiskMetadataSize) {
+        size_t offset = 0;
+        auto take = [&](auto& value) {
+            memcpy(&value, bytes.data() + offset, sizeof(value));
+            offset += sizeof(value);
+        };
+        take(metadata.LastLogIndex);
+        take(metadata.CurrentTerm);
+        take(metadata.VotedFor);
+        return metadata; // Old split stores did not persist commit or voters.
+    }
+
+    if (bytes.size() < DiskMetadataFixedSize) throw std::runtime_error("Truncated Raft metadata");
+    NSnapshotCodec::TReader reader{bytes};
+    if (reader.Read(DiskMetadataMagic.size()) != DiskMetadataMagic ||
+        reader.Take(4) != DiskMetadataVersion)
+        throw std::runtime_error("Unknown Raft metadata format");
+    metadata.LastLogIndex = reader.Take(8);
+    metadata.CurrentTerm = reader.Take(8);
+    metadata.VotedFor = reader.Take(4);
+    metadata.CommitIndex = reader.Take(8);
+    const auto voterCount = reader.Take(4);
+    const auto flags = reader.Take(4);
+    if (voterCount > TSnapshot::MaxVoters || (flags & ~DiskMetadataCommitIndexTrusted) ||
+        reader.Input.size() != voterCount * sizeof(uint32_t) + sizeof(uint32_t))
+        throw std::runtime_error("Invalid Raft metadata dimensions");
+    for (uint32_t i = 0; i < voterCount; ++i)
+        metadata.Voters.push_back(static_cast<uint32_t>(reader.Take(4)));
+    const auto checksum = static_cast<uint32_t>(reader.Take(4));
+    if (!reader.Input.empty() ||
+        NSnapshotCodec::Checksum(bytes.substr(0, bytes.size() - sizeof(uint32_t))) != checksum)
+        throw std::runtime_error("Raft metadata checksum mismatch");
+    metadata.CommitIndexTrusted = flags & DiskMetadataCommitIndexTrusted;
+    if (!metadata.CurrentTerm || metadata.LastLogIndex > uint64_t(INT64_MAX) ||
+        metadata.CommitIndex > metadata.LastLogIndex ||
+        (!metadata.Voters.empty() && !metadata.CommitIndexTrusted))
+        throw std::runtime_error("Invalid Raft metadata bounds");
+    if (!metadata.Voters.empty()) {
+        try { ValidateFixedVoters(metadata.Voters); }
+        catch (const std::invalid_argument&) { throw std::runtime_error("Invalid Raft metadata voter binding"); }
+        if (metadata.VotedFor && !std::binary_search(metadata.Voters.begin(), metadata.Voters.end(), metadata.VotedFor))
+            throw std::runtime_error("Stored vote is outside the voter binding");
+    }
+    return metadata;
+}
+
+std::string EncodeDiskMetadata(uint64_t lastLogIndex, uint64_t currentTerm, uint32_t votedFor,
+        uint64_t commitIndex, const std::vector<uint32_t>& voters, bool commitIndexTrusted) {
+    if (!currentTerm || lastLogIndex > uint64_t(INT64_MAX) || commitIndex > lastLogIndex)
+        throw std::logic_error("Invalid Raft metadata bounds");
+    if (!voters.empty()) {
+        ValidateFixedVoters(voters);
+        if (!commitIndexTrusted) throw std::logic_error("Voter binding requires a trusted commit boundary");
+        if (votedFor && !std::binary_search(voters.begin(), voters.end(), votedFor))
+            throw std::logic_error("Stored vote is outside the voter binding");
+    }
+    std::string bytes;
+    NSnapshotCodec::Append(bytes, DiskMetadataMagic);
+    NSnapshotCodec::Put(bytes, DiskMetadataVersion, 4);
+    NSnapshotCodec::Put(bytes, lastLogIndex, 8);
+    NSnapshotCodec::Put(bytes, currentTerm, 8);
+    NSnapshotCodec::Put(bytes, votedFor, 4);
+    NSnapshotCodec::Put(bytes, commitIndex, 8);
+    NSnapshotCodec::Put(bytes, voters.size(), 4);
+    NSnapshotCodec::Put(bytes, commitIndexTrusted ? DiskMetadataCommitIndexTrusted : 0, 4);
+    for (auto id : voters) NSnapshotCodec::Put(bytes, id, 4);
+    NSnapshotCodec::Put(bytes, NSnapshotCodec::Checksum(bytes), 4);
+    return bytes;
+}
+
 bool SyncFile(const std::string& path) {
 #ifdef _WIN32
     HANDLE file = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE,
@@ -131,15 +218,23 @@ TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitH
 
     State.seekg(0, std::ios::end);
     const auto size = State.tellg();
-    if (size != std::streamoff(sizeof(LastLogIndex) + sizeof(CurrentTerm) + sizeof(VotedFor))) {
+    constexpr auto maxMetadataSize = std::streamoff(DiskMetadataFixedSize + TSnapshot::MaxVoters * sizeof(uint32_t));
+    if (size < 0 || (size != std::streamoff(LegacyDiskMetadataSize) &&
+        (size < std::streamoff(DiskMetadataFixedSize) || size > maxMetadataSize)))
         throw std::runtime_error("Invalid Raft metadata size: " + StatePath);
-    }
+    std::string encodedMetadata(static_cast<size_t>(size), '\0');
     State.seekg(0);
-    if (!State.read(reinterpret_cast<char*>(&LastLogIndex), sizeof(LastLogIndex)) ||
-        !State.read(reinterpret_cast<char*>(&CurrentTerm), sizeof(CurrentTerm)) ||
-        !State.read(reinterpret_cast<char*>(&VotedFor), sizeof(VotedFor)) || CurrentTerm == 0) {
-        throw std::runtime_error("Invalid Raft metadata: " + StatePath);
-    }
+    if (!State.read(encodedMetadata.data(), size))
+        throw std::runtime_error("Cannot read Raft metadata: " + StatePath);
+    const auto metadata = DecodeDiskMetadata(encodedMetadata);
+    LastLogIndex = metadata.LastLogIndex;
+    CurrentTerm = metadata.CurrentTerm;
+    VotedFor = metadata.VotedFor;
+    CommitIndex = metadata.CommitIndex;
+    Voters = metadata.Voters;
+    CommitIndexTrusted = metadata.CommitIndexTrusted;
+    RecoveredStore = true;
+    if (!CurrentTerm) throw std::runtime_error("Invalid Raft metadata term: " + StatePath);
 
     Index.seekg(0, std::ios::end);
     const auto indexSize = Index.tellg();
@@ -285,15 +380,8 @@ void TDiskState::Commit()
         State.close();
         if (State.fail()) Fail("Cannot close Raft metadata");
     }
-    std::array<char, sizeof(LastLogIndex) + sizeof(CurrentTerm) + sizeof(VotedFor)> metadata{};
-    size_t offset = 0;
-    auto put = [&](const auto& value) {
-        memcpy(metadata.data() + offset, &value, sizeof(value));
-        offset += sizeof(value);
-    };
-    put(LastLogIndex);
-    put(CurrentTerm);
-    put(VotedFor);
+    auto metadata = EncodeDiskMetadata(LastLogIndex, CurrentTerm, VotedFor,
+        CommitIndex, Voters, CommitIndexTrusted);
 
     // The backend requires one process per node, as before. Reusing one
     // same-directory temporary file also makes interrupted writes recoverable
@@ -306,4 +394,54 @@ void TDiskState::Commit()
     if (CommitHook) CommitHook(ECommitStage::MetadataRenamed);
     if (!SyncDirectory(StatePath)) Fail("Cannot sync Raft metadata directory");
     if (CommitHook) CommitHook(ECommitStage::DirectorySynced);
+}
+
+bool TDiskState::HasUnboundRecoveredState() const {
+    const bool emptyBootstrap = CurrentTerm == 1 && !VotedFor && !LastLogIndex && !CommitIndex;
+    return RecoveredStore && Voters.empty() && !emptyBootstrap;
+}
+
+std::vector<uint32_t> TDiskState::GetBoundVoters() const { return Voters; }
+
+void TDiskState::BindVoters(const std::vector<uint32_t>& voters) {
+    ValidateVoterBinding(*this, Voters, voters);
+    if (Voters == voters) return;
+    const bool pristine = CurrentTerm == 1 && !VotedFor && !LastLogIndex && !CommitIndex;
+    if (RecoveredStore && Voters.empty()) {
+        if (!pristine)
+            throw std::logic_error("Recovered unbound state requires a trusted baseline before binding voters");
+        CommitIndexTrusted = true; // The empty legacy store has no unknown commit history.
+    }
+    Voters = voters;
+    Commit();
+}
+
+void TDiskState::ValidateTrustedLegacyVoterBaseline(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex) {
+    ValidateFixedVoters(voters);
+    if (RaftStarted)
+        throw std::invalid_argument("Trusted legacy voter migration must happen before Raft startup");
+    if (!Voters.empty()) {
+        if (Voters == voters && CommitIndex == commitIndex && CommitIndexTrusted) return;
+        throw std::invalid_argument("Disk-state voter binding already exists");
+    }
+    if (!RecoveredStore)
+        throw std::invalid_argument("Trusted legacy baseline is only for recovered state");
+    if (SnapshotIndex || SnapshotTerm)
+        throw std::invalid_argument("Legacy disk state cannot validate compacted voter history");
+    if (commitIndex > LastLogIndex)
+        throw std::invalid_argument("Trusted commit boundary exceeds the retained log");
+    if (CommitIndexTrusted && CommitIndex != commitIndex)
+        throw std::invalid_argument("Trusted commit boundary differs from persisted metadata");
+    if (VotedFor && !std::binary_search(voters.begin(), voters.end(), VotedFor))
+        throw std::invalid_argument("Stored vote is outside the trusted voter baseline");
+    for (uint64_t index = 1; index <= LastLogIndex; ++index) {
+        auto entry = Get(index);
+        if (entry->Flags & TLogEntry::EConfiguration)
+            throw std::invalid_argument("Legacy disk voter binding requires a log without configuration entries");
+    }
+    Voters = voters;
+    CommitIndex = commitIndex;
+    CommitIndexTrusted = true;
+    Commit();
 }

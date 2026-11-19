@@ -1028,6 +1028,42 @@ void test_existing_voter_must_advertise_joint_consensus_support(void**) {
     std::filesystem::remove_all(dir, ignored);
 #endif
 }
+void test_versioned_disk_state_can_start_voter_removal(void**) {
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-disk-membership-removal-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    {
+        auto state = std::make_shared<TDiskState>((dir / "raft").string(), 1);
+        state->BindVoters({1, 2, 3});
+        state->CurrentTerm = 2;
+        state->Append(Ordinary(2));
+        state->CommitIndex = 1;
+        state->Commit();
+
+        auto peer2 = std::make_shared<TEndpoint>();
+        auto peer3 = std::make_shared<TEndpoint>();
+        TRaft raft(state, 1, {{2, peer2}, {3, peer3}});
+        raft.Become(EState::LEADER);
+        auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
+        volatileState->PeerCapabilities[2] = {
+            .Term = state->CurrentTerm,
+            .JointConsensus = true,
+        };
+        volatileState->PeerCapabilities[3] = {
+            .Term = state->CurrentTerm,
+            .JointConsensus = true,
+        };
+
+        const auto readiness = raft.CheckJointConfigurationReadiness({1, 2});
+        assert_true(readiness.HasDurableMembershipStorage);
+        assert_true(readiness.Ready());
+        const auto jointIndex = raft.ProposeJointConfiguration({1, 2});
+        assert_int_equal(jointIndex, 2);
+        assert_true(state->GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+}
 void test_new_voter_leader_can_forward_prior_term_joint_entry(void**) {
 #ifdef __linux__
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-new-side-joint-forward-" +
@@ -4890,6 +4926,7 @@ int main() {
         cmocka_unit_test(test_joint_configuration_readiness_reports_log_and_index_capacity),
         cmocka_unit_test(test_new_voter_requires_snapshot_install_capability),
         cmocka_unit_test(test_existing_voter_must_advertise_joint_consensus_support),
+        cmocka_unit_test(test_versioned_disk_state_can_start_voter_removal),
         cmocka_unit_test(test_new_voter_leader_can_forward_prior_term_joint_entry),
         cmocka_unit_test(test_new_side_election_replays_joint_entry_to_old_peer),
         cmocka_unit_test(test_new_stable_leader_replays_transition_to_lagging_joiner),

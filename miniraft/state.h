@@ -40,6 +40,7 @@ struct IState: TStateFields {
     // True only when Commit() durably records CommitIndex and recovery restores
     // it. Membership protocols can require this before trusting recovered history.
     virtual bool SupportsCommitIndexPersistence() const { return false; }
+    virtual bool HasTrustedCommitIndex() const { return SupportsCommitIndexPersistence(); }
     virtual bool SupportsSnapshots() const { return false; }
     // True when this backend can durably adopt an InstallSnapshot image.
     virtual bool SupportsInstallSnapshot() const { return false; }

@@ -1,4 +1,6 @@
 #include <miniraft/persist.h>
+#include <miniraft/raft.h>
+#include <miniraft/snapshot_codec.h>
 #include <filesystem>
 #include <chrono>
 #include <map>
@@ -30,6 +32,39 @@ struct TFiles {
     }
     ~TFiles() { std::error_code ignored; fs::remove_all(Directory, ignored); }
     fs::path Path(const std::string& kind) const { return Name + "." + kind + ".1"; }
+    void WriteLegacyMetadata(uint64_t lastIndex, uint64_t term, uint32_t vote) {
+        std::ofstream file(Path("state"), std::ios::binary | std::ios::trunc);
+        file.write(reinterpret_cast<const char*>(&lastIndex), sizeof(lastIndex));
+        file.write(reinterpret_cast<const char*>(&term), sizeof(term));
+        file.write(reinterpret_cast<const char*>(&vote), sizeof(vote));
+        file.flush();
+        assert_true(bool(file));
+    }
+    void RepairMetadataChecksum() {
+        std::ifstream input(Path("state"), std::ios::binary);
+        std::string bytes{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+        if (bytes.size() < 4 || bytes.substr(0, 8) != "MRFTL001") return;
+        const auto checksum = NSnapshotCodec::Checksum(std::string_view(bytes).substr(0, bytes.size() - 4));
+        for (unsigned i = 0; i < 4; ++i) bytes[bytes.size() - 4 + i] = char(checksum >> (8 * i));
+        std::ofstream output(Path("state"), std::ios::binary | std::ios::trunc);
+        output.write(bytes.data(), bytes.size());
+        output.flush();
+        assert_true(bool(output));
+    }
+    void CorruptMetadataChecksum() {
+        std::fstream file(Path("state"), std::ios::in | std::ios::out | std::ios::binary);
+        file.seekg(0, std::ios::end);
+        auto size = file.tellg();
+        assert_true(size >= std::streamoff(4));
+        file.seekg(size - std::streamoff(1));
+        char byte = 0;
+        assert_true(bool(file.read(&byte, 1)));
+        byte ^= 0x40;
+        file.seekp(size - std::streamoff(1));
+        file.write(&byte, 1);
+        file.flush();
+        assert_true(bool(file));
+    }
     void Seed() {
         TDiskState state(Name, 1);
         state.CurrentTerm = 7;
@@ -46,6 +81,8 @@ struct TFiles {
         file.write(reinterpret_cast<const char*>(&value), sizeof(value));
         file.flush();
         assert_true(bool(file));
+        file.close();
+        if (kind == "state") RepairMetadataChecksum();
     }
     void RejectRecovery() {
         auto contents = [&] {
@@ -81,6 +118,70 @@ void test_oversized_metadata_is_rejected(void**) {
     fs::resize_file(files.Path("state"), 21);
     files.RejectRecovery();
     assert_int_equal(fs::file_size(files.Path("state")), 21);
+}
+void test_versioned_metadata_checksum_is_verified(void**) {
+    TFiles files;
+    files.Seed();
+    files.CorruptMetadataChecksum();
+    files.RejectRecovery();
+}
+void test_versioned_metadata_persists_commit_and_voter_baseline(void**) {
+    TFiles fresh;
+    auto freshState = std::make_shared<TDiskState>(fresh.Name, 1);
+    {
+        TRaft raft(freshState, 1, TNodeDict{});
+        assert_true(freshState->GetBoundVoters() == (std::vector<uint32_t>{1}));
+    }
+
+    TFiles oldEmpty;
+    { TDiskState state(oldEmpty.Name, 1); }
+    oldEmpty.WriteLegacyMetadata(0, 1, 0);
+    auto oldEmptyState = std::make_shared<TDiskState>(oldEmpty.Name, 1);
+    {
+        TRaft raft(oldEmptyState, 1, TNodeDict{});
+        assert_true(oldEmptyState->GetBoundVoters() == (std::vector<uint32_t>{1}));
+        assert_true(oldEmptyState->HasTrustedCommitIndex());
+    }
+
+    TFiles files;
+    files.Seed();
+    files.WriteLegacyMetadata(2, 7, 2);
+    {
+        TDiskState state(files.Name, 1);
+        assert_true(state.SupportsCommitIndexPersistence());
+        assert_true(state.SupportsVoterBinding());
+        assert_true(state.HasUnboundRecoveredState());
+        assert_int_equal(state.CommitIndex, 0); // Old metadata had no commit boundary.
+        bool directBindRejected = false;
+        try { state.BindVoters({1, 2, 3}); }
+        catch (const std::exception&) { directBindRejected = true; }
+        assert_true(directBindRejected);
+        state.ValidateTrustedLegacyVoterBaseline({1, 2, 3}, 1);
+        assert_int_equal(state.CommitIndex, 1);
+        assert_true(state.GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
+        assert_false(state.HasUnboundRecoveredState());
+    }
+    {
+        TDiskState state(files.Name, 1);
+        assert_int_equal(state.CommitIndex, 1);
+        assert_true(state.GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
+        assert_false(state.HasUnboundRecoveredState());
+    }
+
+    TFiles configured;
+    {
+        TDiskState state(configured.Name, 1);
+        state.Append(EncodeConfigurationEntry({EConfigurationPhase::Joint, 1, 0, 0,
+            {1, 2}, {1, 3}}));
+    }
+    {
+        TDiskState state(configured.Name, 1);
+        bool configurationHistoryRejected = false;
+        try { state.ValidateTrustedLegacyVoterBaseline({1, 2}, 0); }
+        catch (const std::invalid_argument&) { configurationHistoryRejected = true; }
+        assert_true(configurationHistoryRejected);
+        assert_true(state.GetBoundVoters().empty());
+    }
 }
 void test_missing_storage_is_not_recreated(void**) {
     for (const std::string kind : {"state", "index", "entries"}) {
@@ -287,6 +388,43 @@ void test_crash_during_metadata_publication_recovers_complete_log_prefix(void**)
     }
 }
 
+void test_trusted_voter_binding_is_atomic_at_each_metadata_stage(void**) {
+    const TDiskState::ECommitStage stages[] = {
+        TDiskState::ECommitStage::LogFilesSynced,
+        TDiskState::ECommitStage::MetadataFileSynced,
+        TDiskState::ECommitStage::MetadataRenamed,
+        TDiskState::ECommitStage::DirectorySynced,
+    };
+    for (const auto stage : stages) {
+        TFiles files;
+        files.Seed();
+        files.WriteLegacyMetadata(2, 7, 2);
+        const auto child = fork();
+        assert_true(child >= 0);
+        if (child == 0) {
+            try {
+                TDiskState state(files.Name, 1, [stage](TDiskState::ECommitStage reached) {
+                    if (reached == stage) _exit(100 + static_cast<int>(stage));
+                });
+                state.ValidateTrustedLegacyVoterBaseline({1, 2, 3}, 1);
+            } catch (...) { _exit(110); }
+            _exit(111);
+        }
+        int status = 0;
+        assert_int_equal(waitpid(child, &status, 0), child);
+        assert_true(WIFEXITED(status));
+        assert_int_equal(WEXITSTATUS(status), 100 + static_cast<int>(stage));
+
+        TDiskState recovered(files.Name, 1);
+        const bool metadataWasPublished = stage == TDiskState::ECommitStage::MetadataRenamed ||
+            stage == TDiskState::ECommitStage::DirectorySynced;
+        assert_int_equal(recovered.CommitIndex, metadataWasPublished ? 1 : 0);
+        assert_true(recovered.GetBoundVoters() == (metadataWasPublished
+            ? std::vector<uint32_t>{1, 2, 3} : std::vector<uint32_t>{}));
+        assert_true(recovered.HasUnboundRecoveredState() == !metadataWasPublished);
+    }
+}
+
 void test_live_storage_failure_is_fatal(void**) {
     TFiles files;
     files.Seed();
@@ -335,6 +473,8 @@ int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_truncated_metadata_is_not_reset),
         cmocka_unit_test(test_oversized_metadata_is_rejected),
+        cmocka_unit_test(test_versioned_metadata_checksum_is_verified),
+        cmocka_unit_test(test_versioned_metadata_persists_commit_and_voter_baseline),
         cmocka_unit_test(test_missing_storage_is_not_recreated),
         cmocka_unit_test(test_short_index_is_rejected),
         cmocka_unit_test(test_short_entry_is_rejected),
@@ -350,6 +490,7 @@ int main() {
         cmocka_unit_test(test_invalid_terms_in_logically_removed_suffix_are_ignored),
 #ifndef _WIN32
         cmocka_unit_test(test_crash_during_metadata_publication_recovers_complete_log_prefix),
+        cmocka_unit_test(test_trusted_voter_binding_is_atomic_at_each_metadata_stage),
         cmocka_unit_test(test_live_storage_failure_is_fatal),
         cmocka_unit_test(test_live_invalid_log_term_is_fatal),
 #endif

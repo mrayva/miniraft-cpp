@@ -84,8 +84,10 @@ Malformed recovery does not rewrite the image. Live publication failure is fatal
 Followers publish a newly learned commit index before acknowledging
 AppendEntries. Leaders publish quorum commit advancement before application
 processing. Snapshot installation commits at least the included boundary, and
-storage refuses to truncate a committed entry. The legacy TDiskState backend
-does not persist CommitIndex.
+storage refuses to truncate a committed entry. Versioned `TDiskState` metadata
+also persists CommitIndex, but that backend does not support compaction or
+snapshot installation. Older 20-byte metadata recovers without a trusted commit
+boundary until an operator supplies one through the legacy voter-baseline API.
 
 An offline active voter deliberately blocks membership-bearing compaction until
 it acknowledges the committed configuration. If a reachable quorum can satisfy

@@ -10,8 +10,10 @@ cmake --build build --target miniraft-migrate-disk-state
 Stop the replica and preserve a backup of all three source files first. Supply
 the complete original voter set from an independently trusted deployment
 record, and supply a commit index that is consistent with the application's
-persisted state. The split `TDiskState` metadata does not contain a commit
-boundary, so the utility never guesses one.
+persisted state. Old 20-byte `TDiskState` metadata does not contain a commit
+boundary, so the utility never guesses one. For versioned metadata, the
+converter also checks any persisted commit boundary and voter binding against
+the supplied values.
 
 ```sh
 build/tools/miniraft-migrate-disk-state \
@@ -30,7 +32,7 @@ before reporting success. It leaves the legacy entries, index and state files
 untouched; point the node at the new durable base only after success.
 
 The converter validates the source log and stored vote, preserves the term,
-vote and every entry, records the supplied commit index and voter binding, and
+vote and every entry, records the verified commit index and voter binding, and
 publishes the new image through the durable backend. It validates retained
 configuration entries in order from the supplied original voter set, including
 their transition predecessor and the commit boundary. It refuses compacted

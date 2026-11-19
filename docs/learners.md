@@ -3,8 +3,11 @@
 Raft startup rejects a zero current term or a persisted vote for an ID outside
 the configured fixed voter set, including on unbound nonfresh and legacy stores.
 It performs this check before voter binding or serving traffic. This check does
-not prove that the full voter set matches a legacy store's original cluster;
-legacy storage still has no persisted voter binding.
+not prove that the full voter set matches a recovered store's original cluster
+unless its metadata already contains a voter binding. New versioned
+`TDiskState` metadata persists that binding; old 20-byte stores require the
+trusted-baseline migration described in
+[trusted legacy voter binding](trusted-legacy-voter-binding.md).
 
 This milestone separates replication targets from the fixed voting set. Learners
 receive log entries, install snapshots and apply committed commands, but never
