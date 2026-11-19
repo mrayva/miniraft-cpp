@@ -429,19 +429,33 @@ void TDurableState::InstallRaftSnapshot(const TSnapshot& snapshot,
     InstallSnapshotImpl(snapshot, true);
 }
 
+void TDurableState::InstallRaftSnapshot(std::shared_ptr<const TSnapshot> snapshot,
+        const TRaftInstallSnapshotPermit&) {
+    InstallSnapshotImpl(std::move(snapshot));
+}
+
 void TDurableState::InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated) {
     ValidateSnapshot(snapshot);
     TSnapshot image = snapshot;
     if (!configurationHistoryValidated) PreserveStableSnapshotIdentity(Impl->Snapshot.get(), image);
     ValidateSnapshot(image);
-    if (!SnapshotCompatibleWithVoterBinding(image, Impl->Voters))
+    InstallValidatedSnapshot(std::make_shared<const TSnapshot>(std::move(image)));
+}
+
+void TDurableState::InstallSnapshotImpl(std::shared_ptr<const TSnapshot> saved) {
+    if (!saved) throw std::invalid_argument("Missing Raft snapshot");
+    ValidateSnapshot(*saved);
+    InstallValidatedSnapshot(std::move(saved));
+}
+
+void TDurableState::InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> saved) {
+    if (!SnapshotCompatibleWithVoterBinding(*saved, Impl->Voters))
         throw std::invalid_argument("Snapshot is incompatible with the persisted voter binding");
-    if (image.Index <= SnapshotIndex || image.Term < SnapshotTerm || image.Term > CurrentTerm)
+    if (saved->Index <= SnapshotIndex || saved->Term < SnapshotTerm || saved->Term > CurrentTerm)
         throw std::invalid_argument("Obsolete or future durable snapshot");
-    if (image.Index <= CommitIndex &&
-        (image.Index > LastLogIndex || LogTerm(image.Index) != image.Term))
+    if (saved->Index <= CommitIndex &&
+        (saved->Index > LastLogIndex || LogTerm(saved->Index) != saved->Term))
         throw std::invalid_argument("Snapshot would discard committed log entries");
-    auto saved = std::make_shared<const TSnapshot>(std::move(image));
     std::vector<TMessageHolder<TLogEntry>> suffix;
     if (saved->Index <= LastLogIndex && LogTerm(saved->Index) == saved->Term)
         suffix.assign(Impl->Log.begin() + (saved->Index - SnapshotIndex), Impl->Log.end());

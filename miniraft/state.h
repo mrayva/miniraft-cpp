@@ -48,6 +48,13 @@ struct IState: TStateFields {
     // that snapshot-only continuity cannot establish.
     virtual void InstallRaftSnapshot(const TSnapshot& snapshot,
             const class TRaftInstallSnapshotPermit&) { InstallSnapshot(snapshot); }
+    // Raft may transfer a validated immutable snapshot into storage without
+    // copying the application image. Existing backends keep the copy-based path.
+    virtual void InstallRaftSnapshot(std::shared_ptr<const TSnapshot> snapshot,
+            const class TRaftInstallSnapshotPermit& permit) {
+        if (!snapshot) throw std::invalid_argument("Missing Raft snapshot");
+        InstallRaftSnapshot(*snapshot, permit);
+    }
     virtual bool SupportsVoterBinding() const { return false; }
     // True when this backend recovered a persistent image without a stored
     // voter identity; Raft must obtain proof before serving this state.
@@ -190,20 +197,29 @@ struct TState: IState {
     void InstallSnapshot(const TSnapshot& snapshot) override { InstallSnapshotImpl(snapshot, false); }
     void InstallRaftSnapshot(const TSnapshot& snapshot,
             const TRaftInstallSnapshotPermit&) override { InstallSnapshotImpl(snapshot, true); }
+    void InstallRaftSnapshot(std::shared_ptr<const TSnapshot> snapshot,
+            const TRaftInstallSnapshotPermit&) override { InstallSnapshotImpl(std::move(snapshot)); }
 private:
     void InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated) {
         ValidateSnapshot(snapshot);
         TSnapshot image = snapshot;
         if (!configurationHistoryValidated) PreserveStableSnapshotIdentity(Snapshot.get(), image);
         ValidateSnapshot(image); // Validate before changing any state.
-        if (!SnapshotCompatibleWithVoterBinding(image, BoundVoters))
+        InstallValidatedSnapshot(std::make_shared<const TSnapshot>(std::move(image)));
+    }
+    void InstallSnapshotImpl(std::shared_ptr<const TSnapshot> saved) {
+        if (!saved) throw std::invalid_argument("Missing Raft snapshot");
+        ValidateSnapshot(*saved);
+        InstallValidatedSnapshot(std::move(saved));
+    }
+    void InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> saved) {
+        if (!SnapshotCompatibleWithVoterBinding(*saved, BoundVoters))
             throw std::invalid_argument("Snapshot is incompatible with the persisted voter binding");
-        if (image.Index <= SnapshotIndex || image.Term < SnapshotTerm || image.Term > CurrentTerm)
+        if (saved->Index <= SnapshotIndex || saved->Term < SnapshotTerm || saved->Term > CurrentTerm)
             throw std::invalid_argument("Obsolete or future snapshot");
-        if (image.Index <= CommitIndex &&
-            (image.Index > LastLogIndex || LogTerm(image.Index) != image.Term))
+        if (saved->Index <= CommitIndex &&
+            (saved->Index > LastLogIndex || LogTerm(saved->Index) != saved->Term))
             throw std::invalid_argument("Snapshot would discard committed log entries");
-        auto saved = std::make_shared<const TSnapshot>(std::move(image));
         std::vector<TMessageHolder<TLogEntry>> suffix;
         if (saved->Index <= LastLogIndex && LogTerm(saved->Index) == saved->Term)
             suffix.assign(Log.begin() + (saved->Index - SnapshotIndex), Log.end());

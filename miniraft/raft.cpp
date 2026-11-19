@@ -2869,19 +2869,22 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     } catch (const std::exception&) {
         IncomingSnapshot.reset(); reply(false, false, 0); return;
     }
+    std::shared_ptr<const TSnapshot> installedSnapshot;
     try {
+        installedSnapshot = std::make_shared<const TSnapshot>(std::move(snapshot));
         TRaftInstallSnapshotPermit permit;
-        State->InstallRaftSnapshot(snapshot, permit); // publish Raft state before app replacement or ACK
-        application->LoadSnapshot(snapshot.Data, snapshot.Index);
-        if (application->LastAppliedIndex != snapshot.Index) std::terminate();
+        State->InstallRaftSnapshot(installedSnapshot, permit); // publish Raft state before app replacement or ACK
+        application->LoadSnapshot(installedSnapshot->Data, installedSnapshot->Index);
+        if (application->LastAppliedIndex != installedSnapshot->Index) std::terminate();
     } catch (...) { std::terminate(); }
     VolatileState->CommitIndex = State->CommitIndex;
     RebuildUncommittedLogUsage();
-    ConfigurationBaseline = snapshot.StableConfiguration
-        ? TConfigurationHistory::FromStableSnapshot(snapshot)
-        : snapshot.IsJoint()
-            ? TConfigurationHistory::FromJointSnapshot(snapshot)
-            : TConfigurationHistory::Stable(snapshot.Voters, 0, 0, snapshot.Index, snapshot.Term);
+    ConfigurationBaseline = installedSnapshot->StableConfiguration
+        ? TConfigurationHistory::FromStableSnapshot(*installedSnapshot)
+        : installedSnapshot->IsJoint()
+            ? TConfigurationHistory::FromJointSnapshot(*installedSnapshot)
+            : TConfigurationHistory::Stable(installedSnapshot->Voters, 0, 0,
+                installedSnapshot->Index, installedSnapshot->Term);
     RefreshConfiguration(VolatileState->CommitIndex);
     IncomingSnapshot.reset();
     reply(true, true, request->TotalBytes);
