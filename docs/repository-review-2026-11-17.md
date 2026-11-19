@@ -90,21 +90,23 @@ capacity changes before proposing.
   the anchored snapshot and restart it again as a learner. The guard remains
   necessary while that node is still an active voter.
 - Snapshots are complete in-memory images, capped at 64 MiB including metadata
-  (`snapshot.h`). Outbound transfer now encodes each chunk directly from the
-  pinned snapshot, avoiding a second full encoded image at the sender. Capture,
-  durable storage encoding and receiver installation still materialize full
-  images. The receiver reuses its completed wire buffer for decoded application
-  data, avoiding another full payload allocation during validation. It still
-  buffers the complete transfer and storage/application installation may make
-  further copies. Large databases need end-to-end streaming or logical object
-  snapshots and resource accounting.
-- Recovery history is now bounded to 256 transitions (MRFTS008/MRFTS009); the
-  legacy MRFTS006/MRFTS007 formats remain capped at 32. Automatic stale-store
-  recovery requires a locally anchored history and the sender membership
-  conditions documented in README and configuration-entries.md. Disjoint or out-of-window
-  histories can require a fresh learner baseline or independently verified
-  recovery history. Joint consensus itself is implemented, including disjoint
-  transitions; unrestricted automatic stale recovery is a separate capability.
+  (`snapshot.h`). Outbound transfer encodes each chunk directly from the pinned
+  snapshot. Durable publication also encodes through a fixed 64 KiB buffer, so
+  it does not allocate a second serialized snapshot image; it still rewrites
+  the snapshot and retained log on each state update. Application capture,
+  receiver chunk accumulation, and restore retain complete images. The receiver
+  reuses its completed wire buffer for decoded application data, avoiding an
+  extra payload allocation during validation. Large databases still need an
+  application and storage streaming contract with disk quotas and generation
+  recovery.
+- Recovery history is bounded to 1,024 transitions in MRFTS010/MRFTS011;
+  MRFTS008/MRFTS009 cap at 256 and MRFTS006/MRFTS007 at 32. Automatic
+  stale-store recovery still requires locally anchored history and the sender
+  membership conditions documented in README and configuration-entries.md.
+  Disjoint or out-of-window histories can require a fresh learner baseline or
+  independently verified recovery history. Joint consensus itself is
+  implemented, including disjoint transitions; unrestricted automatic stale
+  recovery is a separate capability.
 - Legacy migration requires a trusted complete original voter set and commit
   boundary. The new offline converter handles un-compacted split `TDiskState`
   logs and preserves the source files; its dry run checks consistency, not
