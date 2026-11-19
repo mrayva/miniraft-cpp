@@ -49,6 +49,30 @@ struct TApplication : TKv {
     size_t Loads = 0;
     void LoadSnapshot(std::string_view bytes, uint64_t index) override { TKv::LoadSnapshot(bytes, index); ++Loads; }
 };
+void test_kv_snapshot_precomputes_size_without_changing_encoding(void**) {
+    TKv source;
+    const std::string binaryKey("a\0", 2), binaryValue("\0v", 2);
+    source.Write(source.Prepare(Command("z", "last")), 1);
+    source.Write(source.Prepare(Command(binaryKey, binaryValue)), 2);
+
+    const auto bytes = source.SaveSnapshot();
+    std::string expected = "MRKV0001";
+    NSnapshotCodec::Put(expected, 2, 8);
+    NSnapshotCodec::Put(expected, binaryKey.size(), 4);
+    NSnapshotCodec::Put(expected, binaryValue.size(), 4);
+    NSnapshotCodec::Append(expected, binaryKey);
+    NSnapshotCodec::Append(expected, binaryValue);
+    NSnapshotCodec::Put(expected, 1, 4);
+    NSnapshotCodec::Put(expected, 4, 4);
+    NSnapshotCodec::Append(expected, "z");
+    NSnapshotCodec::Append(expected, "last");
+    assert_true(bytes == expected);
+
+    TKv restored;
+    restored.LoadSnapshot(bytes, source.LastAppliedIndex);
+    assert_true(Read(restored, binaryKey) == binaryValue);
+    assert_true(Read(restored, "z") == "last");
+}
 struct TCluster {
     ITimeSource::Time Now{};
     std::vector<std::shared_ptr<TRaft>> Nodes{3};
@@ -1045,6 +1069,7 @@ void test_durable_v4_semantic_corruption_rejects_without_rewriting(void**) {
 }
 int main() {
     const CMUnitTest tests[] = {
+        cmocka_unit_test(test_kv_snapshot_precomputes_size_without_changing_encoding),
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),
         cmocka_unit_test(test_simultaneous_startup_candidates_use_distinct_election_deadlines),
         cmocka_unit_test(test_partial_transfer_restart_and_delayed_ack_are_safe),
