@@ -103,10 +103,13 @@ Snapshot peers advertise configuration-lineage support and support for the
 formats in AppendEntries responses. The leader selects the highest advertised
 level. A peer that supports lineage but no history receives predecessor-only
 MRFTS004/MRFTS005 metadata; a peer without lineage receives MRFTS003 stable or
-MRFTS002 joint metadata without predecessor or transition history. That fallback
-requires an exact trusted configuration match and cannot recover across a
-membership change. Recovery may require a fresh learner if the trusted history
-anchor predates the metadata the peer supports.
+MRFTS002 joint metadata without predecessor or transition history. MRFTS002
+requires the exact committed joint configuration. MRFTS003 can match a
+committed stable configuration or complete that exact committed joint
+configuration's stable successor when the sender belongs to the new set. Fresh
+learners have a separate bootstrap path. These formats cannot recover a stale
+store across an unknown membership transition; recovery may require a fresh
+learner if the trusted history anchor predates the metadata the peer supports.
 Leader compaction rejects active voters that advertise no storage support for
 InstallSnapshot. Offline peers must still support it when they return;
 application capture and restore callbacks remain a deployment requirement.

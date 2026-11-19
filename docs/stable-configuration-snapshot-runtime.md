@@ -23,12 +23,13 @@ The original voter binding still identifies the trusted initial set. The live
 joint-consensus log protocol can move the active set without rewriting that
 binding. After a stable successor commits, local compaction records the new
 active set and startup recovers it from the stable snapshot while the configured
-bootstrap view still matches the original binding. Network snapshot handling
-now allows transfer across a committed stable transition when the receiver has
-the exact same stable identity and voter set. Joint installation requires the
-receiver's committed joint history to match both voter sets and the
-configuration index/term. Snapshot metadata cannot introduce an uncommitted
-transition or establish membership on its own. Upgrade all voters before
+bootstrap view still matches the original binding. Network installation
+accepts MRFTS003 for a receiver with the exact same committed stable identity,
+and a later joint-snapshot follow-up lets it install the stable successor of
+its exact committed joint configuration when the sender belongs to the new
+stable set. Joint MRFTS002 installation still requires the exact committed
+joint identity. Snapshot metadata cannot introduce an uncommitted transition
+or recover a stale store across an unknown transition. Upgrade all voters before
 sending configuration-bearing images because older binaries may acknowledge
 an already-covered unknown snapshot format.
 

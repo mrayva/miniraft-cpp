@@ -175,8 +175,12 @@ requirement. AppendEntries feature bits negotiate lineage support and 32-, 256-
 and 1,024-transition history encodings. A lineage-capable peer without a
 history bit receives predecessor-only MRFTS004/MRFTS005 metadata; a peer without
 lineage receives MRFTS003 stable or MRFTS002 joint configuration metadata
-without predecessor history and can install it only with an exact committed
-configuration match or as a fresh learner. An unsupported learner cannot receive a
+without predecessor history. MRFTS002 requires the exact committed joint
+configuration. MRFTS003 can match a committed stable configuration or complete
+the stable successor of the receiver's exact committed joint configuration
+when the sender belongs to the new set. Fresh learners use a separate
+constrained bootstrap path. These formats cannot recover a stale store across
+unknown membership transitions. An unsupported learner cannot receive a
 snapshot and must catch up before compaction or be removed and re-added after
 its storage is upgraded. Application capture and restore callbacks remain a
 deployment requirement and are not negotiated. Asynchronous/COW capture, disk-streamed

@@ -40,10 +40,12 @@ alpha.46 follow-up enables runtime recovery and transfer of MRFTS003 stable
 snapshots for the configured active voter set. Compaction carries forward the
 stable configuration identity. The stable membership compaction follow-up
 extends local compaction and restart recovery after a finalized voter change,
-while preserving the original binding. Network installation requires the
-receiver's committed configuration and both joint voter sets to match before
-accepting a higher term. Configuration log entries are accepted through the
-guarded joint-consensus path.
+while preserving the original binding. Network installation accepts MRFTS003
+when it matches the receiver's committed stable identity, or when it completes
+the stable successor of the receiver's exact committed joint configuration
+and the sender belongs to the new set. MRFTS002 requires the exact committed
+joint identity. Configuration log entries are accepted through the guarded
+joint-consensus path.
 Since alpha.58, bound storage can preserve its original voter binding while
 installing configuration-bearing snapshots whose active set changed. Raft
 startup uses stable metadata to recover a changed active set after local

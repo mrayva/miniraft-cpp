@@ -139,8 +139,12 @@ transition chain, a peer advertising lineage support but no history feature
 receives predecessor-only MRFTS004/MRFTS005 lineage and can recover from a
 matching trusted predecessor. A peer without lineage support receives MRFTS003
 stable or MRFTS002 joint configuration metadata without predecessor or
-transition history; installation requires an exact trusted configuration
-match, or a fresh learner bootstrap.
+transition history. MRFTS002 installation requires the exact committed joint
+configuration. MRFTS003 can match a committed stable configuration or complete
+the stable successor of the receiver's exact committed joint configuration
+when the sender belongs to the new set. Fresh learners use a separate
+constrained bootstrap path. These formats cannot recover a stale store across
+unknown membership transitions.
 
 Deterministic durable-store tests cover learner catch-up, voter addition and
 removal, leadership transfer and fallback when its request is dropped,

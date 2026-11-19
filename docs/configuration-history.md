@@ -78,8 +78,13 @@ for 32-, 256- and 1,024-transition history formats; the leader chooses the
 highest advertised level. Peers advertising lineage support without a history
 feature receive only MRFTS004/MRFTS005 predecessor lineage; their trusted
 baseline must match that predecessor exactly. Peers without lineage support
-receive MRFTS003 stable or MRFTS002 joint metadata without predecessor history,
-so they can install only when their configuration already matches exactly.
+receive MRFTS003 stable or MRFTS002 joint metadata without predecessor history.
+MRFTS002 installation requires the exact committed joint configuration.
+MRFTS003 can match the receiver's committed stable configuration or complete
+the stable successor of its exact committed joint configuration when the
+sender belongs to the new set. Fresh learners use a separate constrained
+bootstrap path. These formats do not provide stale-store recovery across an
+unknown membership transition.
 Stable
 images require the sender in both voter sets for every transition after that
 anchor. A joint image
