@@ -903,6 +903,43 @@ void test_joint_configuration_readiness_reports_log_and_index_capacity(void**) {
     std::filesystem::remove_all(dir, ignored);
 #endif
 }
+void test_new_voter_requires_snapshot_install_capability(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-readiness-snapshot-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    {
+        auto state = std::make_shared<TDurableState>((dir / "raft").string(), 1);
+        state->BindVoters({1});
+        state->Commit();
+        state->Append(Ordinary(1));
+        state->CommitIndex = 1;
+        state->Commit();
+        auto endpoint = std::make_shared<TEndpoint>();
+        TRaft raft(state, 1, {{2, endpoint}}, {2});
+        raft.Become(EState::LEADER);
+        auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
+        volatileState->MatchIndex[2] = state->LastLogIndex;
+        volatileState->CommitAckIndex[2] = state->CommitIndex;
+
+        auto readiness = raft.CheckJointConfigurationReadiness({1, 2});
+        assert_true(readiness.AddedVotersWithoutCommitAck.empty());
+        assert_true(readiness.AddedVotersWithoutSnapshotInstallSupport == (std::vector<uint32_t>{2}));
+        assert_false(readiness.Ready());
+        const auto before = static_cast<TStateFields>(*state);
+        Reject([&] { raft.ProposeJointConfiguration({1, 2}); });
+        assert_true(static_cast<TStateFields>(*state) == before);
+
+        volatileState->PeerCapabilities[2].InstallSnapshot = true;
+        readiness = raft.CheckJointConfigurationReadiness({1, 2});
+        assert_true(readiness.AddedVotersWithoutSnapshotInstallSupport.empty());
+        assert_true(readiness.Ready());
+        assert_int_equal(raft.ProposeJointConfiguration({1, 2}), 2);
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
 void test_new_voter_leader_can_forward_prior_term_joint_entry(void**) {
 #ifdef __linux__
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-new-side-joint-forward-" +
@@ -1305,6 +1342,7 @@ void test_runtime_peer_provisioning_commits_joint_membership_across_replicas(voi
         assert_true(ready.HasLogCapacity);
         assert_true(ready.MissingPeerTargets.empty());
         assert_true(ready.AddedVotersWithoutCommitAck.empty());
+        assert_true(ready.AddedVotersWithoutSnapshotInstallSupport.empty());
 
         const auto jointIndex = leader.ProposeJointConfiguration({1, 2, 3});
         timeout(std::chrono::seconds(50));
@@ -2044,7 +2082,8 @@ void test_live_joint_transition_waits_for_both_nontrivial_majorities(void**) {
                 leader.Process(start + offset,
                     NewHoldedMessage(TMessageEx{.Src = source, .Dst = 1, .Term = append->Term,
                         .Seqno = append->Seqno},
-                        TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1}));
+                        TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1,
+                            .Padding = TAppendEntriesResponse::SupportsInstallSnapshot}));
                 return matchIndex;
             };
             auto latestAppendMatchIndex = [&](uint32_t source) {
@@ -2409,7 +2448,8 @@ void test_joint_strong_read_waits_for_both_disjoint_majorities(void**) {
                 raft->Process(now + std::chrono::milliseconds(responseMillis),
                     NewHoldedMessage(TMessageEx{.Src = voter, .Dst = 4, .Term = append->Term,
                         .Seqno = append->Seqno},
-                        TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1}));
+                        TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1,
+                            .Padding = TAppendEntriesResponse::SupportsInstallSnapshot}));
                 return matchIndex;
             };
 
@@ -2700,7 +2740,8 @@ void test_old_side_leader_can_transfer_after_joint_snapshot_with_pending_stable_
             NewHoldedMessage(TMessageEx{.Src = voter, .Dst = 5, .Term = targetState->CurrentTerm,
                 .Seqno = append->Cast<TMessageEx>()->Seqno},
                 TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1,
-                    .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier}));
+                    .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier |
+                        TAppendEntriesResponse::SupportsInstallSnapshot}));
         return matchIndex;
     };
     const auto firstProbe = acknowledgeTargetAppend(1, targetToOne);
@@ -3672,7 +3713,8 @@ void test_raft_recovers_joint_quorum_for_candidate_election(void**) {
             assert_int_equal(matchIndex, expectedIndex);
             raft->Process(now + std::chrono::milliseconds(responseMillis),
                 NewHoldedMessage(TMessageEx{.Src = source, .Dst = 4, .Term = 3, .Seqno = request->Seqno},
-                    TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1}));
+                    TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1,
+                        .Padding = TAppendEntriesResponse::SupportsInstallSnapshot}));
         };
         ack(3, 1, 3);
         ack(5, 1, 3);
@@ -4678,6 +4720,7 @@ int main() {
         cmocka_unit_test(test_configuration_rpc_and_proposal_are_rejected_before_mutation),
         cmocka_unit_test(test_follower_can_register_future_voter_endpoint_before_joint_entry),
         cmocka_unit_test(test_joint_configuration_readiness_reports_log_and_index_capacity),
+        cmocka_unit_test(test_new_voter_requires_snapshot_install_capability),
         cmocka_unit_test(test_new_voter_leader_can_forward_prior_term_joint_entry),
         cmocka_unit_test(test_new_side_election_replays_joint_entry_to_old_peer),
         cmocka_unit_test(test_new_stable_leader_replays_transition_to_lagging_joiner),

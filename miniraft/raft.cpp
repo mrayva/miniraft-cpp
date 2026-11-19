@@ -2228,9 +2228,16 @@ TJointConfigurationReadiness TRaft::CheckJointConfigurationReadiness(
         }
         if (readiness.IsLeader) {
             for (auto id : newVoters) {
-                if (!std::binary_search(oldVoters.begin(), oldVoters.end(), id) &&
-                    !IsLearnerCommitAcknowledged(id))
+                const bool added = !std::binary_search(oldVoters.begin(), oldVoters.end(), id);
+                if (!added) continue;
+                if (!IsLearnerCommitAcknowledged(id))
                     readiness.AddedVotersWithoutCommitAck.push_back(id);
+                const auto capability = VolatileState->PeerCapabilities.find(id);
+                const bool supportsSnapshotInstall = id == Id
+                    ? State->SupportsInstallSnapshot()
+                    : capability != VolatileState->PeerCapabilities.end() && capability->second.InstallSnapshot;
+                if (!supportsSnapshotInstall)
+                    readiness.AddedVotersWithoutSnapshotInstallSupport.push_back(id);
             }
         }
     }
@@ -2263,6 +2270,8 @@ uint64_t TRaft::ProposeJointConfiguration(std::vector<uint32_t> newVoters) {
         throw std::invalid_argument("Every active and proposed voter must have a configured replication target");
     if (!readiness.AddedVotersWithoutCommitAck.empty())
         throw std::logic_error("Every added voter must be a staged learner with a committed catch-up ACK");
+    if (!readiness.AddedVotersWithoutSnapshotInstallSupport.empty())
+        throw std::logic_error("Every added voter must support InstallSnapshot before promotion");
 
     const auto& latest = Configuration->Latest;
     TConfigurationRecord record{EConfigurationPhase::Joint, State->CurrentTerm,

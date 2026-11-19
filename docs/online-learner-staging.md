@@ -11,6 +11,10 @@ to promote or a guarantee of application health.
 replication reply confirms the leader's current Raft commit boundary while the
 learner also matches the leader's log. It does not report application-applied
 progress and does not authorize promotion.
+Before promotion, the leader also requires an InstallSnapshot capability
+advertisement from each added voter. A caught-up learner that cannot install
+snapshots is not ready for promotion because it could later block safe log
+compaction.
 
 `TRaft::RegisterPeerTarget` and `TRaft::UnregisterPeerTarget` provide local
 endpoint provisioning on any role. They add or remove this instance's transport

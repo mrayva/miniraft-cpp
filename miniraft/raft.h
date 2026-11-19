@@ -75,11 +75,13 @@ struct TJointConfigurationReadiness {
     bool HasLogCapacity = false;
     std::vector<uint32_t> MissingPeerTargets;
     std::vector<uint32_t> AddedVotersWithoutCommitAck;
+    // Missing/unknown peer capability advertisements fail closed before promotion.
+    std::vector<uint32_t> AddedVotersWithoutSnapshotInstallSupport;
 
     bool Ready() const {
         return IsLeader && HasDurableMembershipStorage && HasStableConfiguration &&
             HasCommittedCurrentTermEntry && ChangesVoterSet && HasLogCapacity && MissingPeerTargets.empty() &&
-            AddedVotersWithoutCommitAck.empty();
+            AddedVotersWithoutCommitAck.empty() && AddedVotersWithoutSnapshotInstallSupport.empty();
     }
 };
 
