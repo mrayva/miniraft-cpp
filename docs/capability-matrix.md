@@ -50,10 +50,11 @@ design notes. This is a capability summary, not a production-readiness claim.
 - Automatic recovery when a stale store lacks an allowed history anchor, or
   its transition chain is disjoint from the sender's voter lineage.
 - An efficient WAL or group-commit storage path; `TDurableState` republishes a
-  complete durable image synchronously on updates. Legacy `TDiskState` also
-  lacks the durable backend's power-loss guarantees.
+  complete durable image synchronously on updates. Legacy `TDiskState` syncs
+  its log/index and atomically publishes hard-state metadata, but keeps its
+  split format without record checksums or a persisted commit boundary.
 
-The membership, compaction and transfer paths have deterministic regression
+The membership, compaction, transfer and legacy disk-publication paths have deterministic regression
 coverage described in their design notes. Joint-election tests also enumerate
 every reply ordering for overlapping and disjoint voter sets, checking each
 delivery prefix before both majorities are present. This coverage does not

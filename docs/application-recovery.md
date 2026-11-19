@@ -62,6 +62,7 @@ approval is claimed.
 The simulator retains stable term/vote/log objects and reconstructs Raft volatile
 state; it is a deterministic process-restart model, not torn-write simulation.
 The SQL integration test performs clean file close/reopen. These additions do not
-establish power-loss durability for TDiskState or SQLite, authenticated pairing
-of stores, exhaustive fault schedules, snapshots or retry deduplication. Those
-and independent review remain production gates.
+establish behavior across every hardware/filesystem power-loss condition for
+TDiskState or SQLite, authenticated pairing of stores, exhaustive fault
+schedules, snapshots or retry deduplication. Those and independent review remain
+production gates.

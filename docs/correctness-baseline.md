@@ -71,9 +71,10 @@ is separate from hosted GitHub Actions results.
 
 ## Remaining release gates before production
 
-* Replace stream-only persistence with a defined durable write protocol, ordered
-  synchronization, recovery validation and crash-injection testing. Current
-  TDiskState is not validated for power-loss durability.
+* Add hardware power-cut and filesystem fault testing for persistence. The later
+  legacy `TDiskState` publication follow-up adds ordered file synchronization,
+  atomic hard-state replacement and deterministic process-crash coverage; it
+  does not establish behavior for every filesystem or storage device.
 * Audit strong-read quorum freshness, pending operations across leadership
   changes, client retry/deduplication semantics and malformed message handling.
   FIFO tests do not establish linearizability.

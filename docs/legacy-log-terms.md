@@ -45,7 +45,8 @@ errors versus fatal live errors, ignored suffixes and fixture ordering. No
 independent reviewer approval is claimed.
 
 This detects impossible metadata rather than all corruption. Valid-looking term
-or payload changes remain undetectable without checksums. Legacy TDiskState still
-requires one writer and lacks power-loss durability, atomic publication and
-crash-safe replacement. It is not upgraded to TDurableState by this validation
-change. Snapshots, safe migration and independent review remain production gates.
+or payload changes remain undetectable without checksums. A later legacy-storage
+follow-up added file synchronization and atomic hard-state replacement, but the
+split format still requires one writer and does not persist the commit boundary
+or provide snapshots. It is not upgraded to TDurableState by this validation
+change. Safe migration and independent review remain production gates.

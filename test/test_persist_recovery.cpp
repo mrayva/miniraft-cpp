@@ -246,6 +246,47 @@ void test_invalid_terms_in_logically_removed_suffix_are_ignored(void**) {
 }
 
 #ifndef _WIN32
+void test_crash_during_metadata_publication_recovers_complete_log_prefix(void**) {
+    const TDiskState::ECommitStage stages[] = {
+        TDiskState::ECommitStage::LogFilesSynced,
+        TDiskState::ECommitStage::MetadataFileSynced,
+        TDiskState::ECommitStage::MetadataRenamed,
+        TDiskState::ECommitStage::DirectorySynced,
+    };
+    for (const auto stage : stages) {
+        TFiles files;
+        files.Seed();
+        const auto child = fork();
+        assert_true(child >= 0);
+        if (child == 0) {
+            try {
+                TDiskState state(files.Name, 1, [stage](TDiskState::ECommitStage reached) {
+                    if (reached == stage) _exit(80 + static_cast<int>(stage));
+                });
+                auto entry = NewHoldedMessage<TLogEntry>();
+                entry->Term = 7;
+                state.Append(entry);
+            } catch (...) { _exit(90); }
+            _exit(91);
+        }
+        int status = 0;
+        assert_int_equal(waitpid(child, &status, 0), child);
+        assert_true(WIFEXITED(status));
+        assert_int_equal(WEXITSTATUS(status), 80 + static_cast<int>(stage));
+
+        TDiskState recovered(files.Name, 1);
+        const bool metadataWasPublished = stage == TDiskState::ECommitStage::MetadataRenamed ||
+            stage == TDiskState::ECommitStage::DirectorySynced;
+        assert_int_equal(recovered.LastLogIndex, metadataWasPublished ? 3 : 2);
+        assert_int_equal(recovered.LastLogTerm, metadataWasPublished ? 7 : 5);
+        assert_int_equal(recovered.Get(1)->Term, 2);
+        assert_int_equal(recovered.Get(2)->Term, 5);
+        if (metadataWasPublished) assert_int_equal(recovered.Get(3)->Term, 7);
+        assert_int_equal(recovered.CurrentTerm, 7);
+        assert_int_equal(recovered.VotedFor, 2);
+    }
+}
+
 void test_live_storage_failure_is_fatal(void**) {
     TFiles files;
     files.Seed();
@@ -308,6 +349,7 @@ int main() {
         cmocka_unit_test(test_equal_and_skipped_terms_and_full_width_current_term_recover),
         cmocka_unit_test(test_invalid_terms_in_logically_removed_suffix_are_ignored),
 #ifndef _WIN32
+        cmocka_unit_test(test_crash_during_metadata_publication_recovers_complete_log_prefix),
         cmocka_unit_test(test_live_storage_failure_is_fatal),
         cmocka_unit_test(test_live_invalid_log_term_is_fatal),
 #endif

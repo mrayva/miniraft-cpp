@@ -33,8 +33,10 @@ provide the same recovery guarantee.
 
 TDurableState is an opt-in storage backend with synchronous durable publication.
 It closes the missing file-sync and atomic-publication gap for new stores, under
-the filesystem assumptions below. The legacy TDiskState backend is unchanged
-and still does not provide power-loss durability.
+the filesystem assumptions below. Legacy `TDiskState` separately syncs its log
+and index before atomically replacing hard-state metadata. It retains the older
+split-file format and does not persist a commit boundary, checksummed records,
+snapshots or voter bindings.
 
 ## Publication protocol
 

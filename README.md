@@ -11,9 +11,13 @@ For the current membership, snapshot and recovery capabilities and their
 operational limits, see the [capability matrix](docs/capability-matrix.md).
 The [persistence recovery follow-up](docs/persistence-recovery.md) rejects
 incomplete or structurally corrupt storage and fixes truncation/restart behavior.
+Legacy `--persist` now syncs log and index files before atomically replacing
+hard-state metadata, then syncs the containing directory. It still lacks the
+checksummed whole-image format, persisted commit boundary and snapshot support
+of the durable backend.
 For new Linux stores, the opt-in [durable state backend](docs/durable-state.md)
 adds checksummed atomic publication with file and directory synchronization.
-The KV example selects it with `--durable`; legacy `--persist` is unchanged.
+The KV example selects it with `--durable`.
 The [strong-read follow-up](docs/strong-reads.md) requires a fresh majority for
 `--consistent` reads and rejects pending reads when their leadership term ends.
 The [leadership-expiration follow-up](docs/leadership-expiration.md) makes a

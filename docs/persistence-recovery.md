@@ -1,7 +1,8 @@
 # Persistence recovery validation: v0.1.0-alpha.2
 
 This follow-up closes unsafe recovery behavior in the original three-file
-TDiskState format. It is still experimental storage, not power-loss durability.
+TDiskState format. At this alpha.2 milestone, the format was still experimental
+and did not have a power-loss publication protocol.
 
 ## Fixed behavior
 
@@ -59,14 +60,15 @@ startup. Previously created empty or partial file sets are deliberately rejected
 
 Validation detects structural damage, not all corruption: there are no checksums
 or record generations, so a bit flip that leaves valid fields can go undetected.
-The three-file format still lacks fsync, atomic metadata publication, directory
-synchronization and a crash-safe replacement protocol. In-place updates can
-destroy an older valid version on power failure. This change rejects detectable
-damage rather than attempting speculative repair. This alpha.2 milestone
+A later durability follow-up adds ordered log/index synchronization, temporary
+hard-state metadata, atomic replacement and directory synchronization. Its
+deterministic process-crash test checks recovery before and after the rename; it
+does not substitute for hardware power-cut testing. This alpha.2 milestone
 predates the later durable-image crash-boundary tests, snapshot/compaction
 support, live joint membership and fresh-quorum read confirmation. Current
 limits are documented in [durable state](durable-state.md),
 [compaction](compaction.md), [live membership](configuration-entries.md) and
 [strong reads](strong-reads.md). The legacy three-file `TDiskState` backend
-still lacks power-loss durability; the strong-read protocol still does not
-claim end-to-end application linearizability.
+still lacks the durable backend's checksummed image, persisted commit boundary
+and snapshot support; the strong-read protocol still does not claim end-to-end
+application linearizability.
