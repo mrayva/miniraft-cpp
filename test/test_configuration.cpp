@@ -211,6 +211,13 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
     const auto encodedStableImage = EncodeSnapshot(stableImage);
     assert_true(encodedStableImage.substr(0, 8) == "MRFTS010");
     assert_true(DecodeSnapshot(encodedStableImage) == stableImage);
+    const auto legacyPeerStableEncoding = PrepareSnapshotEncoding(
+        stableImage, TSnapshot::MaxExtendedConfigurationTransitions);
+    std::string legacyPeerStableImage(SnapshotEncodingSize(*legacyPeerStableEncoding), '\0');
+    CopySnapshotEncodingRange(stableImage, *legacyPeerStableEncoding, 0,
+        legacyPeerStableImage.data(), legacyPeerStableImage.size());
+    assert_true(legacyPeerStableImage.substr(0, 8) == "MRFTS008");
+    assert_int_equal(DecodeSnapshot(legacyPeerStableImage).ConfigurationTransitions.size(), 256);
     auto legacyHistoryImage = encodedStableImage;
     memcpy(legacyHistoryImage.data(), "MRFTS006", 8);
     const auto legacyChecksum = NSnapshotCodec::Checksum(
@@ -311,6 +318,13 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
     assert_true(encodedJointImage.substr(0, 8) == "MRFTS011");
     assert_int_equal(jointImage.ConfigurationTransitions.size(), TSnapshot::MaxConfigurationTransitions);
     assert_true(DecodeSnapshot(encodedJointImage) == jointImage);
+    const auto legacyPeerJointEncoding = PrepareSnapshotEncoding(
+        jointImage, TSnapshot::MaxExtendedConfigurationTransitions);
+    std::string legacyPeerJointImage(SnapshotEncodingSize(*legacyPeerJointEncoding), '\0');
+    CopySnapshotEncodingRange(jointImage, *legacyPeerJointEncoding, 0,
+        legacyPeerJointImage.data(), legacyPeerJointImage.size());
+    assert_true(legacyPeerJointImage.substr(0, 8) == "MRFTS009");
+    assert_int_equal(DecodeSnapshot(legacyPeerJointImage).ConfigurationTransitions.size(), 256);
 
     // Exercise MRFTS011 through the runtime metadata probe and fresh-learner
     // install path, not only through the standalone codec.

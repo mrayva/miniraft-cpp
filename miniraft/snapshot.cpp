@@ -273,12 +273,14 @@ void CheckLocalLog(const TSnapshot& snapshot, const TRaft& raft,
         throw std::runtime_error("Snapshot does not match retained log and active configuration");
 }
 
-std::string EncodeSnapshotMetadata(const TSnapshot& snapshot) {
-    const bool extendedHistory = snapshot.ConfigurationTransitions.size() >
+std::string EncodeSnapshotMetadata(const TSnapshot& snapshot, size_t maxConfigurationTransitions) {
+    const auto transitionCount = std::min(snapshot.ConfigurationTransitions.size(), maxConfigurationTransitions);
+    const auto firstTransition = snapshot.ConfigurationTransitions.size() - transitionCount;
+    const bool extendedHistory = transitionCount >
         TSnapshot::MaxLegacyConfigurationTransitions;
-    const bool largeHistory = snapshot.ConfigurationTransitions.size() >
+    const bool largeHistory = transitionCount >
         TSnapshot::MaxExtendedConfigurationTransitions;
-    std::string out(!snapshot.ConfigurationTransitions.empty()
+    std::string out(transitionCount
         ? (snapshot.StableConfiguration
             ? (largeHistory ? StableLargeHistoryMagic : extendedHistory ? StableExtendedHistoryMagic : StableHistoryMagic)
             : (largeHistory ? JointLargeHistoryMagic : extendedHistory ? JointExtendedHistoryMagic : JointHistoryMagic))
@@ -304,9 +306,10 @@ std::string EncodeSnapshotMetadata(const TSnapshot& snapshot) {
     for (auto voter : snapshot.Voters) Put(out, voter, 4);
     for (auto voter : snapshot.JointVoters) Put(out, voter, 4);
     for (auto voter : snapshot.PreviousVoters) Put(out, voter, 4);
-    if (!snapshot.ConfigurationTransitions.empty()) {
-        Put(out, snapshot.ConfigurationTransitions.size(), 4);
-        for (const auto& transition : snapshot.ConfigurationTransitions) {
+    if (transitionCount) {
+        Put(out, transitionCount, 4);
+        for (size_t i = firstTransition; i < snapshot.ConfigurationTransitions.size(); ++i) {
+            const auto& transition = snapshot.ConfigurationTransitions[i];
             Put(out, transition.PreviousConfigurationIndex, 8);
             Put(out, transition.PreviousConfigurationTerm, 8);
             Put(out, transition.JointIndex, 8);
@@ -402,9 +405,16 @@ std::string EncodeSnapshot(const TSnapshot& snapshot) {
 }
 
 std::shared_ptr<const TSnapshotEncoding> PrepareSnapshotEncoding(const TSnapshot& snapshot) {
+    return PrepareSnapshotEncoding(snapshot, TSnapshot::MaxConfigurationTransitions);
+}
+
+std::shared_ptr<const TSnapshotEncoding> PrepareSnapshotEncoding(
+        const TSnapshot& snapshot, size_t maxConfigurationTransitions) {
+    if (maxConfigurationTransitions > TSnapshot::MaxConfigurationTransitions)
+        throw std::invalid_argument("Snapshot history encoding limit exceeds the supported maximum");
     Validate(snapshot);
     auto encoding = std::make_shared<TSnapshotEncoding>();
-    encoding->Metadata = EncodeSnapshotMetadata(snapshot);
+    encoding->Metadata = EncodeSnapshotMetadata(snapshot, maxConfigurationTransitions);
     encoding->TotalBytes = encoding->Metadata.size() + snapshot.Data.size() + 4;
     if (encoding->TotalBytes > TSnapshot::MaxBytes)
         throw std::runtime_error("Snapshot exceeds size limit");

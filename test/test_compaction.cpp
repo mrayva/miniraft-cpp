@@ -152,6 +152,80 @@ struct TCluster {
         Deliver(response); return response;
     }
 };
+void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
+    const std::vector<uint32_t> stableVoters{1}, addedVoters{1, 2};
+    auto history = TConfigurationHistory::Stable(stableVoters, 0, 0, 0, 0);
+    auto ordinary = NewHoldedMessage<TLogEntry>();
+    ordinary->Term = 1;
+    history = history.Observe(1, ordinary);
+    for (size_t transition = 0; transition < 258; ++transition) {
+        const auto jointIndex = history.ThroughIndex() + 1;
+        const auto& oldVoters = history.OldVoters();
+        const auto& newVoters = oldVoters == stableVoters ? addedVoters : stableVoters;
+        TConfigurationRecord record{EConfigurationPhase::Joint, 2,
+            history.ConfigurationIndex(), history.ConfigurationTerm(), oldVoters, newVoters};
+        history = history.Advance(jointIndex, EncodeConfigurationEntry(record));
+        record.Phase = EConfigurationPhase::Stable;
+        record.PreviousIndex = jointIndex;
+        record.PreviousTerm = 2;
+        history = history.Advance(jointIndex + 1, EncodeConfigurationEntry(record));
+    }
+    const auto snapshot = history.MakeSnapshot("negotiated history image");
+    assert_int_equal(snapshot.ConfigurationTransitions.size(), 258);
+    assert_true(snapshot.StableConfiguration);
+
+    auto state = std::make_shared<TState>();
+    state->BindVoters(stableVoters);
+    state->CurrentTerm = snapshot.Term;
+    state->Commit();
+    state->InstallSnapshot(snapshot);
+
+    std::shared_ptr<TRaft> raft;
+    ITimeSource::Time now{};
+    std::unordered_map<uint32_t, TMessageHolder<TInstallSnapshotRequest>> sentSnapshots;
+    TNodeDict peers;
+    for (const auto [id, supportsFullHistory] : {std::pair{2u, true}, std::pair{3u, false}}) {
+        peers.emplace(id, std::make_shared<TEndpoint>([&, id, supportsFullHistory](auto message) {
+            if (message->Type == uint32_t(EMessageType::APPEND_ENTRIES_REQUEST)) {
+                auto append = message.template Cast<TAppendEntriesRequest>();
+                uint32_t features = TAppendEntriesResponse::SupportsConfigurationBarrier;
+                if (supportsFullHistory) features |= TAppendEntriesResponse::SupportsSnapshotHistory1024;
+                auto response = NewHoldedMessage(
+                    TMessageEx{.Src = id, .Dst = 1, .Term = append->Term, .Seqno = append->Seqno},
+                    TAppendEntriesResponse{.MatchIndex = 0, .Success = 0, .Padding = features});
+                raft->Process(now, std::move(response));
+            } else if (message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_REQUEST)) {
+                sentSnapshots.try_emplace(id, message.template Cast<TInstallSnapshotRequest>());
+            }
+        }));
+    }
+    raft = std::make_shared<TRaft>(state, 1, peers, std::vector<uint32_t>{2, 3});
+    for (unsigned attempt = 0; attempt < 30 && sentSnapshots.size() != 2; ++attempt) {
+        now += std::chrono::seconds(1);
+        raft->ProcessTimeout(now);
+    }
+
+    assert_int_equal(raft->CurrentStateName(), EState::LEADER);
+    assert_true(raft->GetVolatileState()->PeerCapabilities.at(2).SnapshotHistory1024);
+    assert_false(raft->GetVolatileState()->PeerCapabilities.at(3).SnapshotHistory1024);
+    assert_true(sentSnapshots.contains(2));
+    assert_true(sentSnapshots.contains(3));
+    for (const auto id : {2u, 3u}) {
+        auto request = sentSnapshots.at(id);
+        assert_true(request->Done);
+        const std::string wire(request->Data, request->Len - sizeof(TInstallSnapshotRequest));
+        const auto decoded = DecodeSnapshot(wire);
+        if (id == 2) {
+            assert_true(wire.substr(0, 8) == "MRFTS010");
+            assert_int_equal(decoded.ConfigurationTransitions.size(), 258);
+        } else {
+            assert_true(wire.substr(0, 8) == "MRFTS008");
+            assert_int_equal(decoded.ConfigurationTransitions.size(), 256);
+            assert_true(std::equal(decoded.ConfigurationTransitions.begin(), decoded.ConfigurationTransitions.end(),
+                snapshot.ConfigurationTransitions.end() - 256));
+        }
+    }
+}
 void test_compaction_lagging_follower_installs_snapshot_then_tail(void**) {
     TCluster cluster; cluster.Prepare();
     const auto boundary = cluster.Nodes[0]->GetState()->SnapshotIndex;
@@ -1130,6 +1204,7 @@ void test_durable_v4_semantic_corruption_rejects_without_rewriting(void**) {
 int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_kv_snapshot_precomputes_size_without_changing_encoding),
+        cmocka_unit_test(test_snapshot_history_encoding_is_negotiated_per_peer),
         cmocka_unit_test(test_snapshot_install_accepts_every_small_fixed_chunk_size),
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),
         cmocka_unit_test(test_simultaneous_startup_candidates_use_distinct_election_deadlines),

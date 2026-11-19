@@ -248,9 +248,15 @@ void test_configuration_barrier_rpc_roundtrip(void**) {
     auto response = NewHoldedMessage(
         TMessageEx{.Src = 2, .Dst = 1, .Term = 3, .Seqno = 9},
         TConfigurationBarrierResponse{.ConfigurationIndex = 12, .ConfigurationTerm = 2, .Accepted = 1});
+    const auto features = TAppendEntriesResponse::SupportsConfigurationBarrier |
+        TAppendEntriesResponse::SupportsSnapshotHistory1024;
+    auto appendResponse = NewHoldedMessage(
+        TMessageEx{.Src = 2, .Dst = 1, .Term = 3, .Seqno = 10},
+        TAppendEntriesResponse{.MatchIndex = 12, .Success = 1, .Padding = features});
     TStream stream; stream.Chunk = 1;
     TMessageWriter(stream).Write(request).await_resume();
     TMessageWriter(stream).Write(response).await_resume();
+    TMessageWriter(stream).Write(appendResponse).await_resume();
     stream.Bytes = stream.Output;
     auto receivedRequest = Read(stream);
     assert_true(receivedRequest.IsEx());
@@ -262,6 +268,8 @@ void test_configuration_barrier_rpc_roundtrip(void**) {
     auto ack = receivedResponse.Cast<TConfigurationBarrierResponse>();
     assert_true(ack->Accepted);
     assert_int_equal(ack->ConfigurationTerm, 2);
+    auto receivedAppendResponse = Read(stream).Cast<TAppendEntriesResponse>();
+    assert_int_equal(receivedAppendResponse->Padding, features);
     assert_int_equal(stream.Position, stream.Bytes.size());
 }
 }

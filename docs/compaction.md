@@ -170,8 +170,10 @@ leader removal and corresponding quorum/read changes were added in later
 follow-ups ([live membership](configuration-entries.md) and
 [leadership transfer](leadership-transfer.md)). All participating
 applications/backends must support snapshots before
-compaction is enabled; no capability negotiation is implemented. Asynchronous/COW
-capture, disk-streamed transfer, bounded transport queues, total heap quotas,
+compaction is enabled. AppendEntries feature bits negotiate only the
+1,024-transition history encoding; there is no general snapshot capability
+negotiation. Asynchronous/COW capture, disk-streamed transfer, bounded
+transport queues, total heap quotas,
 cluster/store authentication and independent review remain open.
 The conservative backend still rewrites the entire snapshot and retained suffix
 on each update, and capture/publication runs synchronously on the event loop.

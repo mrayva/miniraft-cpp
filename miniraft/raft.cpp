@@ -1253,7 +1253,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             TAppendEntriesResponse {
                 .MatchIndex = 0,
                 .Success = false,
-                .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier,
+                .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier |
+                    TAppendEntriesResponse::SupportsSnapshotHistory1024,
             });
         (void)Nodes[reply->Dst]->TrySend(std::move(reply));
         return;
@@ -1346,7 +1347,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
         TAppendEntriesResponse {
             .MatchIndex = matchIndex,
             .Success = success,
-            .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier,
+            .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier |
+                TAppendEntriesResponse::SupportsSnapshotHistory1024,
         });
 
     AdvanceCommitIndex(commitIndex);
@@ -1384,6 +1386,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
         capabilities.AppendAckSeqno = message->Seqno;
         capabilities.ConfigurationBarrier =
             message->Padding & TAppendEntriesResponse::SupportsConfigurationBarrier;
+        capabilities.SnapshotHistory1024 =
+            message->Padding & TAppendEntriesResponse::SupportsSnapshotHistory1024;
     }
     const auto acknowledgedLeaderCommit = request->LeaderCommit;
     // A newer response supersedes older RPCs. Reordered/duplicate failures
@@ -1571,6 +1575,8 @@ void TRaft::Process(ITimeSource::Time now, TMessageHolder<TMessage> message, con
             VolatileState->SnapshotRpcs.clear();
             EncodedSnapshot.reset();
             EncodedSnapshotIndex = 0;
+            EncodedSnapshotExtendedHistory.reset();
+            EncodedSnapshotExtendedHistoryIndex = 0;
             VolatileState->LeaderId = 0;
             if (VolatileState->ElectionDue <= now || VolatileState->ElectionDue == ITimeSource::Max) {
                 VolatileState->ElectionDue = MakeElection(now);
@@ -2530,7 +2536,9 @@ TSnapshot TRaft::Compact() {
     // Outstanding transfers own their immutable encoding metadata; discard any
     // otherwise-retained metadata for the old local snapshot.
     EncodedSnapshot.reset();
+    EncodedSnapshotExtendedHistory.reset();
     EncodedSnapshotIndex = 0;
+    EncodedSnapshotExtendedHistoryIndex = 0;
     return snapshot;
 }
 
@@ -2542,11 +2550,28 @@ TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t no
     if (!rpc.Snapshot) {
         auto snapshot = State->GetSnapshot();
         if (!snapshot) throw std::logic_error("Missing snapshot for compacted log");
-        if (EncodedSnapshotIndex != snapshot->Index) {
-            EncodedSnapshot = PrepareSnapshotEncoding(*snapshot);
-            EncodedSnapshotIndex = snapshot->Index;
+        const auto capability = VolatileState->PeerCapabilities.find(nodeId);
+        const bool supportsFullHistory = capability != VolatileState->PeerCapabilities.end() &&
+            capability->second.SnapshotHistory1024;
+        std::shared_ptr<const TSnapshotEncoding> encoding;
+        if (!supportsFullHistory && snapshot->ConfigurationTransitions.size() >
+                TSnapshot::MaxExtendedConfigurationTransitions) {
+            // Peers predating the 1,024-transition encoding receive its newest
+            // 256-edge suffix in the compatible MRFTS008/MRFTS009 format.
+            if (EncodedSnapshotExtendedHistoryIndex != snapshot->Index) {
+                EncodedSnapshotExtendedHistory = PrepareSnapshotEncoding(
+                    *snapshot, TSnapshot::MaxExtendedConfigurationTransitions);
+                EncodedSnapshotExtendedHistoryIndex = snapshot->Index;
+            }
+            encoding = EncodedSnapshotExtendedHistory;
+        } else {
+            if (EncodedSnapshotIndex != snapshot->Index) {
+                EncodedSnapshot = PrepareSnapshotEncoding(*snapshot);
+                EncodedSnapshotIndex = snapshot->Index;
+            }
+            encoding = EncodedSnapshot;
         }
-        rpc = TVolatileState::TSnapshotRpc{snapshot, EncodedSnapshot};
+        rpc = TVolatileState::TSnapshotRpc{snapshot, std::move(encoding)};
         VolatileState->PendingAppendRpcs[nodeId].clear();
     }
     // Pin one immutable image until this peer finishes. Periodic compaction

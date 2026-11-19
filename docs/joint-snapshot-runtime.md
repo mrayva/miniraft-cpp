@@ -106,9 +106,11 @@ to that configuration, then checks the complete image and CRC before storage or
 application replacement. Metadata does not authenticate a peer or prove each
 historical transition committed; this path retains the Raft trusted-leader and
 crash-fault assumptions. MRFTS006/MRFTS007 are limited to 32 transitions;
-MRFTS008/MRFTS009 carry up to 256; MRFTS010/MRFTS011 carry up to 1,024. All
-voters must understand MRFTS004 through MRFTS011 before using these lineage
-snapshots; older versions reject the new formats.
+MRFTS008/MRFTS009 carry up to 256; MRFTS010/MRFTS011 carry up to 1,024. The
+leader uses the latter only after a peer advertises the capability in an
+AppendEntries response. Other peers receive the newest 256-transition suffix;
+they can recover only if their trusted anchor appears within it. Peers that do
+not understand MRFTS008/MRFTS009 still require a compatible upgrade.
 
 Before publishing an installed image, the receiver also checks that it has a
 local replication target for every voter in the snapshot's active configuration.

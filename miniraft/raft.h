@@ -117,7 +117,7 @@ struct TVolatileState {
     std::unordered_map<uint32_t, ITimeSource::Time> ConfigurationBarrierAckDue;
     struct TPeerCapabilities {
         uint64_t AppendAckSeqno = 0;
-        bool ConfigurationBarrier = false;
+        bool ConfigurationBarrier = false, SnapshotHistory1024 = false;
     };
     std::unordered_map<uint32_t, TPeerCapabilities> PeerCapabilities;
     struct TLeadershipTransfer {
@@ -389,6 +389,8 @@ private:
     std::optional<TIncomingSnapshot> IncomingSnapshot;
     std::shared_ptr<const TSnapshotEncoding> EncodedSnapshot;
     uint64_t EncodedSnapshotIndex = 0;
+    std::shared_ptr<const TSnapshotEncoding> EncodedSnapshotExtendedHistory;
+    uint64_t EncodedSnapshotExtendedHistoryIndex = 0;
 
     EState StateName;
     uint32_t Seed = 31337;
