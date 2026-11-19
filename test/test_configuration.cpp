@@ -218,6 +218,16 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
         legacyPeerStableImage.data(), legacyPeerStableImage.size());
     assert_true(legacyPeerStableImage.substr(0, 8) == "MRFTS008");
     assert_int_equal(DecodeSnapshot(legacyPeerStableImage).ConfigurationTransitions.size(), 256);
+    const auto olderPeerStableEncoding = PrepareSnapshotEncoding(
+        stableImage, TSnapshot::MaxLegacyConfigurationTransitions);
+    std::string olderPeerStableImage(SnapshotEncodingSize(*olderPeerStableEncoding), '\0');
+    CopySnapshotEncodingRange(stableImage, *olderPeerStableEncoding, 0,
+        olderPeerStableImage.data(), olderPeerStableImage.size());
+    const auto decodedOlderStable = DecodeSnapshot(olderPeerStableImage);
+    assert_true(olderPeerStableImage.substr(0, 8) == "MRFTS006");
+    assert_int_equal(decodedOlderStable.ConfigurationTransitions.size(), 32);
+    assert_true(std::equal(decodedOlderStable.ConfigurationTransitions.begin(),
+        decodedOlderStable.ConfigurationTransitions.end(), stableImage.ConfigurationTransitions.end() - 32));
     auto legacyHistoryImage = encodedStableImage;
     memcpy(legacyHistoryImage.data(), "MRFTS006", 8);
     const auto legacyChecksum = NSnapshotCodec::Checksum(
@@ -325,6 +335,16 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
         legacyPeerJointImage.data(), legacyPeerJointImage.size());
     assert_true(legacyPeerJointImage.substr(0, 8) == "MRFTS009");
     assert_int_equal(DecodeSnapshot(legacyPeerJointImage).ConfigurationTransitions.size(), 256);
+    const auto olderPeerJointEncoding = PrepareSnapshotEncoding(
+        jointImage, TSnapshot::MaxLegacyConfigurationTransitions);
+    std::string olderPeerJointImage(SnapshotEncodingSize(*olderPeerJointEncoding), '\0');
+    CopySnapshotEncodingRange(jointImage, *olderPeerJointEncoding, 0,
+        olderPeerJointImage.data(), olderPeerJointImage.size());
+    const auto decodedOlderJoint = DecodeSnapshot(olderPeerJointImage);
+    assert_true(olderPeerJointImage.substr(0, 8) == "MRFTS007");
+    assert_int_equal(decodedOlderJoint.ConfigurationTransitions.size(), 32);
+    assert_true(std::equal(decodedOlderJoint.ConfigurationTransitions.begin(),
+        decodedOlderJoint.ConfigurationTransitions.end(), jointImage.ConfigurationTransitions.end() - 32));
 
     // Exercise MRFTS011 through the runtime metadata probe and fresh-learner
     // install path, not only through the standalone codec.

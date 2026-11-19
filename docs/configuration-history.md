@@ -74,8 +74,9 @@ MRFTS007 remain limited to 32; MRFTS008/MRFTS009 carry up to 256, and
 MRFTS010/MRFTS011 carry longer chains. The runtime can use these chains for
 online stale-store recovery when a transition predecessor matches the
 receiver's trusted stable baseline. AppendEntries responses advertise support
-for MRFTS010/MRFTS011; peers without that capability receive the newest 256
-transitions in MRFTS008/MRFTS009 and need an anchor within that suffix. Stable
+for 32-, 256- and 1,024-transition history formats; the leader chooses the
+highest advertised level, with unadvertised peers capped at 32 transitions.
+They need an anchor within the transmitted suffix. Stable
 images require the sender in both voter sets for every transition after that
 anchor. A joint image
 requires this for completed transitions and accepts a sender from either side

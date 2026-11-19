@@ -1254,6 +1254,7 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
                 .MatchIndex = 0,
                 .Success = false,
                 .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier |
+                    TAppendEntriesResponse::SupportsSnapshotHistory256 |
                     TAppendEntriesResponse::SupportsSnapshotHistory1024,
             });
         (void)Nodes[reply->Dst]->TrySend(std::move(reply));
@@ -1348,6 +1349,7 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             .MatchIndex = matchIndex,
             .Success = success,
             .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier |
+                TAppendEntriesResponse::SupportsSnapshotHistory256 |
                 TAppendEntriesResponse::SupportsSnapshotHistory1024,
         });
 
@@ -1386,6 +1388,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
         capabilities.AppendAckSeqno = message->Seqno;
         capabilities.ConfigurationBarrier =
             message->Padding & TAppendEntriesResponse::SupportsConfigurationBarrier;
+        capabilities.SnapshotHistory256 =
+            message->Padding & TAppendEntriesResponse::SupportsSnapshotHistory256;
         capabilities.SnapshotHistory1024 =
             message->Padding & TAppendEntriesResponse::SupportsSnapshotHistory1024;
     }
@@ -1577,6 +1581,8 @@ void TRaft::Process(ITimeSource::Time now, TMessageHolder<TMessage> message, con
             EncodedSnapshotIndex = 0;
             EncodedSnapshotExtendedHistory.reset();
             EncodedSnapshotExtendedHistoryIndex = 0;
+            EncodedSnapshotLegacyHistory.reset();
+            EncodedSnapshotLegacyHistoryIndex = 0;
             VolatileState->LeaderId = 0;
             if (VolatileState->ElectionDue <= now || VolatileState->ElectionDue == ITimeSource::Max) {
                 VolatileState->ElectionDue = MakeElection(now);
@@ -2537,8 +2543,10 @@ TSnapshot TRaft::Compact() {
     // otherwise-retained metadata for the old local snapshot.
     EncodedSnapshot.reset();
     EncodedSnapshotExtendedHistory.reset();
+    EncodedSnapshotLegacyHistory.reset();
     EncodedSnapshotIndex = 0;
     EncodedSnapshotExtendedHistoryIndex = 0;
+    EncodedSnapshotLegacyHistoryIndex = 0;
     return snapshot;
 }
 
@@ -2553,17 +2561,30 @@ TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t no
         const auto capability = VolatileState->PeerCapabilities.find(nodeId);
         const bool supportsFullHistory = capability != VolatileState->PeerCapabilities.end() &&
             capability->second.SnapshotHistory1024;
+        const bool supportsExtendedHistory = supportsFullHistory ||
+            (capability != VolatileState->PeerCapabilities.end() &&
+                capability->second.SnapshotHistory256);
         std::shared_ptr<const TSnapshotEncoding> encoding;
-        if (!supportsFullHistory && snapshot->ConfigurationTransitions.size() >
+        if (!supportsFullHistory && supportsExtendedHistory && snapshot->ConfigurationTransitions.size() >
                 TSnapshot::MaxExtendedConfigurationTransitions) {
-            // Peers predating the 1,024-transition encoding receive its newest
-            // 256-edge suffix in the compatible MRFTS008/MRFTS009 format.
+            // Peers with the 256-history feature receive its newest suffix in
+            // the compatible MRFTS008/MRFTS009 format.
             if (EncodedSnapshotExtendedHistoryIndex != snapshot->Index) {
                 EncodedSnapshotExtendedHistory = PrepareSnapshotEncoding(
                     *snapshot, TSnapshot::MaxExtendedConfigurationTransitions);
                 EncodedSnapshotExtendedHistoryIndex = snapshot->Index;
             }
             encoding = EncodedSnapshotExtendedHistory;
+        } else if (!supportsExtendedHistory && snapshot->ConfigurationTransitions.size() >
+                TSnapshot::MaxLegacyConfigurationTransitions) {
+            // Peers without a history capability get the original bounded
+            // MRFTS006/MRFTS007 suffix rather than an unreadable newer version.
+            if (EncodedSnapshotLegacyHistoryIndex != snapshot->Index) {
+                EncodedSnapshotLegacyHistory = PrepareSnapshotEncoding(
+                    *snapshot, TSnapshot::MaxLegacyConfigurationTransitions);
+                EncodedSnapshotLegacyHistoryIndex = snapshot->Index;
+            }
+            encoding = EncodedSnapshotLegacyHistory;
         } else {
             if (EncodedSnapshotIndex != snapshot->Index) {
                 EncodedSnapshot = PrepareSnapshotEncoding(*snapshot);

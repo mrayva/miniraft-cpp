@@ -128,6 +128,7 @@ struct TAppendEntriesResponse: public TMessageEx {
     static constexpr EMessageType MessageType = EMessageType::APPEND_ENTRIES_RESPONSE;
     static constexpr uint32_t SupportsConfigurationBarrier = 1u << 0;
     static constexpr uint32_t SupportsSnapshotHistory1024 = 1u << 1;
+    static constexpr uint32_t SupportsSnapshotHistory256 = 1u << 2;
     // Success: matched index. Failure: zero or a compacted-boundary probe hint;
     // a hint never advances MatchIndex or confirms a read.
     uint64_t MatchIndex;

@@ -132,11 +132,13 @@ old leader to finish that phase. The chain is checked before a higher term is
 accepted. Disjoint transitions and senders absent from a required set remain
 unsupported for online stale-store recovery; use a fresh learner or
 independently verified history. Snapshot metadata does not prove commitment by
-itself. AppendEntries responses advertise MRFTS010/MRFTS011 support. The leader
-sends the newest 256-transition suffix in MRFTS008/MRFTS009 to peers without
-that capability. Such a peer still needs a trusted anchor within that suffix;
-older nodes that do not support MRFTS008/MRFTS009 require a compatible upgrade
-before snapshot transfer.
+itself. AppendEntries responses advertise support for the 32-, 256- and
+1,024-transition snapshot-history formats. The leader sends the highest
+advertised format and caps its history to that format's limit. A peer without
+a history feature receives at most 32 transitions in MRFTS006/MRFTS007 and
+still needs a trusted anchor within that suffix. Nodes older than MRFTS006/
+MRFTS007 require a compatible upgrade before configuration-history snapshot
+transfer.
 
 Deterministic durable-store tests cover learner catch-up, voter addition and
 removal, leadership transfer and fallback when its request is dropped,

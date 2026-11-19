@@ -98,11 +98,13 @@ checks the boundary, fixed voters, and stable identity before that term update.
 The [configuration entry support](docs/configuration-entries.md) describes the
 live joint-to-stable transition API and snapshot catch-up across committed
 transitions. Joint snapshot transfer requires matching committed history.
-Snapshot peers advertise support for the 1,024-transition MRFTS010/MRFTS011
-formats in AppendEntries responses. A peer that does not advertise support
-receives the newest 256 transitions in MRFTS008/MRFTS009 instead; recovery may
-still require a fresh learner if its trusted history anchor predates that
-suffix. All peers must support the snapshot formats they receive.
+Snapshot peers advertise support for the 32-, 256- and 1,024-transition
+MRFTS006/007, MRFTS008/009 and MRFTS010/011 formats in AppendEntries
+responses. The leader selects the highest advertised level; a peer without a
+history feature receives at most 32 transitions in MRFTS006/MRFTS007. Recovery
+may still require a fresh learner if its trusted history anchor predates the
+transferred suffix. Peers older than MRFTS006/MRFTS007 need a compatible
+upgrade before receiving configuration-history snapshots.
 The [stable snapshot membership follow-up](docs/stable-snapshot-membership-install.md)
 documents the committed-history checks for snapshot transfer after a voter
 change.
@@ -143,9 +145,9 @@ stable voter set, its configuration identity, and the joint entry identity.
 MRFTS006 stable and MRFTS007 joint snapshots add a bounded chain of up to 32
 membership transitions. MRFTS008 stable and MRFTS009 joint snapshots extend
 that limit to 256 transitions; MRFTS010 stable and MRFTS011 joint snapshots
-extend it to 1,024 transitions when the peer advertises support. Otherwise,
-the sender caps the transfer at the newest 256 transitions. A nonempty stale
-store can recover across
+extend it to 1,024 transitions. The leader selects among these formats from
+the peer's advertised history level, capping an unadvertised peer at 32
+transitions. A nonempty stale store can recover across
 multiple compacted transitions when a transition in the chain matches its
 exact trusted stable configuration and the sender belongs to every old and new
 voter set in the suffix from that anchor. For a joint snapshot, the sender must belong to
@@ -158,7 +160,7 @@ a peer or prove commitment by themselves. MRFTS006/MRFTS007 remain capped at 32
 transitions; MRFTS008/MRFTS009 use the same payload with an explicit format
 version and a 256-transition cap; MRFTS010/MRFTS011 raise the cap to 1,024.
 The leader selects the history format from the peer's AppendEntries feature
-advertisement. A peer without the new feature receives a 256-transition suffix.
+advertisement and sends at most that format's history limit.
 The [durable configuration snapshot follow-up](docs/durable-configuration-snapshots.md)
 documents its voter-binding requirement and recovery boundary.
 The [trusted legacy voter binding follow-up](docs/trusted-legacy-voter-binding.md)
