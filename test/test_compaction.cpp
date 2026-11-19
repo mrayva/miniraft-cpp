@@ -415,6 +415,62 @@ TMessageHolder<TInstallSnapshotRequest> Chunk(const TSnapshot& snapshot, std::st
     message->Offset = offset; message->TotalBytes = bytes.size(); message->Done = offset + count == bytes.size();
     message->LeaderId = 1; memcpy(message->Data, bytes.data() + offset, count); return message;
 }
+void test_snapshot_install_accepts_every_small_fixed_chunk_size(void**) {
+    TKv source;
+    source.Write(source.Prepare(Command("key", "value")), 1);
+    const TSnapshot snapshot{1, 1, {1, 2}, source.SaveSnapshot()};
+    const auto bytes = EncodeSnapshot(snapshot);
+
+    for (uint32_t chunkSize = 1; chunkSize <= bytes.size(); ++chunkSize) {
+        auto state = std::make_shared<TState>();
+        state->CurrentTerm = 3;
+        state->Commit();
+        uint64_t nextOffset = 0;
+        size_t responses = 0;
+        bool success = false, installed = false;
+        auto peer = std::make_shared<TEndpoint>([&](auto message) {
+            if (message->Type != uint32_t(EMessageType::INSTALL_SNAPSHOT_RESPONSE)) return;
+            const auto response = message.template Cast<TInstallSnapshotResponse>();
+            nextOffset = response->NextOffset;
+            success = response->Success;
+            installed = response->Installed;
+            ++responses;
+        });
+        TNodeDict peers{{1, peer}};
+        auto raft = std::make_shared<TRaft>(state, 2, peers);
+        auto app = std::make_shared<TApplication>();
+        TRequestProcessor processor(raft, app, peers);
+
+        for (uint64_t offset = 0; offset < bytes.size();) {
+            const auto remaining = bytes.size() - offset;
+            const auto count = static_cast<uint32_t>(remaining < chunkSize ? remaining : chunkSize);
+            auto request = Chunk(snapshot, bytes, offset, count);
+            raft->Process({}, request);
+            assert_int_equal(responses, size_t(2 * (offset / chunkSize) + 1));
+            assert_true(success);
+            assert_int_equal(nextOffset, offset + count);
+
+            const bool final = offset + count == bytes.size();
+            assert_int_equal(installed, final);
+            if (!final) {
+                assert_int_equal(app->Loads, 0);
+                assert_int_equal(state->SnapshotIndex, 0);
+                // An exact retry of the most recent chunk is idempotent and
+                // returns the receiver's next contiguous offset.
+                const auto previousResponses = responses;
+                raft->Process({}, request);
+                assert_int_equal(responses, previousResponses + 1);
+                assert_true(success); assert_false(installed);
+                assert_int_equal(nextOffset, offset + count);
+            }
+            offset += count;
+        }
+        assert_int_equal(app->Loads, 1);
+        assert_int_equal(app->LastAppliedIndex, snapshot.Index);
+        assert_true(Read(*app, "key") == "value");
+        assert_true(*state->GetSnapshot() == snapshot);
+    }
+}
 void test_joint_snapshot_is_rejected_without_matching_history_even_if_boundary_is_covered(void**) {
     TKv source; source.Write(source.Prepare(Command("a", "old")), 5);
     TSnapshot fixed{5, 1, {1, 2}, source.SaveSnapshot()};
@@ -1070,6 +1126,7 @@ void test_durable_v4_semantic_corruption_rejects_without_rewriting(void**) {
 int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_kv_snapshot_precomputes_size_without_changing_encoding),
+        cmocka_unit_test(test_snapshot_install_accepts_every_small_fixed_chunk_size),
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),
         cmocka_unit_test(test_simultaneous_startup_candidates_use_distinct_election_deadlines),
         cmocka_unit_test(test_partial_transfer_restart_and_delayed_ack_are_safe),
