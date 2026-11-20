@@ -159,9 +159,12 @@ capacity changes before proposing.
   membership schedules, model/history checking, broad parser fuzzing, workload
   benchmarks and operational metrics remain gaps. Current CI includes Debug,
   Release and ASan/UBSan jobs; it does not establish those additional claims.
-- CMake builds the library but has no first-party install/export package
-  contract. Several milestone documents describe historical limits that later
-  work superseded; a single current capability/recovery matrix would help.
+- Follow-up: CMake now installs and exports the core library as
+  `miniraft::miniraft`, including public headers and its C++20 requirement. A
+  Release install and independent downstream configure/build were verified.
+  The optional built-in network server is not part of this package. Several
+  milestone documents describe historical limits that later work superseded;
+  a single current capability/recovery matrix would help.
 
 ## Comparison with NuRaft
 
