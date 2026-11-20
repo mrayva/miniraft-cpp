@@ -58,11 +58,13 @@ Recovery rejection requires restoring verified state or deliberately rebuilding
 the node through a safe cluster procedure; never delete metadata alone to force
 startup. Previously created empty or partial file sets are deliberately rejected.
 
-Validation detects structural damage, not all corruption. Versioned
-`TDiskState` metadata has a CRC32, but its log and index records have no
-checksums or record generations, so a bit flip that leaves valid fields can go
-undetected. A later durability follow-up adds ordered log/index
-synchronization, temporary hard-state metadata, atomic replacement and directory synchronization. Its
+Validation detects structural damage, not all corruption. Fresh `TDiskState`
+stores use MRFTL002 with CRC32 for hard-state metadata, log
+entries and index offsets. MRFTL001 and old split files remain readable; their
+existing log/index records have no checksums or record generations, so a bit
+flip that leaves valid fields can go undetected. A later durability follow-up
+adds ordered log/index synchronization, temporary hard-state metadata, atomic
+replacement and directory synchronization. Its
 deterministic process-crash test checks recovery before and after the rename; it
 does not substitute for hardware power-cut testing. This alpha.2 milestone
 predates the later durable-image crash-boundary tests, snapshot/compaction

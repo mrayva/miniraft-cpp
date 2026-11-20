@@ -39,11 +39,15 @@ private:
     bool Recovering = true;
     bool RecoveredStore = false;
     bool CommitIndexTrusted = true;
+    bool ChecksummedRecords = true;
     bool RaftStarted = false;
     [[noreturn]] void Fail(const char* message) const;
     std::fstream Open(const std::string& name, bool create);
     TMessageHolder<TMessage> Read() const;
     void Write(TMessageHolder<TMessage>);
+    uint64_t ReadOffset(uint64_t index) const;
+    void WriteOffset(uint64_t index, uint64_t offset);
+    uint64_t IndexRecordSize() const { return ChecksummedRecords ? 12 : sizeof(uint64_t); }
 
     std::string EntriesPath;
     std::string IndexPath;

@@ -51,8 +51,9 @@ design notes. This is a capability summary, not a production-readiness claim.
   its transition chain is disjoint from the sender's voter lineage.
 - An efficient WAL or group-commit storage path; `TDurableState` republishes a
   complete durable image synchronously on updates. Legacy `TDiskState` syncs
-  its log/index and atomically publishes versioned, checksummed hard-state
-  metadata, but its split log/index records still have no checksums.
+  its log/index and atomically publishes versioned hard-state metadata. Fresh
+  `TDiskState` stores checksum records; older split files and their record
+  encoding remain readable after trusted-baseline migration.
 
 The membership, compaction, transfer and legacy disk-publication paths have deterministic regression
 coverage described in their design notes. Joint-election tests also enumerate

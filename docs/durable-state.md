@@ -35,11 +35,13 @@ TDurableState is an opt-in storage backend with synchronous durable publication.
 It closes the missing file-sync and atomic-publication gap for new stores, under
 the filesystem assumptions below. Legacy `TDiskState` separately syncs its log
 and index before atomically replacing hard-state metadata. It retains the older
-split-file format and does not persist checksummed log or index records,
-snapshots or InstallSnapshot support. New `TDiskState` metadata is versioned and
-checksummed and includes the commit boundary and original voter binding. A
-recovered old 20-byte metadata record has neither value; it must be supplied
-through the trusted-baseline API before Raft startup.
+split-file format and does not support snapshots or InstallSnapshot. Fresh
+`TDiskState` stores use checksummed log/index records and MRFTL002 metadata that
+includes CRC32, the commit boundary and original voter binding. MRFTL001 and
+old 20-byte stores remain readable; after binding an old store, its existing
+records keep the unchecked legacy encoding. An old 20-byte metadata record has
+no commit boundary or voter binding; supply both through the trusted-baseline
+API before Raft startup.
 
 ## Publication protocol
 

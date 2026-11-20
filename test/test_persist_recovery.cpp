@@ -32,7 +32,38 @@ struct TFiles {
     }
     ~TFiles() { std::error_code ignored; fs::remove_all(Directory, ignored); }
     fs::path Path(const std::string& kind) const { return Name + "." + kind + ".1"; }
+    void DowngradeRecords(uint64_t lastIndex) {
+        std::ifstream entriesInput(Path("entries"), std::ios::binary);
+        std::string encodedEntries{std::istreambuf_iterator<char>(entriesInput), std::istreambuf_iterator<char>()};
+        std::string legacyEntries;
+        size_t entryOffset = 0;
+        for (uint64_t i = 0; i < lastIndex; ++i) {
+            assert_true(entryOffset + sizeof(TLogEntry) <= encodedEntries.size());
+            uint32_t len = 0;
+            memcpy(&len, encodedEntries.data() + entryOffset + sizeof(uint32_t), sizeof(len));
+            assert_true(entryOffset + len + sizeof(uint32_t) <= encodedEntries.size());
+            legacyEntries.append(encodedEntries, entryOffset, len);
+            entryOffset += size_t(len) + sizeof(uint32_t);
+        }
+        entriesInput.close();
+        Rewrite("entries", legacyEntries);
+
+        std::ifstream indexInput(Path("index"), std::ios::binary);
+        std::string encodedIndex{std::istreambuf_iterator<char>(indexInput), std::istreambuf_iterator<char>()};
+        std::string legacyIndex;
+        for (uint64_t i = 0; i < lastIndex; ++i) {
+            assert_true((i + 1) * 12 <= encodedIndex.size());
+            uint64_t offset = 0;
+            memcpy(&offset, encodedIndex.data() + size_t(i) * 12, sizeof(offset));
+            offset -= i * sizeof(uint32_t); // Remove each prior entry's CRC trailer.
+            legacyIndex.append(reinterpret_cast<const char*>(&offset), sizeof(offset));
+        }
+        indexInput.close();
+        Rewrite("index", legacyIndex);
+    }
     void WriteLegacyMetadata(uint64_t lastIndex, uint64_t term, uint32_t vote) {
+        DowngradeRecords(lastIndex);
+
         std::ofstream file(Path("state"), std::ios::binary | std::ios::trunc);
         file.write(reinterpret_cast<const char*>(&lastIndex), sizeof(lastIndex));
         file.write(reinterpret_cast<const char*>(&term), sizeof(term));
@@ -40,16 +71,103 @@ struct TFiles {
         file.flush();
         assert_true(bool(file));
     }
+    void WritePriorVersionedMetadata(uint64_t lastIndex, uint64_t term, uint32_t vote,
+            uint64_t commitIndex, const std::vector<uint32_t>& voters) {
+        DowngradeRecords(lastIndex);
+        std::string metadata;
+        NSnapshotCodec::Append(metadata, "MRFTL001");
+        NSnapshotCodec::Put(metadata, 1, 4);
+        NSnapshotCodec::Put(metadata, lastIndex, 8);
+        NSnapshotCodec::Put(metadata, term, 8);
+        NSnapshotCodec::Put(metadata, vote, 4);
+        NSnapshotCodec::Put(metadata, commitIndex, 8);
+        NSnapshotCodec::Put(metadata, voters.size(), 4);
+        NSnapshotCodec::Put(metadata, 1, 4); // Trusted commit boundary; no record CRC flag existed yet.
+        for (auto id : voters) NSnapshotCodec::Put(metadata, id, 4);
+        NSnapshotCodec::Put(metadata, NSnapshotCodec::Checksum(metadata), 4);
+        Rewrite("state", metadata);
+    }
     void RepairMetadataChecksum() {
         std::ifstream input(Path("state"), std::ios::binary);
         std::string bytes{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-        if (bytes.size() < 4 || bytes.substr(0, 8) != "MRFTL001") return;
+        if (bytes.size() < 4 ||
+            (bytes.substr(0, 8) != "MRFTL001" && bytes.substr(0, 8) != "MRFTL002")) return;
         const auto checksum = NSnapshotCodec::Checksum(std::string_view(bytes).substr(0, bytes.size() - 4));
         for (unsigned i = 0; i < 4; ++i) bytes[bytes.size() - 4 + i] = char(checksum >> (8 * i));
+        input.close();
         std::ofstream output(Path("state"), std::ios::binary | std::ios::trunc);
         output.write(bytes.data(), bytes.size());
         output.flush();
         assert_true(bool(output));
+    }
+    void Rewrite(const std::string& kind, const std::string& bytes) {
+        std::ofstream output(Path(kind), std::ios::binary | std::ios::trunc);
+        output.write(bytes.data(), bytes.size());
+        output.flush();
+        assert_true(bool(output));
+    }
+    void OverwriteEntry(uint64_t entryIndex, size_t fieldOffset, const void* value, size_t valueSize) {
+        std::ifstream input(Path("entries"), std::ios::binary);
+        std::string bytes{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+        size_t recordOffset = 0;
+        for (uint64_t i = 0; i < entryIndex; ++i) {
+            uint32_t len = 0;
+            assert_true(recordOffset + sizeof(uint32_t) * 2 <= bytes.size());
+            memcpy(&len, bytes.data() + recordOffset + sizeof(uint32_t), sizeof(len));
+            assert_true(len >= sizeof(TLogEntry));
+            recordOffset += size_t(len) + sizeof(uint32_t);
+            assert_true(recordOffset <= bytes.size());
+        }
+        uint32_t len = 0;
+        assert_true(recordOffset + sizeof(uint32_t) * 2 <= bytes.size());
+        memcpy(&len, bytes.data() + recordOffset + sizeof(uint32_t), sizeof(len));
+        assert_true(len >= sizeof(TLogEntry) && recordOffset + len + sizeof(uint32_t) <= bytes.size());
+        assert_true(fieldOffset <= len && valueSize <= len - fieldOffset);
+        memcpy(bytes.data() + recordOffset + fieldOffset, value, valueSize);
+        const auto checksum = NSnapshotCodec::Checksum(std::string_view(bytes).substr(recordOffset, len));
+        for (unsigned i = 0; i < 4; ++i) bytes[recordOffset + len + i] = char(checksum >> (8 * i));
+        input.close();
+        Rewrite("entries", bytes);
+    }
+    template<class T> void OverwriteEntry(uint64_t entryIndex, size_t fieldOffset, T value) {
+        OverwriteEntry(entryIndex, fieldOffset, &value, sizeof(value));
+    }
+    void OverwriteIndexOffset(uint64_t recordIndex, uint64_t offset) {
+        std::ifstream input(Path("index"), std::ios::binary);
+        std::string bytes{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+        const auto start = size_t(recordIndex) * 12;
+        assert_true(start + 12 <= bytes.size());
+        memcpy(bytes.data() + start, &offset, sizeof(offset));
+        const auto checksum = NSnapshotCodec::Checksum(std::string_view(bytes).substr(start, sizeof(offset)));
+        for (unsigned i = 0; i < 4; ++i) bytes[start + sizeof(offset) + i] = char(checksum >> (8 * i));
+        input.close();
+        Rewrite("index", bytes);
+    }
+    void CorruptEntryChecksum(uint64_t entryIndex) {
+        std::ifstream input(Path("entries"), std::ios::binary);
+        std::string bytes{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+        size_t recordOffset = 0;
+        for (uint64_t i = 0; i < entryIndex; ++i) {
+            uint32_t len = 0;
+            memcpy(&len, bytes.data() + recordOffset + sizeof(uint32_t), sizeof(len));
+            recordOffset += size_t(len) + sizeof(uint32_t);
+        }
+        uint32_t len = 0;
+        memcpy(&len, bytes.data() + recordOffset + sizeof(uint32_t), sizeof(len));
+        const auto checksumByte = recordOffset + len;
+        assert_true(checksumByte < bytes.size());
+        bytes[checksumByte] ^= 0x40;
+        input.close();
+        Rewrite("entries", bytes);
+    }
+    void CorruptIndexChecksum(uint64_t recordIndex) {
+        std::ifstream input(Path("index"), std::ios::binary);
+        std::string bytes{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+        const auto checksumByte = size_t(recordIndex) * 12 + sizeof(uint64_t);
+        assert_true(checksumByte < bytes.size());
+        bytes[checksumByte] ^= 0x40;
+        input.close();
+        Rewrite("index", bytes);
     }
     void CorruptMetadataChecksum() {
         std::fstream file(Path("state"), std::ios::in | std::ios::out | std::ios::binary);
@@ -125,6 +243,28 @@ void test_versioned_metadata_checksum_is_verified(void**) {
     files.CorruptMetadataChecksum();
     files.RejectRecovery();
 }
+void test_checksums_detect_log_and_index_record_corruption(void**) {
+    {
+        TFiles files;
+        files.Seed();
+        std::ifstream metadata(files.Path("state"), std::ios::binary);
+        std::string magic(8, '\0');
+        assert_true(bool(metadata.read(magic.data(), magic.size())));
+        assert_true(magic == "MRFTL002");
+        uint32_t flags = 0;
+        metadata.seekg(44);
+        assert_true(bool(metadata.read(reinterpret_cast<char*>(&flags), sizeof(flags))));
+        assert_true(flags & (1u << 1));
+        files.CorruptEntryChecksum(0);
+        files.RejectRecovery();
+    }
+    {
+        TFiles files;
+        files.Seed();
+        files.CorruptIndexChecksum(0);
+        files.RejectRecovery();
+    }
+}
 void test_versioned_metadata_persists_commit_and_voter_baseline(void**) {
     TFiles fresh;
     auto freshState = std::make_shared<TDiskState>(fresh.Name, 1);
@@ -152,6 +292,7 @@ void test_versioned_metadata_persists_commit_and_voter_baseline(void**) {
         assert_true(state.SupportsVoterBinding());
         assert_true(state.HasUnboundRecoveredState());
         assert_int_equal(state.CommitIndex, 0); // Old metadata had no commit boundary.
+        assert_int_equal(state.Get(1)->Term, 2); // Old entries and offsets remain readable.
         bool directBindRejected = false;
         try { state.BindVoters({1, 2, 3}); }
         catch (const std::exception&) { directBindRejected = true; }
@@ -166,6 +307,17 @@ void test_versioned_metadata_persists_commit_and_voter_baseline(void**) {
         assert_int_equal(state.CommitIndex, 1);
         assert_true(state.GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
         assert_false(state.HasUnboundRecoveredState());
+    }
+
+    TFiles priorVersioned;
+    priorVersioned.Seed();
+    priorVersioned.WritePriorVersionedMetadata(2, 7, 2, 1, {1, 2, 3});
+    {
+        TDiskState state(priorVersioned.Name, 1);
+        assert_int_equal(state.CommitIndex, 1);
+        assert_true(state.GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
+        assert_int_equal(state.Get(1)->Term, 2);
+        assert_int_equal(state.Get(2)->Term, 5);
     }
 
     TFiles configured;
@@ -208,32 +360,32 @@ void test_invalid_entry_header_is_rejected(void**) {
     for (uint32_t len : {0u, 7u, 8u, uint32_t(sizeof(TLogEntry) - 1), UINT32_MAX}) {
         TFiles files;
         files.Seed();
-        files.Overwrite("entries", sizeof(uint32_t), len);
+        files.OverwriteEntry(0, sizeof(uint32_t), len);
         files.RejectRecovery();
     }
     TFiles files;
     files.Seed();
-    files.Overwrite("entries", 0, uint32_t(EMessageType::COMMAND_REQUEST));
+    files.OverwriteEntry(0, 0, uint32_t(EMessageType::COMMAND_REQUEST));
     files.RejectRecovery();
 }
 void test_invalid_offsets_are_rejected(void**) {
     for (uint64_t offset : {uint64_t(0), uint64_t(1), UINT64_MAX}) {
         TFiles files;
         files.Seed();
-        files.Overwrite("index", sizeof(uint64_t), offset);
+        files.OverwriteIndexOffset(1, offset);
         files.RejectRecovery();
     }
 }
 void test_invalid_term_is_rejected(void**) {
     TFiles files;
     files.Seed();
-    files.Overwrite("state", sizeof(uint64_t), uint64_t(0));
+    files.Overwrite("state", 20, uint64_t(0));
     files.RejectRecovery();
 }
 void test_invalid_log_count_is_rejected(void**) {
     TFiles files;
     files.Seed();
-    files.Overwrite("state", 0, UINT64_MAX);
+    files.Overwrite("state", 12, UINT64_MAX);
     files.RejectRecovery();
 }
 void test_truncate_updates_last_term_and_restarts(void**) {
@@ -283,7 +435,7 @@ void test_zero_log_entry_terms_are_rejected_without_mutation(void**) {
     for (uint64_t index : {0, 1}) {
         TFiles files;
         files.Seed();
-        files.Overwrite("entries", index * sizeof(TLogEntry) + sizeof(TMessage), uint64_t(0));
+        files.OverwriteEntry(index, sizeof(TMessage), uint64_t(0));
         files.RejectRecovery();
     }
 }
@@ -291,19 +443,19 @@ void test_log_terms_newer_than_current_term_are_rejected(void**) {
     for (uint64_t term : {uint64_t(8), UINT64_MAX}) {
         TFiles files;
         files.Seed();
-        files.Overwrite("entries", sizeof(TLogEntry) + sizeof(TMessage), term);
+        files.OverwriteEntry(1, sizeof(TMessage), term);
         files.RejectRecovery();
     }
     TFiles files;
     files.Seed();
-    files.Overwrite("state", sizeof(uint64_t), uint64_t(4));
+    files.Overwrite("state", 20, uint64_t(4));
     files.RejectRecovery();
 }
 void test_decreasing_log_terms_are_rejected(void**) {
     for (uint64_t index : {0, 1}) {
         TFiles files;
         files.Seed();
-        files.Overwrite("entries", index * sizeof(TLogEntry) + sizeof(TMessage), uint64_t(index == 0 ? 6 : 1));
+        files.OverwriteEntry(index, sizeof(TMessage), uint64_t(index == 0 ? 6 : 1));
         files.RejectRecovery();
     }
 }
@@ -335,7 +487,7 @@ void test_invalid_terms_in_logically_removed_suffix_are_ignored(void**) {
         TDiskState state(files.Name, 1);
         state.RemoveLast();
     }
-    files.Overwrite("entries", sizeof(TLogEntry) + sizeof(TMessage), uint64_t(0));
+    files.OverwriteEntry(1, sizeof(TMessage), uint64_t(0));
     TDiskState recovered(files.Name, 1);
     assert_int_equal(recovered.LastLogIndex, 1);
     assert_int_equal(recovered.LastLogTerm, 2);
@@ -454,7 +606,7 @@ void test_live_invalid_log_term_is_fatal(void**) {
             std::set_terminate([] { _exit(73); });
             try {
                 TDiskState state(files.Name, 1);
-                files.Overwrite("entries", sizeof(TMessage), term);
+                files.OverwriteEntry(0, sizeof(TMessage), term);
                 state.Get(1);
             } catch (...) { _exit(74); }
             _exit(75);
@@ -474,6 +626,7 @@ int main() {
         cmocka_unit_test(test_truncated_metadata_is_not_reset),
         cmocka_unit_test(test_oversized_metadata_is_rejected),
         cmocka_unit_test(test_versioned_metadata_checksum_is_verified),
+        cmocka_unit_test(test_checksums_detect_log_and_index_record_corruption),
         cmocka_unit_test(test_versioned_metadata_persists_commit_and_voter_baseline),
         cmocka_unit_test(test_missing_storage_is_not_recreated),
         cmocka_unit_test(test_short_index_is_rejected),
