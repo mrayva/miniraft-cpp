@@ -21,8 +21,10 @@ active peer transfer, with sharing between transfers of the same image. The
 distinct image generations and defers further compaction until a transfer
 completes or becomes idle for 30 seconds without a successful chunk ACK. The
 idle timeout releases stalled pins so a dead peer cannot block compaction
-indefinitely. It does not add a byte quota for all Raft, application, transport
-and temporary snapshot memory, or a general transfer cancellation API.
+indefinitely. Incomplete incoming images share a 256 MiB process-wide budget by
+default. The budget does not include retained Raft or application state,
+outgoing images, capture buffers or transport memory, and no general transfer
+cancellation API is provided.
 
 A deterministic regression commits and compacts new data before every chunk ACK,
 including the final ACK, for both voter and learner receivers. The old code fails

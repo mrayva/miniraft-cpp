@@ -215,6 +215,9 @@ public:
         size_t ReservedControlEntries = 1;
         // Yield leadership after this long without a fresh voter quorum.
         std::chrono::milliseconds LeadershipExpiration = TTimeout::LeadershipExpiration;
+        // Shared by all Raft instances in a process by default. Supply one
+        // shared budget here to override the process-wide InstallSnapshot cap.
+        std::shared_ptr<TSnapshotInstallBudget> SnapshotInstallBudget;
     };
 
     // Nodes contains every configured replication peer; learners may include
@@ -395,6 +398,7 @@ private:
     int Nservers;
     std::shared_ptr<IState> State;
     TLogLimits LogLimits;
+    std::shared_ptr<TSnapshotInstallBudget> SnapshotInstallBudget;
     struct TUncommittedLogEntry { uint64_t Index; uint32_t Bytes; };
     std::deque<TUncommittedLogEntry> UncommittedLog;
     uint64_t UncommittedLogBytes = 0;
@@ -406,6 +410,7 @@ private:
         uint32_t Leader;
         ITimeSource::Time LastProgress;
         std::string Bytes;
+        std::shared_ptr<void> MemoryReservation;
     };
     std::optional<TIncomingSnapshot> IncomingSnapshot;
     std::shared_ptr<const TSnapshotEncoding> EncodedSnapshot;

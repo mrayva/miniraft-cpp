@@ -997,6 +997,8 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
     , Nservers(0)
     , State(std::move(state))
     , LogLimits(logLimits)
+    , SnapshotInstallBudget(LogLimits.SnapshotInstallBudget
+        ? LogLimits.SnapshotInstallBudget : TSnapshotInstallBudget::DefaultProcessBudget())
     , VolatileState(std::make_unique<TVolatileState>())
     , StateName(EState::FOLLOWER)
 {
@@ -2870,8 +2872,11 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     if (!same) {
         if (request->Offset != 0 || (IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
             IncomingSnapshot->Index > request->SnapshotIndex)) { reply(false, false, 0); return; }
+        IncomingSnapshot.reset(); // Release a superseded image before reserving its replacement.
+        auto reservation = SnapshotInstallBudget->TryReserve(request->TotalBytes);
+        if (!reservation) { reply(false, false, 0); return; }
         IncomingSnapshot = TIncomingSnapshot{request->Term, request->SnapshotIndex, request->SnapshotTerm,
-            request->TotalBytes, request->LeaderId, now, {}};
+            request->TotalBytes, request->LeaderId, now, {}, std::move(reservation)};
     }
     auto& bytes = IncomingSnapshot->Bytes;
     const auto count = request->Len - sizeof(TInstallSnapshotRequest);
@@ -2904,6 +2909,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     if (!probe.Supported) { IncomingSnapshot.reset(); reply(false, false, 0); return; }
     acceptLeaderContact();
     if (bytes.size() < request->TotalBytes) { reply(true, false, bytes.size()); return; }
+    auto installationReservation = std::move(IncomingSnapshot->MemoryReservation);
+    (void)installationReservation; // Hold the aggregate reservation through validation and publication.
     TSnapshot snapshot;
     try {
         snapshot = DecodeSnapshotOwned(std::move(IncomingSnapshot->Bytes));

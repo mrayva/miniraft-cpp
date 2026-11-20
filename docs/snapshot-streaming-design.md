@@ -14,6 +14,15 @@ application that does not implement the callback keeps the legacy post-capture
 size check. This preflight still uses complete in-memory images and does not
 change the 64 MiB limit.
 
+Incoming InstallSnapshot assemblies reserve their declared image size against
+a shared 256 MiB process-wide budget by default. Raft instances can share a
+custom `TSnapshotInstallBudget` through `TLogLimits`; a transfer that cannot
+reserve space is rejected at offset zero and can retry after capacity is
+released. Completion, rejection, term change and idle expiry release the
+reservation. This accounts for incomplete receive images only; retained
+snapshots, outgoing pins, capture buffers, application memory and transport
+buffers remain outside this budget.
+
 ## Why this needs a storage contract
 
 InstallSnapshot already sends bounded chunks, but the receiver assembles the

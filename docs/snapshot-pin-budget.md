@@ -23,10 +23,12 @@ fails without mutation, completes one transfer and verifies that compaction then
 succeeds while the other peer still owns its older image. Existing tests continue
 to verify catch-up progress under compaction during every chunk.
 
-This caps the number of distinct active transfer generations, not total process
-heap usage. Current application/log state, snapshot capture and installation,
-transport buffers and other allocations remain outside this limit; a global byte
-quota and disk-streamed snapshot transfer remain open. Voter membership changes
+This caps the number of distinct outgoing transfer generations, not total process
+heap usage. Incomplete incoming InstallSnapshot images also share a 256 MiB
+process-wide byte budget by default, configurable through a shared
+`TSnapshotInstallBudget`. Current application/log state, outgoing snapshots,
+snapshot capture, transport buffers and other allocations remain outside these
+limits; disk-streamed snapshot transfer remains open. Voter membership changes
 are available through [live membership](configuration-entries.md), with leader
 removal supported by [leadership transfer](leadership-transfer.md). This alpha.43
 milestone predates joint snapshot installation, which is now supported when the

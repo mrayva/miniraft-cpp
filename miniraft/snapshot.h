@@ -1,9 +1,13 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <exception>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <stdexcept>
+#include <utility>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -53,6 +57,68 @@ struct TSnapshot {
     bool HasConfigurationMetadata() const { return StableConfiguration || IsJoint(); }
     bool operator==(const TSnapshot&) const = default;
 };
+
+// Shares an aggregate byte limit across concurrent InstallSnapshot assemblies.
+// One process-wide instance is used by default; callers may provide a shared
+// custom budget through Raft limits when they need a different cap.
+class TSnapshotInstallBudget : public std::enable_shared_from_this<TSnapshotInstallBudget> {
+    class TReservation {
+    public:
+        TReservation(std::shared_ptr<TSnapshotInstallBudget> budget, uint64_t bytes)
+            : Budget(std::move(budget)), Bytes(bytes) { }
+        ~TReservation() { Budget->Release(Bytes); }
+    private:
+        std::shared_ptr<TSnapshotInstallBudget> Budget;
+        uint64_t Bytes;
+    };
+
+public:
+    static constexpr uint64_t DefaultMaxBytes = 256ULL * 1024 * 1024;
+
+    explicit TSnapshotInstallBudget(uint64_t maxBytes = DefaultMaxBytes)
+        : MaxBytes(maxBytes) {
+        if (!MaxBytes) throw std::invalid_argument("Snapshot install budget must be positive");
+    }
+
+    static std::shared_ptr<TSnapshotInstallBudget> DefaultProcessBudget() {
+        static auto budget = std::make_shared<TSnapshotInstallBudget>();
+        return budget;
+    }
+
+    std::shared_ptr<void> TryReserve(uint64_t bytes) {
+        if (!bytes) return {};
+        {
+            std::lock_guard lock(Mutex);
+            if (Used > MaxBytes || bytes > MaxBytes - Used) return {};
+            Used += bytes;
+        }
+        try {
+            return std::make_shared<TReservation>(shared_from_this(), bytes);
+        } catch (...) {
+            Release(bytes);
+            throw;
+        }
+    }
+
+    uint64_t UsedBytes() const {
+        std::lock_guard lock(Mutex);
+        return Used;
+    }
+
+    uint64_t LimitBytes() const { return MaxBytes; }
+
+private:
+    void Release(uint64_t bytes) noexcept {
+        std::lock_guard lock(Mutex);
+        if (bytes > Used) std::terminate();
+        Used -= bytes;
+    }
+
+    const uint64_t MaxBytes;
+    mutable std::mutex Mutex;
+    uint64_t Used = 0;
+};
+
 std::string EncodeSnapshot(const TSnapshot& snapshot);
 TSnapshot DecodeSnapshot(std::string_view bytes);
 // Reuses the input allocation for application data after the image checksum

@@ -684,6 +684,69 @@ void test_idle_snapshot_transfer_discards_partial_image_and_restarts(void**) {
     assert_int_equal(restartedAck->NextOffset,
         restarted->Offset + restarted->Len - sizeof(TInstallSnapshotRequest));
 }
+void test_snapshot_install_budget_is_shared_and_reclaimed_after_idle_expiry(void**) {
+    auto budget = std::make_shared<TSnapshotInstallBudget>(200);
+    TRaft::TLogLimits limits;
+    limits.SnapshotInstallBudget = budget;
+    std::vector<TMessageHolder<TMessage>> replies;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) { replies.push_back(std::move(message)); });
+    TNodeDict peers{{1, peer}};
+
+    auto raft2 = std::make_shared<TRaft>(std::make_shared<TState>(), 2, peers,
+        std::vector<uint32_t>{}, limits);
+    auto app2 = std::make_shared<TApplication>();
+    TRequestProcessor processor2(raft2, app2, peers);
+    auto raft3 = std::make_shared<TRaft>(std::make_shared<TState>(), 3, peers,
+        std::vector<uint32_t>{}, limits);
+    auto app3 = std::make_shared<TApplication>();
+    TRequestProcessor processor3(raft3, app3, peers);
+
+    auto request = [](uint32_t target) {
+        constexpr std::string_view prefix = "MRFT";
+        auto chunk = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + prefix.size());
+        chunk->Src = 1; chunk->Dst = target; chunk->Term = 1; chunk->Seqno = 1;
+        chunk->SnapshotIndex = 1; chunk->SnapshotTerm = 1;
+        chunk->TotalBytes = 128; chunk->Offset = 0; chunk->LeaderId = 1; chunk->Done = 0;
+        memcpy(chunk->Data, prefix.data(), prefix.size());
+        return chunk;
+    };
+
+    raft2->Process(ITimeSource::Time{}, request(2));
+    auto firstAck = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_true(firstAck->Success); assert_false(firstAck->Installed);
+    assert_int_equal(firstAck->NextOffset, 4);
+    assert_int_equal(budget->UsedBytes(), 128);
+
+    replies.clear();
+    raft3->Process(ITimeSource::Time{}, request(3));
+    auto overBudget = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_false(overBudget->Success); assert_false(overBudget->Installed);
+    assert_int_equal(overBudget->NextOffset, 0);
+    assert_int_equal(budget->UsedBytes(), 128);
+
+    const auto expiredAt = ITimeSource::Time{} + TTimeout::SnapshotTransferIdle;
+    raft2->ProcessTimeout(expiredAt);
+    assert_int_equal(budget->UsedBytes(), 0);
+    replies.clear();
+    raft3->Process(expiredAt, request(3));
+    auto retried = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_true(retried->Success); assert_false(retried->Installed);
+    assert_int_equal(retried->NextOffset, 4);
+    assert_int_equal(budget->UsedBytes(), 128);
+
+    TKv source;
+    const auto image = EncodeSnapshot(TSnapshot{1, 1, {1, 3}, source.SaveSnapshot()});
+    auto complete = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + image.size());
+    complete->Src = 1; complete->Dst = 3; complete->Term = 1; complete->Seqno = 2;
+    complete->SnapshotIndex = 1; complete->SnapshotTerm = 1;
+    complete->TotalBytes = image.size(); complete->Offset = 0; complete->LeaderId = 1; complete->Done = 1;
+    memcpy(complete->Data, image.data(), image.size());
+    replies.clear();
+    raft3->Process(expiredAt, complete);
+    auto installed = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_true(installed->Success); assert_true(installed->Installed);
+    assert_int_equal(budget->UsedBytes(), 0);
+}
 void test_snapshot_install_accepts_every_small_fixed_chunk_size(void**) {
     TKv source;
     source.Write(source.Prepare(Command("key", "value")), 1);
@@ -1455,6 +1518,7 @@ int main() {
         cmocka_unit_test(test_shared_compaction_reuses_storage_snapshot_image),
         cmocka_unit_test(test_snapshot_history_encoding_is_negotiated_per_peer),
         cmocka_unit_test(test_idle_snapshot_transfer_discards_partial_image_and_restarts),
+        cmocka_unit_test(test_snapshot_install_budget_is_shared_and_reclaimed_after_idle_expiry),
         cmocka_unit_test(test_snapshot_install_accepts_every_small_fixed_chunk_size),
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),
         cmocka_unit_test(test_simultaneous_startup_candidates_use_distinct_election_deadlines),
