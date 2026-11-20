@@ -575,6 +575,41 @@ TMessageHolder<TInstallSnapshotRequest> Chunk(const TSnapshot& snapshot, std::st
     message->Offset = offset; message->TotalBytes = bytes.size(); message->Done = offset + count == bytes.size();
     message->LeaderId = 1; memcpy(message->Data, bytes.data() + offset, count); return message;
 }
+void test_idle_snapshot_transfer_discards_partial_image_and_restarts(void**) {
+    TCluster cluster({3}); // Learners must also reclaim stalled transfers.
+    cluster.Prepare();
+
+    auto first = cluster.SendChunk();
+    cluster.Deliver(first);
+    auto firstAck = cluster.Take(3, 1, EMessageType::INSTALL_SNAPSHOT_RESPONSE)
+        .Cast<TInstallSnapshotResponse>();
+    assert_true(firstAck->Success);
+    assert_false(firstAck->Installed);
+    assert_true(firstAck->NextOffset > 0);
+    cluster.Deliver(firstAck);
+
+    auto next = cluster.SendChunk();
+    assert_int_equal(next->Offset, firstAck->NextOffset);
+    cluster.Now += TTimeout::SnapshotTransferIdle;
+    cluster.Nodes[2]->ProcessTimeout(cluster.Now);
+
+    cluster.Deliver(next);
+    auto expiredAck = cluster.Take(3, 1, EMessageType::INSTALL_SNAPSHOT_RESPONSE)
+        .Cast<TInstallSnapshotResponse>();
+    assert_false(expiredAck->Success);
+    assert_int_equal(expiredAck->NextOffset, 0);
+    cluster.Deliver(expiredAck);
+
+    auto restarted = cluster.SendChunk();
+    assert_int_equal(restarted->Offset, 0);
+    cluster.Deliver(restarted);
+    auto restartedAck = cluster.Take(3, 1, EMessageType::INSTALL_SNAPSHOT_RESPONSE)
+        .Cast<TInstallSnapshotResponse>();
+    assert_true(restartedAck->Success);
+    assert_false(restartedAck->Installed);
+    assert_int_equal(restartedAck->NextOffset,
+        restarted->Offset + restarted->Len - sizeof(TInstallSnapshotRequest));
+}
 void test_snapshot_install_accepts_every_small_fixed_chunk_size(void**) {
     TKv source;
     source.Write(source.Prepare(Command("key", "value")), 1);
@@ -1344,6 +1379,7 @@ int main() {
         cmocka_unit_test(test_kv_snapshot_precomputes_size_without_changing_encoding),
         cmocka_unit_test(test_snapshot_capture_preflights_application_size_bound),
         cmocka_unit_test(test_snapshot_history_encoding_is_negotiated_per_peer),
+        cmocka_unit_test(test_idle_snapshot_transfer_discards_partial_image_and_restarts),
         cmocka_unit_test(test_snapshot_install_accepts_every_small_fixed_chunk_size),
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),
         cmocka_unit_test(test_simultaneous_startup_candidates_use_distinct_election_deadlines),
