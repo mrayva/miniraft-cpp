@@ -17,8 +17,10 @@ entries generation is reclaimed. MRFTL003 stores remain readable; their old
 entries file is reclaimed at the next snapshot installation. MRFTL001,
 MRFTL002 and 20-byte metadata remain readable.
 The disk backend writes the encoded snapshot sidecar in 64 KiB ranges, avoiding
-an additional full-size encoded string. Snapshot capture and InstallSnapshot
-still hold a complete image in memory and retain the 64 MiB limit.
+an additional full-size encoded string. Recovery decodes the owned sidecar
+buffer in place, avoiding a second heap allocation for the application payload.
+Snapshot capture and InstallSnapshot still hold a complete image in memory and
+retain the 64 MiB limit.
 
 ## Operation and compatibility
 

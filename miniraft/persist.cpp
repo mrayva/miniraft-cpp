@@ -303,7 +303,7 @@ TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitH
         std::ifstream snapshotFile(SnapshotFilePath, std::ios::binary);
         if (!snapshotFile) throw std::runtime_error("Missing Raft snapshot: " + SnapshotFilePath);
         std::string encodedSnapshot{std::istreambuf_iterator<char>(snapshotFile), std::istreambuf_iterator<char>()};
-        Snapshot = std::make_shared<const TSnapshot>(DecodeSnapshot(encodedSnapshot));
+        Snapshot = std::make_shared<const TSnapshot>(DecodeSnapshotOwned(std::move(encodedSnapshot)));
         if (Snapshot->Index != SnapshotIndex || Snapshot->Term != SnapshotTerm)
             throw std::runtime_error("Raft snapshot boundary disagrees with metadata: " + SnapshotFilePath);
     }
