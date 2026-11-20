@@ -1,4 +1,5 @@
 #include <miniraft/persist.h>
+#include <miniraft/configuration.h>
 #include <miniraft/raft.h>
 #include <miniraft/snapshot_codec.h>
 #include <filesystem>
@@ -335,6 +336,102 @@ void test_versioned_metadata_persists_commit_and_voter_baseline(void**) {
         assert_true(configurationHistoryRejected);
         assert_true(state.GetBoundVoters().empty());
     }
+}
+void test_disk_legacy_membership_history_can_be_bound_and_recovered(void**) {
+    const std::vector<uint32_t> original{1, 2, 3};
+    const std::vector<uint32_t> active{2, 3, 4};
+    {
+        TFiles files;
+        TStateFields before;
+        {
+            TDiskState state(files.Name, 1);
+            state.CurrentTerm = 3;
+            state.VotedFor = 4; // Added voters remain valid historical vote holders.
+            state.Append(EncodeConfigurationEntry({EConfigurationPhase::Joint, 2, 0, 0,
+                original, active}));
+            state.Append(EncodeConfigurationEntry({EConfigurationPhase::Stable, 3, 1, 2,
+                original, active}));
+            state.CommitIndex = 2;
+            state.Commit();
+            before = state;
+        }
+
+        {
+            TDiskState state(files.Name, 1);
+            std::string reason;
+            assert_false(state.CanBindVotersFromTrustedHistory({1, 2, 5}, 2, &reason));
+            assert_true(!reason.empty());
+            assert_true(static_cast<TStateFields>(state) == before);
+            assert_true(state.GetBoundVoters().empty());
+            assert_true(state.CanBindVotersFromTrustedHistory(original, 2, &reason));
+            assert_true(reason.empty());
+            assert_true(static_cast<TStateFields>(state) == before);
+            assert_true(state.GetBoundVoters().empty());
+
+            state.BindVotersFromTrustedHistory(original, 2);
+            assert_true(state.GetBoundVoters() == original);
+            assert_int_equal(state.CommitIndex, 2);
+            assert_true(state.HasTrustedCommitIndex());
+        }
+
+        TDiskState recovered(files.Name, 1);
+        assert_true(recovered.GetBoundVoters() == original);
+        const auto scan = ScanConfigurationHistory(recovered,
+            TConfigurationHistory::Stable(original, 0, 0, 0, 0), 2);
+        assert_true(scan.Committed.OldVoters() == active);
+        assert_false(scan.Committed.IsJoint());
+    }
+
+    {
+        TFiles files;
+        {
+            TDiskState state(files.Name, 1);
+            state.BindVoters(original);
+            state.CurrentTerm = 3;
+            state.Append(EncodeConfigurationEntry({EConfigurationPhase::Joint, 2, 0, 0,
+                original, active}));
+            state.Append(EncodeConfigurationEntry({EConfigurationPhase::Stable, 3, 1, 2,
+                original, active}));
+            state.CommitIndex = 2;
+            state.Commit();
+
+            TSnapshot snapshot{2, 3, active, "compacted membership image"};
+            snapshot.StableConfiguration = true;
+            snapshot.ConfigurationIndex = 2;
+            snapshot.ConfigurationTerm = 3;
+            snapshot.PreviousVoters = original;
+            snapshot.PreviousJointIndex = 1;
+            snapshot.PreviousJointTerm = 2;
+            snapshot.ConfigurationTransitions.push_back({original, active, 0, 0, 1, 2, 2, 3});
+            state.InstallSnapshot(snapshot);
+            state.VotedFor = 4;
+            state.Commit();
+        }
+
+        TDiskState state(files.Name, 1);
+        assert_true(state.GetBoundVoters() == original);
+        assert_int_equal(state.VotedFor, 4);
+        assert_true(state.GetSnapshot() && state.GetSnapshot()->StableConfiguration);
+        assert_true(state.GetSnapshot()->Voters == active);
+        const auto scan = ScanConfigurationHistory(state,
+            TConfigurationHistory::FromStableSnapshot(*state.GetSnapshot()), 2);
+        assert_true(scan.Committed.OldVoters() == active);
+        assert_false(scan.Committed.IsJoint());
+    }
+}
+void test_disk_vote_outside_original_binding_requires_committed_membership_proof(void**) {
+    TFiles files;
+    {
+        TDiskState state(files.Name, 1);
+        state.BindVoters({1, 2, 3});
+        state.CurrentTerm = 2;
+        state.VotedFor = 4;
+        state.Commit();
+    }
+    bool rejected = false;
+    try { TDiskState recovered(files.Name, 1); }
+    catch (const std::exception&) { rejected = true; }
+    assert_true(rejected);
 }
 void test_disk_snapshot_generation_recovers_suffix_and_replaces_conflict(void**) {
     TFiles files;
@@ -973,6 +1070,8 @@ int main() {
         cmocka_unit_test(test_versioned_metadata_checksum_is_verified),
         cmocka_unit_test(test_checksums_detect_log_and_index_record_corruption),
         cmocka_unit_test(test_versioned_metadata_persists_commit_and_voter_baseline),
+        cmocka_unit_test(test_disk_legacy_membership_history_can_be_bound_and_recovered),
+        cmocka_unit_test(test_disk_vote_outside_original_binding_requires_committed_membership_proof),
         cmocka_unit_test(test_disk_snapshot_generation_recovers_suffix_and_replaces_conflict),
         cmocka_unit_test(test_disk_snapshot_generation_rejects_corrupt_image_without_rewriting),
 #ifndef _WIN32

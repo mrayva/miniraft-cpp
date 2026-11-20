@@ -44,9 +44,20 @@ struct TDiskState : IState {
     // rejects logs that already contain configuration entries.
     void ValidateTrustedLegacyVoterBaseline(const std::vector<uint32_t>& voters,
         uint64_t commitIndex);
+    // Full-history variant for operators migrating recovered stores that have
+    // membership records or a configuration-bearing compacted snapshot. The
+    // supplied original voter set and commit boundary are trusted inputs; all
+    // retained history must validate against them before metadata is published.
+    bool CanBindVotersFromTrustedHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex, std::string* reason = nullptr) const;
+    void BindVotersFromTrustedHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex);
     void MarkRaftStarted() override { RaftStarted = true; }
 
 private:
+    void ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex) const;
+    void ValidateStoredVoteMembershipHistory() const;
     bool Recovering = true;
     bool RecoveredStore = false;
     bool CommitIndexTrusted = true;
