@@ -583,6 +583,49 @@ void test_legacy_recovered_vote_outside_voters_preserves_storage(void**) {
         assert_true(std::string(std::istreambuf_iterator<char>(input), {}) == before[i++]);
     }
 }
+void test_durable_recovered_vote_must_appear_in_committed_membership_history(void**) {
+    auto checkCommittedHistoryVote = [](uint32_t vote, bool accepted) {
+        TFiles files;
+        {
+            TDurableState state(files.Name, 2);
+            state.BindVoters({1, 2, 3});
+            state.CurrentTerm = 3;
+            state.Append(EncodeConfigurationEntry({EConfigurationPhase::Joint, 2, 0, 0,
+                {1, 2, 3}, {2, 3, 4}}));
+            state.Append(EncodeConfigurationEntry({EConfigurationPhase::Stable, 3, 1, 2,
+                {1, 2, 3}, {2, 3, 4}}));
+            state.CommitIndex = 2;
+            state.VotedFor = vote;
+            state.Commit();
+        }
+
+        auto recovered = std::make_shared<TDurableState>(files.Name, 2);
+        if (!accepted) {
+            Reject([&] { TRaft invalid(recovered, 2, Peers(2, 4), {4}); });
+            return;
+        }
+        TRaft raft(recovered, 2, Peers(2, 4), {4});
+        assert_true(raft.GetVoterIds() == (std::vector<uint32_t>{2, 3, 4}));
+        assert_int_equal(recovered->VotedFor, vote);
+    };
+
+    checkCommittedHistoryVote(1, true);  // Removed by the committed transition.
+    checkCommittedHistoryVote(4, true);  // Added by the committed transition.
+    checkCommittedHistoryVote(99, false); // Never a voter.
+
+    TFiles files;
+    {
+        TDurableState state(files.Name, 2);
+        state.BindVoters({1, 2, 3});
+        state.CurrentTerm = 2;
+        state.Append(EncodeConfigurationEntry({EConfigurationPhase::Joint, 2, 0, 0,
+            {1, 2, 3}, {3, 4, 5}}));
+        state.VotedFor = 5; // Present only in the uncommitted configuration.
+        state.Commit();
+    }
+    auto recovered = std::make_shared<TDurableState>(files.Name, 2);
+    Reject([&] { TRaft invalid(recovered, 2, Peers(2, 5), {4, 5}); });
+}
 void test_durable_voter_binding_is_atomic_before_first_vote(void**) {
     using TStage = TDurableState::EStage;
     for (auto stage : {TStage::TempCreated, TStage::PayloadStarted, TStage::Written,
@@ -941,6 +984,7 @@ int main() {
         cmocka_unit_test(test_recovered_hard_state_must_match_fixed_voters),
 #ifdef __linux__
         cmocka_unit_test(test_legacy_recovered_vote_outside_voters_preserves_storage),
+        cmocka_unit_test(test_durable_recovered_vote_must_appear_in_committed_membership_history),
         cmocka_unit_test(test_durable_voter_binding_is_atomic_before_first_vote),
         cmocka_unit_test(test_durable_learner_snapshot_suffix_and_role_survive_restart),
         cmocka_unit_test(test_durable_v4_corrupt_commit_or_roles_fail_without_rewriting),

@@ -207,6 +207,17 @@ std::vector<uint32_t> ConfigurationVoterUnion(const TConfigurationHistory& confi
     return voters;
 }
 
+bool ConfigurationHistoryContainsVoter(const TConfigurationHistory& configuration, uint32_t id) {
+    auto contains = [id](const std::vector<uint32_t>& voters) {
+        return std::binary_search(voters.begin(), voters.end(), id);
+    };
+    if (contains(configuration.OldVoters()) || contains(configuration.NewVoters()) ||
+        contains(configuration.PreviousVoters())) return true;
+    for (const auto& transition : configuration.ConfigurationTransitions())
+        if (contains(transition.OldVoters) || contains(transition.NewVoters)) return true;
+    return false;
+}
+
 bool MayForwardPriorTermJointRecord(const TConfigurationRecord& record, uint64_t requestTerm,
         uint32_t leaderId, const TConfigurationScan* configuration) {
     if (record.Phase != EConfigurationPhase::Joint || record.Term >= requestTerm ||
@@ -1095,12 +1106,14 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
     if (hasRetainedConfiguration && (!State->SupportsVoterBinding() || bound.empty() ||
         !State->SupportsCommitIndexPersistence()))
         throw std::invalid_argument("Retained membership changes require bound voters and a persisted commit index");
-    // A configuration-bearing snapshot may have compacted the entry that
-    // changed voter roles. Its identity still proves that a persisted vote
-    // from the preceding configuration can name a now-removed voter.
+    // A persisted vote may name a voter removed by a committed transition, but
+    // any such voter must actually occur in the trusted configuration history.
     const bool hasMembershipHistory = hasRetainedConfiguration || baseline.ConfigurationIndex() != 0;
-    if (State->VotedFor && !IsVoter(State->VotedFor) && !hasMembershipHistory)
-        throw std::invalid_argument("Stored vote does not name a configured voter");
+    const bool voteWasCastForKnownVoter = State->VotedFor &&
+        (std::binary_search(InitialVoters.begin(), InitialVoters.end(), State->VotedFor) ||
+            ConfigurationHistoryContainsVoter(Configuration->Committed, State->VotedFor));
+    if (State->VotedFor && !voteWasCastForKnownVoter)
+        throw std::invalid_argument("Stored vote is outside the validated membership history");
     if (!IsVoter(Id) && State->VotedFor && !hasMembershipHistory)
         throw std::invalid_argument("A learner store must not contain a vote");
     if (bindInitialVoters) State->BindVoters(InitialVoters);
