@@ -27,19 +27,33 @@ bool TNode<TSocket>::TryGetMessageTreeBytes(const TMessageHolder<TMessage>& mess
 
 template<typename TSocket>
 void TNode<TSocket>::RecountPendingMessages() {
-    PendingDataMessages = PendingRaftMessages = 0;
-    PendingDataBytes = PendingRaftBytes = 0;
+    size_t dataMessages = 0, raftMessages = 0;
+    uint64_t dataBytes = 0, raftBytes = 0;
     for (const auto& message : Messages) {
         uint64_t bytes = 0;
         if (!TryGetMessageTreeBytes(message, bytes)) throw std::logic_error("Outbound message size overflow");
         if (QueueClassFor(message->Type) == EQueueClass::Client) {
-            ++PendingDataMessages;
-            PendingDataBytes += bytes;
+            if (dataMessages == SIZE_MAX || bytes > UINT64_MAX - dataBytes)
+                throw std::logic_error("Outbound data queue accounting overflow");
+            ++dataMessages;
+            dataBytes += bytes;
         } else {
-            ++PendingRaftMessages;
-            PendingRaftBytes += bytes;
+            if (raftMessages == SIZE_MAX || bytes > UINT64_MAX - raftBytes)
+                throw std::logic_error("Outbound Raft queue accounting overflow");
+            ++raftMessages;
+            raftBytes += bytes;
         }
     }
+    const auto oldMessages = PendingMessageCount();
+    const auto oldBytes = PendingMessageBytes();
+    const auto budget = QueueBudget.lock();
+    if (budget && !budget->TryReplace(oldMessages, oldBytes,
+            dataMessages + raftMessages, dataBytes + raftBytes))
+        throw std::logic_error("Recount exceeds aggregate outbound queue budget");
+    PendingDataMessages = dataMessages;
+    PendingRaftMessages = raftMessages;
+    PendingDataBytes = dataBytes;
+    PendingRaftBytes = raftBytes;
 }
 
 template<typename TSocket>
@@ -47,6 +61,10 @@ void TNode<TSocket>::CompletePendingMessage(EQueueClass queueClass, uint64_t byt
     auto& count = queueClass == EQueueClass::Client ? PendingDataMessages : PendingRaftMessages;
     auto& totalBytes = queueClass == EQueueClass::Client ? PendingDataBytes : PendingRaftBytes;
     if (!count || totalBytes < bytes) throw std::logic_error("Outbound queue accounting underflow");
+    const auto budget = QueueBudget.lock();
+    if (budget && !budget->TryReplace(PendingMessageCount(), PendingMessageBytes(),
+            PendingMessageCount() - 1, PendingMessageBytes() - bytes))
+        throw std::logic_error("Completion exceeds aggregate outbound queue budget");
     --count;
     totalBytes -= bytes;
 }
@@ -90,8 +108,29 @@ bool TNode<TSocket>::TrySend(TMessageHolder<TMessage> message) {
             return false;
     }
 
+    const auto oldTotalMessages = PendingMessageCount();
+    const auto oldTotalBytes = PendingMessageBytes();
+    if (replacedMessages > oldTotalMessages || replacedBytes > oldTotalBytes ||
+        oldTotalMessages - replacedMessages == SIZE_MAX ||
+        bytes > UINT64_MAX - (oldTotalBytes - replacedBytes))
+        return false;
+    const auto newTotalMessages = oldTotalMessages - replacedMessages + 1;
+    const auto newTotalBytes = oldTotalBytes - replacedBytes + bytes;
+
     // Append first so allocation failure leaves the previously queued retry intact.
     Messages.emplace_back(std::move(message));
+    if (const auto budget = QueueBudget.lock()) {
+        try {
+            if (!budget->TryReplace(oldTotalMessages, oldTotalBytes,
+                    newTotalMessages, newTotalBytes)) {
+                Messages.pop_back();
+                return false;
+            }
+        } catch (...) {
+            Messages.pop_back();
+            throw;
+        }
+    }
     if (queueClass != EQueueClass::Client) {
         for (size_t i = 0; i + 1 < Messages.size();) {
             if (QueueClassFor(Messages[i]->Type) == queueClass)
@@ -137,6 +176,9 @@ void TNode<TSocket>::Retire() {
     if (Retired) return;
     if (!SupportsRetirement())
         throw std::logic_error("Socket type does not support safe peer retirement");
+    if (const auto budget = QueueBudget.lock())
+        if (!budget->TryReplace(PendingMessageCount(), PendingMessageBytes(), 0, 0))
+            throw std::logic_error("Failed to release retired node's aggregate outbound queue usage");
     Retired = true;
     Messages.clear();
     PendingDataMessages = PendingRaftMessages = 0;

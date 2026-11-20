@@ -85,7 +85,9 @@ void TRaftServer<TSocket>::RegisterPeerTargetImpl(
 
     bool insertedNode = false;
     bool insertedRequestPeer = false;
+    bool attachedQueueBudget = false;
     try {
+        attachedQueueBudget = node->AttachQueueBudget(OutboundQueueBudget);
         insertedNode = Nodes.insert(node).second;
         if (!insertedNode) throw std::invalid_argument("Peer endpoint is already registered");
         RequestProcessor->AddPeerEndpoint(id, node);
@@ -95,6 +97,7 @@ void TRaftServer<TSocket>::RegisterPeerTargetImpl(
     } catch (...) {
         if (insertedRequestPeer) RequestProcessor->RemovePeerEndpoint(id, node);
         if (insertedNode) Nodes.erase(node);
+        if (attachedQueueBudget) node->DetachQueueBudget(OutboundQueueBudget);
         PeerNodes.erase(peer);
         throw;
     }
@@ -133,6 +136,7 @@ std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::UnregisterPeerTargetImpl(
     RequestProcessor->RemovePeerEndpoint(id, endpoint);
     Nodes.erase(endpoint);
     PeerNodes.erase(peer);
+    endpoint->DetachQueueBudget(OutboundQueueBudget);
     if (readerStarted) endpoint->Retire();
     RequestProcessor->OnPeerDisconnected(endpoint);
     return endpoint;

@@ -105,6 +105,54 @@ void test_node_send_queue_bounds_data_and_coalesces_raft_retries(void**) {
     retired.Retire();
     assert_false(retired.TrySend(NewHoldedMessage<TCommandResponse>()));
     retired.Send(NewHoldedMessage<TCommandResponse>()); // Preserve retired Send's no-op behavior.
+
+    auto aggregateBudget = std::make_shared<TOutboundQueueBudget>(TOutboundQueueLimits{1, 1024});
+    auto aggregateFirst = makeNode();
+    auto aggregateSecond = makeNode();
+    assert_true(aggregateFirst.AttachQueueBudget(aggregateBudget));
+    assert_true(aggregateSecond.AttachQueueBudget(aggregateBudget));
+    assert_true(aggregateFirst.TrySend(NewHoldedMessage<TAppendEntriesRequest>()));
+    assert_false(aggregateSecond.TrySend(NewHoldedMessage<TCommandResponse>()));
+    // Replacing a coalesced retry keeps the shared reservation at one message.
+    assert_true(aggregateFirst.TrySend(NewHoldedMessage<TAppendEntriesRequest>()));
+    assert_false(aggregateSecond.TrySend(NewHoldedMessage<TCommandResponse>()));
+    aggregateFirst.Retire();
+    assert_true(aggregateSecond.TrySend(NewHoldedMessage<TCommandResponse>()));
+    aggregateSecond.Retire();
+
+    auto measuredReply = NewHoldedMessage<TCommandResponse>();
+    auto byteBudget = std::make_shared<TOutboundQueueBudget>(
+        TOutboundQueueLimits{2, measuredReply->Len});
+    auto byteFirst = makeNode();
+    auto byteSecond = makeNode();
+    assert_true(byteFirst.AttachQueueBudget(byteBudget));
+    assert_true(byteSecond.AttachQueueBudget(byteBudget));
+    assert_true(byteFirst.TrySend(std::move(measuredReply)));
+    assert_false(byteSecond.TrySend(NewHoldedMessage<TCommandResponse>()));
+    byteFirst.Retire();
+    assert_true(byteSecond.TrySend(NewHoldedMessage<TCommandResponse>()));
+    byteSecond.Retire();
+
+    struct TImmediatePoller {
+        NNet::TValueTask<void> Sleep(std::chrono::milliseconds) { co_return; }
+    };
+    struct TImmediateSocket {
+        using TPoller = TImmediatePoller;
+        TPoller* Poller() { return nullptr; }
+        NNet::TValueTask<void> Connect() { co_return; }
+        NNet::TValueTask<std::ptrdiff_t> WriteSome(const void*, size_t size) {
+            co_return static_cast<std::ptrdiff_t>(size);
+        }
+    };
+    auto drainBudget = std::make_shared<TOutboundQueueBudget>(TOutboundQueueLimits{1, 1024});
+    TNode<TImmediateSocket> drainFirst("drain-first", TImmediateSocket{}, timeSource);
+    TNode<TImmediateSocket> drainSecond("drain-second", TImmediateSocket{}, timeSource);
+    assert_true(drainFirst.AttachQueueBudget(drainBudget));
+    assert_true(drainSecond.AttachQueueBudget(drainBudget));
+    assert_true(drainFirst.TrySend(NewHoldedMessage<TCommandResponse>()));
+    assert_false(drainSecond.TrySend(NewHoldedMessage<TCommandResponse>()));
+    drainFirst.Drain(); // Successful completion returns its aggregate reservation.
+    assert_true(drainSecond.TrySend(NewHoldedMessage<TCommandResponse>()));
 }
 
 void test_message_send_recv(void**) {

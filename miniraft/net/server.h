@@ -1,8 +1,10 @@
 #pragma once
 
 #include <exception>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <coroutine>
 #include <stdexcept>
 #include <string>
@@ -34,6 +36,49 @@ void ReconcilePeerResponseReaders(const TPeerMap& peers,
 class TNodeQueueFull : public std::runtime_error {
 public:
     TNodeQueueFull() : std::runtime_error("Outbound node queue limit exceeded") {}
+};
+
+struct TOutboundQueueLimits {
+    size_t MaxMessages = 4096;
+    uint64_t MaxBytes = 256ULL * 1024 * 1024;
+};
+
+// Shared by a server's peer nodes so per-peer limits cannot multiply without
+// bound as the cluster grows. A replacement reserves its new usage atomically
+// with releasing the superseded message usage.
+class TOutboundQueueBudget {
+public:
+    explicit TOutboundQueueBudget(TOutboundQueueLimits limits = {})
+        : Limits(limits) { }
+
+    bool TryReplace(size_t oldMessages, uint64_t oldBytes,
+            size_t newMessages, uint64_t newBytes) {
+        std::lock_guard lock(Mutex);
+        if (oldMessages > UsedMessages || oldBytes > UsedBytes)
+            throw std::logic_error("Aggregate outbound queue accounting underflow");
+        const auto retainedMessages = UsedMessages - oldMessages;
+        const auto retainedBytes = UsedBytes - oldBytes;
+        if (retainedMessages > Limits.MaxMessages || retainedBytes > Limits.MaxBytes ||
+            newMessages > Limits.MaxMessages - retainedMessages ||
+            newBytes > Limits.MaxBytes - retainedBytes)
+            return false;
+        UsedMessages = retainedMessages + newMessages;
+        UsedBytes = retainedBytes + newBytes;
+        return true;
+    }
+
+    void Release(size_t messages, uint64_t bytes) noexcept {
+        std::lock_guard lock(Mutex);
+        if (messages > UsedMessages || bytes > UsedBytes) std::terminate();
+        UsedMessages -= messages;
+        UsedBytes -= bytes;
+    }
+
+private:
+    const TOutboundQueueLimits Limits;
+    std::mutex Mutex;
+    size_t UsedMessages = 0;
+    uint64_t UsedBytes = 0;
 };
 
 template<typename TSocket>
@@ -183,6 +228,11 @@ public:
         , TimeSource(ts)
     { }
 
+    ~TNode() {
+        if (auto budget = QueueBudget.lock())
+            budget->Release(PendingMessageCount(), PendingMessageBytes());
+    }
+
     void Send(TMessageHolder<TMessage> message) override;
     bool TrySend(TMessageHolder<TMessage> message) override;
     void Drain() override;
@@ -191,6 +241,24 @@ public:
     void Disconnect() { Disconnect(ConnectionGeneration); }
     void Disconnect(uint64_t generation);
     void Retire();
+    // Returns true only when this call attached the budget. Reattaching the
+    // same budget is harmless; switching budgets requires a prior detach.
+    bool AttachQueueBudget(const std::shared_ptr<TOutboundQueueBudget>& budget) {
+        if (!budget) throw std::invalid_argument("Outbound queue budget is null");
+        const auto attachedBudget = QueueBudget.lock();
+        if (attachedBudget == budget) return false;
+        if (attachedBudget) throw std::logic_error("Node already has an outbound queue budget");
+        if (!budget->TryReplace(0, 0, PendingMessageCount(), PendingMessageBytes()))
+            throw TNodeQueueFull{};
+        QueueBudget = budget;
+        return true;
+    }
+    void DetachQueueBudget(const std::shared_ptr<TOutboundQueueBudget>& budget) noexcept {
+        const auto attachedBudget = QueueBudget.lock();
+        if (!budget || attachedBudget != budget) return;
+        attachedBudget->Release(PendingMessageCount(), PendingMessageBytes());
+        QueueBudget.reset();
+    }
     bool SupportsRetirement() const {
         if constexpr (requires(TSocket& socket) { socket.SupportsRetirement(); }) {
             if (Socket.SupportsRetirement()) return true;
@@ -250,6 +318,8 @@ private:
     enum class EQueueClass : uint8_t { Client, Vote, Replication, TimeoutNow, ConfigurationBarrier };
     static EQueueClass QueueClassFor(uint32_t type);
     static bool TryGetMessageTreeBytes(const TMessageHolder<TMessage>& message, uint64_t& bytes);
+    size_t PendingMessageCount() const { return PendingDataMessages + PendingRaftMessages; }
+    uint64_t PendingMessageBytes() const { return PendingDataBytes + PendingRaftBytes; }
     void RecountPendingMessages();
     void CompletePendingMessage(EQueueClass queueClass, uint64_t bytes);
 
@@ -318,6 +388,7 @@ private:
     // Includes messages in Messages and in the active writer batch.
     size_t PendingDataMessages = 0, PendingRaftMessages = 0;
     uint64_t PendingDataBytes = 0, PendingRaftBytes = 0;
+    std::weak_ptr<TOutboundQueueBudget> QueueBudget;
 };
 
 template<typename TSocket>
@@ -330,18 +401,29 @@ public:
         const std::shared_ptr<IRsm>& rsm,
         const TNodeDict& nodes,
         const std::shared_ptr<ITimeSource>& ts,
-        TRequestProcessor::TAdmissionLimits admissionLimits = {})
+        TRequestProcessor::TAdmissionLimits admissionLimits = {},
+        TOutboundQueueLimits outboundQueueLimits = {})
         : Poller(poller)
         , Socket(std::move(socket))
         , Raft(raft)
+        , OutboundQueueBudget(std::make_shared<TOutboundQueueBudget>(outboundQueueLimits))
         , RequestProcessor(std::make_shared<TRequestProcessor>(raft, rsm, nodes, admissionLimits, ts))
         , TimeSource(ts)
     {
-        for (const auto& [id, node] : nodes) {
-            Nodes.insert(node);
-            if (auto realNode = std::dynamic_pointer_cast<TNode<TSocket>>(node)) {
-                PeerNodes.emplace(id, std::move(realNode));
+        try {
+            for (const auto& [id, node] : nodes) {
+                if (!Nodes.insert(node).second)
+                    throw std::invalid_argument("Peer endpoint is registered more than once");
+                if (auto realNode = std::dynamic_pointer_cast<TNode<TSocket>>(node)) {
+                    realNode->AttachQueueBudget(OutboundQueueBudget);
+                    PeerNodes.emplace(id, std::move(realNode));
+                }
             }
+        } catch (...) {
+            for (const auto& [_, node] : nodes)
+                if (auto realNode = std::dynamic_pointer_cast<TNode<TSocket>>(node))
+                    realNode->DetachQueueBudget(OutboundQueueBudget);
+            throw;
         }
     }
 
@@ -376,6 +458,7 @@ private:
     typename TSocket::TPoller& Poller;
     TSocket Socket;
     std::shared_ptr<TRaft> Raft;
+    std::shared_ptr<TOutboundQueueBudget> OutboundQueueBudget;
     std::shared_ptr<TRequestProcessor> RequestProcessor;
     std::unordered_set<std::shared_ptr<INode>> Nodes;
     std::unordered_map<uint32_t, std::shared_ptr<TNode<TSocket>>> PeerNodes;
