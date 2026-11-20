@@ -250,7 +250,7 @@ void test_checksums_detect_log_and_index_record_corruption(void**) {
         std::ifstream metadata(files.Path("state"), std::ios::binary);
         std::string magic(8, '\0');
         assert_true(bool(metadata.read(magic.data(), magic.size())));
-        assert_true(magic == "MRFTL003");
+        assert_true(magic == "MRFTL004");
         uint32_t flags = 0;
         metadata.seekg(44);
         assert_true(bool(metadata.read(reinterpret_cast<char*>(&flags), sizeof(flags))));
@@ -361,6 +361,8 @@ void test_disk_snapshot_generation_recovers_suffix_and_replaces_conflict(void**)
         assert_int_equal(state.LogTerm(1), 2);
         assert_false(state.Get(1));
         assert_int_equal(state.Get(2)->Term, 5);
+        assert_int_equal(fs::file_size(files.Path("entries")), 0);
+        assert_int_equal(fs::file_size(files.Name + ".entries.1.g1"), sizeof(TLogEntry) + sizeof(uint32_t));
     }
     {
         TDiskState state(files.Name, 1);
@@ -420,6 +422,69 @@ void test_disk_snapshot_generation_rejects_corrupt_image_without_rewriting(void*
     fs::resize_file(files.Name + ".state.1.snapshot.g1", 4);
     files.RejectRecovery();
 }
+void test_disk_compacted_entries_keep_record_checksums(void**) {
+    TFiles files;
+    files.Seed();
+    {
+        TDiskState state(files.Name, 1);
+        state.InstallSnapshot(TSnapshot{1, 2, {1, 2}, "compacted image"});
+    }
+    const auto entriesPath = files.Name + ".entries.1.g1";
+    std::fstream entries(entriesPath, std::ios::in | std::ios::out | std::ios::binary);
+    entries.seekg(sizeof(TLogEntry));
+    char checksumByte = 0;
+    assert_true(bool(entries.read(&checksumByte, 1)));
+    checksumByte ^= 0x20;
+    entries.seekp(sizeof(TLogEntry));
+    assert_true(bool(entries.write(&checksumByte, 1)));
+    entries.flush();
+    assert_true(bool(entries));
+    entries.close();
+    files.RejectRecovery();
+}
+void test_previous_snapshot_metadata_version_remains_readable(void**) {
+    TFiles files;
+    files.Seed();
+    std::ifstream originalInput(files.Path("entries"), std::ios::binary);
+    std::string originalEntries{std::istreambuf_iterator<char>(originalInput), std::istreambuf_iterator<char>()};
+    {
+        TDiskState state(files.Name, 1);
+        state.InstallSnapshot(TSnapshot{1, 2, {1, 2}, "MRFTL003 snapshot"});
+    }
+    files.Rewrite("entries", originalEntries);
+    const uint64_t retainedOffset = sizeof(TLogEntry) + sizeof(uint32_t);
+    std::string previousIndex;
+    previousIndex.append(reinterpret_cast<const char*>(&retainedOffset), sizeof(retainedOffset));
+    NSnapshotCodec::Put(previousIndex,
+        NSnapshotCodec::Checksum(std::string_view(reinterpret_cast<const char*>(&retainedOffset), sizeof(retainedOffset))),
+        sizeof(uint32_t));
+    {
+        std::ofstream index(files.Name + ".index.1.g1", std::ios::binary | std::ios::trunc);
+        index.write(previousIndex.data(), previousIndex.size());
+        assert_true(bool(index));
+    }
+    std::string metadata;
+    NSnapshotCodec::Append(metadata, "MRFTL003");
+    NSnapshotCodec::Put(metadata, 3, 4);
+    NSnapshotCodec::Put(metadata, 2, 8); // Last log index.
+    NSnapshotCodec::Put(metadata, 7, 8); // Current term.
+    NSnapshotCodec::Put(metadata, 2, 4); // Voted for.
+    NSnapshotCodec::Put(metadata, 1, 8); // Commit index.
+    NSnapshotCodec::Put(metadata, 0, 4); // No voter binding.
+    NSnapshotCodec::Put(metadata, 3, 4); // Trusted commit + checksummed records.
+    NSnapshotCodec::Put(metadata, 1, 8); // Index generation.
+    NSnapshotCodec::Put(metadata, 2, 8); // First retained index.
+    NSnapshotCodec::Put(metadata, 1, 8); // Snapshot index.
+    NSnapshotCodec::Put(metadata, 2, 8); // Snapshot term.
+    NSnapshotCodec::Put(metadata, NSnapshotCodec::Checksum(metadata), 4);
+    files.Rewrite("state", metadata);
+
+    TDiskState recovered(files.Name, 1);
+    const TSnapshot expected{1, 2, {1, 2}, "MRFTL003 snapshot"};
+    assert_true(recovered.GetSnapshot() && *recovered.GetSnapshot() == expected);
+    assert_int_equal(recovered.LastLogIndex, 2);
+    assert_int_equal(recovered.Get(2)->Term, 5);
+}
 void test_disk_append_rejects_invalid_or_nonmonotonic_terms_before_mutation(void**) {
     TFiles files;
     files.Seed();
@@ -441,6 +506,7 @@ void test_disk_append_rejects_invalid_or_nonmonotonic_terms_before_mutation(void
 #ifndef _WIN32
 void test_snapshot_generation_crashes_publish_old_or_new_complete_image(void**) {
     const TDiskState::ECommitStage stages[] = {
+        TDiskState::ECommitStage::EntriesPublished,
         TDiskState::ECommitStage::SnapshotIndexPublished,
         TDiskState::ECommitStage::SnapshotImagePublished,
         TDiskState::ECommitStage::LogFilesSynced,
@@ -776,6 +842,8 @@ int main() {
         cmocka_unit_test(test_versioned_metadata_persists_commit_and_voter_baseline),
         cmocka_unit_test(test_disk_snapshot_generation_recovers_suffix_and_replaces_conflict),
         cmocka_unit_test(test_disk_snapshot_generation_rejects_corrupt_image_without_rewriting),
+        cmocka_unit_test(test_disk_compacted_entries_keep_record_checksums),
+        cmocka_unit_test(test_previous_snapshot_metadata_version_remains_readable),
         cmocka_unit_test(test_disk_append_rejects_invalid_or_nonmonotonic_terms_before_mutation),
 #ifndef _WIN32
         cmocka_unit_test(test_snapshot_generation_crashes_publish_old_or_new_complete_image),

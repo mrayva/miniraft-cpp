@@ -8,6 +8,7 @@
 
 struct TDiskState : IState {
     enum class ECommitStage {
+        EntriesPublished,
         SnapshotIndexPublished,
         SnapshotImagePublished,
         LogFilesSynced,
@@ -59,13 +60,18 @@ private:
     void WriteOffset(uint64_t index, uint64_t offset);
     uint64_t IndexRecordSize() const { return ChecksummedRecords ? 12 : sizeof(uint64_t); }
     std::string GenerationPath(uint64_t generation) const;
+    std::string EntryGenerationPath(uint64_t generation) const;
     std::string SnapshotPath(uint64_t generation) const;
     void InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated);
     void InstallSnapshotImpl(std::shared_ptr<const TSnapshot> snapshot);
     void InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snapshot);
     void WriteGenerationFile(const std::string& path, const std::string& bytes);
+    uint64_t WriteCompactedLogGeneration(const std::string& entriesPath, const std::string& indexPath,
+        uint64_t firstIndex, uint64_t lastIndex, uint64_t& lastTerm);
+    void ReclaimPreviousGeneration(uint64_t previousEntriesGeneration, uint64_t previousIndexGeneration);
 
     std::string EntriesPath;
+    std::string EntriesBasePath;
     std::string IndexPath;
     std::string IndexBasePath;
     std::string StatePath;
@@ -73,6 +79,7 @@ private:
     TCommitHook CommitHook;
     std::vector<uint32_t> Voters;
     std::shared_ptr<const TSnapshot> Snapshot;
+    uint64_t EntriesGeneration = 0;
     uint64_t IndexGeneration = 0;
     uint64_t IndexBaseIndex = 1;
     mutable std::fstream Entries;
