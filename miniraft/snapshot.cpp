@@ -284,13 +284,47 @@ std::string EncodeSnapshotMetadata(const TSnapshot& snapshot, size_t maxConfigur
         TSnapshot::MaxLegacyConfigurationTransitions;
     const bool largeHistory = transitionCount >
         TSnapshot::MaxExtendedConfigurationTransitions;
-    std::string out(transitionCount
+    const std::string_view magic = transitionCount
         ? (snapshot.StableConfiguration
             ? (largeHistory ? StableLargeHistoryMagic : extendedHistory ? StableExtendedHistoryMagic : StableHistoryMagic)
             : (largeHistory ? JointLargeHistoryMagic : extendedHistory ? JointExtendedHistoryMagic : JointHistoryMagic))
         : hasStablePredecessor ? StableLineageMagic :
         hasLineage ? JointLineageMagic :
-        snapshot.StableConfiguration ? StableMagic : snapshot.IsJoint() ? JointMagic : Magic);
+        snapshot.StableConfiguration ? StableMagic : snapshot.IsJoint() ? JointMagic : Magic;
+    size_t metadataSize = magic.size();
+    const auto addSize = [&](size_t bytes) {
+        if (bytes > SIZE_MAX - metadataSize)
+            throw std::overflow_error("Snapshot metadata size overflow");
+        metadataSize += bytes;
+    };
+    const auto addArraySize = [&](size_t count, size_t width) {
+        if (width && count > (SIZE_MAX - metadataSize) / width)
+            throw std::overflow_error("Snapshot metadata size overflow");
+        addSize(count * width);
+    };
+    addSize(8 + 8 + 4 + 8);
+    if (snapshot.HasConfigurationMetadata()) {
+        addSize(8 + 8);
+        if (!snapshot.StableConfiguration) addSize(4);
+        if (hasLineage) addSize(8 + 8 + 8 + 8 + 4);
+    }
+    addArraySize(snapshot.Voters.size(), 4);
+    addArraySize(snapshot.JointVoters.size(), 4);
+    if (hasLineage) addArraySize(snapshot.PreviousVoters.size(), 4);
+    if (transitionCount) {
+        addSize(4);
+        for (size_t i = firstTransition; i < snapshot.ConfigurationTransitions.size(); ++i) {
+            const auto& transition = snapshot.ConfigurationTransitions[i];
+            addSize(8 * 6 + 4 + 4);
+            addArraySize(transition.OldVoters.size(), 4);
+            addArraySize(transition.NewVoters.size(), 4);
+        }
+    }
+    if (metadataSize > TSnapshot::MaxBytes)
+        throw std::runtime_error("Snapshot metadata exceeds size limit");
+    std::string out;
+    out.reserve(metadataSize);
+    out.append(magic);
     Put(out, snapshot.Index, 8);
     Put(out, snapshot.Term, 8);
     Put(out, snapshot.Voters.size(), 4);
@@ -327,6 +361,8 @@ std::string EncodeSnapshotMetadata(const TSnapshot& snapshot, size_t maxConfigur
             for (auto voter : transition.NewVoters) Put(out, voter, 4);
         }
     }
+    if (out.size() != metadataSize)
+        throw std::logic_error("Snapshot metadata size calculation mismatch");
     return out;
 }
 #ifdef __linux__
@@ -508,6 +544,9 @@ TSnapshot DecodeSnapshotImpl(std::string_view bytes, std::string* reusableStorag
         previousCount > TSnapshot::MaxVoters ||
         count + newCount + previousCount > reader.Input.size() / 4)
         throw std::runtime_error("Invalid snapshot voter count");
+    snapshot.Voters.reserve(size_t(count));
+    snapshot.JointVoters.reserve(size_t(newCount));
+    snapshot.PreviousVoters.reserve(size_t(previousCount));
     for (uint32_t i = 0; i < count; ++i) snapshot.Voters.push_back(reader.Take(4));
     for (uint32_t i = 0; i < newCount; ++i) snapshot.JointVoters.push_back(reader.Take(4));
     for (uint32_t i = 0; i < previousCount; ++i) snapshot.PreviousVoters.push_back(reader.Take(4));
@@ -518,6 +557,7 @@ TSnapshot DecodeSnapshotImpl(std::string_view bytes, std::string* reusableStorag
             TSnapshot::MaxLegacyConfigurationTransitions;
         if (!transitions || transitions > transitionLimit)
             throw std::runtime_error("Invalid snapshot configuration history count");
+        snapshot.ConfigurationTransitions.reserve(size_t(transitions));
         for (uint32_t i = 0; i < transitions; ++i) {
             TSnapshotConfigurationTransition transition;
             transition.PreviousConfigurationIndex = reader.Take(8);
@@ -530,6 +570,8 @@ TSnapshot DecodeSnapshotImpl(std::string_view bytes, std::string* reusableStorag
             if (oldCount > TSnapshot::MaxVoters || newCount > TSnapshot::MaxVoters ||
                 oldCount + newCount > reader.Input.size() / 4)
                 throw std::runtime_error("Invalid snapshot configuration history voter count");
+            transition.OldVoters.reserve(size_t(oldCount));
+            transition.NewVoters.reserve(size_t(newCount));
             for (uint32_t j = 0; j < oldCount; ++j) transition.OldVoters.push_back(reader.Take(4));
             for (uint32_t j = 0; j < newCount; ++j) transition.NewVoters.push_back(reader.Take(4));
             snapshot.ConfigurationTransitions.push_back(std::move(transition));
