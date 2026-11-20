@@ -625,6 +625,49 @@ void test_durable_recovered_vote_must_appear_in_committed_membership_history(voi
     }
     auto recovered = std::make_shared<TDurableState>(files.Name, 2);
     Reject([&] { TRaft invalid(recovered, 2, Peers(2, 5), {4, 5}); });
+
+    const std::vector<uint32_t> original{1, 2, 3};
+    const std::vector<uint32_t> afterFirst{1, 2, 3, 4};
+    const std::vector<uint32_t> afterSecond{1, 2, 3, 5};
+    const std::vector<uint32_t> current{2, 3, 5, 6};
+    auto history = TConfigurationHistory::Stable(original, 0, 0, 0, 0);
+    history = history.Advance(1, EncodeConfigurationEntry({EConfigurationPhase::Joint, 2, 0, 0,
+        original, afterFirst}));
+    history = history.Advance(2, EncodeConfigurationEntry({EConfigurationPhase::Stable, 2, 1, 2,
+        original, afterFirst}));
+    history = history.Advance(3, EncodeConfigurationEntry({EConfigurationPhase::Joint, 3, 2, 2,
+        afterFirst, afterSecond}));
+    history = history.Advance(4, EncodeConfigurationEntry({EConfigurationPhase::Stable, 3, 3, 3,
+        afterFirst, afterSecond}));
+    history = history.Advance(5, EncodeConfigurationEntry({EConfigurationPhase::Joint, 3, 4, 3,
+        afterSecond, current}));
+    history = history.Advance(6, EncodeConfigurationEntry({EConfigurationPhase::Stable, 3, 5, 3,
+        afterSecond, current}));
+    const auto snapshot = history.MakeSnapshot("compacted membership history");
+    assert_true(snapshot.Voters == current);
+    assert_false(std::binary_search(snapshot.PreviousVoters.begin(), snapshot.PreviousVoters.end(), 4));
+
+    auto checkSnapshotHistoryVote = [&snapshot, &current](uint32_t vote, bool accepted) {
+        TFiles snapshotFiles;
+        {
+            TDurableState state(snapshotFiles.Name, 2);
+            state.BindVoters({1, 2, 3});
+            state.CurrentTerm = 3;
+            state.InstallSnapshot(snapshot);
+            state.VotedFor = vote;
+            state.Commit();
+        }
+        auto snapshotState = std::make_shared<TDurableState>(snapshotFiles.Name, 2);
+        if (!accepted) {
+            Reject([&] { TRaft invalid(snapshotState, 2, Peers(2, 6), {4, 5, 6}); });
+            return;
+        }
+        TRaft raft(snapshotState, 2, Peers(2, 6), {4, 5, 6});
+        assert_true(raft.GetVoterIds() == current);
+        assert_int_equal(snapshotState->VotedFor, vote);
+    };
+    checkSnapshotHistoryVote(4, true); // Historical voter appears only in transition lineage.
+    checkSnapshotHistoryVote(99, false);
 }
 void test_durable_voter_binding_is_atomic_before_first_vote(void**) {
     using TStage = TDurableState::EStage;
