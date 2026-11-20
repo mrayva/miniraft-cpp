@@ -272,6 +272,40 @@ bool SyncFile(const std::string& path) {
 #endif
 }
 
+bool TruncateAndSyncRegularFileNoFollow(const std::string& path) {
+#ifdef _WIN32
+    HANDLE file = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION info{};
+    bool ok = GetFileInformationByHandle(file, &info) != 0 &&
+        !(info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY));
+    LARGE_INTEGER beginning{};
+    if (ok) ok = SetFilePointerEx(file, beginning, nullptr, FILE_BEGIN) != 0 && SetEndOfFile(file) != 0;
+    if (ok) ok = FlushFileBuffers(file) != 0;
+    return CloseHandle(file) != 0 && ok;
+#else
+#ifdef O_NOFOLLOW
+    int flags = O_WRONLY | O_CLOEXEC | O_NOFOLLOW;
+#ifdef O_NONBLOCK
+    flags |= O_NONBLOCK;
+#endif
+    const int file = open(path.c_str(), flags);
+    if (file < 0) return false;
+    struct stat info{};
+    bool ok = fstat(file, &info) == 0 && S_ISREG(info.st_mode) && ftruncate(file, 0) == 0;
+    if (ok) {
+        int result;
+        do { result = fsync(file); } while (result != 0 && errno == EINTR);
+        ok = result == 0;
+    }
+    return close(file) == 0 && ok;
+#else
+    return false;
+#endif
+#endif
+}
+
 bool WriteAndSyncFile(const std::string& path, const char* data, size_t size) {
     TSafeTempFile output;
     return output.Open(path) && output.Write(data, size) && output.SyncAndClose();
@@ -737,12 +771,7 @@ void TDiskState::ReclaimPreviousGeneration(uint64_t previousEntriesGeneration,
         changed |= std::filesystem::remove(EntryGenerationPath(previousEntriesGeneration), ignored);
         ignored.clear();
     } else {
-        std::filesystem::resize_file(EntriesBasePath, 0, ignored);
-        if (!ignored) {
-            changed = true;
-            (void)SyncFile(EntriesBasePath);
-        }
-        ignored.clear();
+        changed |= TruncateAndSyncRegularFileNoFollow(EntriesBasePath);
     }
     if (previousIndexGeneration) {
         changed |= std::filesystem::remove(GenerationPath(previousIndexGeneration), ignored);

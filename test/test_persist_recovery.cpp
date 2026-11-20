@@ -463,6 +463,33 @@ void test_snapshot_generation_temp_symlinks_do_not_modify_targets(void**) {
         assert_int_equal(recovered.Get(2)->Term, 5);
     }
 }
+
+void test_snapshot_reclaim_does_not_truncate_symlinked_base_log(void**) {
+    TFiles files;
+    files.Seed();
+    const auto entriesPath = files.Path("entries");
+    const auto victimPath = files.Directory / "base-log-target";
+    fs::copy_file(entriesPath, victimPath);
+    std::ifstream original(victimPath, std::ios::binary);
+    const std::string originalContents{std::istreambuf_iterator<char>(original), {}};
+    fs::remove(entriesPath);
+    fs::create_symlink(victimPath, entriesPath);
+
+    const TSnapshot snapshot{3, 7, {1, 2}, "safe image"};
+    {
+        TDiskState state(files.Name, 1);
+        state.InstallSnapshot(snapshot);
+    }
+
+    std::ifstream victim(victimPath, std::ios::binary);
+    const std::string actualContents{std::istreambuf_iterator<char>(victim), {}};
+    assert_true(actualContents == originalContents);
+    assert_true(fs::is_symlink(entriesPath));
+    TDiskState recovered(files.Name, 1);
+    assert_true(recovered.GetSnapshot() && *recovered.GetSnapshot() == snapshot);
+    assert_int_equal(recovered.SnapshotIndex, 3);
+    assert_int_equal(recovered.LastLogIndex, 3);
+}
 #endif
 void test_disk_compacted_entries_keep_record_checksums(void**) {
     TFiles files;
@@ -886,6 +913,7 @@ int main() {
         cmocka_unit_test(test_disk_snapshot_generation_rejects_corrupt_image_without_rewriting),
 #ifndef _WIN32
         cmocka_unit_test(test_snapshot_generation_temp_symlinks_do_not_modify_targets),
+        cmocka_unit_test(test_snapshot_reclaim_does_not_truncate_symlinked_base_log),
 #endif
         cmocka_unit_test(test_disk_compacted_entries_keep_record_checksums),
         cmocka_unit_test(test_previous_snapshot_metadata_version_remains_readable),
