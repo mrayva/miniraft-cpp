@@ -562,9 +562,8 @@ void TDiskState::InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snaps
     const auto nextLastIndex = retainSuffix ? LastLogIndex : snapshot->Index;
     const auto suffixCount = WriteCompactedLogGeneration(nextEntriesPath, nextIndexPath,
         snapshot->Index + 1, nextLastIndex, nextLastTerm);
-    const auto encodedSnapshot = EncodeSnapshot(*snapshot);
     const auto nextSnapshotPath = SnapshotPath(nextGeneration);
-    WriteGenerationFile(nextSnapshotPath, encodedSnapshot);
+    WriteSnapshotGenerationFile(nextSnapshotPath, *snapshot);
     if (CommitHook) CommitHook(ECommitStage::SnapshotImagePublished);
 
     Entries.close();
@@ -593,10 +592,24 @@ void TDiskState::InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snaps
     ReclaimPreviousGeneration(previousEntriesGeneration, previousIndexGeneration);
 }
 
-void TDiskState::WriteGenerationFile(const std::string& path, const std::string& bytes) {
+void TDiskState::WriteSnapshotGenerationFile(const std::string& path, const TSnapshot& snapshot) {
+    const auto encoding = PrepareSnapshotEncoding(snapshot);
+    const auto totalBytes = SnapshotEncodingSize(*encoding);
     const auto tempPath = path + ".tmp";
-    if (!WriteAndSyncFile(tempPath, bytes.data(), bytes.size()) || !ReplaceFile(tempPath, path) ||
-        !SyncDirectory(path))
+    std::ofstream output(tempPath, std::ios::binary | std::ios::trunc);
+    if (!output) Fail("Cannot create Raft snapshot generation file");
+    std::array<char, 64 * 1024> buffer{};
+    for (uint64_t offset = 0; offset < totalBytes;) {
+        const auto length = std::min<uint64_t>(buffer.size(), totalBytes - offset);
+        CopySnapshotEncodingRange(snapshot, *encoding, offset, buffer.data(), size_t(length));
+        if (!output.write(buffer.data(), std::streamsize(length)))
+            Fail("Cannot write Raft snapshot generation file");
+        offset += length;
+    }
+    output.flush();
+    if (!output) Fail("Cannot flush Raft snapshot generation file");
+    output.close();
+    if (output.fail() || !SyncFile(tempPath) || !ReplaceFile(tempPath, path) || !SyncDirectory(path))
         Fail("Cannot publish Raft snapshot generation file");
 }
 

@@ -65,7 +65,7 @@ private:
     void InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated);
     void InstallSnapshotImpl(std::shared_ptr<const TSnapshot> snapshot);
     void InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snapshot);
-    void WriteGenerationFile(const std::string& path, const std::string& bytes);
+    void WriteSnapshotGenerationFile(const std::string& path, const TSnapshot& snapshot);
     uint64_t WriteCompactedLogGeneration(const std::string& entriesPath, const std::string& indexPath,
         uint64_t firstIndex, uint64_t lastIndex, uint64_t& lastTerm);
     void ReclaimPreviousGeneration(uint64_t previousEntriesGeneration, uint64_t previousIndexGeneration);
