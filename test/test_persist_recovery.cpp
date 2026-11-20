@@ -2,6 +2,7 @@
 #include <miniraft/raft.h>
 #include <miniraft/snapshot_codec.h>
 #include <filesystem>
+#include <fstream>
 #include <chrono>
 #include <map>
 #include <iterator>
@@ -426,6 +427,43 @@ void test_disk_snapshot_generation_rejects_corrupt_image_without_rewriting(void*
     fs::resize_file(files.Name + ".state.1.snapshot.g1", 4);
     files.RejectRecovery();
 }
+#ifndef _WIN32
+void test_snapshot_generation_temp_symlinks_do_not_modify_targets(void**) {
+    for (const std::string kind : {"entries", "index", "snapshot"}) {
+        TFiles files;
+        files.Seed();
+        const auto victimPath = files.Directory / "symlink-target";
+        const std::string originalContents = "leave this file untouched";
+        {
+            std::ofstream victim(victimPath, std::ios::binary);
+            victim.write(originalContents.data(), originalContents.size());
+            assert_true(bool(victim));
+        }
+        const auto tempPath = kind == "entries" ? files.Name + ".entries.1.g1.tmp" :
+            kind == "index" ? files.Name + ".index.1.g1.tmp" : files.Name + ".state.1.snapshot.g1.tmp";
+        fs::create_symlink(victimPath, tempPath);
+
+        const TSnapshot expected{1, 2, {1, 2}, "safe image"};
+        {
+            TDiskState state(files.Name, 1);
+            state.InstallSnapshot(expected);
+        }
+
+        std::ifstream victim(victimPath, std::ios::binary);
+        const std::string actualContents{std::istreambuf_iterator<char>(victim), {}};
+        assert_true(actualContents == originalContents);
+        assert_false(fs::is_symlink(files.Name + ".entries.1.g1"));
+        assert_false(fs::is_symlink(files.Name + ".index.1.g1"));
+        assert_false(fs::is_symlink(files.Name + ".state.1.snapshot.g1"));
+
+        TDiskState recovered(files.Name, 1);
+        assert_true(recovered.GetSnapshot() && *recovered.GetSnapshot() == expected);
+        assert_int_equal(recovered.SnapshotIndex, 1);
+        assert_int_equal(recovered.LastLogIndex, 2);
+        assert_int_equal(recovered.Get(2)->Term, 5);
+    }
+}
+#endif
 void test_disk_compacted_entries_keep_record_checksums(void**) {
     TFiles files;
     files.Seed();
@@ -846,6 +884,9 @@ int main() {
         cmocka_unit_test(test_versioned_metadata_persists_commit_and_voter_baseline),
         cmocka_unit_test(test_disk_snapshot_generation_recovers_suffix_and_replaces_conflict),
         cmocka_unit_test(test_disk_snapshot_generation_rejects_corrupt_image_without_rewriting),
+#ifndef _WIN32
+        cmocka_unit_test(test_snapshot_generation_temp_symlinks_do_not_modify_targets),
+#endif
         cmocka_unit_test(test_disk_compacted_entries_keep_record_checksums),
         cmocka_unit_test(test_previous_snapshot_metadata_version_remains_readable),
         cmocka_unit_test(test_disk_append_rejects_invalid_or_nonmonotonic_terms_before_mutation),

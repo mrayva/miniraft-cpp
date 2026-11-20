@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string_view>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -17,6 +18,7 @@
 #else
 #include <cerrno>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -154,6 +156,106 @@ std::string EncodeDiskMetadata(uint64_t lastLogIndex, uint64_t currentTerm, uint
     return bytes;
 }
 
+class TSafeTempFile {
+public:
+    ~TSafeTempFile() { (void)Close(); }
+
+    bool Open(const std::string& path) {
+#ifdef _WIN32
+        if (!DeleteFileA(path.c_str())) {
+            const auto error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) return false;
+        }
+        File = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (File == INVALID_HANDLE_VALUE) return false;
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!GetFileInformationByHandle(File, &info) ||
+            (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY))) {
+            (void)Close();
+            return false;
+        }
+        return true;
+#else
+        if (unlink(path.c_str()) != 0 && errno != ENOENT) return false;
+#ifdef O_NOFOLLOW
+        const int flags = O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW
+#ifdef O_NONBLOCK
+            | O_NONBLOCK
+#endif
+            ;
+        File = open(path.c_str(), flags, 0600);
+        if (File < 0) return false;
+        struct stat info{};
+        if (fstat(File, &info) != 0 || !S_ISREG(info.st_mode)) {
+            (void)Close();
+            return false;
+        }
+        return true;
+#else
+        // Fail closed on platforms without a way to forbid following the final
+        // path component.
+        return false;
+#endif
+#endif
+    }
+
+    bool Write(const char* data, size_t size) {
+        size_t offset = 0;
+        while (offset < size) {
+#ifdef _WIN32
+            const auto count = static_cast<DWORD>(std::min<size_t>(size - offset, MAXDWORD));
+            DWORD written = 0;
+            if (!WriteFile(File, data + offset, count, &written, nullptr) || !written) return false;
+            offset += written;
+#else
+            const auto count = std::min<size_t>(size - offset,
+                static_cast<size_t>(std::numeric_limits<ssize_t>::max()));
+            const auto written = write(File, data + offset, count);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) return false;
+            offset += static_cast<size_t>(written);
+#endif
+        }
+        return true;
+    }
+
+    bool SyncAndClose() {
+#ifdef _WIN32
+        const bool synced = File != INVALID_HANDLE_VALUE && FlushFileBuffers(File) != 0;
+#else
+        bool synced = false;
+        if (File >= 0) {
+            int result;
+            do { result = fsync(File); } while (result != 0 && errno == EINTR);
+            synced = result == 0;
+        }
+#endif
+        return Close() && synced;
+    }
+
+private:
+    bool Close() {
+#ifdef _WIN32
+        if (File == INVALID_HANDLE_VALUE) return true;
+        const auto file = File;
+        File = INVALID_HANDLE_VALUE;
+        return CloseHandle(file) != 0;
+#else
+        if (File < 0) return true;
+        const auto file = File;
+        File = -1;
+        return close(file) == 0;
+#endif
+    }
+
+#ifdef _WIN32
+    HANDLE File = INVALID_HANDLE_VALUE;
+#else
+    int File = -1;
+#endif
+};
+
 bool SyncFile(const std::string& path) {
 #ifdef _WIN32
     HANDLE file = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE,
@@ -171,44 +273,8 @@ bool SyncFile(const std::string& path) {
 }
 
 bool WriteAndSyncFile(const std::string& path, const char* data, size_t size) {
-#ifdef _WIN32
-    HANDLE file = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return false;
-    size_t offset = 0;
-    bool ok = true;
-    while (offset < size) {
-        const auto count = static_cast<DWORD>(std::min<size_t>(size - offset, MAXDWORD));
-        DWORD written = 0;
-        if (!WriteFile(file, data + offset, count, &written, nullptr) || !written) {
-            ok = false;
-            break;
-        }
-        offset += written;
-    }
-    if (ok) ok = FlushFileBuffers(file) != 0;
-    return CloseHandle(file) != 0 && ok;
-#else
-    int flags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC;
-#ifdef O_NOFOLLOW
-    flags |= O_NOFOLLOW;
-#endif
-    const int file = open(path.c_str(), flags, 0600);
-    if (file < 0) return false;
-    size_t offset = 0;
-    bool ok = true;
-    while (offset < size) {
-        const auto written = write(file, data + offset, size - offset);
-        if (written < 0 && errno == EINTR) continue;
-        if (written <= 0) {
-            ok = false;
-            break;
-        }
-        offset += static_cast<size_t>(written);
-    }
-    if (ok) ok = fsync(file) == 0;
-    return close(file) == 0 && ok;
-#endif
+    TSafeTempFile output;
+    return output.Open(path) && output.Write(data, size) && output.SyncAndClose();
 }
 
 bool ReplaceFile(const std::string& source, const std::string& target) {
@@ -596,20 +662,17 @@ void TDiskState::WriteSnapshotGenerationFile(const std::string& path, const TSna
     const auto encoding = PrepareSnapshotEncoding(snapshot);
     const auto totalBytes = SnapshotEncodingSize(*encoding);
     const auto tempPath = path + ".tmp";
-    std::ofstream output(tempPath, std::ios::binary | std::ios::trunc);
-    if (!output) Fail("Cannot create Raft snapshot generation file");
+    TSafeTempFile output;
+    if (!output.Open(tempPath)) Fail("Cannot create Raft snapshot generation file");
     std::array<char, 64 * 1024> buffer{};
     for (uint64_t offset = 0; offset < totalBytes;) {
         const auto length = std::min<uint64_t>(buffer.size(), totalBytes - offset);
         CopySnapshotEncodingRange(snapshot, *encoding, offset, buffer.data(), size_t(length));
-        if (!output.write(buffer.data(), std::streamsize(length)))
+        if (!output.Write(buffer.data(), size_t(length)))
             Fail("Cannot write Raft snapshot generation file");
         offset += length;
     }
-    output.flush();
-    if (!output) Fail("Cannot flush Raft snapshot generation file");
-    output.close();
-    if (output.fail() || !SyncFile(tempPath) || !ReplaceFile(tempPath, path) || !SyncDirectory(path))
+    if (!output.SyncAndClose() || !ReplaceFile(tempPath, path) || !SyncDirectory(path))
         Fail("Cannot publish Raft snapshot generation file");
 }
 
@@ -617,9 +680,10 @@ uint64_t TDiskState::WriteCompactedLogGeneration(const std::string& entriesPath,
         const std::string& indexPath, uint64_t firstIndex, uint64_t lastIndex, uint64_t& lastTerm) {
     const auto entriesTempPath = entriesPath + ".tmp";
     const auto indexTempPath = indexPath + ".tmp";
-    std::ofstream entriesOutput(entriesTempPath, std::ios::binary | std::ios::trunc);
-    std::ofstream indexOutput(indexTempPath, std::ios::binary | std::ios::trunc);
-    if (!entriesOutput || !indexOutput) Fail("Cannot create compacted Raft log generation");
+    TSafeTempFile entriesOutput;
+    TSafeTempFile indexOutput;
+    if (!entriesOutput.Open(entriesTempPath) || !indexOutput.Open(indexTempPath))
+        Fail("Cannot create compacted Raft log generation");
 
     uint64_t count = 0;
     uint64_t offset = 0;
@@ -629,25 +693,25 @@ uint64_t TDiskState::WriteCompactedLogGeneration(const std::string& entriesPath,
         const auto checksumBytes = ChecksummedRecords ? sizeof(uint32_t) : 0;
         if (offset > uint64_t(INT64_MAX) - entry->Len - checksumBytes)
             Fail("Compacted Raft log exceeds supported file size");
-        if (!entriesOutput.write(reinterpret_cast<const char*>(entry.Mes), entry->Len))
+        if (!entriesOutput.Write(reinterpret_cast<const char*>(entry.Mes), entry->Len))
             Fail("Cannot write compacted Raft log entry");
         if (ChecksummedRecords) {
             std::string checksum;
             NSnapshotCodec::Put(checksum, NSnapshotCodec::Checksum(std::string_view(
                 reinterpret_cast<const char*>(entry.Mes), entry->Len)), sizeof(uint32_t));
-            if (!entriesOutput.write(checksum.data(), checksum.size()))
+            if (!entriesOutput.Write(checksum.data(), checksum.size()))
                 Fail("Cannot write compacted Raft log checksum");
         }
 
         std::array<char, sizeof(offset)> offsetBytes{};
         memcpy(offsetBytes.data(), &offset, sizeof(offset));
-        if (!indexOutput.write(offsetBytes.data(), offsetBytes.size()))
+        if (!indexOutput.Write(offsetBytes.data(), offsetBytes.size()))
             Fail("Cannot write compacted Raft log index");
         if (ChecksummedRecords) {
             std::string checksum;
             NSnapshotCodec::Put(checksum,
                 NSnapshotCodec::Checksum(std::string_view(offsetBytes.data(), offsetBytes.size())), sizeof(uint32_t));
-            if (!indexOutput.write(checksum.data(), checksum.size()))
+            if (!indexOutput.Write(checksum.data(), checksum.size()))
                 Fail("Cannot write compacted Raft index checksum");
         }
         offset += entry->Len + checksumBytes;
@@ -655,13 +719,7 @@ uint64_t TDiskState::WriteCompactedLogGeneration(const std::string& entriesPath,
         lastTerm = entry->Term;
     }
 
-    entriesOutput.flush();
-    indexOutput.flush();
-    if (!entriesOutput || !indexOutput) Fail("Cannot flush compacted Raft log generation");
-    entriesOutput.close();
-    indexOutput.close();
-    if (entriesOutput.fail() || indexOutput.fail()) Fail("Cannot close compacted Raft log generation");
-    if (!SyncFile(entriesTempPath) || !SyncFile(indexTempPath) ||
+    if (!entriesOutput.SyncAndClose() || !indexOutput.SyncAndClose() ||
         !ReplaceFile(entriesTempPath, entriesPath) || !SyncDirectory(entriesPath))
         Fail("Cannot publish compacted Raft entries generation");
     if (CommitHook) CommitHook(ECommitStage::EntriesPublished);
