@@ -163,6 +163,56 @@ void test_aggregate_budget_is_shared_between_entries(void**) {
             sizeof(TAppendEntriesRequest) + sizeof(TLogEntry) + 1 + sizeof(TMessage));
     }
 }
+void test_inbound_frame_budget_is_held_until_all_message_copies_are_released(void**) {
+    auto original = NewHoldedMessage(TRequestVoteRequest{
+        .LastLogIndex = 7, .LastLogTerm = 2, .CandidateId = 1});
+    auto budget = std::make_shared<TInboundMessageBudget>(
+        TInboundMessageBudgetLimits{original->Len});
+
+    TStream first;
+    first.Add(original);
+    auto firstTask = TMessageReader(first, {}, budget).Read();
+    auto received = firstTask.await_resume();
+    auto retainedCopy = received.Cast<TRequestVoteRequest>();
+    received = {};
+
+    TStream blocked;
+    blocked.Add(original);
+    auto blockedTask = TMessageReader(blocked, {}, budget).Read();
+    bool rejected = false;
+    try { (void)blockedTask.await_resume(); }
+    catch (const TMessageError&) { rejected = true; }
+    assert_true(rejected);
+
+    retainedCopy = {};
+    TStream recovered;
+    recovered.Add(original);
+    auto recoveredTask = TMessageReader(recovered, {}, budget).Read();
+    auto recoveredMessage = recoveredTask.await_resume();
+    assert_int_equal(recoveredMessage.Cast<TRequestVoteRequest>()->CandidateId, 1);
+}
+void test_inbound_frame_budget_covers_append_entries_payload_arrays(void**) {
+    auto append = NewHoldedMessage(TAppendEntriesRequest{.Nentries = 1});
+    const auto payloadArrayBytes = sizeof(TMessageHolder<TMessage>);
+    auto budget = std::make_shared<TInboundMessageBudget>(TInboundMessageBudgetLimits{
+        uint64_t(append->Len) + payloadArrayBytes - 1});
+    TStream stream;
+    stream.Add(append);
+    stream.Add(NewHoldedMessage<TLogEntry>());
+
+    auto task = TMessageReader(stream, {}, budget).Read();
+    bool rejected = false;
+    try { (void)task.await_resume(); }
+    catch (const TMessageError&) { rejected = true; }
+    assert_true(rejected);
+    assert_int_equal(stream.Position, append->Len);
+
+    auto small = NewHoldedMessage<TRequestVoteRequest>();
+    TStream recovered;
+    recovered.Add(small);
+    auto recoveredTask = TMessageReader(recovered, {}, budget).Read();
+    assert_true(recoveredTask.await_resume());
+}
 void test_failed_reader_cannot_resume_at_another_frame(void**) {
     TStream stream;
     stream.Add(10, sizeof(TMessage));

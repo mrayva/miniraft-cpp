@@ -351,8 +351,21 @@ struct TMessageHolder {
     { }
 
     void InitPayload(uint32_t size) {
+        InitPayload(size, {});
+    }
+
+    void InitPayload(uint32_t size, std::shared_ptr<void> lifetime) {
         PayloadSize = size;
-        Payload = std::shared_ptr<TMessageHolder<TMessage>[]>(new TMessageHolder<TMessage>[size]);
+        auto* payload = new TMessageHolder<TMessage>[size];
+        if (lifetime) {
+            Payload = std::shared_ptr<TMessageHolder<TMessage>[]>(payload,
+                [lifetime = std::move(lifetime)](TMessageHolder<TMessage>* value) {
+                    (void)lifetime;
+                    delete[] value;
+                });
+        } else {
+            Payload = std::shared_ptr<TMessageHolder<TMessage>[]>(payload);
+        }
         PayloadCapacity = size;
     }
 

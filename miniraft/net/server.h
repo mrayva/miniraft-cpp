@@ -81,11 +81,62 @@ private:
     uint64_t UsedBytes = 0;
 };
 
+struct TInboundMessageBudgetLimits {
+    uint64_t MaxBytes = 256ULL * 1024 * 1024;
+};
+
+// Bounds serialized frame storage and AppendEntries payload-holder arrays while
+// the decoded messages remain alive. This is a network-buffer quota, not a
+// process-wide allocator limit.
+class TInboundMessageBudget : public std::enable_shared_from_this<TInboundMessageBudget> {
+    class TReservation {
+    public:
+        TReservation(std::shared_ptr<TInboundMessageBudget> budget, uint64_t bytes)
+            : Budget(std::move(budget)), Bytes(bytes) { }
+        ~TReservation() { Budget->Release(Bytes); }
+    private:
+        std::shared_ptr<TInboundMessageBudget> Budget;
+        uint64_t Bytes;
+    };
+
+public:
+    explicit TInboundMessageBudget(TInboundMessageBudgetLimits limits = {})
+        : Limits(limits) { }
+
+    std::shared_ptr<void> TryReserve(uint64_t bytes) {
+        if (!bytes) return {};
+        {
+            std::lock_guard lock(Mutex);
+            if (UsedBytes > Limits.MaxBytes || bytes > Limits.MaxBytes - UsedBytes)
+                return {};
+            UsedBytes += bytes;
+        }
+        try {
+            return std::make_shared<TReservation>(shared_from_this(), bytes);
+        } catch (...) {
+            Release(bytes);
+            throw;
+        }
+    }
+
+private:
+    void Release(uint64_t bytes) noexcept {
+        std::lock_guard lock(Mutex);
+        if (bytes > UsedBytes) std::terminate();
+        UsedBytes -= bytes;
+    }
+
+    const TInboundMessageBudgetLimits Limits;
+    std::mutex Mutex;
+    uint64_t UsedBytes = 0;
+};
+
 template<typename TSocket>
 class TMessageReader {
 public:
-    TMessageReader(TSocket& socket, TMessageLimits limits = {})
-        : Socket(socket), Limits(limits) { ValidateMessageLimits(Limits); }
+    TMessageReader(TSocket& socket, TMessageLimits limits = {},
+            std::shared_ptr<TInboundMessageBudget> budget = {})
+        : Socket(socket), Limits(limits), Budget(std::move(budget)) { ValidateMessageLimits(Limits); }
 
     NNet::TValueTask<TMessageHolder<TMessage>> Read() {
         if (Failed) throw TMessageError("Cannot reuse a failed frame reader");
@@ -107,13 +158,31 @@ private:
             throw TMessageError("AppendEntries children must be log entries");
         if (header.Len > remaining) throw TMessageError("Message batch exceeds byte limit");
         remaining -= header.Len;
-        auto message = NewHoldedMessage<TMessage>(header.Type, header.Len);
+        auto frameReservation = Budget ? Budget->TryReserve(header.Len) : std::shared_ptr<void>{};
+        if (Budget && !frameReservation)
+            throw TMessageError("Aggregate inbound message byte limit exceeded");
+        TMessageHolder<TMessage> message;
+        if (Budget) {
+            auto* rawMessage = NewMessage<TMessage>(header.Type, header.Len);
+            auto rawData = std::shared_ptr<char[]>(reinterpret_cast<char*>(rawMessage),
+                [reservation = std::move(frameReservation)](char* data) {
+                    (void)reservation;
+                    delete[] data;
+                });
+            message = TMessageHolder<TMessage>(rawMessage, rawData, 0, {}, header.Len);
+        } else {
+            message = NewHoldedMessage<TMessage>(header.Type, header.Len);
+        }
         co_await NNet::TByteReader(Socket).Read(message->Value, header.Len - sizeof(TMessage));
         if (header.Type == uint32_t(EMessageType::APPEND_ENTRIES_REQUEST)) {
             const auto count = message.template Cast<TAppendEntriesRequest>()->Nentries;
             if (count > Limits.MaxEntries || uint64_t(count) * sizeof(TLogEntry) > remaining)
                 throw TMessageError("AppendEntries count exceeds limits");
-            message.InitPayload(count);
+            const auto payloadBytes = uint64_t(count) * sizeof(TMessageHolder<TMessage>);
+            auto payloadReservation = Budget && payloadBytes ? Budget->TryReserve(payloadBytes) : std::shared_ptr<void>{};
+            if (Budget && payloadBytes && !payloadReservation)
+                throw TMessageError("Aggregate inbound message byte limit exceeded");
+            message.InitPayload(count, std::move(payloadReservation));
             for (uint32_t i = 0; i < count; ++i)
                 message.Payload[i] = co_await ReadFrame(true, remaining);
         }
@@ -121,6 +190,7 @@ private:
     }
     TSocket& Socket;
     TMessageLimits Limits;
+    std::shared_ptr<TInboundMessageBudget> Budget;
     bool Failed = false;
 };
 
@@ -402,11 +472,13 @@ public:
         const TNodeDict& nodes,
         const std::shared_ptr<ITimeSource>& ts,
         TRequestProcessor::TAdmissionLimits admissionLimits = {},
-        TOutboundQueueLimits outboundQueueLimits = {})
+        TOutboundQueueLimits outboundQueueLimits = {},
+        TInboundMessageBudgetLimits inboundMessageBudgetLimits = {})
         : Poller(poller)
         , Socket(std::move(socket))
         , Raft(raft)
         , OutboundQueueBudget(std::make_shared<TOutboundQueueBudget>(outboundQueueLimits))
+        , InboundMessageBudget(std::make_shared<TInboundMessageBudget>(inboundMessageBudgetLimits))
         , RequestProcessor(std::make_shared<TRequestProcessor>(raft, rsm, nodes, admissionLimits, ts))
         , TimeSource(ts)
     {
@@ -459,6 +531,7 @@ private:
     TSocket Socket;
     std::shared_ptr<TRaft> Raft;
     std::shared_ptr<TOutboundQueueBudget> OutboundQueueBudget;
+    std::shared_ptr<TInboundMessageBudget> InboundMessageBudget;
     std::shared_ptr<TRequestProcessor> RequestProcessor;
     std::unordered_set<std::shared_ptr<INode>> Nodes;
     std::unordered_map<uint32_t, std::shared_ptr<TNode<TSocket>>> PeerNodes;

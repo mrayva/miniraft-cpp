@@ -201,9 +201,10 @@ deployment requirement and are not negotiated. Asynchronous/COW capture, disk-st
 transfer, process-wide heap quotas, cluster/store authentication, and
 independent review remain open. `TRaftServer` now applies configurable aggregate
 message and byte budgets to its real peer-node outbound queues (defaults: 4096
-messages and 256 MiB), in addition to the existing per-peer limits. This budget
-covers queued and in-flight outbound messages; it does not cap snapshot capture,
-state-machine memory, or total process heap.
+messages and 256 MiB), in addition to the existing per-peer limits. It also
+applies a configurable 256 MiB aggregate inbound message-storage budget across
+decoded frame buffers and AppendEntries payload-holder arrays. These network
+budgets do not cap snapshot capture, state-machine memory, or total process heap.
 The conservative backend still rewrites the entire snapshot and retained suffix
 on each update, and capture/publication runs synchronously on the event loop.
 

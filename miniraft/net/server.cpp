@@ -18,7 +18,7 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(TSocket socket) {
         );
         Nodes.insert(client);
         while (true) {
-            auto mes = co_await TMessageReader(client->Sock()).Read();
+            auto mes = co_await TMessageReader(client->Sock(), {}, InboundMessageBudget).Read();
             // client request
             if (auto maybeCapabilities = mes.template Maybe<TPeerCapabilitiesRequest>()) {
                 auto request = maybeCapabilities.Cast();
@@ -190,7 +190,7 @@ NNet::TVoidTask TRaftServer<TSocket>::OutboundServe(std::shared_ptr<TNode<TSocke
             if (!node->IsConnected()) {
                 throw std::runtime_error("Not connected");
             }
-            auto mes = co_await TMessageReader(node->Sock()).Read();
+            auto mes = co_await TMessageReader(node->Sock(), {}, InboundMessageBudget).Read();
             if (auto maybeCapabilities = mes.template Maybe<TPeerCapabilitiesResponse>()) {
                 if (!node->CompleteCapabilityNegotiation(
                         maybeCapabilities.Cast(), generation))
