@@ -605,6 +605,29 @@ void test_split_legacy_disk_state_migration_requires_trusted_baselines(void**) {
         assert_true(history.Latest.OldVoters() == newVoters);
     }
 
+    // An uncommitted configuration suffix must not be used to justify a
+    // persisted vote for a voter outside the committed membership history.
+    const auto uncommittedVoteLegacy = (files.Directory / "uncommitted-vote-legacy").string();
+    {
+        TDiskState source(uncommittedVoteLegacy, 2);
+        source.CurrentTerm = 3;
+        source.VotedFor = 4;
+        source.Commit();
+        source.Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Joint, 2, 0, 0, voters, newVoters}));
+        source.Commit(); // The joint entry remains beyond the zero commit boundary.
+    }
+    bool uncommittedVoteRejected = false;
+    try { CheckLegacyDiskStateMigration(uncommittedVoteLegacy, 2, voters, 0); }
+    catch (const std::exception&) { uncommittedVoteRejected = true; }
+    assert_true(uncommittedVoteRejected);
+    const auto uncommittedVoteDurable = (files.Directory / "uncommitted-vote-durable").string();
+    bool uncommittedVoteMigrationRejected = false;
+    try { MigrateLegacyDiskState(uncommittedVoteLegacy, uncommittedVoteDurable, 2, voters, 0); }
+    catch (const std::exception&) { uncommittedVoteMigrationRejected = true; }
+    assert_true(uncommittedVoteMigrationRejected);
+    assert_false(fs::exists(uncommittedVoteDurable + ".durable.2"));
+
     const auto invalidConfig = (files.Directory / "invalid-config").string();
     {
         TDiskState source(invalidConfig, 2);
