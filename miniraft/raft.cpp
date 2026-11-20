@@ -630,6 +630,9 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
         return {true, false, 0};
     if (headerBytes > prefix.size()) return {false, false, size_t(headerBytes)};
     std::vector<uint32_t> incomingOld, incomingNew, incomingPrevious;
+    incomingOld.reserve(size_t(voterCount));
+    incomingNew.reserve(size_t(newCount));
+    incomingPrevious.reserve(size_t(previousVoterCount));
     auto readVoterList = [&](size_t offset, uint64_t count, std::vector<uint32_t>& result) {
         uint32_t previous = 0;
         for (uint64_t i = 0; i < count; ++i) {
@@ -658,6 +661,7 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
             TSnapshot::MaxLegacyConfigurationTransitions;
         if (!transitionCount || transitionCount > transitionLimit)
             return {true, false, 0};
+        transitions.reserve(size_t(transitionCount));
         headerBytes += 4;
         for (uint64_t i = 0; i < transitionCount; ++i) {
             if (headerBytes + 56 > totalBytes - 4) return {true, false, 0};
@@ -680,6 +684,8 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
                 return {true, false, 0};
             if (headerBytes + transitionBytes > prefix.size())
                 return {false, false, size_t(headerBytes + transitionBytes)};
+            transition.OldVoters.reserve(size_t(oldCount));
+            transition.NewVoters.reserve(size_t(nextCount));
             auto readTransitionVoters = [&](size_t listOffset, uint64_t count,
                     std::vector<uint32_t>& output) {
                 uint32_t previous = 0;
