@@ -1598,6 +1598,7 @@ void TRaft::Become(EState newStateName) {
 }
 
 void TRaft::Process(ITimeSource::Time now, TMessageHolder<TMessage> message, const std::shared_ptr<INode>& replyTo) {
+    LastRaftTime = now;
     if (!ValidateRpc(message)) return;
     if (message.IsEx()) {
         auto messageEx = message.Cast<TMessageEx>();
@@ -2092,6 +2093,7 @@ uint64_t TRaft::NextSeqno() {
 }
 
 void TRaft::ProcessTimeout(ITimeSource::Time now) {
+    LastRaftTime = now;
     // Learners do not campaign, so their election timeout cannot be used to
     // reclaim an interrupted InstallSnapshot transfer. Expire partial images
     // independently of role and ordinary heartbeat activity.
@@ -2184,6 +2186,24 @@ void TRaft::ProcessTimeout(ITimeSource::Time now) {
         LeaderTimeout(now); break;
     default:
         throw std::logic_error("Unknown state");
+    }
+
+    // Bound outgoing snapshot retention when a peer stops acknowledging chunks.
+    // Run after this tick's replication sends so a synchronously delivered ACK
+    // can refresh progress before its transfer is considered idle.
+    if (StateName == EState::LEADER) {
+        for (auto it = VolatileState->SnapshotRpcs.begin(); it != VolatileState->SnapshotRpcs.end();) {
+            auto& rpc = it->second;
+            if (!rpc.LastProgress) {
+                rpc.LastProgress = now;
+                ++it;
+            } else if (now >= *rpc.LastProgress &&
+                    now - *rpc.LastProgress >= TTimeout::SnapshotTransferIdle) {
+                it = VolatileState->SnapshotRpcs.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 }
 
@@ -2715,6 +2735,7 @@ TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t no
             encoding = EncodedSnapshot;
         }
         rpc = TVolatileState::TSnapshotRpc{snapshot, std::move(encoding)};
+        rpc.LastProgress = LastRaftTime;
         VolatileState->PendingAppendRpcs[nodeId].clear();
     }
     // Pin one immutable image until this peer finishes. Periodic compaction
@@ -2765,6 +2786,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         // Snapshot completion is not a fresh-read acknowledgement. AppendEntries
         // must still establish the next read barrier and replicate the suffix.
     } else {
+        // Only a successful chunk ACK advances the transfer's idle deadline.
+        rpc.LastProgress = now;
         rpc.Offset = response->NextOffset;
         rpc.Seqno = 0; // Next chunk gets a new identity; old replies stay stale.
     }

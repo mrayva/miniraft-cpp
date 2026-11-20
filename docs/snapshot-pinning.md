@@ -19,8 +19,10 @@ discard outgoing transfer contexts. One image/encoding pair is retained per
 active peer transfer, with sharing between transfers of the same image. The
 [alpha.43 pin budget](snapshot-pin-budget.md) later capped active retention to two
 distinct image generations and defers further compaction until a transfer
-completes. It does not add a byte quota for all Raft, application, transport and
-temporary snapshot memory, or a general transfer cancellation API.
+completes or becomes idle for 30 seconds without a successful chunk ACK. The
+idle timeout releases stalled pins so a dead peer cannot block compaction
+indefinitely. It does not add a byte quota for all Raft, application, transport
+and temporary snapshot memory, or a general transfer cancellation API.
 
 A deterministic regression commits and compacts new data before every chunk ACK,
 including the final ACK, for both voter and learner receivers. The old code fails

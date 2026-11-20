@@ -16,6 +16,12 @@ failure with offset zero, which tells the sender to restart the pinned image
 from its first chunk. Completed installations and the covered-prefix metadata
 fast path release the partial state as before.
 
+The sender also releases a pinned image after 30 seconds without a successful
+chunk acknowledgement. It retries from the current local snapshot on a later
+heartbeat, so a peer that stopped responding cannot retain an old generation
+and block future compaction indefinitely. Only successful forward progress
+refreshes this deadline; failed replies and repeated sends do not.
+
 A deterministic learner test starts a partial transfer, continues ordinary
 leader heartbeats, advances the injected clock beyond the idle limit, and
 verifies that the old continuation is rejected and a fresh transfer succeeds.
@@ -23,10 +29,11 @@ The test also verifies the application and Raft snapshot boundary are unchanged
 until the fresh image completes.
 
 Self-review checked both receiving paths, duplicate chunk handling, role
-independence and restart-from-zero behavior. This bounds the lifetime of one
-partial in-memory image; it does not impose a cluster-wide memory quota or stream
-snapshot content to disk. At alpha.42, live voter reconfiguration and joint
-snapshot adoption were still open. They are now covered by [live membership](configuration-entries.md)
-and [matching-history joint snapshot installation](joint-snapshot-runtime.md).
+independence, restart-from-zero behavior and release of a stalled sender pin.
+This bounds the lifetime of one partial in-memory image; it does not impose a
+cluster-wide memory quota or stream snapshot content to disk. At alpha.42, live
+voter reconfiguration and joint snapshot adoption were still open. They are now
+covered by [live membership](configuration-entries.md) and [matching-history
+joint snapshot installation](joint-snapshot-runtime.md).
 Snapshot installation still requires the receiver's committed or validated
 pending history to match; an image cannot introduce an unknown transition.

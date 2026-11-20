@@ -98,18 +98,21 @@ void test_snapshot_capture_preflights_application_size_bound(void**) {
 }
 struct TCluster {
     ITimeSource::Time Now{};
-    std::vector<std::shared_ptr<TRaft>> Nodes{3};
-    std::vector<std::shared_ptr<TApplication>> Apps{3};
-    std::vector<std::unique_ptr<TRequestProcessor>> Processors{3};
+    uint32_t NodeCount;
+    std::vector<std::shared_ptr<TRaft>> Nodes;
+    std::vector<std::shared_ptr<TApplication>> Apps;
+    std::vector<std::unique_ptr<TRequestProcessor>> Processors;
     std::deque<TMessageHolder<TMessage>> Packets;
     std::set<uint32_t> Isolated;
     std::vector<uint32_t> Learners;
-    explicit TCluster(std::vector<uint32_t> learners = {}) : Learners(std::move(learners)) {
-        for (uint32_t id = 1; id <= 3; ++id) Build(id, std::make_shared<TState>());
+    explicit TCluster(std::vector<uint32_t> learners = {}, uint32_t nodeCount = 3)
+        : NodeCount(nodeCount), Nodes(nodeCount), Apps(nodeCount), Processors(nodeCount),
+          Learners(std::move(learners)) {
+        for (uint32_t id = 1; id <= NodeCount; ++id) Build(id, std::make_shared<TState>());
     }
     void Build(uint32_t id, std::shared_ptr<IState> state) {
         TNodeDict peers;
-        for (uint32_t dst = 1; dst <= 3; ++dst) if (dst != id)
+        for (uint32_t dst = 1; dst <= NodeCount; ++dst) if (dst != id)
             peers[dst] = std::make_shared<TEndpoint>([this](auto message) { Packets.push_back(std::move(message)); });
         Processors[id - 1].reset();
         Nodes[id - 1] = std::make_shared<TRaft>(state, id, peers, Learners);
@@ -489,8 +492,8 @@ void test_compaction_during_each_chunk_cannot_restart_snapshot_catchup(void**) {
         if (!learners.empty()) assert_true(cluster.Nodes[0]->IsLearnerCaughtUp(3));
     }
 }
-void test_compaction_is_deferred_until_one_pinned_generation_finishes(void**) {
-    TCluster cluster({3}); cluster.Prepare();
+void test_stalled_snapshot_transfer_expires_and_releases_pinned_generation(void**) {
+    TCluster cluster({4}, 4); cluster.Prepare();
     auto firstChunk = cluster.SendChunk();
     const auto firstIndex = firstChunk->SnapshotIndex;
     cluster.Deliver(firstChunk); // Lose the ACK; peer 3 keeps the first image pinned.
@@ -498,21 +501,23 @@ void test_compaction_is_deferred_until_one_pinned_generation_finishes(void**) {
     auto* progress = const_cast<TVolatileState*>(cluster.Nodes[0]->GetVolatileState());
     assert_true(progress->SnapshotRpcs.contains(3));
 
-    cluster.Isolated = {3};
+    cluster.Isolated = {3, 4};
     cluster.Write(1, "generation", "two");
     auto second = cluster.Nodes[0]->Compact();
     assert_true(second.Index > firstIndex);
     cluster.Write(1, "generation", "three");
     assert_true(cluster.Apps[0]->LastAppliedIndex > second.Index);
 
-    // Force a second peer to begin a transfer from the newer generation.
-    progress->NextIndex[2] = 1;
+    // Force the lagging learner to begin a transfer from the newer generation.
+    progress->NextIndex[4] = 1;
     cluster.Packets.clear();
     cluster.Nodes[0]->ApproveRead();
-    auto secondChunk = cluster.Take(1, 2, EMessageType::INSTALL_SNAPSHOT_REQUEST).Cast<TInstallSnapshotRequest>();
+    auto secondChunk = cluster.Take(1, 4, EMessageType::INSTALL_SNAPSHOT_REQUEST).Cast<TInstallSnapshotRequest>();
     assert_int_equal(secondChunk->SnapshotIndex, second.Index);
+    assert_int_equal(secondChunk->Offset, 0);
+    assert_true(secondChunk->TotalBytes > TInstallSnapshotRequest::MaxChunkBytes);
     assert_int_equal(progress->SnapshotRpcs.at(3).Snapshot->Index, firstIndex);
-    assert_int_equal(progress->SnapshotRpcs.at(2).Snapshot->Index, second.Index);
+    assert_int_equal(progress->SnapshotRpcs.at(4).Snapshot->Index, second.Index);
 
     const auto storedBoundary = cluster.Nodes[0]->GetState()->SnapshotIndex;
     const auto storedLastIndex = cluster.Nodes[0]->GetState()->LastLogIndex;
@@ -521,15 +526,72 @@ void test_compaction_is_deferred_until_one_pinned_generation_finishes(void**) {
     assert_int_equal(cluster.Nodes[0]->GetState()->SnapshotIndex, storedBoundary);
     assert_int_equal(cluster.Nodes[0]->GetState()->LastLogIndex, storedLastIndex);
     assert_int_equal(cluster.Apps[0]->LastAppliedIndex, appliedIndex);
-    assert_true(progress->SnapshotRpcs.contains(2)); assert_true(progress->SnapshotRpcs.contains(3));
+    assert_true(progress->SnapshotRpcs.contains(3)); assert_true(progress->SnapshotRpcs.contains(4));
 
-    // Once peer 2 completes, compaction can advance while peer 3 still owns
-    // its older immutable image.
+    // A peer that has stopped making progress eventually releases its old
+    // immutable image, allowing compaction to proceed while another transfer
+    // remains active.
+    std::weak_ptr<const TSnapshot> stalledImage = progress->SnapshotRpcs.at(3).Snapshot;
+    // Keep the leader's quorum lease alive with voter 2 while the learner
+    // advances and the isolated voter 3 remains stalled.
+    cluster.Now += std::chrono::seconds(10);
     cluster.Deliver(secondChunk);
-    auto ack = cluster.Take(2, 1, EMessageType::INSTALL_SNAPSHOT_RESPONSE).Cast<TInstallSnapshotResponse>();
-    cluster.Deliver(ack);
-    assert_true(ack->Installed);
-    assert_false(progress->SnapshotRpcs.contains(2)); assert_true(progress->SnapshotRpcs.contains(3));
+    auto partialAck = cluster.Take(4, 1, EMessageType::INSTALL_SNAPSHOT_RESPONSE)
+        .Cast<TInstallSnapshotResponse>();
+    assert_false(partialAck->Installed);
+    cluster.Deliver(partialAck);
+
+    auto deliverVoterTwoTraffic = [&] {
+        while (!cluster.Packets.empty()) {
+            auto message = cluster.Packets.front(); cluster.Packets.pop_front();
+            const auto header = message.Cast<TMessageEx>();
+            if ((header->Src == 1 && header->Dst == 2) || (header->Src == 2 && header->Dst == 1))
+                cluster.Deliver(message);
+        }
+    };
+    cluster.Nodes[0]->ProcessTimeout(cluster.Now);
+    deliverVoterTwoTraffic();
+    cluster.Now += std::chrono::seconds(10);
+    cluster.Nodes[0]->ProcessTimeout(cluster.Now);
+    auto nextChunk = cluster.Take(1, 4, EMessageType::INSTALL_SNAPSHOT_REQUEST)
+        .Cast<TInstallSnapshotRequest>();
+    deliverVoterTwoTraffic();
+    cluster.Deliver(nextChunk);
+    partialAck = cluster.Take(4, 1, EMessageType::INSTALL_SNAPSHOT_RESPONSE)
+        .Cast<TInstallSnapshotResponse>();
+    assert_false(partialAck->Installed);
+    cluster.Deliver(partialAck);
+    cluster.Now += std::chrono::seconds(10);
+    cluster.Nodes[0]->ProcessTimeout(cluster.Now);
+    deliverVoterTwoTraffic();
+    assert_false(progress->SnapshotRpcs.contains(3));
+    assert_true(progress->SnapshotRpcs.contains(4));
+    assert_true(stalledImage.expired());
+    cluster.Now += TTimeout::Rpc;
+    cluster.Nodes[0]->ProcessTimeout(cluster.Now);
+    auto retryChunk = cluster.Take(1, 4, EMessageType::INSTALL_SNAPSHOT_REQUEST)
+        .Cast<TInstallSnapshotRequest>();
+    cluster.Packets.clear();
+    const auto afterIdleExpiry = cluster.Nodes[0]->Compact();
+    assert_true(afterIdleExpiry.Index > storedBoundary);
+
+    // The learner can still complete its pinned image after this newer
+    // compaction; its installed ACK releases that remaining generation.
+    bool installed = false;
+    for (unsigned attempts = 0; !installed && attempts < 8; ++attempts) {
+        auto request = attempts == 0 ? std::move(retryChunk) :
+            cluster.Take(1, 4, EMessageType::INSTALL_SNAPSHOT_REQUEST).Cast<TInstallSnapshotRequest>();
+        cluster.Deliver(request);
+        auto ack = cluster.Take(4, 1, EMessageType::INSTALL_SNAPSHOT_RESPONSE)
+            .Cast<TInstallSnapshotResponse>();
+        installed = ack->Installed;
+        cluster.Deliver(ack);
+        if (!installed) cluster.Nodes[0]->ProcessTimeout(cluster.Now);
+    }
+    assert_true(installed);
+    assert_false(progress->SnapshotRpcs.contains(4));
+    if (auto restarted = progress->SnapshotRpcs.find(3); restarted != progress->SnapshotRpcs.end())
+        assert_true(restarted->second.Snapshot->Index > firstIndex);
     cluster.Packets.clear();
     auto latest = cluster.Nodes[0]->Compact();
     assert_true(latest.Index > storedBoundary);
@@ -1401,7 +1463,7 @@ int main() {
         cmocka_unit_test(test_snapshot_timeout_retries_do_not_starve_delayed_acks),
         cmocka_unit_test(test_snapshot_read_traffic_does_not_starve_delayed_acks),
         cmocka_unit_test(test_compaction_during_each_chunk_cannot_restart_snapshot_catchup),
-        cmocka_unit_test(test_compaction_is_deferred_until_one_pinned_generation_finishes),
+        cmocka_unit_test(test_stalled_snapshot_transfer_expires_and_releases_pinned_generation),
         cmocka_unit_test(test_leader_change_mid_snapshot_rejects_old_chunks),
         cmocka_unit_test(test_partial_and_installed_snapshot_acks_do_not_confirm_strong_reads),
         cmocka_unit_test(test_compacted_follower_hint_requires_boundary_probe_before_match),

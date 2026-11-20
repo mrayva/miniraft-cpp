@@ -115,6 +115,9 @@ struct TVolatileState {
         // Seqno identifies the outstanding chunk across retries; zero means
         // its reply was consumed and the next send needs a fresh identity.
         uint64_t Offset = 0, Seqno = 0, SentEnd = 0;
+        // Lack of forward progress releases this pin so stalled peers cannot
+        // retain old snapshot generations indefinitely.
+        std::optional<ITimeSource::Time> LastProgress;
     };
     std::unordered_map<uint32_t, TSnapshotRpc> SnapshotRpcs;
     struct TConfigurationBarrierRpc {
@@ -415,6 +418,7 @@ private:
     uint64_t EncodedSnapshotLineageIndex = 0;
     std::shared_ptr<const TSnapshotEncoding> EncodedSnapshotBaseFormat;
     uint64_t EncodedSnapshotBaseFormatIndex = 0;
+    ITimeSource::Time LastRaftTime{};
 
     EState StateName;
     uint32_t Seed = 31337;
