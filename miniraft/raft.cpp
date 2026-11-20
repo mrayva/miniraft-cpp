@@ -2830,8 +2830,14 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         if (!same) {
             if (request->Offset != 0 || (IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
                 IncomingSnapshot->Index > request->SnapshotIndex)) { reply(false, false, 0); return; }
+            IncomingSnapshot.reset(); // Release the superseded assembly before reserving its replacement.
+            // Covered snapshots buffer only metadata, but a large history prefix
+            // can still consume substantial memory. Charge its declared image
+            // against the same aggregate receive budget before appending bytes.
+            auto reservation = SnapshotInstallBudget->TryReserve(request->TotalBytes);
+            if (!reservation) { reply(false, false, 0); return; }
             IncomingSnapshot = TIncomingSnapshot{request->Term, request->SnapshotIndex, request->SnapshotTerm,
-                request->TotalBytes, request->LeaderId, now, {}};
+                request->TotalBytes, request->LeaderId, now, {}, std::move(reservation)};
         }
         auto& prefix = IncomingSnapshot->Bytes;
         const auto count = request->Len - sizeof(TInstallSnapshotRequest);

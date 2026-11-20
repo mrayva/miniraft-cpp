@@ -747,6 +747,59 @@ void test_snapshot_install_budget_is_shared_and_reclaimed_after_idle_expiry(void
     assert_true(installed->Success); assert_true(installed->Installed);
     assert_int_equal(budget->UsedBytes(), 0);
 }
+void test_covered_snapshot_metadata_uses_shared_install_budget(void**) {
+    auto budget = std::make_shared<TSnapshotInstallBudget>(200);
+    TRaft::TLogLimits limits;
+    limits.SnapshotInstallBudget = budget;
+    std::vector<TMessageHolder<TMessage>> replies;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) { replies.push_back(std::move(message)); });
+    TNodeDict peers{{1, peer}};
+    auto makeState = [] {
+        auto state = std::make_shared<TState>();
+        auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = 1;
+        state->Append(entry);
+        state->CommitIndex = 1;
+        return state;
+    };
+    auto raft2 = std::make_shared<TRaft>(makeState(), 2, peers, std::vector<uint32_t>{}, limits);
+    auto raft3 = std::make_shared<TRaft>(makeState(), 3, peers, std::vector<uint32_t>{}, limits);
+
+    auto request = [](uint32_t target, uint64_t totalBytes = 128) {
+        constexpr std::string_view prefix = "MRFT";
+        auto chunk = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + prefix.size());
+        chunk->Src = 1; chunk->Dst = target; chunk->Term = 1; chunk->Seqno = 1;
+        chunk->SnapshotIndex = 1; chunk->SnapshotTerm = 1;
+        chunk->TotalBytes = totalBytes; chunk->Offset = 0; chunk->LeaderId = 1; chunk->Done = 0;
+        memcpy(chunk->Data, prefix.data(), prefix.size());
+        return chunk;
+    };
+
+    raft2->Process(ITimeSource::Time{}, request(2));
+    auto first = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_true(first->Success); assert_int_equal(first->NextOffset, 4);
+    assert_int_equal(budget->UsedBytes(), 128);
+
+    replies.clear();
+    raft2->Process(ITimeSource::Time{}, request(2, 150));
+    auto replaced = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_true(replaced->Success); assert_int_equal(replaced->NextOffset, 4);
+    assert_int_equal(budget->UsedBytes(), 150);
+
+    replies.clear();
+    raft3->Process(ITimeSource::Time{}, request(3));
+    auto overBudget = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_false(overBudget->Success); assert_int_equal(overBudget->NextOffset, 0);
+    assert_int_equal(budget->UsedBytes(), 150);
+
+    const auto expiredAt = ITimeSource::Time{} + TTimeout::SnapshotTransferIdle;
+    raft2->ProcessTimeout(expiredAt);
+    assert_int_equal(budget->UsedBytes(), 0);
+    replies.clear();
+    raft3->Process(expiredAt, request(3));
+    auto retried = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_true(retried->Success); assert_int_equal(retried->NextOffset, 4);
+    assert_int_equal(budget->UsedBytes(), 128);
+}
 void test_snapshot_install_accepts_every_small_fixed_chunk_size(void**) {
     TKv source;
     source.Write(source.Prepare(Command("key", "value")), 1);
@@ -1519,6 +1572,7 @@ int main() {
         cmocka_unit_test(test_snapshot_history_encoding_is_negotiated_per_peer),
         cmocka_unit_test(test_idle_snapshot_transfer_discards_partial_image_and_restarts),
         cmocka_unit_test(test_snapshot_install_budget_is_shared_and_reclaimed_after_idle_expiry),
+        cmocka_unit_test(test_covered_snapshot_metadata_uses_shared_install_budget),
         cmocka_unit_test(test_snapshot_install_accepts_every_small_fixed_chunk_size),
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),
         cmocka_unit_test(test_simultaneous_startup_candidates_use_distinct_election_deadlines),

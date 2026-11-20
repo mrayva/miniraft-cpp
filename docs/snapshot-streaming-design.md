@@ -18,8 +18,10 @@ Incoming InstallSnapshot assemblies reserve their declared image size against
 a shared 256 MiB process-wide budget by default. Raft instances can share a
 custom `TSnapshotInstallBudget` through `TLogLimits`; a transfer that cannot
 reserve space is rejected at offset zero and can retry after capacity is
-released. Completion, rejection, term change and idle expiry release the
-reservation. This accounts for incomplete receive images only; retained
+released. Full-image transfers and covered-boundary metadata probes both
+reserve their declared image size, even though the latter retains only a
+metadata prefix. Completion, rejection, term change and idle expiry release the
+reservation. This accounts for incomplete receive buffers only; retained
 snapshots, outgoing pins, capture buffers, application memory and transport
 buffers remain outside this budget.
 
