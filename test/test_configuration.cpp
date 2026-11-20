@@ -3157,6 +3157,84 @@ void test_snapshot_install_validates_and_advances_committed_membership_history(v
         assert_int_equal(state->LastLogIndex, 6); assert_int_equal(state->CommitIndex, 6);
         assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
     }
+
+    // A stale voter can catch up from a joint snapshot after missing a stable
+    // membership change. The old-side leader remains valid during joint
+    // consensus, but a chain with a different trusted anchor must be rejected.
+    {
+        const std::vector<uint32_t> originalVoters{1, 2, 3};
+        const std::vector<uint32_t> intermediateVoters{1, 2, 4};
+        const std::vector<uint32_t> jointNewVoters{2, 4, 5};
+        auto history = TConfigurationHistory::Stable(originalVoters, 0, 0, 0, 0)
+            .Observe(1, Ordinary(1));
+        const TConfigurationRecord firstJoint{
+            EConfigurationPhase::Joint, 2, 0, 0, originalVoters, intermediateVoters};
+        history = history.Advance(2, EncodeConfigurationEntry(firstJoint));
+        auto firstStable = firstJoint;
+        firstStable.Phase = EConfigurationPhase::Stable;
+        firstStable.PreviousIndex = 2;
+        firstStable.PreviousTerm = 2;
+        history = history.Advance(3, EncodeConfigurationEntry(firstStable));
+        history = history.Observe(4, Ordinary(3));
+        const TConfigurationRecord activeJoint{
+            EConfigurationPhase::Joint, 3, 3, 2, intermediateVoters, jointNewVoters};
+        history = history.Advance(5, EncodeConfigurationEntry(activeJoint));
+        const auto snapshot = history.MakeSnapshot("5");
+        auto wrongAnchor = snapshot;
+        wrongAnchor.ConfigurationTransitions.front().OldVoters = {1, 2, 7};
+
+        auto state = std::make_shared<TDurableState>((dir / "stale-history").string(), 3);
+        state->BindVoters(originalVoters);
+        state->CurrentTerm = 4;
+        state->Append(Ordinary(1));
+        state->CommitIndex = 1;
+        state->Commit();
+        auto toLeader = std::make_shared<TEndpoint>();
+        TNodeDict peers{{1, toLeader}, {2, std::make_shared<TEndpoint>()},
+            {4, std::make_shared<TEndpoint>()}, {5, std::make_shared<TEndpoint>()}};
+        auto raft = std::make_shared<TRaft>(state, 3, peers, std::vector<uint32_t>{4, 5});
+        auto application = std::make_shared<TSnapshotRsm>();
+        TRequestProcessor processor(raft, application, peers);
+
+        auto install = [&](const TSnapshot& incoming, uint64_t sequence) {
+            const auto bytes = EncodeSnapshot(incoming);
+            auto request = NewHoldedMessage<TInstallSnapshotRequest>(
+                sizeof(TInstallSnapshotRequest) + bytes.size());
+            request->Src = 1;
+            request->Dst = 3;
+            request->Term = 4;
+            request->Seqno = sequence;
+            request->SnapshotIndex = incoming.Index;
+            request->SnapshotTerm = incoming.Term;
+            request->Offset = 0;
+            request->TotalBytes = bytes.size();
+            request->Done = 1;
+            request->LeaderId = 1;
+            memcpy(request->Data, bytes.data(), bytes.size());
+            raft->Process(ITimeSource::Time{}, std::move(request));
+        };
+
+        install(wrongAnchor, 40);
+        assert_int_equal(state->SnapshotIndex, 0);
+        assert_int_equal(state->LastLogIndex, 1);
+        assert_int_equal(application->LastAppliedIndex, 0);
+        auto rejected = toLeader->Messages.back().Cast<TInstallSnapshotResponse>();
+        assert_false(rejected->Success);
+        assert_false(rejected->Installed);
+
+        install(snapshot, 41);
+        assert_int_equal(state->SnapshotIndex, snapshot.Index);
+        assert_int_equal(state->CommitIndex, snapshot.Index);
+        assert_int_equal(application->LastAppliedIndex, snapshot.Index);
+        assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2, 4, 5}));
+        assert_true(raft->IsVoter(1)); // The valid sender belongs to the old side only.
+        assert_false(raft->IsVoter(3));
+        assert_true(state->GetSnapshot()->IsJoint());
+        assert_true(state->GetSnapshot()->JointVoters == jointNewVoters);
+        auto installed = toLeader->Messages.back().Cast<TInstallSnapshotResponse>();
+        assert_true(installed->Success);
+        assert_true(installed->Installed);
+    }
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 #endif
 }
