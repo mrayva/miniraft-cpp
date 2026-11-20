@@ -604,9 +604,7 @@ void TDurableState::ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t
         if (!entry) throw std::invalid_argument("Missing retained legacy log entry");
         ValidateMessageTree(entry);
         if (entry->Flags == TLogEntry::EConfiguration) {
-            const auto record = DecodeConfigurationEntry(entry);
-            historicalVoters.insert(historicalVoters.end(), record.OldVoters.begin(), record.OldVoters.end());
-            historicalVoters.insert(historicalVoters.end(), record.NewVoters.begin(), record.NewVoters.end());
+            (void)DecodeConfigurationEntry(entry);
         } else if (entry->Flags != TLogEntry::ENone && entry->Flags != TLogEntry::EStub) {
             throw std::invalid_argument("Legacy log contains unsupported entry flags");
         }
@@ -617,7 +615,15 @@ void TDurableState::ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t
     if (LastLogTerm != previousTerm)
         throw std::invalid_argument("Legacy log last term mismatch");
 
-    (void)ScanConfigurationHistory(*this, baseline, commitIndex);
+    const auto configuration = ScanConfigurationHistory(*this, baseline, commitIndex);
+    for (const auto& transition : configuration.Committed.ConfigurationTransitions()) {
+        historicalVoters.insert(historicalVoters.end(), transition.OldVoters.begin(), transition.OldVoters.end());
+        historicalVoters.insert(historicalVoters.end(), transition.NewVoters.begin(), transition.NewVoters.end());
+    }
+    historicalVoters.insert(historicalVoters.end(), configuration.Committed.OldVoters().begin(),
+        configuration.Committed.OldVoters().end());
+    historicalVoters.insert(historicalVoters.end(), configuration.Committed.NewVoters().begin(),
+        configuration.Committed.NewVoters().end());
     std::sort(historicalVoters.begin(), historicalVoters.end());
     historicalVoters.erase(std::unique(historicalVoters.begin(), historicalVoters.end()), historicalVoters.end());
     if (VotedFor && !std::binary_search(historicalVoters.begin(), historicalVoters.end(), VotedFor))

@@ -48,11 +48,12 @@ uint32_t Crc32(std::string_view bytes) {
     return ~crc;
 }
 std::string LegacyImage(std::string_view magic, bool hasSnapshot, bool configured,
-        const TSnapshot* replacementSnapshot = nullptr) {
+        const TSnapshot* replacementSnapshot = nullptr, uint32_t votedFor = 1,
+        const std::vector<TMessageHolder<TLogEntry>>* replacementEntries = nullptr) {
     std::string payload;
     Put(payload, 3, 8); // current term
-    Put(payload, 1, 4); // vote
-    Put(payload, 1, 8); // retained entry count
+    Put(payload, votedFor, 4);
+    Put(payload, replacementEntries ? replacementEntries->size() : 1, 8); // retained entry count
     if (configured) {
         Put(payload, 2, 4); Put(payload, 1, 4); Put(payload, 2, 4);
     }
@@ -61,7 +62,17 @@ std::string LegacyImage(std::string_view magic, bool hasSnapshot, bool configure
             TSnapshot{1, 2, {1, 2}, "legacy snapshot"});
         Put(payload, image.size(), 8); payload.append(image);
     }
-    Put(payload, 3, 8); Put(payload, 0, 8); Put(payload, 4, 4); payload.append("tail");
+    if (replacementEntries) {
+        for (const auto& entry : *replacementEntries) {
+            const auto dataSize = entry->Len - sizeof(TLogEntry);
+            Put(payload, entry->Term, 8);
+            Put(payload, entry->Flags, 8);
+            Put(payload, dataSize, 4);
+            payload.append(entry->Data, dataSize);
+        }
+    } else {
+        Put(payload, 3, 8); Put(payload, 0, 8); Put(payload, 4, 4); payload.append("tail");
+    }
     std::string checksumInput;
     if (magic != "MRFTD001") checksumInput.append(magic);
     checksumInput.append(payload);
@@ -180,6 +191,37 @@ void test_legacy_configuration_snapshot_migration_requires_complete_trusted_hist
         catch (const std::invalid_argument&) { rejected = true; }
         assert_true(rejected);
         assert_true(state.HasUnboundRecoveredState());
+    }
+}
+void test_legacy_vote_cannot_be_justified_by_uncommitted_membership(void**) {
+    const std::vector<uint32_t> originalVoters{1, 2, 3};
+    const std::vector<uint32_t> newVoters{2, 3, 4};
+    std::vector<TMessageHolder<TLogEntry>> entries;
+    entries.push_back(EncodeConfigurationEntry({
+        EConfigurationPhase::Joint, 2, 0, 0, originalVoters, newVoters}));
+
+    TFiles files;
+    const auto legacy = LegacyImage("MRFTD001", false, false, nullptr, 4, &entries);
+    { std::ofstream output(files.Image(), std::ios::binary); output.write(legacy.data(), legacy.size()); }
+    {
+        TDurableState state(files.Name, 1);
+        assert_true(state.HasUnboundRecoveredState());
+        std::string reason;
+        assert_false(state.CanBindVotersFromTrustedHistory(originalVoters, 0, &reason));
+        assert_true(reason.find("Stored vote is outside") != std::string::npos);
+
+        bool rejected = false;
+        try { state.BindVotersFromTrustedHistory(originalVoters, 0); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        assert_true(rejected);
+        assert_true(state.HasUnboundRecoveredState());
+        assert_true(state.GetBoundVoters().empty());
+        assert_int_equal(state.CommitIndex, 0);
+
+        std::string persisted(legacy.size(), '\0');
+        std::ifstream input(files.Image(), std::ios::binary);
+        assert_true(bool(input.read(persisted.data(), std::streamsize(persisted.size()))));
+        assert_true(persisted == legacy);
     }
 }
 void TFiles::Seed() {
@@ -644,6 +686,7 @@ int main() {
         cmocka_unit_test(test_legacy_store_is_not_silently_migrated),
         cmocka_unit_test(test_split_legacy_disk_state_migration_requires_trusted_baselines),
         cmocka_unit_test(test_legacy_configuration_snapshot_migration_requires_complete_trusted_history),
+        cmocka_unit_test(test_legacy_vote_cannot_be_justified_by_uncommitted_membership),
         cmocka_unit_test(test_get_and_append_do_not_share_mutable_entries),
         cmocka_unit_test(test_raft_election_and_application_replay_after_restart),
     };
