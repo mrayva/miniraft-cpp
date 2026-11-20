@@ -306,6 +306,17 @@ bool TruncateAndSyncRegularFileNoFollow(const std::string& path) {
 #endif
 }
 
+bool IsRegularFileNoFollow(const std::string& path) {
+#ifdef _WIN32
+    const auto attributes = GetFileAttributesA(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+        !(attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY));
+#else
+    struct stat info{};
+    return lstat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode);
+#endif
+}
+
 bool WriteAndSyncFile(const std::string& path, const char* data, size_t size) {
     TSafeTempFile output;
     return output.Open(path) && output.Write(data, size) && output.SyncAndClose();
@@ -400,8 +411,10 @@ TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitH
         IndexPath = GenerationPath(IndexGeneration);
         Index = Open(IndexPath, false);
         SnapshotFilePath = SnapshotPath(IndexGeneration);
+        if (!IsRegularFileNoFollow(SnapshotFilePath))
+            throw std::runtime_error("Missing or invalid Raft snapshot: " + SnapshotFilePath);
         std::ifstream snapshotFile(SnapshotFilePath, std::ios::binary);
-        if (!snapshotFile) throw std::runtime_error("Missing Raft snapshot: " + SnapshotFilePath);
+        if (!snapshotFile) throw std::runtime_error("Cannot open Raft snapshot: " + SnapshotFilePath);
         std::string encodedSnapshot{std::istreambuf_iterator<char>(snapshotFile), std::istreambuf_iterator<char>()};
         Snapshot = std::make_shared<const TSnapshot>(DecodeSnapshotOwned(std::move(encodedSnapshot)));
         if (Snapshot->Index != SnapshotIndex || Snapshot->Term != SnapshotTerm)
@@ -451,9 +464,38 @@ std::string TDiskState::SnapshotPath(uint64_t generation) const {
 
 std::fstream TDiskState::Open(const std::string& name, bool create)
 {
+#ifdef _WIN32
+    const auto attributes = GetFileAttributesA(name.c_str());
+    bool missing = false;
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        const auto error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) missing = true;
+        else throw std::runtime_error("Cannot inspect Raft storage path: " + name);
+    } else if (attributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+        throw std::runtime_error("Raft storage path cannot be a reparse point: " + name);
+    } else if (attributes & FILE_ATTRIBUTE_DIRECTORY) {
+        throw std::runtime_error("Raft storage path must be a regular file: " + name);
+    }
+#else
+    std::error_code statusError;
+    const auto status = std::filesystem::symlink_status(name, statusError);
+    if (statusError && statusError != std::errc::no_such_file_or_directory)
+        throw std::runtime_error("Cannot inspect Raft storage path: " + name);
+    const bool missing = status.type() == std::filesystem::file_type::not_found ||
+        status.type() == std::filesystem::file_type::none ||
+        statusError == std::errc::no_such_file_or_directory;
+    if (!missing && std::filesystem::is_symlink(status))
+        throw std::runtime_error("Raft storage path cannot be a symlink: " + name);
+    if (!missing && !std::filesystem::is_regular_file(status))
+        throw std::runtime_error("Raft storage path must be a regular file: " + name);
+#endif
     if (create) {
-        std::ofstream file(name, std::ios::binary);
-        if (!file) throw std::runtime_error("Cannot create file: " + name);
+        if (!missing) throw std::runtime_error("Raft storage file already exists: " + name);
+        TSafeTempFile file;
+        if (!file.Open(name) || !file.SyncAndClose())
+            throw std::runtime_error("Cannot safely create file: " + name);
+    } else if (missing) {
+        throw std::runtime_error("Cannot open file: " + name);
     }
     std::fstream file(name, std::ios::in | std::ios::out | std::ios::binary);
     // An open failure must never fall back to truncating an existing file.

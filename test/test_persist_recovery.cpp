@@ -472,12 +472,14 @@ void test_snapshot_reclaim_does_not_truncate_symlinked_base_log(void**) {
     fs::copy_file(entriesPath, victimPath);
     std::ifstream original(victimPath, std::ios::binary);
     const std::string originalContents{std::istreambuf_iterator<char>(original), {}};
-    fs::remove(entriesPath);
-    fs::create_symlink(victimPath, entriesPath);
 
     const TSnapshot snapshot{3, 7, {1, 2}, "safe image"};
     {
         TDiskState state(files.Name, 1);
+        // Replace the path after the state has opened its original log handle
+        // to exercise the reclamation check independently of startup checks.
+        fs::remove(entriesPath);
+        fs::create_symlink(victimPath, entriesPath);
         state.InstallSnapshot(snapshot);
     }
 
@@ -485,10 +487,72 @@ void test_snapshot_reclaim_does_not_truncate_symlinked_base_log(void**) {
     const std::string actualContents{std::istreambuf_iterator<char>(victim), {}};
     assert_true(actualContents == originalContents);
     assert_true(fs::is_symlink(entriesPath));
+    fs::remove(entriesPath);
+    std::ofstream replacement(entriesPath, std::ios::binary);
+    assert_true(bool(replacement));
+    replacement.close();
     TDiskState recovered(files.Name, 1);
     assert_true(recovered.GetSnapshot() && *recovered.GetSnapshot() == snapshot);
     assert_int_equal(recovered.SnapshotIndex, 3);
     assert_int_equal(recovered.LastLogIndex, 3);
+}
+
+void test_disk_storage_rejects_symlinked_paths(void**) {
+    for (const std::string kind : {"entries", "index", "state"}) {
+        TFiles files;
+        files.Seed();
+        const auto storagePath = files.Path(kind);
+        const auto victimPath = files.Directory / (kind + "-target");
+        fs::copy_file(storagePath, victimPath);
+        std::ifstream original(victimPath, std::ios::binary);
+        const std::string originalContents{std::istreambuf_iterator<char>(original), {}};
+        fs::remove(storagePath);
+        fs::create_symlink(victimPath, storagePath);
+
+        bool rejected = false;
+        try { TDiskState state(files.Name, 1); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert_true(rejected);
+        assert_true(fs::is_symlink(storagePath));
+        std::ifstream victim(victimPath, std::ios::binary);
+        const std::string actualContents{std::istreambuf_iterator<char>(victim), {}};
+        assert_true(actualContents == originalContents);
+    }
+
+    TFiles fresh;
+    const auto danglingPath = fresh.Path("entries");
+    const auto absentTarget = fresh.Directory / "not-created";
+    fs::create_symlink(absentTarget, danglingPath);
+    bool rejected = false;
+    try { TDiskState state(fresh.Name, 1); }
+    catch (const std::runtime_error&) { rejected = true; }
+    assert_true(rejected);
+    assert_true(fs::is_symlink(danglingPath));
+    assert_false(fs::exists(absentTarget));
+
+    TFiles snapshotFiles;
+    snapshotFiles.Seed();
+    {
+        TDiskState state(snapshotFiles.Name, 1);
+        state.InstallSnapshot(TSnapshot{1, 2, {1, 2}, "stored image"});
+    }
+    const auto snapshotPath = snapshotFiles.Name + ".state.1.snapshot.g1";
+    const auto snapshotVictim = snapshotFiles.Directory / "snapshot-target";
+    fs::copy_file(snapshotPath, snapshotVictim);
+    std::ifstream originalSnapshot(snapshotVictim, std::ios::binary);
+    const std::string originalSnapshotContents{
+        std::istreambuf_iterator<char>(originalSnapshot), {}};
+    fs::remove(snapshotPath);
+    fs::create_symlink(snapshotVictim, snapshotPath);
+    rejected = false;
+    try { TDiskState recovered(snapshotFiles.Name, 1); }
+    catch (const std::runtime_error&) { rejected = true; }
+    assert_true(rejected);
+    assert_true(fs::is_symlink(snapshotPath));
+    std::ifstream snapshotTarget(snapshotVictim, std::ios::binary);
+    const std::string actualSnapshotContents{
+        std::istreambuf_iterator<char>(snapshotTarget), {}};
+    assert_true(actualSnapshotContents == originalSnapshotContents);
 }
 #endif
 void test_disk_compacted_entries_keep_record_checksums(void**) {
@@ -914,6 +978,7 @@ int main() {
 #ifndef _WIN32
         cmocka_unit_test(test_snapshot_generation_temp_symlinks_do_not_modify_targets),
         cmocka_unit_test(test_snapshot_reclaim_does_not_truncate_symlinked_base_log),
+        cmocka_unit_test(test_disk_storage_rejects_symlinked_paths),
 #endif
         cmocka_unit_test(test_disk_compacted_entries_keep_record_checksums),
         cmocka_unit_test(test_previous_snapshot_metadata_version_remains_readable),

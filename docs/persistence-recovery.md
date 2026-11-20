@@ -54,6 +54,13 @@ Use one writer per storage set. Startup validation throws std::runtime_error.
 Detected live storage read/write/flush errors call std::terminate: the network
 layer catches ordinary exceptions, so throwing alone would allow a node with
 unpersisted state to continue processing.
+`TDiskState` requires base and selected log files to be regular files and
+rejects symlink/reparse-point paths during startup, including snapshot sidecars.
+Fresh files are created exclusively. Snapshot-generation and metadata
+temporaries use no-follow creation, and base-log reclamation truncates through a
+checked file handle. These checks prevent path redirection through links; they
+do not authenticate a storage directory or protect against arbitrary file
+rewrites.
 Recovery rejection requires restoring verified state or deliberately rebuilding
 the node through a safe cluster procedure; never delete metadata alone to force
 startup. Previously created empty or partial file sets are deliberately rejected.
