@@ -76,7 +76,7 @@ NNet::TVoidTask CompactLoop(TPoller& poller, std::shared_ptr<TRaft> raft,
         co_await poller.Sleep(std::chrono::seconds(1));
         if (rsm->LastAppliedIndex <= saved || rsm->LastAppliedIndex - saved < interval) continue;
         try {
-            saved = raft->Compact().Index;
+            saved = raft->CompactShared()->Index;
         } catch (const std::exception& error) {
             std::cerr << "SQL compaction deferred/failed: " << error.what() << "\n";
         }

@@ -178,6 +178,18 @@ struct TCluster {
         Deliver(response); return response;
     }
 };
+void test_shared_compaction_reuses_storage_snapshot_image(void**) {
+    TCluster cluster;
+    cluster.Elect(1);
+    cluster.Pump(1);
+    cluster.Write(1, "key", "value");
+
+    const auto snapshot = cluster.Nodes[0]->CompactShared();
+    const auto stored = cluster.Nodes[0]->GetState()->GetSnapshot();
+    assert_true(snapshot == stored);
+    assert_int_equal(snapshot->Index, cluster.Apps[0]->LastAppliedIndex);
+    assert_true(Read(*cluster.Apps[0], "key") == "value");
+}
 void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
     const std::vector<uint32_t> stableVoters{1, 5}, addedVoters{1, 2, 5};
     auto history = TConfigurationHistory::Stable(stableVoters, 0, 0, 0, 0);
@@ -1378,6 +1390,7 @@ int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_kv_snapshot_precomputes_size_without_changing_encoding),
         cmocka_unit_test(test_snapshot_capture_preflights_application_size_bound),
+        cmocka_unit_test(test_shared_compaction_reuses_storage_snapshot_image),
         cmocka_unit_test(test_snapshot_history_encoding_is_negotiated_per_peer),
         cmocka_unit_test(test_idle_snapshot_transfer_discards_partial_image_and_restarts),
         cmocka_unit_test(test_snapshot_install_accepts_every_small_fixed_chunk_size),

@@ -102,9 +102,9 @@ NNet::TVoidTask CheckpointLoop(TPoller& poller, std::shared_ptr<TRaft> raft,
         co_await poller.Sleep(std::chrono::seconds(1));
         if (rsm->LastAppliedIndex <= saved || rsm->LastAppliedIndex - saved < interval) continue;
         try {
-            auto snapshot = raft->Compact();
-            store->Save(snapshot);
-            saved = snapshot.Index;
+            auto snapshot = raft->CompactShared();
+            store->Save(*snapshot);
+            saved = snapshot->Index;
         } catch (const std::exception& error) {
             // The durable state image already contains the authoritative snapshot.
             // A failed standalone checkpoint export can be retried safely.

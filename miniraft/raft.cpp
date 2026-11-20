@@ -2572,6 +2572,10 @@ bool TRaft::IsLearnerCommitAcknowledged(uint32_t id) const {
 }
 
 TSnapshot TRaft::Compact() {
+    return *CompactShared();
+}
+
+std::shared_ptr<const TSnapshot> TRaft::CompactShared() {
     if (!State->SupportsSnapshots()) throw std::logic_error("Storage cannot compact snapshots");
     if (StateName == EState::LEADER) {
         for (auto voterId : Voters) {
@@ -2596,22 +2600,23 @@ TSnapshot TRaft::Compact() {
     }
     auto application = SnapshotApplication.lock();
     if (!application) throw std::logic_error("Compaction requires a bound application");
-    if (application->LastAppliedIndex == State->SnapshotIndex && State->GetSnapshot()) return *State->GetSnapshot();
+    if (application->LastAppliedIndex == State->SnapshotIndex && State->GetSnapshot()) return State->GetSnapshot();
     std::unordered_set<uint64_t> pinnedGenerations;
     for (const auto& [_, rpc] : VolatileState->SnapshotRpcs)
         if (rpc.Snapshot) pinnedGenerations.insert(rpc.Snapshot->Index);
     if (pinnedGenerations.size() >= TVolatileState::MaxPinnedSnapshotGenerations)
         throw std::runtime_error("Compaction deferred while snapshot transfers pin multiple generations");
-    auto snapshot = CaptureSnapshot(*this, *application);
-    application->ValidateSnapshot(snapshot.Data, snapshot.Index);
+    auto snapshot = std::make_shared<const TSnapshot>(CaptureSnapshot(*this, *application));
+    application->ValidateSnapshot(snapshot->Data, snapshot->Index);
     AdvanceCommitIndex(VolatileState->CommitIndex);
-    State->InstallSnapshot(snapshot);
+    TRaftInstallSnapshotPermit permit;
+    State->InstallRaftSnapshot(snapshot, permit);
     RebuildUncommittedLogUsage();
-    ConfigurationBaseline = snapshot.StableConfiguration
-        ? TConfigurationHistory::FromStableSnapshot(snapshot)
-        : snapshot.IsJoint()
-            ? TConfigurationHistory::FromJointSnapshot(snapshot)
-            : TConfigurationHistory::Stable(Voters, 0, 0, snapshot.Index, snapshot.Term);
+    ConfigurationBaseline = snapshot->StableConfiguration
+        ? TConfigurationHistory::FromStableSnapshot(*snapshot)
+        : snapshot->IsJoint()
+            ? TConfigurationHistory::FromJointSnapshot(*snapshot)
+            : TConfigurationHistory::Stable(Voters, 0, 0, snapshot->Index, snapshot->Term);
     RefreshConfiguration(VolatileState->CommitIndex);
     // Outstanding transfers own their immutable encoding metadata; discard any
     // otherwise-retained metadata for the old local snapshot.

@@ -277,6 +277,10 @@ public:
     // Throws without mutation while two distinct generations remain pinned by
     // outgoing peer transfers; callers may retry after a transfer completes.
     TSnapshot Compact();
+    // Shared variant for callers that can consume the immutable image by
+    // reference. Backends that support shared snapshot installation can keep
+    // one application-data image; legacy backends may copy it.
+    std::shared_ptr<const TSnapshot> CompactShared();
     uint64_t ApproveRead();
     // Highest barrier confirmed by a fresh majority in this leadership term.
     // Zero means no confirmation (including before a current-term commit).

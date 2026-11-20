@@ -46,9 +46,10 @@ struct IState: TStateFields {
     virtual bool SupportsInstallSnapshot() const { return false; }
     virtual std::shared_ptr<const TSnapshot> GetSnapshot() const { return {}; }
     virtual void InstallSnapshot(const TSnapshot&) { throw std::logic_error("Storage snapshots are unsupported"); }
-    // Raft calls this only after validating the sender and complete membership
-    // lineage. Backends may then rely on that proof for a stable-set transition
-    // that snapshot-only continuity cannot establish.
+    // Raft calls this after validating configuration lineage, either from its
+    // local scan during compaction or from the sender during snapshot transfer.
+    // Backends may rely on that proof for a stable-set transition that
+    // snapshot-only continuity cannot establish.
     virtual void InstallRaftSnapshot(const TSnapshot& snapshot,
             const class TRaftInstallSnapshotPermit&) { InstallSnapshot(snapshot); }
     // Raft may transfer a validated immutable snapshot into storage without
