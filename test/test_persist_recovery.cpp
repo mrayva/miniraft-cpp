@@ -250,7 +250,7 @@ void test_checksums_detect_log_and_index_record_corruption(void**) {
         std::ifstream metadata(files.Path("state"), std::ios::binary);
         std::string magic(8, '\0');
         assert_true(bool(metadata.read(magic.data(), magic.size())));
-        assert_true(magic == "MRFTL002");
+        assert_true(magic == "MRFTL003");
         uint32_t flags = 0;
         metadata.seekg(44);
         assert_true(bool(metadata.read(reinterpret_cast<char*>(&flags), sizeof(flags))));
@@ -335,6 +335,152 @@ void test_versioned_metadata_persists_commit_and_voter_baseline(void**) {
         assert_true(state.GetBoundVoters().empty());
     }
 }
+void test_disk_snapshot_generation_recovers_suffix_and_replaces_conflict(void**) {
+    TFiles files;
+    {
+        TDiskState state(files.Name, 1);
+        assert_true(state.SupportsSnapshots());
+        assert_true(state.SupportsInstallSnapshot());
+        state.BindVoters({1, 2, 3});
+        state.CurrentTerm = 7;
+        state.VotedFor = 2;
+        for (uint64_t term : {2, 5}) {
+            auto entry = NewHoldedMessage<TLogEntry>();
+            entry->Term = term;
+            state.Append(entry);
+        }
+        state.CommitIndex = 1;
+        state.Commit();
+        TSnapshot first{1, 2, {2, 3}, "first image"};
+        first.StableConfiguration = true;
+        first.ConfigurationIndex = 1;
+        first.ConfigurationTerm = 2;
+        state.InstallSnapshot(first);
+        assert_int_equal(state.SnapshotIndex, 1);
+        assert_int_equal(state.LastLogIndex, 2);
+        assert_int_equal(state.LogTerm(1), 2);
+        assert_false(state.Get(1));
+        assert_int_equal(state.Get(2)->Term, 5);
+    }
+    {
+        TDiskState state(files.Name, 1);
+        TSnapshot expectedFirst{1, 2, {2, 3}, "first image"};
+        expectedFirst.StableConfiguration = true;
+        expectedFirst.ConfigurationIndex = 1;
+        expectedFirst.ConfigurationTerm = 2;
+        assert_true(state.GetSnapshot() && *state.GetSnapshot() == expectedFirst);
+        assert_true(state.GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
+        assert_int_equal(state.LastLogTerm, 5);
+        state.RemoveLast();
+        assert_int_equal(state.LastLogIndex, 1);
+        assert_int_equal(state.LastLogTerm, 2);
+        auto entry = NewHoldedMessage<TLogEntry>();
+        entry->Term = 7;
+        state.Append(entry);
+        assert_int_equal(state.Get(2)->Term, 7);
+        TSnapshot replacement{2, 5, {2, 3}, "replacement image"};
+        replacement.StableConfiguration = true;
+        replacement.ConfigurationIndex = 1;
+        replacement.ConfigurationTerm = 2;
+        state.InstallSnapshot(replacement);
+        assert_int_equal(state.LastLogIndex, 2);
+        assert_int_equal(state.LastLogTerm, 5);
+        assert_false(state.Get(2));
+    }
+    TDiskState recovered(files.Name, 1);
+    TSnapshot expectedReplacement{2, 5, {2, 3}, "replacement image"};
+    expectedReplacement.StableConfiguration = true;
+    expectedReplacement.ConfigurationIndex = 1;
+    expectedReplacement.ConfigurationTerm = 2;
+    assert_true(recovered.GetSnapshot() && *recovered.GetSnapshot() == expectedReplacement);
+    assert_true(recovered.GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
+    assert_int_equal(recovered.SnapshotIndex, 2);
+    assert_int_equal(recovered.LastLogIndex, 2);
+    assert_int_equal(recovered.CommitIndex, 2);
+    assert_int_equal(recovered.LogTerm(2), 5);
+    assert_false(recovered.Get(2));
+    auto afterSnapshot = NewHoldedMessage<TLogEntry>();
+    afterSnapshot->Term = 7;
+    recovered.Append(afterSnapshot);
+    assert_int_equal(recovered.LastLogIndex, 3);
+    assert_int_equal(recovered.Get(3)->Term, 7);
+    TDiskState afterAppend(files.Name, 1);
+    assert_int_equal(afterAppend.SnapshotIndex, 2);
+    assert_int_equal(afterAppend.LastLogIndex, 3);
+    assert_int_equal(afterAppend.LastLogTerm, 7);
+    assert_int_equal(afterAppend.Get(3)->Term, 7);
+}
+void test_disk_snapshot_generation_rejects_corrupt_image_without_rewriting(void**) {
+    TFiles files;
+    files.Seed();
+    {
+        TDiskState state(files.Name, 1);
+        state.InstallSnapshot(TSnapshot{1, 2, {1, 2}, "durable image"});
+    }
+    fs::resize_file(files.Name + ".state.1.snapshot.g1", 4);
+    files.RejectRecovery();
+}
+void test_disk_append_rejects_invalid_or_nonmonotonic_terms_before_mutation(void**) {
+    TFiles files;
+    files.Seed();
+    TDiskState state(files.Name, 1);
+    for (uint64_t term : {uint64_t(0), uint64_t(4), uint64_t(8)}) {
+        auto entry = NewHoldedMessage<TLogEntry>();
+        entry->Term = term;
+        bool rejected = false;
+        try { state.Append(entry); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        assert_true(rejected);
+        assert_int_equal(state.LastLogIndex, 2);
+        assert_int_equal(state.LastLogTerm, 5);
+    }
+    TDiskState recovered(files.Name, 1);
+    assert_int_equal(recovered.LastLogIndex, 2);
+    assert_int_equal(recovered.LastLogTerm, 5);
+}
+#ifndef _WIN32
+void test_snapshot_generation_crashes_publish_old_or_new_complete_image(void**) {
+    const TDiskState::ECommitStage stages[] = {
+        TDiskState::ECommitStage::SnapshotIndexPublished,
+        TDiskState::ECommitStage::SnapshotImagePublished,
+        TDiskState::ECommitStage::LogFilesSynced,
+        TDiskState::ECommitStage::MetadataFileSynced,
+        TDiskState::ECommitStage::MetadataRenamed,
+        TDiskState::ECommitStage::DirectorySynced,
+    };
+    for (const auto stage : stages) {
+        TFiles files;
+        files.Seed();
+        {
+            TDiskState state(files.Name, 1);
+            state.CommitIndex = 1;
+            state.Commit();
+        }
+        const auto child = fork();
+        assert_true(child >= 0);
+        if (child == 0) {
+            try {
+                TDiskState state(files.Name, 1, [stage](TDiskState::ECommitStage reached) {
+                    if (reached == stage) _exit(120 + static_cast<int>(stage));
+                });
+                state.InstallSnapshot(TSnapshot{1, 2, {1, 2}, "durable image"});
+            } catch (...) { _exit(130); }
+            _exit(131);
+        }
+        int status = 0;
+        assert_int_equal(waitpid(child, &status, 0), child);
+        assert_true(WIFEXITED(status));
+        assert_int_equal(WEXITSTATUS(status), 120 + static_cast<int>(stage));
+        TDiskState recovered(files.Name, 1);
+        const bool published = stage == TDiskState::ECommitStage::MetadataRenamed ||
+            stage == TDiskState::ECommitStage::DirectorySynced;
+        assert_int_equal(recovered.SnapshotIndex, published ? 1 : 0);
+        assert_int_equal(recovered.LastLogIndex, 2);
+        assert_int_equal(recovered.Get(2)->Term, 5);
+        assert_true(bool(recovered.GetSnapshot()) == published);
+    }
+}
+#endif
 void test_missing_storage_is_not_recreated(void**) {
     for (const std::string kind : {"state", "index", "entries"}) {
         TFiles files;
@@ -628,6 +774,12 @@ int main() {
         cmocka_unit_test(test_versioned_metadata_checksum_is_verified),
         cmocka_unit_test(test_checksums_detect_log_and_index_record_corruption),
         cmocka_unit_test(test_versioned_metadata_persists_commit_and_voter_baseline),
+        cmocka_unit_test(test_disk_snapshot_generation_recovers_suffix_and_replaces_conflict),
+        cmocka_unit_test(test_disk_snapshot_generation_rejects_corrupt_image_without_rewriting),
+        cmocka_unit_test(test_disk_append_rejects_invalid_or_nonmonotonic_terms_before_mutation),
+#ifndef _WIN32
+        cmocka_unit_test(test_snapshot_generation_crashes_publish_old_or_new_complete_image),
+#endif
         cmocka_unit_test(test_missing_storage_is_not_recreated),
         cmocka_unit_test(test_short_index_is_rejected),
         cmocka_unit_test(test_short_entry_is_rejected),

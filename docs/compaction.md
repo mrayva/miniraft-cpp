@@ -10,6 +10,12 @@ legacy TDiskState does not. KV implements snapshot validation/restoration. SQL
 support is described in [the SQL snapshot follow-up](sql-snapshots.md); the dummy
 state machine remains unsupported for compaction and installation.
 
+Current split-format `TDiskState` stores also support snapshot publication and
+InstallSnapshot. MRFTL003 metadata atomically selects a snapshot sidecar and a
+new retained-suffix index generation. Covered log-entry bytes remain in the
+entries file, so this backend does not reclaim the disk space used by a compacted
+prefix. MRFTL001, MRFTL002 and 20-byte metadata remain readable.
+
 ## Operation and compatibility
 
 The existing Linux KV option `--durable --snapshots N` now compacts after N more

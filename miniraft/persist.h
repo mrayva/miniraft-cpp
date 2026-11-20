@@ -8,6 +8,8 @@
 
 struct TDiskState : IState {
     enum class ECommitStage {
+        SnapshotIndexPublished,
+        SnapshotImagePublished,
         LogFilesSynced,
         MetadataFileSynced,
         MetadataRenamed,
@@ -24,6 +26,14 @@ struct TDiskState : IState {
     void Commit() override;
     bool SupportsCommitIndexPersistence() const override { return true; }
     bool HasTrustedCommitIndex() const override { return CommitIndexTrusted; }
+    bool SupportsSnapshots() const override { return true; }
+    bool SupportsInstallSnapshot() const override { return true; }
+    std::shared_ptr<const TSnapshot> GetSnapshot() const override { return Snapshot; }
+    void InstallSnapshot(const TSnapshot& snapshot) override;
+    void InstallRaftSnapshot(const TSnapshot& snapshot,
+        const TRaftInstallSnapshotPermit&) override;
+    void InstallRaftSnapshot(std::shared_ptr<const TSnapshot> snapshot,
+        const TRaftInstallSnapshotPermit&) override;
     bool SupportsVoterBinding() const override { return true; }
     bool HasUnboundRecoveredState() const override;
     std::vector<uint32_t> GetBoundVoters() const override;
@@ -48,12 +58,23 @@ private:
     uint64_t ReadOffset(uint64_t index) const;
     void WriteOffset(uint64_t index, uint64_t offset);
     uint64_t IndexRecordSize() const { return ChecksummedRecords ? 12 : sizeof(uint64_t); }
+    std::string GenerationPath(uint64_t generation) const;
+    std::string SnapshotPath(uint64_t generation) const;
+    void InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated);
+    void InstallSnapshotImpl(std::shared_ptr<const TSnapshot> snapshot);
+    void InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snapshot);
+    void WriteGenerationFile(const std::string& path, const std::string& bytes);
 
     std::string EntriesPath;
     std::string IndexPath;
+    std::string IndexBasePath;
     std::string StatePath;
+    std::string SnapshotFilePath;
     TCommitHook CommitHook;
     std::vector<uint32_t> Voters;
+    std::shared_ptr<const TSnapshot> Snapshot;
+    uint64_t IndexGeneration = 0;
+    uint64_t IndexBaseIndex = 1;
     mutable std::fstream Entries;
     mutable std::fstream Index;
     std::fstream State;

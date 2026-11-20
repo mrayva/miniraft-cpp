@@ -664,7 +664,7 @@ TLegacyDiskStateMigrationInfo InspectLegacyDiskState(const IState& source, uint3
     if (!nodeId || !std::binary_search(voters.begin(), voters.end(), nodeId))
         throw std::invalid_argument("The migrated node must belong to the trusted voter set");
     if (!source.CurrentTerm || source.LastLogIndex > uint64_t(INT64_MAX) ||
-        source.SnapshotIndex || source.SnapshotTerm || source.GetSnapshot() || source.SupportsSnapshots())
+        source.SnapshotIndex || source.SnapshotTerm || source.GetSnapshot())
         throw std::invalid_argument("Only un-compacted legacy disk state can be migrated");
     if (source.HasTrustedCommitIndex() && source.CommitIndex != commitIndex)
         throw std::invalid_argument("Supplied commit boundary differs from versioned disk metadata");

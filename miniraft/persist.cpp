@@ -22,16 +22,20 @@
 
 namespace {
 constexpr std::string_view PreviousDiskMetadataMagic = "MRFTL001";
-constexpr std::string_view DiskMetadataMagic = "MRFTL002";
+constexpr std::string_view ChecksummedDiskMetadataMagic = "MRFTL002";
+constexpr std::string_view DiskMetadataMagic = "MRFTL003";
 constexpr uint32_t PreviousDiskMetadataVersion = 1;
-constexpr uint32_t DiskMetadataVersion = 2;
+constexpr uint32_t ChecksummedDiskMetadataVersion = 2;
+constexpr uint32_t DiskMetadataVersion = 3;
 constexpr uint32_t DiskMetadataCommitIndexTrusted = 1u << 0;
 constexpr uint32_t DiskMetadataChecksummedRecords = 1u << 1;
 constexpr size_t LegacyDiskMetadataSize = sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t);
-constexpr size_t DiskMetadataFixedSize = 52;
+constexpr size_t ChecksummedDiskMetadataFixedSize = 52;
+constexpr size_t DiskMetadataFixedSize = 84;
 
 struct TDiskMetadata {
     uint64_t LastLogIndex = 0, CurrentTerm = 1, CommitIndex = 0;
+    uint64_t IndexGeneration = 0, IndexBaseIndex = 1, SnapshotIndex = 0, SnapshotTerm = 0;
     uint32_t VotedFor = 0;
     std::vector<uint32_t> Voters;
     bool CommitIndexTrusted = false, ChecksummedRecords = false;
@@ -51,13 +55,14 @@ TDiskMetadata DecodeDiskMetadata(std::string_view bytes) {
         return metadata; // Old split stores did not persist commit or voters.
     }
 
-    if (bytes.size() < DiskMetadataFixedSize) throw std::runtime_error("Truncated Raft metadata");
+    if (bytes.size() < ChecksummedDiskMetadataFixedSize) throw std::runtime_error("Truncated Raft metadata");
     NSnapshotCodec::TReader reader{bytes};
     const auto magic = reader.Read(DiskMetadataMagic.size());
     const auto version = reader.Take(4);
     const bool previousFormat = magic == PreviousDiskMetadataMagic && version == PreviousDiskMetadataVersion;
+    const bool checksummedFormat = magic == ChecksummedDiskMetadataMagic && version == ChecksummedDiskMetadataVersion;
     const bool currentFormat = magic == DiskMetadataMagic && version == DiskMetadataVersion;
-    if (!previousFormat && !currentFormat)
+    if (!previousFormat && !checksummedFormat && !currentFormat)
         throw std::runtime_error("Unknown Raft metadata format");
     metadata.LastLogIndex = reader.Take(8);
     metadata.CurrentTerm = reader.Take(8);
@@ -66,9 +71,16 @@ TDiskMetadata DecodeDiskMetadata(std::string_view bytes) {
     const auto voterCount = reader.Take(4);
     const auto flags = reader.Take(4);
     const auto allowedFlags = DiskMetadataCommitIndexTrusted |
-        (currentFormat ? DiskMetadataChecksummedRecords : 0u);
-    if (voterCount > TSnapshot::MaxVoters || (flags & ~allowedFlags) ||
-        reader.Input.size() != voterCount * sizeof(uint32_t) + sizeof(uint32_t))
+        ((checksummedFormat || currentFormat) ? DiskMetadataChecksummedRecords : 0u);
+    if (voterCount > TSnapshot::MaxVoters || (flags & ~allowedFlags))
+        throw std::runtime_error("Invalid Raft metadata dimensions");
+    if (currentFormat) {
+        metadata.IndexGeneration = reader.Take(8);
+        metadata.IndexBaseIndex = reader.Take(8);
+        metadata.SnapshotIndex = reader.Take(8);
+        metadata.SnapshotTerm = reader.Take(8);
+    }
+    if (reader.Input.size() != voterCount * sizeof(uint32_t) + sizeof(uint32_t))
         throw std::runtime_error("Invalid Raft metadata dimensions");
     for (uint32_t i = 0; i < voterCount; ++i)
         metadata.Voters.push_back(static_cast<uint32_t>(reader.Take(4)));
@@ -77,9 +89,15 @@ TDiskMetadata DecodeDiskMetadata(std::string_view bytes) {
         NSnapshotCodec::Checksum(bytes.substr(0, bytes.size() - sizeof(uint32_t))) != checksum)
         throw std::runtime_error("Raft metadata checksum mismatch");
     metadata.CommitIndexTrusted = flags & DiskMetadataCommitIndexTrusted;
-    metadata.ChecksummedRecords = currentFormat && (flags & DiskMetadataChecksummedRecords);
+    metadata.ChecksummedRecords = (checksummedFormat || currentFormat) && (flags & DiskMetadataChecksummedRecords);
     if (!metadata.CurrentTerm || metadata.LastLogIndex > uint64_t(INT64_MAX) ||
         metadata.CommitIndex > metadata.LastLogIndex ||
+        metadata.IndexBaseIndex != metadata.SnapshotIndex + 1 ||
+        metadata.SnapshotIndex > metadata.LastLogIndex ||
+        ((metadata.SnapshotIndex == 0) != (metadata.SnapshotTerm == 0)) ||
+        metadata.SnapshotTerm > metadata.CurrentTerm ||
+        metadata.CommitIndex < metadata.SnapshotIndex ||
+        ((metadata.IndexGeneration == 0) != (metadata.SnapshotIndex == 0)) ||
         (!metadata.Voters.empty() && !metadata.CommitIndexTrusted))
         throw std::runtime_error("Invalid Raft metadata bounds");
     if (!metadata.Voters.empty()) {
@@ -93,8 +111,12 @@ TDiskMetadata DecodeDiskMetadata(std::string_view bytes) {
 
 std::string EncodeDiskMetadata(uint64_t lastLogIndex, uint64_t currentTerm, uint32_t votedFor,
         uint64_t commitIndex, const std::vector<uint32_t>& voters, bool commitIndexTrusted,
-        bool checksummedRecords) {
-    if (!currentTerm || lastLogIndex > uint64_t(INT64_MAX) || commitIndex > lastLogIndex)
+        bool checksummedRecords, uint64_t indexGeneration, uint64_t indexBaseIndex,
+        uint64_t snapshotIndex, uint64_t snapshotTerm) {
+    if (!currentTerm || lastLogIndex > uint64_t(INT64_MAX) || commitIndex > lastLogIndex ||
+        indexBaseIndex != snapshotIndex + 1 || snapshotIndex > lastLogIndex ||
+        ((snapshotIndex == 0) != (snapshotTerm == 0)) || snapshotTerm > currentTerm ||
+        commitIndex < snapshotIndex || ((indexGeneration == 0) != (snapshotIndex == 0)))
         throw std::logic_error("Invalid Raft metadata bounds");
     if (!voters.empty()) {
         ValidateFixedVoters(voters);
@@ -113,6 +135,10 @@ std::string EncodeDiskMetadata(uint64_t lastLogIndex, uint64_t currentTerm, uint
     const uint32_t flags = (commitIndexTrusted ? DiskMetadataCommitIndexTrusted : 0) |
         (checksummedRecords ? DiskMetadataChecksummedRecords : 0);
     NSnapshotCodec::Put(bytes, flags, 4);
+    NSnapshotCodec::Put(bytes, indexGeneration, 8);
+    NSnapshotCodec::Put(bytes, indexBaseIndex, 8);
+    NSnapshotCodec::Put(bytes, snapshotIndex, 8);
+    NSnapshotCodec::Put(bytes, snapshotTerm, 8);
     for (auto id : voters) NSnapshotCodec::Put(bytes, id, 4);
     NSnapshotCodec::Put(bytes, NSnapshotCodec::Checksum(bytes), 4);
     return bytes;
@@ -210,7 +236,8 @@ TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitH
 {
     const auto suffix = "." + std::to_string(id);
     EntriesPath = name + ".entries" + suffix;
-    IndexPath = name + ".index" + suffix;
+    IndexBasePath = name + ".index" + suffix;
+    IndexPath = IndexBasePath;
     StatePath = name + ".state" + suffix;
     const int existing = std::filesystem::exists(EntriesPath) +
         std::filesystem::exists(IndexPath) + std::filesystem::exists(StatePath);
@@ -232,7 +259,7 @@ TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitH
     const auto size = State.tellg();
     constexpr auto maxMetadataSize = std::streamoff(DiskMetadataFixedSize + TSnapshot::MaxVoters * sizeof(uint32_t));
     if (size < 0 || (size != std::streamoff(LegacyDiskMetadataSize) &&
-        (size < std::streamoff(DiskMetadataFixedSize) || size > maxMetadataSize)))
+        (size < std::streamoff(ChecksummedDiskMetadataFixedSize) || size > maxMetadataSize)))
         throw std::runtime_error("Invalid Raft metadata size: " + StatePath);
     std::string encodedMetadata(static_cast<size_t>(size), '\0');
     State.seekg(0);
@@ -246,18 +273,36 @@ TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitH
     Voters = metadata.Voters;
     CommitIndexTrusted = metadata.CommitIndexTrusted;
     ChecksummedRecords = metadata.ChecksummedRecords;
+    IndexGeneration = metadata.IndexGeneration;
+    IndexBaseIndex = metadata.IndexBaseIndex;
+    SnapshotIndex = metadata.SnapshotIndex;
+    SnapshotTerm = metadata.SnapshotTerm;
+    if (IndexGeneration) {
+        Index.close();
+        IndexPath = GenerationPath(IndexGeneration);
+        Index = Open(IndexPath, false);
+        SnapshotFilePath = SnapshotPath(IndexGeneration);
+        std::ifstream snapshotFile(SnapshotFilePath, std::ios::binary);
+        if (!snapshotFile) throw std::runtime_error("Missing Raft snapshot: " + SnapshotFilePath);
+        std::string encodedSnapshot{std::istreambuf_iterator<char>(snapshotFile), std::istreambuf_iterator<char>()};
+        Snapshot = std::make_shared<const TSnapshot>(DecodeSnapshot(encodedSnapshot));
+        if (Snapshot->Index != SnapshotIndex || Snapshot->Term != SnapshotTerm)
+            throw std::runtime_error("Raft snapshot boundary disagrees with metadata: " + SnapshotFilePath);
+    }
     RecoveredStore = true;
     if (!CurrentTerm) throw std::runtime_error("Invalid Raft metadata term: " + StatePath);
 
     Index.seekg(0, std::ios::end);
     const auto indexSize = Index.tellg();
-    if (indexSize < 0 || LastLogIndex > uint64_t(indexSize) / IndexRecordSize()) {
+    const auto retainedCount = LastLogIndex - SnapshotIndex;
+    if (indexSize < 0 || retainedCount > uint64_t(indexSize) / IndexRecordSize()) {
         throw std::runtime_error("Truncated Raft index: " + IndexPath);
     }
     // Validate the entire selected prefix, not only its last entry. Trailing
     // bytes can be left by logical truncation and are deliberately ignored.
-    uint64_t expectedOffset = 0;
-    for (uint64_t i = 1; i <= LastLogIndex; ++i) {
+    LastLogTerm = SnapshotTerm;
+    uint64_t expectedOffset = retainedCount ? ReadOffset(IndexBaseIndex) : 0;
+    for (uint64_t i = IndexBaseIndex; i <= LastLogIndex; ++i) {
         const auto offset = ReadOffset(i);
         if (offset != expectedOffset) {
             throw std::runtime_error("Invalid Raft log offset: " + IndexPath);
@@ -270,6 +315,14 @@ TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitH
         LastLogTerm = entry->Term;
     }
     Recovering = false;
+}
+
+std::string TDiskState::GenerationPath(uint64_t generation) const {
+    return IndexBasePath + ".g" + std::to_string(generation);
+}
+
+std::string TDiskState::SnapshotPath(uint64_t generation) const {
+    return StatePath + ".snapshot.g" + std::to_string(generation);
 }
 
 std::fstream TDiskState::Open(const std::string& name, bool create)
@@ -347,8 +400,10 @@ void TDiskState::Write(TMessageHolder<TMessage> message)
 }
 
 uint64_t TDiskState::ReadOffset(uint64_t index) const {
-    if (!index || index > uint64_t(INT64_MAX) / IndexRecordSize()) Fail("Raft index position overflow");
-    const auto position = std::streamoff((index - 1) * IndexRecordSize());
+    if (index < IndexBaseIndex || index > LastLogIndex ||
+        index - IndexBaseIndex > uint64_t(INT64_MAX) / IndexRecordSize())
+        Fail("Raft index position overflow");
+    const auto position = std::streamoff((index - IndexBaseIndex) * IndexRecordSize());
     Index.seekg(position);
     std::array<char, sizeof(uint64_t)> offsetBytes{};
     if (!Index.read(offsetBytes.data(), offsetBytes.size())) Fail("Cannot read Raft log index");
@@ -366,8 +421,9 @@ uint64_t TDiskState::ReadOffset(uint64_t index) const {
 }
 
 void TDiskState::WriteOffset(uint64_t index, uint64_t offset) {
-    if (index > uint64_t(INT64_MAX) / IndexRecordSize()) Fail("Raft index position overflow");
-    const auto position = std::streamoff(index * IndexRecordSize());
+    if (index < SnapshotIndex || index - SnapshotIndex > uint64_t(INT64_MAX) / IndexRecordSize())
+        Fail("Raft index position overflow");
+    const auto position = std::streamoff((index - SnapshotIndex) * IndexRecordSize());
     Index.seekp(position);
     std::array<char, sizeof(uint64_t)> offsetBytes{};
     memcpy(offsetBytes.data(), &offset, sizeof(offset));
@@ -382,10 +438,11 @@ void TDiskState::WriteOffset(uint64_t index, uint64_t offset) {
 
 void TDiskState::RemoveLast()
 {
-    if (LastLogIndex > 0) {
+    if (LastLogIndex > SnapshotIndex) {
         if (LastLogIndex <= CommitIndex)
             throw std::logic_error("Cannot remove a committed log entry");
-        const auto previousTerm = LastLogIndex == 1 ? 0 : Get(LastLogIndex - 1)->Term;
+        const auto previousTerm = LastLogIndex - 1 == SnapshotIndex
+            ? SnapshotTerm : Get(LastLogIndex - 1)->Term;
         --LastLogIndex;
         LastLogTerm = previousTerm;
         Commit();
@@ -394,9 +451,20 @@ void TDiskState::RemoveLast()
 
 void TDiskState::Append(TMessageHolder<TLogEntry> entry)
 {
+    if (!entry.HasValidExtent() || entry->Type != uint32_t(EMessageType::LOG_ENTRY) ||
+        entry->Len < sizeof(TLogEntry))
+        throw std::invalid_argument("Invalid Raft log entry");
+    if (LastLogIndex >= uint64_t(INT64_MAX)) throw std::overflow_error("Raft log index exhausted");
+    if (!entry->Term || entry->Term < LastLogTerm || entry->Term > CurrentTerm)
+        throw std::invalid_argument("Raft log entry term outside current log range");
     uint64_t offset = 0;
-    if (Get(LastLogIndex)) {
+    if (LastLogIndex > SnapshotIndex && Get(LastLogIndex)) {
         offset = Entries.tellg();
+    } else {
+        Entries.seekg(0, std::ios::end);
+        const auto end = Entries.tellg();
+        if (end < 0) Fail("Cannot determine Raft log end");
+        offset = uint64_t(end);
     }
     // In particular, after truncation to zero the stream may still point into
     // the old suffix. Always position the output explicitly.
@@ -410,7 +478,7 @@ void TDiskState::Append(TMessageHolder<TLogEntry> entry)
 
 TMessageHolder<TLogEntry> TDiskState::Get(int64_t index) const
 {
-    if (index > LastLogIndex || index < 1) return {};
+    if (index > LastLogIndex || index < 1 || uint64_t(index) <= SnapshotIndex) return {};
     const auto offset = ReadOffset(uint64_t(index));
     Entries.seekg(0, std::ios::end);
     const auto end = Entries.tellg();
@@ -419,6 +487,107 @@ TMessageHolder<TLogEntry> TDiskState::Get(int64_t index) const
     }
     Entries.seekg(offset);
     return Read().Cast<TLogEntry>();
+}
+
+void TDiskState::InstallSnapshot(const TSnapshot& snapshot) {
+    InstallSnapshotImpl(snapshot, false);
+}
+
+void TDiskState::InstallRaftSnapshot(const TSnapshot& snapshot,
+        const TRaftInstallSnapshotPermit&) {
+    InstallSnapshotImpl(snapshot, true);
+}
+
+void TDiskState::InstallRaftSnapshot(std::shared_ptr<const TSnapshot> snapshot,
+        const TRaftInstallSnapshotPermit&) {
+    InstallSnapshotImpl(std::move(snapshot));
+}
+
+void TDiskState::InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated) {
+    ValidateSnapshot(snapshot);
+    TSnapshot image = snapshot;
+    if (!configurationHistoryValidated) PreserveStableSnapshotIdentity(Snapshot.get(), image);
+    ValidateSnapshot(image);
+    InstallValidatedSnapshot(std::make_shared<const TSnapshot>(std::move(image)));
+}
+
+void TDiskState::InstallSnapshotImpl(std::shared_ptr<const TSnapshot> snapshot) {
+    if (!snapshot) throw std::invalid_argument("Missing Raft snapshot");
+    ValidateSnapshot(*snapshot);
+    InstallValidatedSnapshot(std::move(snapshot));
+}
+
+void TDiskState::InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snapshot) {
+    if (!SnapshotCompatibleWithVoterBinding(*snapshot, Voters))
+        throw std::invalid_argument("Snapshot is incompatible with the persisted voter binding");
+    if (snapshot->Index <= SnapshotIndex || snapshot->Term < SnapshotTerm || snapshot->Term > CurrentTerm)
+        throw std::invalid_argument("Obsolete or future disk snapshot");
+    if (snapshot->Index <= CommitIndex &&
+        (snapshot->Index > LastLogIndex || LogTerm(snapshot->Index) != snapshot->Term))
+        throw std::invalid_argument("Snapshot would discard committed log entries");
+
+    std::vector<uint64_t> suffixOffsets;
+    std::vector<uint64_t> suffixTerms;
+    if (snapshot->Index <= LastLogIndex && LogTerm(snapshot->Index) == snapshot->Term) {
+        suffixOffsets.reserve(LastLogIndex - snapshot->Index);
+        suffixTerms.reserve(LastLogIndex - snapshot->Index);
+        for (uint64_t index = snapshot->Index + 1; index <= LastLogIndex; ++index) {
+            suffixOffsets.push_back(ReadOffset(index));
+            suffixTerms.push_back(LogTerm(index));
+        }
+    }
+    if (IndexGeneration == UINT64_MAX) throw std::overflow_error("Disk snapshot generation exhausted");
+    const auto previousGeneration = IndexGeneration;
+    const auto previousIndexPath = IndexPath;
+    const auto previousSnapshotPath = SnapshotFilePath;
+    const auto nextGeneration = IndexGeneration + 1;
+    std::string encodedIndex;
+    for (const auto offset : suffixOffsets) {
+        std::array<char, sizeof(offset)> offsetBytes{};
+        memcpy(offsetBytes.data(), &offset, sizeof(offset));
+        encodedIndex.append(offsetBytes.data(), offsetBytes.size());
+        if (ChecksummedRecords) {
+            NSnapshotCodec::Put(encodedIndex,
+                NSnapshotCodec::Checksum(std::string_view(offsetBytes.data(), offsetBytes.size())), sizeof(uint32_t));
+        }
+    }
+    const auto encodedSnapshot = EncodeSnapshot(*snapshot);
+    const auto nextIndexPath = GenerationPath(nextGeneration);
+    const auto nextSnapshotPath = SnapshotPath(nextGeneration);
+    WriteGenerationFile(nextIndexPath, encodedIndex);
+    if (CommitHook) CommitHook(ECommitStage::SnapshotIndexPublished);
+    WriteGenerationFile(nextSnapshotPath, encodedSnapshot);
+    if (CommitHook) CommitHook(ECommitStage::SnapshotImagePublished);
+
+    Index.close();
+    if (Index.fail()) Fail("Cannot close previous Raft log index");
+    IndexGeneration = nextGeneration;
+    IndexBaseIndex = snapshot->Index + 1;
+    IndexPath = nextIndexPath;
+    try { Index = Open(IndexPath, false); }
+    catch (...) { Fail("Cannot open new Raft log index"); }
+    SnapshotFilePath = nextSnapshotPath;
+    Snapshot = std::move(snapshot);
+    SnapshotIndex = Snapshot->Index;
+    SnapshotTerm = Snapshot->Term;
+    LastLogIndex = SnapshotIndex + suffixOffsets.size();
+    LastLogTerm = suffixTerms.empty() ? SnapshotTerm : suffixTerms.back();
+    CommitIndex = std::max(CommitIndex, SnapshotIndex);
+    Commit();
+    // The metadata rename and directory sync make the new generation
+    // authoritative. Older generations are now only crash orphans.
+    if (previousGeneration) {
+        std::error_code ignored;
+        std::filesystem::remove(previousIndexPath, ignored);
+        if (!previousSnapshotPath.empty()) std::filesystem::remove(previousSnapshotPath, ignored);
+    }
+}
+
+void TDiskState::WriteGenerationFile(const std::string& path, const std::string& bytes) {
+    const auto tempPath = path + ".tmp";
+    if (!WriteAndSyncFile(tempPath, bytes.data(), bytes.size()) || !ReplaceFile(tempPath, path) ||
+        !SyncDirectory(path))
+        Fail("Cannot publish Raft snapshot generation file");
 }
 
 void TDiskState::Commit()
@@ -436,7 +605,8 @@ void TDiskState::Commit()
         if (State.fail()) Fail("Cannot close Raft metadata");
     }
     auto metadata = EncodeDiskMetadata(LastLogIndex, CurrentTerm, VotedFor,
-        CommitIndex, Voters, CommitIndexTrusted, ChecksummedRecords);
+        CommitIndex, Voters, CommitIndexTrusted, ChecksummedRecords,
+        IndexGeneration, IndexBaseIndex, SnapshotIndex, SnapshotTerm);
 
     // The backend requires one process per node, as before. Reusing one
     // same-directory temporary file also makes interrupted writes recoverable
