@@ -850,6 +850,20 @@ void test_covered_snapshot_metadata_uses_shared_install_budget(void**) {
     auto retried = replies.back().Cast<TInstallSnapshotResponse>();
     assert_true(retried->Success); assert_int_equal(retried->NextOffset, 4);
     assert_int_equal(budget->UsedBytes(), 128);
+
+    TKv source;
+    const auto image = EncodeSnapshot(TSnapshot{1, 1, {1, 3}, source.SaveSnapshot()});
+    auto complete = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + image.size());
+    complete->Src = 1; complete->Dst = 3; complete->Term = 1; complete->Seqno = 2;
+    complete->SnapshotIndex = 1; complete->SnapshotTerm = 1; complete->Offset = 0;
+    complete->TotalBytes = image.size(); complete->LeaderId = 1; complete->Done = 1;
+    memcpy(complete->Data, image.data(), image.size());
+    replies.clear();
+    raft3->Process(expiredAt, complete);
+    auto covered = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_true(covered->Success); assert_true(covered->Installed);
+    assert_int_equal(covered->NextOffset, image.size());
+    assert_int_equal(budget->UsedBytes(), 0);
 }
 void test_snapshot_install_accepts_every_small_fixed_chunk_size(void**) {
     TKv source;
