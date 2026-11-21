@@ -117,11 +117,13 @@ whose `InstallSnapshot` capability has not been positively advertised on a
 leader. The leader blocks compaction until each remote voter advertises support;
 it also sends the all-voter acknowledgement barrier only after that check. A
 follower relies on that barrier and does not need its own outbound capability
-cache. The barrier also covers the fixed initial voter set with configuration
-index zero; the explicit zero-index marker prevents that baseline from
-bypassing the check. A ready result still does not guarantee that storage or
-the application can create and validate the snapshot. Serialize the check with
-Raft work, as with `CompactShared()`.
+cache. The follower accepts the certificate only in the Raft term in which it
+arrived; after a term change, the current leader must establish it again. The
+barrier also covers the fixed initial voter set with configuration index zero;
+the explicit zero-index marker prevents that baseline from bypassing the check.
+A ready result still does not guarantee that storage or the application can
+create and validate the snapshot. Serialize the check with Raft work, as with
+`CompactShared()`.
 
 ## Transfer protocol
 

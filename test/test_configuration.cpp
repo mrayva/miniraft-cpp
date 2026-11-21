@@ -970,6 +970,7 @@ void test_compaction_membership_readiness_reports_acknowledgement_blockers(void*
         assert_false(readiness.HasLeaderAcknowledgementBarrier);
         assert_false(readiness.Ready());
         volatileState->CompactionSafeConfigurationIndex = 3;
+        volatileState->CompactionSafeConfigurationTerm = state->CurrentTerm;
         readiness = raft.CheckCompactionMembershipReadiness();
         assert_true(readiness.HasLeaderAcknowledgementBarrier);
         assert_true(readiness.Ready());
@@ -3053,7 +3054,9 @@ void test_stable_membership_compaction_recovers_active_voters(void**) {
         // The receiver's certificate is volatile; periodic re-advertisement
         // reconstructs it after a process restart without a new election.
         const auto requestsBeforeRefresh = configurationBarrierRequests;
-        const_cast<TVolatileState*>(added->GetVolatileState())->CompactionSafeConfigurationIndex = 0;
+        auto* addedVolatileState = const_cast<TVolatileState*>(added->GetVolatileState());
+        addedVolatileState->CompactionSafeConfigurationIndex = 0;
+        addedVolatileState->CompactionSafeConfigurationTerm = 0;
         pump(); pump();
         assert_int_equal(added->GetVolatileState()->CompactionSafeConfigurationIndex, 0);
         pump();

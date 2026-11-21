@@ -210,6 +210,16 @@ void test_zero_index_follower_compaction_waits_for_capability_barrier(void**) {
     assert_true(readiness.RequiresLeaderAcknowledgementBarrier);
     assert_true(readiness.HasLeaderAcknowledgementBarrier);
     assert_true(readiness.Ready());
+    assert_int_equal(followerState->CompactionSafeConfigurationTerm,
+        cluster.Nodes[1]->GetState()->CurrentTerm);
+
+    const auto certificateTerm = followerState->CompactionSafeConfigurationTerm;
+    ++cluster.Nodes[1]->GetState()->CurrentTerm;
+    readiness = cluster.Nodes[1]->CheckCompactionMembershipReadiness();
+    assert_false(readiness.HasLeaderAcknowledgementBarrier);
+    assert_false(readiness.Ready());
+    Reject([&] { cluster.Nodes[1]->Compact(); });
+    cluster.Nodes[1]->GetState()->CurrentTerm = certificateTerm;
 
     followerState->HasCompactionSafeInitialConfigurationBarrier = false;
     readiness = cluster.Nodes[1]->CheckCompactionMembershipReadiness();
@@ -1360,6 +1370,7 @@ void test_newer_snapshot_cannot_regress_committed_term(void**) {
         if (compacted) {
             auto* volatileState = const_cast<TVolatileState*>(raft->GetVolatileState());
             volatileState->HasCompactionSafeInitialConfigurationBarrier = true;
+            volatileState->CompactionSafeConfigurationTerm = state->CurrentTerm;
             raft->Compact();
         }
         assert_int_equal(app->LastAppliedIndex, 3); assert_true(Read(*app, "key") == "3");

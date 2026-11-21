@@ -171,6 +171,8 @@ struct TVolatileState {
     // active voters support snapshot installation. The zero-index baseline
     // needs a separate marker because its configuration index cannot encode it.
     uint64_t CompactionSafeConfigurationIndex = 0;
+    // A certificate expires for readiness purposes when the Raft term changes.
+    uint64_t CompactionSafeConfigurationTerm = 0;
     bool HasCompactionSafeInitialConfigurationBarrier = false;
     uint32_t LeaderId = 0;
     std::unordered_map<uint32_t, uint64_t> NextIndex;

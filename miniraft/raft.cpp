@@ -2438,6 +2438,7 @@ void TRaft::OnConfigurationBarrier(TMessageHolder<TConfigurationBarrierRequest> 
         Configuration->Committed.ConfigurationIndex() == request->ConfigurationIndex &&
         Configuration->Committed.ConfigurationTerm() == request->ConfigurationTerm;
     if (accepted) {
+        VolatileState->CompactionSafeConfigurationTerm = request->Term;
         if (!request->ConfigurationIndex) {
             VolatileState->HasCompactionSafeInitialConfigurationBarrier = true;
         } else {
@@ -2563,9 +2564,11 @@ TCompactionMembershipReadiness TRaft::CheckCompactionMembershipReadiness() const
         }
     } else if (Voters.size() > 1) {
         readiness.RequiresLeaderAcknowledgementBarrier = true;
-        readiness.HasLeaderAcknowledgementBarrier = readiness.ConfigurationIndex
+        const bool currentTermCertificate =
+            VolatileState->CompactionSafeConfigurationTerm == State->CurrentTerm;
+        readiness.HasLeaderAcknowledgementBarrier = currentTermCertificate && (readiness.ConfigurationIndex
             ? VolatileState->CompactionSafeConfigurationIndex >= readiness.ConfigurationIndex
-            : VolatileState->HasCompactionSafeInitialConfigurationBarrier;
+            : VolatileState->HasCompactionSafeInitialConfigurationBarrier);
     } else {
         readiness.HasLeaderAcknowledgementBarrier = true;
     }

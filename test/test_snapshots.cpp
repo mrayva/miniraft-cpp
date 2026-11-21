@@ -657,6 +657,7 @@ void test_stable_configuration_snapshot_durable_runtime_recovery_and_compaction(
         // Model a follower that received the all-voter configuration barrier;
         // only the new application tail is local.
         volatileState->CompactionSafeConfigurationIndex = snapshot.ConfigurationIndex;
+        volatileState->CompactionSafeConfigurationTerm = state->CurrentTerm;
         compacted = raft->Compact();
         assert_true(compacted.StableConfiguration);
         assert_int_equal(compacted.ConfigurationIndex, snapshot.ConfigurationIndex);
