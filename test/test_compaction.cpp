@@ -185,6 +185,15 @@ struct TCluster {
         auto response = Take(3, 1, EMessageType::INSTALL_SNAPSHOT_RESPONSE).Cast<TInstallSnapshotResponse>();
         Deliver(response); return response;
     }
+    void ReprobeSnapshotPeer(uint32_t peer) {
+        Packets.clear();
+        Nodes[0]->ProcessTimeout(Now);
+        auto probe = Take(1, peer, EMessageType::APPEND_ENTRIES_REQUEST);
+        Deliver(probe);
+        auto response = Take(peer, 1, EMessageType::APPEND_ENTRIES_RESPONSE);
+        Deliver(response);
+        Packets.clear();
+    }
 };
 void test_shared_compaction_reuses_storage_snapshot_image(void**) {
     TCluster cluster;
@@ -410,6 +419,7 @@ void test_partial_transfer_restart_and_delayed_ack_are_safe(void**) {
     auto second = cluster.SendChunk(); assert_true(second->Offset > 0);
     auto failure = cluster.AckChunk(second); assert_false(failure->Success);
     cluster.Deliver(delayed); // stale sequence cannot restore old progress
+    cluster.ReprobeSnapshotPeer(3);
     auto restarted = cluster.SendChunk(); assert_int_equal(restarted->Offset, 0);
     cluster.AckChunk(restarted); cluster.Pump(1, 80, true);
     assert_int_equal(cluster.Apps[2]->Loads, 1);
@@ -635,6 +645,37 @@ void test_stalled_snapshot_transfer_expires_and_releases_pinned_generation(void*
     assert_true(latest.Index > storedBoundary);
     assert_int_equal(cluster.Nodes[0]->GetState()->SnapshotIndex, latest.Index);
 }
+void test_rejected_snapshot_reprobes_peer_capabilities_before_retry(void**) {
+    TCluster cluster; cluster.Prepare();
+    auto chunk = cluster.SendChunk();
+    auto rejected = NewHoldedMessage(
+        TMessageEx{.Src = 3, .Dst = 1, .Term = chunk->Term, .Seqno = chunk->Seqno},
+        TInstallSnapshotResponse{.SnapshotIndex = chunk->SnapshotIndex});
+    cluster.Deliver(rejected);
+
+    auto readiness = cluster.Nodes[0]->CheckCompactionMembershipReadiness();
+    assert_true(readiness.ActiveVotersWithoutSnapshotInstallSupport == (std::vector<uint32_t>{3}));
+    assert_false(readiness.Ready());
+
+    // A current capability probe distinguishes an old or restarted peer from
+    // a transient snapshot rejection before the leader retries the image.
+    cluster.Packets.clear();
+    cluster.Nodes[0]->ProcessTimeout(cluster.Now);
+    auto probe = cluster.Take(1, 3, EMessageType::APPEND_ENTRIES_REQUEST);
+    cluster.Deliver(probe);
+    auto probeResponse = cluster.Take(3, 1, EMessageType::APPEND_ENTRIES_RESPONSE);
+    cluster.Deliver(probeResponse);
+    const auto& capability = cluster.Nodes[0]->GetVolatileState()->PeerCapabilities.at(3);
+    assert_true(capability.InstallSnapshot);
+    assert_int_equal(capability.Term, cluster.Nodes[0]->GetState()->CurrentTerm);
+
+    cluster.Packets.clear();
+    cluster.Nodes[0]->ProcessTimeout(cluster.Now + TTimeout::Rpc);
+    auto retry = cluster.Take(1, 3, EMessageType::INSTALL_SNAPSHOT_REQUEST)
+        .Cast<TInstallSnapshotRequest>();
+    assert_int_equal(retry->SnapshotIndex, chunk->SnapshotIndex);
+    assert_int_equal(retry->Offset, 0);
+}
 void test_leader_change_mid_snapshot_rejects_old_chunks(void**) {
     TCluster cluster; cluster.Prepare();
     auto old = cluster.SendChunk(); cluster.AckChunk(old);
@@ -710,9 +751,12 @@ void test_idle_snapshot_transfer_discards_partial_image_and_restarts(void**) {
         .Cast<TInstallSnapshotResponse>();
     assert_false(expiredAck->Success);
     assert_int_equal(expiredAck->NextOffset, 0);
-    cluster.Deliver(expiredAck);
 
-    auto restarted = cluster.SendChunk();
+    // The sender may retry its original first chunk if the negative ACK is
+    // delayed or lost. Receiver-side idle expiry must have released the old
+    // assembly so that this offset-zero retry starts cleanly.
+    cluster.Packets.clear();
+    auto restarted = first;
     assert_int_equal(restarted->Offset, 0);
     cluster.Deliver(restarted);
     auto restartedAck = cluster.Take(3, 1, EMessageType::INSTALL_SNAPSHOT_RESPONSE)
@@ -1737,6 +1781,7 @@ int main() {
         cmocka_unit_test(test_snapshot_read_traffic_does_not_starve_delayed_acks),
         cmocka_unit_test(test_compaction_during_each_chunk_cannot_restart_snapshot_catchup),
         cmocka_unit_test(test_stalled_snapshot_transfer_expires_and_releases_pinned_generation),
+        cmocka_unit_test(test_rejected_snapshot_reprobes_peer_capabilities_before_retry),
         cmocka_unit_test(test_leader_change_mid_snapshot_rejects_old_chunks),
         cmocka_unit_test(test_partial_and_installed_snapshot_acks_do_not_confirm_strong_reads),
         cmocka_unit_test(test_compacted_follower_hint_requires_boundary_probe_before_match),

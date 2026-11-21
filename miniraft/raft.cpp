@@ -2807,6 +2807,11 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     if (!response->Success) {
         rpc.Offset = 0;
         rpc.Seqno = 0;
+        // A peer may have restarted or changed binaries since its last
+        // AppendEntries response. Do not keep routing snapshots from that
+        // cached advertisement after a rejection; the boundary probe refreshes
+        // the full capability set before another transfer attempt.
+        VolatileState->PeerCapabilities[response->Src] = {};
     } else if (response->Installed) {
         const auto index = std::max(VolatileState->MatchIndex[response->Src], response->SnapshotIndex);
         (*VolatileState).SetMatchIndex(response->Src, index).SetNextIndex(response->Src, index + 1)
