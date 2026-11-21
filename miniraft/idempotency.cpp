@@ -8,10 +8,13 @@
 namespace {
 using namespace NSnapshotCodec;
 constexpr std::string_view Magic = "MRIDEM01";
+constexpr std::string_view LogMagic = "MRILOG01";
 constexpr uint32_t EncodedVersion = TIdempotencySnapshot::CurrentVersion;
+constexpr uint32_t LogVersion = 1;
 constexpr uint64_t FixedHeaderBytes = 40;
 constexpr uint64_t FixedRecordBytes = 80;
 constexpr uint64_t ChecksumBytes = 4;
+constexpr uint64_t FixedLogRecordBytes = 92;
 
 constexpr std::array<uint32_t, 64> Sha256RoundConstants{
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -89,22 +92,26 @@ uint64_t EncodedSize(const TIdempotencySnapshot& snapshot) {
 std::array<uint8_t, 32> ComputeIdempotentPayloadDigest(std::string_view payload) {
     if (payload.size() > UINT64_MAX / 8)
         throw std::length_error("Idempotent payload is too large to hash");
-    const auto blocks = payload.size() / 64 + 1 + (payload.size() % 64 >= 56 ? 1 : 0);
-    if (blocks > SIZE_MAX / 64)
-        throw std::length_error("Idempotent payload padding size overflow");
-    std::vector<uint8_t> padded(blocks * 64, 0);
-    if (!payload.empty()) memcpy(padded.data(), payload.data(), payload.size());
-    padded[payload.size()] = 0x80;
-    const uint64_t bitLength = uint64_t(payload.size()) * 8;
-    for (unsigned i = 0; i < 8; ++i)
-        padded[padded.size() - 1 - i] = uint8_t(bitLength >> (8 * i));
-
     std::array<uint32_t, 8> hash{
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
         0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
     };
-    for (size_t offset = 0; offset < padded.size(); offset += 64)
-        ProcessSha256Block(padded.data() + offset, hash);
+    size_t offset = 0;
+    while (payload.size() - offset >= 64) {
+        ProcessSha256Block(reinterpret_cast<const uint8_t*>(payload.data() + offset), hash);
+        offset += 64;
+    }
+
+    const auto remaining = payload.size() - offset;
+    std::array<uint8_t, 128> tail{};
+    if (remaining) memcpy(tail.data(), payload.data() + offset, remaining);
+    tail[remaining] = 0x80;
+    const size_t tailBytes = remaining < 56 ? 64 : 128;
+    const uint64_t bitLength = uint64_t(payload.size()) * 8;
+    for (unsigned i = 0; i < 8; ++i)
+        tail[tailBytes - 1 - i] = uint8_t(bitLength >> (8 * i));
+    ProcessSha256Block(tail.data(), hash);
+    if (tailBytes == 128) ProcessSha256Block(tail.data() + 64, hash);
 
     std::array<uint8_t, 32> digest{};
     for (size_t i = 0; i < hash.size(); ++i) {
@@ -112,6 +119,87 @@ std::array<uint8_t, 32> ComputeIdempotentPayloadDigest(std::string_view payload)
             digest[4 * i + j] = uint8_t(hash[i] >> (24 - 8 * j));
     }
     return digest;
+}
+
+TMessageHolder<TLogEntry> EncodeIdempotentLogEntry(
+        const TIdempotentOperationIdentity& identity,
+        TMessageHolder<TLogEntry> applicationEntry) {
+    constexpr uint64_t reservedFlags = TLogEntry::EStub | TLogEntry::EIdempotent |
+        TLogEntry::EConfiguration;
+    if (!identity.Epoch || (!identity.SessionIdHigh && !identity.SessionIdLow) || !identity.Sequence ||
+        !applicationEntry.HasValidExtent() || applicationEntry->Type != uint32_t(EMessageType::LOG_ENTRY) ||
+        applicationEntry->Len < sizeof(TLogEntry) || !applicationEntry->Term ||
+        (applicationEntry->Flags & reservedFlags))
+        throw std::invalid_argument("Invalid idempotent operation log record");
+
+    const uint64_t payloadBytes = applicationEntry->Len - sizeof(TLogEntry);
+    const uint64_t encodedBytes = sizeof(TLogEntry) + FixedLogRecordBytes + payloadBytes + ChecksumBytes;
+    if (encodedBytes > TMessageLimits{}.MaxFrameBytes)
+        throw TMessageError("Idempotent log record exceeds the frame limit");
+
+    std::string bytes;
+    bytes.reserve(static_cast<size_t>(FixedLogRecordBytes + payloadBytes + ChecksumBytes));
+    Append(bytes, LogMagic);
+    Put(bytes, LogVersion, 4);
+    Put(bytes, identity.Epoch, 8);
+    Put(bytes, identity.SessionIdHigh, 8);
+    Put(bytes, identity.SessionIdLow, 8);
+    Put(bytes, identity.Sequence, 8);
+    Append(bytes, std::string_view(reinterpret_cast<const char*>(identity.PayloadDigest.data()),
+        identity.PayloadDigest.size()));
+    Put(bytes, applicationEntry->Flags, 8);
+    Put(bytes, payloadBytes, 8);
+    Append(bytes, std::string_view(applicationEntry->Data, static_cast<size_t>(payloadBytes)));
+    Put(bytes, Checksum(bytes), 4);
+
+    auto entry = NewHoldedMessage<TLogEntry>(static_cast<size_t>(encodedBytes));
+    entry->Term = applicationEntry->Term;
+    entry->Flags = TLogEntry::EIdempotent;
+    memcpy(entry->Data, bytes.data(), bytes.size());
+    return entry;
+}
+
+TDecodedIdempotentLogEntry DecodeIdempotentLogEntry(TMessageHolder<TLogEntry> entry) {
+    if (!entry.HasValidExtent() || entry->Type != uint32_t(EMessageType::LOG_ENTRY) ||
+        entry->Len < sizeof(TLogEntry) + FixedLogRecordBytes + ChecksumBytes ||
+        entry->Len > TMessageLimits{}.MaxFrameBytes || !entry->Term ||
+        entry->Flags != TLogEntry::EIdempotent)
+        Invalid("Invalid idempotent operation log entry");
+    const std::string_view bytes(entry->Data, entry->Len - sizeof(TLogEntry));
+    TReader checksumReader{bytes.substr(bytes.size() - ChecksumBytes)};
+    const auto expectedChecksum = checksumReader.Take(4);
+    const auto body = bytes.substr(0, bytes.size() - ChecksumBytes);
+    if (Checksum(body) != expectedChecksum)
+        Invalid("Idempotent operation log checksum mismatch");
+
+    TReader reader{body};
+    if (reader.Read(LogMagic.size()) != LogMagic || reader.Take(4) != LogVersion)
+        Invalid("Unknown idempotent operation log format");
+    TDecodedIdempotentLogEntry decoded;
+    auto& identity = decoded.Identity;
+    identity.Epoch = reader.Take(8);
+    identity.SessionIdHigh = reader.Take(8);
+    identity.SessionIdLow = reader.Take(8);
+    identity.Sequence = reader.Take(8);
+    const auto digest = reader.Read(identity.PayloadDigest.size());
+    memcpy(identity.PayloadDigest.data(), digest.data(), digest.size());
+    const auto applicationFlags = reader.Take(8);
+    const auto applicationBytes = reader.Take(8);
+    constexpr uint64_t reservedFlags = TLogEntry::EStub | TLogEntry::EIdempotent |
+        TLogEntry::EConfiguration;
+    if (!identity.Epoch || (!identity.SessionIdHigh && !identity.SessionIdLow) || !identity.Sequence ||
+        (applicationFlags & reservedFlags) || applicationBytes != reader.Input.size())
+        Invalid("Invalid idempotent operation log metadata");
+
+    decoded.ApplicationEntry = NewHoldedMessage<TLogEntry>(
+        sizeof(TLogEntry) + static_cast<size_t>(applicationBytes));
+    decoded.ApplicationEntry->Term = entry->Term;
+    decoded.ApplicationEntry->Flags = applicationFlags;
+    if (applicationBytes)
+        memcpy(decoded.ApplicationEntry->Data, reader.Read(static_cast<size_t>(applicationBytes)).data(),
+            static_cast<size_t>(applicationBytes));
+    if (!reader.Input.empty()) Invalid("Trailing idempotent operation log data");
+    return decoded;
 }
 
 void ValidateIdempotencySnapshotLimits(const TIdempotencySnapshotLimits& limits) {

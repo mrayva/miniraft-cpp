@@ -158,8 +158,50 @@ void test_idempotent_payload_digest_matches_sha256_vectors(void**) {
     assert_string_equal(Hex(ComputeIdempotentPayloadDigest(
         "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")).c_str(),
         "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    assert_string_equal(Hex(ComputeIdempotentPayloadDigest(
+        "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn"
+        "hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu")).c_str(),
+        "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1");
     assert_true(ComputeIdempotentPayloadDigest(std::string_view("a\0b", 3)) !=
         ComputeIdempotentPayloadDigest("a"));
+}
+
+void test_idempotent_log_record_roundtrip_and_rejects_corruption(void**) {
+    auto application = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 5);
+    application->Term = 4;
+    application->Data[0] = 'a';
+    application->Data[1] = '\0';
+    application->Data[2] = 'b';
+    application->Data[3] = 'c';
+    application->Data[4] = 'd';
+
+    TIdempotentOperationIdentity identity;
+    identity.Epoch = 8;
+    identity.SessionIdHigh = 9;
+    identity.SessionIdLow = 10;
+    identity.Sequence = 11;
+    identity.PayloadDigest = ComputeIdempotentPayloadDigest(std::string_view("a\0bcd", 5));
+    auto encoded = EncodeIdempotentLogEntry(identity, application);
+    assert_int_equal(encoded->Term, 4);
+    assert_int_equal(encoded->Flags, TLogEntry::EIdempotent);
+
+    const auto decoded = DecodeIdempotentLogEntry(encoded);
+    assert_true(decoded.Identity == identity);
+    assert_int_equal(decoded.ApplicationEntry->Term, 4);
+    assert_int_equal(decoded.ApplicationEntry->Flags, TLogEntry::ENone);
+    assert_int_equal(decoded.ApplicationEntry->Len, sizeof(TLogEntry) + 5);
+    assert_memory_equal(decoded.ApplicationEntry->Data, "a\0bcd", 5);
+
+    auto corrupt = NewHoldedMessage<TLogEntry>(encoded->Len);
+    memcpy(corrupt.Mes, encoded.Mes, encoded->Len);
+    corrupt->Data[12] ^= 1;
+    Reject([&] { (void)DecodeIdempotentLogEntry(corrupt); });
+
+    auto invalid = identity;
+    invalid.Epoch = 0;
+    Reject([&] { (void)EncodeIdempotentLogEntry(invalid, application); });
+    application->Flags = TLogEntry::EConfiguration;
+    Reject([&] { (void)EncodeIdempotentLogEntry(identity, application); });
 }
 
 void test_idempotent_rsm_snapshot_hook_validates_before_atomic_restore(void**) {
@@ -200,6 +242,7 @@ int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_idempotency_snapshot_roundtrip_preserves_dedup_state),
         cmocka_unit_test(test_idempotent_payload_digest_matches_sha256_vectors),
+        cmocka_unit_test(test_idempotent_log_record_roundtrip_and_rejects_corruption),
         cmocka_unit_test(test_idempotent_rsm_snapshot_hook_validates_before_atomic_restore),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);

@@ -120,7 +120,9 @@ application response that exceeds its declared bound is a contract violation.
 2. Add the optional idempotent state-machine contract and versioned session
    snapshot codec with strict limits. (The contract and codec have landed.)
 3. Carry identity through negotiated forwarding, wrap commands in replicated
-   log metadata, and apply duplicate checks at the state-machine boundary.
+   log metadata, and apply duplicate checks at the state-machine boundary. (The
+   digest and strict log-record codec are present; request routing and replay
+   integration remain open.)
 4. Add end-to-end loss, retry, leadership-change, restart, compaction and
    resource-limit tests before advertising the capability.
 

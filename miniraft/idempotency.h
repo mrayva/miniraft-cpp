@@ -70,6 +70,16 @@ struct TIdempotencySnapshotLimits {
     uint64_t MaxEncodedBytes = TSnapshot::MaxBytes;
 };
 
+struct TDecodedIdempotentLogEntry {
+    TIdempotentOperationIdentity Identity;
+    TMessageHolder<TLogEntry> ApplicationEntry;
+};
+
+TMessageHolder<TLogEntry> EncodeIdempotentLogEntry(
+    const TIdempotentOperationIdentity& identity,
+    TMessageHolder<TLogEntry> applicationEntry);
+TDecodedIdempotentLogEntry DecodeIdempotentLogEntry(TMessageHolder<TLogEntry> entry);
+
 void ValidateIdempotencySnapshotLimits(const TIdempotencySnapshotLimits& limits);
 void ValidateIdempotencySnapshot(const TIdempotencySnapshot& snapshot,
                                  const TIdempotencySnapshotLimits& limits = {});

@@ -60,6 +60,8 @@ struct TLogEntry: public TMessage {
     enum EFlags : uint64_t {
         ENone = 0,
         EStub = 1,
+        // Reserved for versioned idempotent-operation log records.
+        EIdempotent = uint64_t(1) << 1,
         // Marks entries consumed by the guarded live membership protocol.
         EConfiguration = uint64_t(1) << 63,
     };
