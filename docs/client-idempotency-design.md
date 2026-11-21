@@ -5,12 +5,13 @@ implemented. The current client request path does not provide durable operation
 identity. A timeout or lost response leaves the write outcome unknown; retrying
 a non-idempotent write may apply it twice.
 
-The new request and response frame types are strictly validated. The request
-processor returns `Unsupported` before forwarding, appending, or applying the
-command because the RSM and snapshot contracts are not implemented yet. No
-capability is advertised, and clients must not treat this frame as a usable
-idempotency feature. In particular, this protocol foundation does not preserve
-identity across forwarding or replication yet.
+The new request and response frame types are strictly validated. An optional
+`IIdempotentRsm` contract and bounded, versioned combined application/session
+snapshot codec are also present. The request processor still returns
+`Unsupported` before forwarding, appending, or applying because operation
+identity is not yet carried through forwarding or replicated log entries. No
+capability is advertised, and clients must not treat these interfaces as a
+usable idempotency feature.
 
 ## Goal and boundary
 
@@ -115,7 +116,7 @@ application response that exceeds its declared bound is a contract violation.
    legacy requests unchanged and reject the new type until the durable contract
    is available. (The frame types and fail-closed response have landed.)
 2. Add the optional idempotent state-machine contract and versioned session
-   snapshot codec with strict limits.
+   snapshot codec with strict limits. (The contract and codec have landed.)
 3. Carry identity through negotiated forwarding, wrap commands in replicated
    log metadata, and apply duplicate checks at the state-machine boundary.
 4. Add end-to-end loss, retry, leadership-change, restart, compaction and

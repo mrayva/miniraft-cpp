@@ -1,5 +1,6 @@
 add_library(miniraft
     messages.cpp
+    idempotency.cpp
     raft.cpp
     persist.cpp
     durable.cpp
@@ -33,6 +34,7 @@ install(FILES
     quorum.h
     snapshot.h
     snapshot_codec.h
+    idempotency.h
     configuration.h
     raft.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/miniraft

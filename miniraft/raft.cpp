@@ -101,6 +101,9 @@ struct TSnapshotMetadataProbe {
     bool Supported = false;
     size_t Need = 8;
     bool FreshLearnerBootstrap = false;
+    // True once the available base voter list authenticates the sender, even
+    // when a bounded configuration-history suffix still spans later chunks.
+    bool TermValidated = false;
 };
 
 bool IsSupportedSnapshotMagicPrefix(std::string_view prefix) {
@@ -661,12 +664,33 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
         (joint && incomingOld == incomingNew) || (jointLineage && incomingPrevious != incomingOld))
         return {true, false, 0};
 
+    const bool senderInSnapshotVoters =
+        std::binary_search(incomingOld.begin(), incomingOld.end(), leaderId) ||
+        std::binary_search(incomingNew.begin(), incomingNew.end(), leaderId);
+    bool termValidated = false;
+    if (senderInSnapshotVoters && freshLearnerBootstrap) {
+        termValidated = !std::binary_search(incomingOld.begin(), incomingOld.end(), receiverId) &&
+            !std::binary_search(incomingNew.begin(), incomingNew.end(), receiverId);
+    } else if (senderInSnapshotVoters && pendingConfigurationBoundary) {
+        termValidated = incomingOld == pendingConfiguration->OldVoters() &&
+            (pendingConfiguration->IsJoint()
+                ? incomingNew == pendingConfiguration->NewVoters() : incomingNew.empty());
+    } else if (senderInSnapshotVoters && stableSuccessorMetadata) {
+        termValidated = incomingOld == committedConfiguration->NewVoters() && incomingNew.empty();
+    } else if (senderInSnapshotVoters && (staleStableLineageMetadata || staleJointHistoryMetadata)) {
+        const auto trustedVoters = ConfigurationVoterUnion(*committedConfiguration);
+        termValidated = std::binary_search(trustedVoters.begin(), trustedVoters.end(), leaderId);
+    } else if (senderInSnapshotVoters && !staleStableLineageMetadata && !staleJointHistoryMetadata) {
+        termValidated = incomingOld == committedConfiguration->OldVoters() &&
+            incomingNew == committedConfiguration->NewVoters();
+    }
+
     std::vector<TSnapshotConfigurationTransition> transitions;
     if (configurationHistory) {
         if (headerBytes + 4 > totalBytes - 4) return {true, false, 0};
         uint64_t transitionCount = 0;
         if (!ReadSnapshotInteger(prefix, size_t(headerBytes), 4, transitionCount))
-            return {false, false, size_t(headerBytes + 4)};
+            return {false, false, size_t(headerBytes + 4), false, termValidated};
         const auto transitionLimit = largeHistory ? TSnapshot::MaxConfigurationTransitions :
             extendedHistory ? TSnapshot::MaxExtendedConfigurationTransitions :
             TSnapshot::MaxLegacyConfigurationTransitions;
@@ -676,7 +700,8 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
         headerBytes += 4;
         for (uint64_t i = 0; i < transitionCount; ++i) {
             if (headerBytes + 56 > totalBytes - 4) return {true, false, 0};
-            if (headerBytes + 56 > prefix.size()) return {false, false, size_t(headerBytes + 56)};
+            if (headerBytes + 56 > prefix.size())
+                return {false, false, size_t(headerBytes + 56), false, termValidated};
             TSnapshotConfigurationTransition transition;
             const size_t offset = size_t(headerBytes);
             uint64_t oldCount = 0, nextCount = 0;
@@ -694,7 +719,7 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
             if (transitionBytes > totalBytes - 4 - headerBytes)
                 return {true, false, 0};
             if (headerBytes + transitionBytes > prefix.size())
-                return {false, false, size_t(headerBytes + transitionBytes)};
+                return {false, false, size_t(headerBytes + transitionBytes), false, termValidated};
             transition.OldVoters.reserve(size_t(oldCount));
             transition.NewVoters.reserve(size_t(nextCount));
             auto readTransitionVoters = [&](size_t listOffset, uint64_t count,
@@ -2990,7 +3015,15 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             committedConfiguration, pendingConfiguration,
             false, MayRecoverMembershipFromSnapshot(Id, *State, GetVoterIds(), committedConfiguration),
             request->LeaderId, Id);
-        if (!probe.Complete) { reply(true, false, receivedBytes); return; }
+        if (!probe.Complete) {
+            // Once the base voter lists authenticate this sender, record its
+            // term even if configuration-history metadata spans later chunks.
+            // Leader recognition and timer refresh still wait for full support.
+            if (probe.TermValidated && request->Term > State->CurrentTerm)
+                AdvanceTerm(now, request->Term, true);
+            reply(true, false, receivedBytes);
+            return;
+        }
         IncomingSnapshot.reset();
         if (probe.Supported) acceptLeaderContact();
         reply(probe.Supported, probe.Supported, probe.Supported ? request->TotalBytes : 0);
@@ -3051,7 +3084,15 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             committedConfiguration, !pendingConfiguration),
         MayRecoverMembershipFromSnapshot(Id, *State, GetVoterIds(), committedConfiguration),
         request->LeaderId, Id);
-    if (!probe.Complete) { reply(true, false, receivedBytes); return; }
+    if (!probe.Complete) {
+        // Term observation is independent of leader recognition: retain the
+        // transfer after its base voter lists authenticate the sender, while
+        // deferring LeaderId and timer changes until full metadata validation.
+        if (probe.TermValidated && request->Term > State->CurrentTerm)
+            AdvanceTerm(now, request->Term, true);
+        reply(true, false, receivedBytes);
+        return;
+    }
     if (!probe.Supported) { IncomingSnapshot.reset(); reply(false, false, 0); return; }
     acceptLeaderContact();
     if (receivedBytes < request->TotalBytes) { reply(true, false, receivedBytes); return; }

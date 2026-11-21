@@ -16,6 +16,7 @@
 #include "state.h"
 #include "quorum.h"
 #include "configuration.h"
+#include "idempotency.h"
 
 struct INode {
     virtual ~INode() = default;
@@ -55,6 +56,97 @@ struct IRsm {
     // Durable RSMs restore this atomically with application data before constructing
     // TRequestProcessor. It must identify committed progress in the same Raft log.
     uint64_t LastAppliedIndex = 0;
+};
+
+struct TIdempotentWriteResult {
+    uint64_t Index = 0;
+    uint32_t ErrorCode = TCommandResponse::Success;
+    std::string Data;
+};
+
+// Optional application contract for durable write deduplication. Implementors
+// must apply a new operation and update its session record atomically. On log
+// replay, an exact latest-operation duplicate returns the stored result without
+// reapplying; identity reuse with another digest and invalid sequence/epoch
+// transitions return deterministic error results without mutating application
+// state. Snapshot capture and restore cover application data, epoch, all active
+// sessions/tombstones, cached results and LastAppliedIndex as one state image.
+struct IIdempotentRsm : IRsm {
+    explicit IIdempotentRsm(TIdempotencySnapshotLimits limits = {})
+        : SnapshotLimits(std::move(limits)) {
+        ValidateIdempotencySnapshotLimits(SnapshotLimits);
+    }
+
+    virtual void ValidateIdempotent(TMessageHolder<TIdempotentCommandRequest>) const = 0;
+    // Bound for cached response data, excluding the fixed response frame.
+    virtual uint64_t CachedResponseDataUpperBound(
+        TMessageHolder<TIdempotentCommandRequest>) const = 0;
+    uint64_t IdempotentResponseSizeUpperBound(
+            TMessageHolder<TIdempotentCommandRequest> request) const {
+        const auto bound = CachedResponseDataUpperBound(std::move(request));
+        if (bound > SnapshotLimits.MaxResponseBytes)
+            throw TMessageError("Idempotent response bound exceeds the configured limit");
+        return bound;
+    }
+    virtual TMessageHolder<TLogEntry> PrepareIdempotent(
+        TMessageHolder<TIdempotentCommandRequest>) = 0;
+    virtual TIdempotentWriteResult WriteIdempotent(
+        TMessageHolder<TLogEntry>, uint64_t index,
+        const TIdempotentOperationIdentity& identity) = 0;
+    virtual void ValidateIdempotencyControl(
+        const TIdempotencyControlOperation&) const = 0;
+    virtual TMessageHolder<TLogEntry> PrepareIdempotencyControl(
+        const TIdempotencyControlOperation&) = 0;
+    virtual void ApplyIdempotencyControl(
+        const TIdempotencyControlOperation&, uint64_t index) = 0;
+
+    // Capture returns application data and dedup state together. Validation must
+    // not mutate state; restore must publish the whole image and LastAppliedIndex
+    // only after the complete image has passed validation.
+    virtual TIdempotencySnapshot CaptureIdempotencySnapshot() const = 0;
+    virtual void ValidateIdempotencySnapshot(
+        const TIdempotencySnapshot&, uint64_t index) const = 0;
+    virtual void RestoreIdempotencySnapshot(
+        TIdempotencySnapshot, uint64_t index) = 0;
+    // Upper bound for the complete encoded wrapper returned by SaveSnapshot.
+    virtual std::optional<uint64_t> IdempotencySnapshotSizeUpperBound() const {
+        return std::nullopt;
+    }
+
+    std::string SaveSnapshot() const final {
+        auto snapshot = CaptureIdempotencySnapshot();
+        if (snapshot.LastAppliedIndex != LastAppliedIndex)
+            throw std::logic_error("Idempotency snapshot progress does not match the RSM");
+        auto bytes = EncodeIdempotencySnapshot(snapshot, SnapshotLimits);
+        const auto bound = IdempotencySnapshotSizeUpperBound();
+        if (bound && bytes.size() > *bound)
+            throw std::logic_error("Idempotency snapshot exceeded its declared size bound");
+        return bytes;
+    }
+    std::optional<uint64_t> SnapshotSizeUpperBound() const final {
+        auto bound = IdempotencySnapshotSizeUpperBound();
+        if (bound && *bound > SnapshotLimits.MaxEncodedBytes)
+            throw std::runtime_error("Idempotency snapshot size bound exceeds its configured limit");
+        return bound;
+    }
+    void ValidateSnapshot(std::string_view bytes, uint64_t index) const final {
+        auto snapshot = DecodeIdempotencySnapshot(bytes, SnapshotLimits);
+        if (snapshot.LastAppliedIndex != index)
+            throw std::runtime_error("Idempotency snapshot progress does not match its Raft boundary");
+        ValidateIdempotencySnapshot(snapshot, index);
+    }
+    void LoadSnapshot(std::string_view bytes, uint64_t index) final {
+        auto snapshot = DecodeIdempotencySnapshot(bytes, SnapshotLimits);
+        if (snapshot.LastAppliedIndex != index)
+            throw std::runtime_error("Idempotency snapshot progress does not match its Raft boundary");
+        ValidateIdempotencySnapshot(snapshot, index);
+        RestoreIdempotencySnapshot(std::move(snapshot), index);
+        if (LastAppliedIndex != index)
+            throw std::runtime_error("Idempotent RSM failed to restore snapshot progress");
+    }
+
+protected:
+    const TIdempotencySnapshotLimits SnapshotLimits;
 };
 
 struct TDummyRsm: public IRsm {

@@ -92,7 +92,7 @@ void ValidateIdempotentCommandResponse(
     ValidateMessageTree(message, limits);
     if (message->Version != TIdempotentCommandRequest::CurrentVersion || message->Reserved != 0 ||
         message->Epoch == 0 || (!message->SessionIdHigh && !message->SessionIdLow) ||
-        message->Sequence == 0 || message->ErrorCode > TCommandResponse::Unsupported ||
+        message->Sequence == 0 || message->ErrorCode > TCommandResponse::AlreadyCompleted ||
         (message->ErrorCode == TCommandResponse::Success && message->Index == 0))
         throw TMessageError("Invalid idempotent command response metadata");
 }

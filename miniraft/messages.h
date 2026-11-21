@@ -233,6 +233,12 @@ struct TCommandResponse: public TMessage {
         Overloaded = 3,
         TimedOut = 4,
         Unsupported = 5,
+        // Deterministic idempotent-write protocol outcomes.
+        IdempotencyConflict = 6,
+        SequenceGap = 7,
+        StaleEpoch = 8,
+        SessionClosed = 9,
+        AlreadyCompleted = 10,
     };
     uint64_t Index = 0;
     uint32_t Cookie = 0;
