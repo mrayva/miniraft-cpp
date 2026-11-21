@@ -29,6 +29,23 @@ state->BindVotersFromTrustedBaseline(originalVoters);
 TRaft raft(state, nodeId, peers);
 ```
 
+For an offline operation, `miniraft-migrate-disk-state` can validate and bind
+the same recovered durable image. Stop the replica, preserve a backup, and
+obtain the voter set from an independently verified deployment record first:
+
+```sh
+miniraft-migrate-disk-state --bind-durable --durable-base /var/lib/raft/node \
+  --node-id 7 --voters 1,2,3 --dry-run
+miniraft-migrate-disk-state --bind-durable --durable-base /var/lib/raft/node \
+  --node-id 7 --voters 1,2,3
+```
+
+Use `--commit-index INDEX` when binding through the trusted-history path for a
+configuration-bearing snapshot. That commit boundary must also come from an
+independently verified record. The tool checks and reopens the published
+binding, but cannot prove the completeness or historical correctness of either
+operator-supplied value. Do not run it while the replica is serving traffic.
+
 The dry run does not write state. It reports the same consistency checks that
 the mutating call will apply, including vote, snapshot, and retained-log checks.
 It cannot establish that `originalVoters` is complete or historically correct;
@@ -70,5 +87,9 @@ Dry-run tests verify both successful and rejected checks preserve the source
 bytes, and that diagnostics are cleared on success. Legacy formats recover
 their commit floor at the snapshot boundary; the explicit history API accepts a
 separately supplied commit boundary.
+
+The CLI selects this path when `--commit-index` is present; without that option
+it uses the simpler baseline path, which rejects retained configuration entries
+and configuration-bearing snapshots.
 
 Self-review completed. No independent reviewer approval is claimed.
