@@ -39,6 +39,7 @@ public:
     TDurableState& operator=(const TDurableState&) = delete;
     void RemoveLast() override;
     void Append(TMessageHolder<TLogEntry> entry) override;
+    void AppendBatch(const std::vector<TMessageHolder<TLogEntry>>& entries) override;
     TMessageHolder<TLogEntry> Get(int64_t index) const override;
     uint64_t RetainedLogTerm(int64_t index) const override;
     uint64_t RetainedLogFlags(int64_t index) const override;

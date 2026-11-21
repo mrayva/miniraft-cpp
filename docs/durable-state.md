@@ -48,7 +48,10 @@ both through the trusted-baseline API before Raft startup.
 ## Publication protocol
 
 Each Append, RemoveLast and Commit publishes one complete image containing the
-current term, vote and selected log prefix:
+current term, vote and selected log prefix. Follower `AppendEntries` groups the
+new entries from one request through `AppendBatch`, so a replicated batch is
+published once before the follower acknowledges it. A later commit-index advance
+is still a separate publication:
 
 1. Serialize the complete state into a temporary file in the same directory.
 2. fsync the temporary file and check the result.
@@ -131,10 +134,12 @@ recovery's refusal to adopt temporary images. No independent approval is claimed
 
 ## Limits and assumptions
 
-This first implementation rewrites the entire log on every update, uses memory
-proportional to the log, and blocks the calling thread during sync. It establishes
-a conservative protocol baseline, not NuRaft-level throughput. An efficient WAL,
-group commit, snapshots and compaction remain necessary for substantial workloads.
+This implementation rewrites the entire log on every publication, uses memory
+proportional to the log, and blocks the calling thread during sync. `AppendBatch`
+reduces publications for a multi-entry follower request, but individual client
+proposals and commit-index advances still publish separately. There is no WAL or
+group commit across requests; this remains a conservative protocol baseline, not
+NuRaft-level throughput.
 
 The durability contract assumes Linux, a pre-existing durable parent directory,
 and a local filesystem/storage stack honoring fsync and same-directory atomic

@@ -384,6 +384,26 @@ void TDurableState::Append(TMessageHolder<TLogEntry> entry)
     Commit();
 }
 
+void TDurableState::AppendBatch(const std::vector<TMessageHolder<TLogEntry>>& entries)
+{
+    if (entries.empty()) return;
+    if (LastLogIndex >= uint64_t(INT64_MAX) ||
+        entries.size() > uint64_t(INT64_MAX) - LastLogIndex)
+        throw std::overflow_error("Raft log index exhausted");
+    if (entries.size() > Impl->Log.max_size() - Impl->Log.size())
+        throw std::length_error("Durable log is too large for this platform");
+
+    std::vector<TMessageHolder<TLogEntry>> cloned;
+    cloned.reserve(entries.size());
+    for (const auto& entry : entries) cloned.push_back(Clone(entry));
+    Impl->Log.reserve(Impl->Log.size() + cloned.size());
+    for (auto& entry : cloned) Impl->Log.push_back(std::move(entry));
+
+    LastLogIndex = SnapshotIndex + Impl->Log.size();
+    LastLogTerm = Impl->Log.back()->Term;
+    Commit();
+}
+
 void TDurableState::RemoveLast()
 {
     if (Impl->Log.empty()) return;

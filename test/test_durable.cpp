@@ -361,6 +361,42 @@ void test_follower_persists_commit_before_ack_and_recovers_it(void**) {
     assert_int_equal(recovered.LastLogIndex, 1);
 }
 
+void test_follower_batches_durable_append_before_ack(void**) {
+    TFiles files;
+    std::vector<std::string> events;
+    auto peer = std::make_shared<TEndpoint>();
+    peer->Events = &events;
+    {
+        auto state = std::make_shared<TDurableState>(files.Name, 1, [&](auto stage) {
+            if (stage == TDurableState::EStage::DirectorySynced) events.push_back("durable");
+        });
+        TRaft raft(state, 1, {{2, peer}});
+        events.clear();
+
+        auto request = NewHoldedMessage(TMessageEx{.Src = 2, .Dst = 1, .Term = 1},
+            TAppendEntriesRequest{.PrevLogIndex = 0, .PrevLogTerm = 0, .LeaderCommit = 0,
+                                  .LeaderId = 2, .Nentries = 3});
+        request.InitPayload(3);
+        request.Payload[0] = Entry(1, "first");
+        request.Payload[1] = Entry(1, "second");
+        request.Payload[2] = Entry(1, "third");
+        raft.Process(ITimeSource::Time{}, request);
+
+        assert_int_equal(state->LastLogIndex, 3);
+        assert_int_equal(peer->Sent.size(), 1);
+        const auto response = peer->Sent.back().Cast<TAppendEntriesResponse>();
+        assert_true(response->Success);
+        assert_int_equal(response->MatchIndex, 3);
+        assert_true((events == std::vector<std::string>{"durable", "ack"}));
+    }
+
+    TDurableState recovered(files.Name, 1);
+    assert_int_equal(recovered.LastLogIndex, 3);
+    assert_string_equal(Data(recovered, 1).c_str(), "first");
+    assert_string_equal(Data(recovered, 2).c_str(), "second");
+    assert_string_equal(Data(recovered, 3).c_str(), "third");
+}
+
 void test_publication_order(void**) {
     TFiles files;
     files.Seed();
@@ -697,6 +733,7 @@ int main() {
         cmocka_unit_test(test_crash_at_every_publication_boundary),
         cmocka_unit_test(test_acknowledged_updates_survive_immediate_exit),
         cmocka_unit_test(test_follower_persists_commit_before_ack_and_recovers_it),
+        cmocka_unit_test(test_follower_batches_durable_append_before_ack),
         cmocka_unit_test(test_publication_order),
         cmocka_unit_test(test_v1_v2_v3_images_recover_conservatively_and_upgrade_on_publish),
         cmocka_unit_test(test_live_publication_failure_is_fatal),

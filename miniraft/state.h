@@ -21,6 +21,11 @@ struct TStateFields {
 struct IState: TStateFields {
     virtual void RemoveLast() = 0;
     virtual void Append(TMessageHolder<TLogEntry>) = 0;
+    // Backends may persist one replicated AppendEntries batch with a single
+    // storage update. The default preserves the existing per-entry behavior.
+    virtual void AppendBatch(const std::vector<TMessageHolder<TLogEntry>>& entries) {
+        for (const auto& entry : entries) Append(entry);
+    }
     // Absolute indices; only the suffix after SnapshotIndex has log entries.
     // The boundary term remains available through LogTerm(SnapshotIndex).
     virtual TMessageHolder<TLogEntry> Get(int64_t index) const = 0;

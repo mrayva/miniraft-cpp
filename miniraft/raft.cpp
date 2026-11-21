@@ -1342,6 +1342,7 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
         if (fits) {
             success = true;
             index = message->PrevLogIndex;
+            std::vector<TMessageHolder<TLogEntry>> appendBatch;
             for (uint32_t i = 0; i < message.PayloadSize; ++i) {
                 auto& data = message.Payload[i];
                 auto entry = data.Cast<TLogEntry>();
@@ -1355,11 +1356,16 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
                         State->RemoveLast();
                         RemoveUncommittedLogSuffix(removedIndex);
                     }
-                    const auto bytes = entry->Len;
-                    State->Append(entry);
-                    RecordUncommittedLogEntry(index, bytes);
+                    appendBatch.push_back(entry);
                     if (entry->Flags & TLogEntry::EConfiguration) configurationTouched = true;
                 }
+            }
+
+            if (!appendBatch.empty()) {
+                State->AppendBatch(appendBatch);
+                const auto firstAppendedIndex = State->LastLogIndex - appendBatch.size() + 1;
+                for (size_t i = 0; i < appendBatch.size(); ++i)
+                    RecordUncommittedLogEntry(firstAppendedIndex + i, appendBatch[i]->Len);
             }
 
             matchIndex = index;
