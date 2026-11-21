@@ -361,7 +361,13 @@ bool SyncDirectory(const std::string& path) {
 }
 
 TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitHook)
-    : CommitHook(std::move(commitHook))
+    : TDiskState(name, id, std::move(commitHook), true)
+{ }
+
+TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitHook,
+        bool reclaimPreviousGenerationOnRecovery)
+    : ReclaimPreviousGenerationOnRecovery(reclaimPreviousGenerationOnRecovery)
+    , CommitHook(std::move(commitHook))
 {
     const auto suffix = "." + std::to_string(id);
     EntriesBasePath = name + ".entries" + suffix;
@@ -461,7 +467,7 @@ TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitH
     }
     ValidateStoredVoteMembershipHistory();
     Recovering = false;
-    if (EntriesGeneration && EntriesGeneration == IndexGeneration)
+    if (ReclaimPreviousGenerationOnRecovery && EntriesGeneration && EntriesGeneration == IndexGeneration)
         ReclaimPreviousGeneration(EntriesGeneration - 1, IndexGeneration - 1);
 }
 

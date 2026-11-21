@@ -76,9 +76,11 @@ constructing Raft. It requires an independently verified voter set and commit
 index, checks the stored vote and term/log bounds, and refuses compacted state
 or any retained configuration entry. A successful call atomically writes the
 new metadata before startup. Recovered unbound state otherwise fails Raft
-startup. The storage still does not support snapshots or compaction. The
-separate Linux [offline converter](legacy-disk-state-migration.md) remains the
-path to move a split-format store to `TDurableState`.
+startup. For retained membership entries or a compacted snapshot, use the
+full-history offline `--bind-disk-state` path below. Split `TDiskState` supports
+snapshot installation and compaction with versioned metadata. The separate
+Linux [offline converter](legacy-disk-state-migration.md) remains the path to
+move a split-format store to `TDurableState`.
 
 Tests cover MRFTD001, MRFTD002 and MRFTD003 recovery, rejection of inconsistent
 vote/snapshot baselines and unanchored configuration history without rewriting
@@ -88,8 +90,27 @@ bytes, and that diagnostics are cleared on success. Legacy formats recover
 their commit floor at the snapshot boundary; the explicit history API accepts a
 separately supplied commit boundary.
 
-The CLI selects this path when `--commit-index` is present; without that option
-it uses the simpler baseline path, which rejects retained configuration entries
-and configuration-bearing snapshots.
+The durable-store CLI selects this path when `--commit-index` is present;
+without that option it uses the simpler baseline path, which rejects retained
+configuration entries and configuration-bearing snapshots.
+
+For an existing split-format `TDiskState` store, bind its original voters using
+the retained log and snapshot history validator:
+
+```sh
+miniraft-migrate-disk-state --bind-disk-state --disk-base /var/lib/raft/node \
+  --node-id 7 --voters 1,2,3 --commit-index 42 --dry-run
+miniraft-migrate-disk-state --bind-disk-state --disk-base /var/lib/raft/node \
+  --node-id 7 --voters 1,2,3 --commit-index 42
+```
+
+This mode requires the independently verified commit boundary. It supports
+retained membership entries and compacted snapshots only when the validated
+history is anchored at configuration index zero and names the supplied original
+voters. The dry run checks the same history without changing files, including
+orphaned previous generations; it also refuses a missing store rather than
+creating one. A successful bind publishes metadata, reopens the split store, and
+verifies its voter set, Raft boundaries, and snapshot. As with the durable mode,
+stop the replica and back up its files before running the command.
 
 Self-review completed. No independent reviewer approval is claimed.

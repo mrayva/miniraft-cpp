@@ -1,6 +1,8 @@
 #include <miniraft/durable.h>
+#include <miniraft/persist.h>
 #include <algorithm>
 #include <charconv>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -20,7 +22,11 @@ void Usage(std::ostream& out) {
         << "Usage: miniraft-migrate-disk-state --bind-durable --durable-base PREFIX "
            "--node-id ID --voters ID,ID,... [--commit-index INDEX] [--dry-run]\n"
         << "Omit --commit-index for an unconfigured legacy log or legacy snapshot; "
-           "include it to validate a configuration-bearing snapshot history.\n";
+           "include it to validate a configuration-bearing snapshot history.\n"
+        << "Usage: miniraft-migrate-disk-state --bind-disk-state --disk-base PREFIX "
+           "--node-id ID --voters ID,ID,... --commit-index INDEX [--dry-run]\n"
+        << "Split-format stores require a trusted commit index; retained membership "
+           "history and compacted snapshot history are validated before binding.\n";
 }
 
 uint64_t ParseUnsigned(std::string_view text, const char* name) {
@@ -60,6 +66,15 @@ void PrintInfo(const TLegacyDiskStateMigrationInfo& info) {
               << "last log term: " << info.LastLogTerm << '\n'
               << "commit index: " << info.CommitIndex << '\n';
 }
+
+void RequireExistingRegularFiles(const std::vector<std::string>& paths) {
+    for (const auto& path : paths) {
+        std::error_code error;
+        const auto status = std::filesystem::symlink_status(path, error);
+        if (error || !std::filesystem::is_regular_file(status))
+            throw std::invalid_argument("Expected an existing regular store file: " + path);
+    }
+}
 }
 
 int main(int argc, char** argv) {
@@ -67,6 +82,7 @@ int main(int argc, char** argv) {
         std::map<std::string, std::string> values;
         bool dryRun = false;
         bool bindDurable = false;
+        bool bindDiskState = false;
         for (int i = 1; i < argc; ++i) {
             const std::string option = argv[i];
             if (option == "--help" || option == "-h") {
@@ -83,25 +99,37 @@ int main(int argc, char** argv) {
                 bindDurable = true;
                 continue;
             }
+            if (option == "--bind-disk-state") {
+                if (bindDiskState) throw std::invalid_argument("Duplicate --bind-disk-state option");
+                bindDiskState = true;
+                continue;
+            }
             if (option != "--input-base" && option != "--output-base" && option != "--node-id" &&
-                option != "--voters" && option != "--commit-index" && option != "--durable-base")
+                option != "--voters" && option != "--commit-index" && option != "--durable-base" &&
+                option != "--disk-base")
                 throw std::invalid_argument("Unknown option: " + option);
             if (i + 1 == argc) throw std::invalid_argument("Missing value for " + option);
             if (!values.emplace(option, argv[++i]).second)
                 throw std::invalid_argument("Duplicate option: " + option);
         }
-        if (bindDurable) {
-            for (const auto* required : {"--durable-base", "--node-id", "--voters"})
+        if (bindDurable && bindDiskState)
+            throw std::invalid_argument("Choose only one voter binding mode");
+        if (bindDurable || bindDiskState) {
+            const auto* requiredBase = bindDurable ? "--durable-base" : "--disk-base";
+            for (const auto* required : {requiredBase, "--node-id", "--voters"})
                 if (!values.contains(required)) throw std::invalid_argument(std::string("Missing ") + required);
-            if (values.contains("--input-base") || values.contains("--output-base"))
-                throw std::invalid_argument("--bind-durable cannot be combined with disk migration paths");
-            if (values.at("--durable-base").empty())
-                throw std::invalid_argument("Durable store base path must not be empty");
+            if (values.contains("--input-base") || values.contains("--output-base") ||
+                values.contains(bindDurable ? "--disk-base" : "--durable-base"))
+                throw std::invalid_argument("Voter binding cannot be combined with other storage paths");
+            if (bindDiskState && !values.contains("--commit-index"))
+                throw std::invalid_argument("--bind-disk-state requires --commit-index");
+            if (values.at(requiredBase).empty())
+                throw std::invalid_argument("Store base path must not be empty");
         } else {
             for (const auto* required : {"--input-base", "--output-base", "--node-id", "--voters", "--commit-index"})
                 if (!values.contains(required)) throw std::invalid_argument(std::string("Missing ") + required);
-            if (values.contains("--durable-base"))
-                throw std::invalid_argument("--durable-base requires --bind-durable");
+            if (values.contains("--durable-base") || values.contains("--disk-base"))
+                throw std::invalid_argument("Storage binding paths require a binding mode");
             if (values.at("--input-base").empty() || values.at("--output-base").empty())
                 throw std::invalid_argument("Store base paths must not be empty");
         }
@@ -114,6 +142,8 @@ int main(int argc, char** argv) {
 
         TLegacyDiskStateMigrationInfo info;
         if (bindDurable) {
+            const auto base = values.at("--durable-base");
+            RequireExistingRegularFiles({base + ".durable." + std::to_string(nodeId)});
             const bool useTrustedHistory = values.contains("--commit-index");
             const auto commitIndex = useTrustedHistory
                 ? ParseUnsigned(values.at("--commit-index"), "commit index") : uint64_t{0};
@@ -143,6 +173,46 @@ int main(int argc, char** argv) {
                     verified.LastLogTerm != info.LastLogTerm || verified.CommitIndex != expectedCommitIndex ||
                     verified.SnapshotIndex != snapshotIndex || verified.SnapshotTerm != snapshotTerm)
                     throw std::runtime_error("Durable voter binding failed reopen verification");
+                info = {verified.CurrentTerm, verified.VotedFor, verified.LastLogIndex,
+                    verified.LastLogTerm, verified.CommitIndex};
+                std::cout << "trusted voter binding completed\n";
+            } else {
+                std::cout << "dry run passed; no store was written\n";
+            }
+        } else if (bindDiskState) {
+            const auto base = values.at("--disk-base");
+            const auto suffix = "." + std::to_string(nodeId);
+            RequireExistingRegularFiles({base + ".entries" + suffix,
+                base + ".index" + suffix, base + ".state" + suffix});
+            const auto commitIndex = ParseUnsigned(values.at("--commit-index"), "commit index");
+            uint64_t snapshotIndex = 0;
+            uint64_t snapshotTerm = 0;
+            std::shared_ptr<const TSnapshot> snapshot;
+            {
+                // Opening split stores can reclaim a previous generation. Keep
+                // validation read-only; successful publication is verified by
+                // a normal reopen after the metadata commit.
+                TDiskState state(base, nodeId, {}, false);
+                info = {state.CurrentTerm, state.VotedFor, state.LastLogIndex,
+                    state.LastLogTerm, state.CommitIndex};
+                snapshotIndex = state.SnapshotIndex;
+                snapshotTerm = state.SnapshotTerm;
+                snapshot = state.GetSnapshot();
+                std::string reason;
+                if (!state.CanBindVotersFromTrustedHistory(voters, commitIndex, &reason))
+                    throw std::invalid_argument("Trusted voter binding refused: " + reason);
+                if (!dryRun) state.BindVotersFromTrustedHistory(voters, commitIndex);
+            }
+            if (!dryRun) {
+                TDiskState verified(values.at("--disk-base"), nodeId);
+                const auto verifiedSnapshot = verified.GetSnapshot();
+                if (verified.GetBoundVoters() != voters || verified.CurrentTerm != info.CurrentTerm ||
+                    verified.VotedFor != info.VotedFor || verified.LastLogIndex != info.LastLogIndex ||
+                    verified.LastLogTerm != info.LastLogTerm || verified.CommitIndex != commitIndex ||
+                    verified.SnapshotIndex != snapshotIndex || verified.SnapshotTerm != snapshotTerm ||
+                    bool(verifiedSnapshot) != bool(snapshot) ||
+                    (snapshot && *verifiedSnapshot != *snapshot))
+                    throw std::runtime_error("Split disk-state voter binding failed reopen verification");
                 info = {verified.CurrentTerm, verified.VotedFor, verified.LastLogIndex,
                     verified.LastLogTerm, verified.CommitIndex};
                 std::cout << "trusted voter binding completed\n";

@@ -1,8 +1,10 @@
 #include <miniraft/durable.h>
+#include <miniraft/persist.h>
 #include <miniraft/configuration.h>
 #include <miniraft/snapshot_codec.h>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -71,6 +73,60 @@ void SeedUnboundDurableStore(const std::string& base, uint32_t vote) {
     state.Append(entry);
 }
 
+TMessageHolder<TLogEntry> MakeEntry(uint64_t term, const std::string& data) {
+    auto entry = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + data.size());
+    entry->Term = term;
+    std::memcpy(entry->Data, data.data(), data.size());
+    return entry;
+}
+
+void SeedUnboundSplitStore(const std::string& base, uint32_t vote) {
+    const std::vector<uint32_t> original{1, 2, 3};
+    const std::vector<uint32_t> active{2, 3, 4};
+    TDiskState state(base, 7);
+    state.CurrentTerm = 5;
+    state.VotedFor = vote;
+    state.Append(MakeEntry(2, "before joint"));
+    state.Append(EncodeConfigurationEntry({EConfigurationPhase::Joint, 3, 0, 0,
+        original, active}));
+    state.Append(MakeEntry(3, "in joint"));
+    state.Append(EncodeConfigurationEntry({EConfigurationPhase::Stable, 4, 2, 3,
+        original, active}));
+    state.CommitIndex = 2;
+    state.Commit();
+}
+
+TSnapshot SeedUnboundSplitSnapshotStore(const std::string& base) {
+    const std::vector<uint32_t> original{1, 2, 3};
+    const std::vector<uint32_t> active{2, 3, 4};
+    auto history = TConfigurationHistory::Stable(original, 0, 0, 0, 0);
+    history = history.Advance(1, EncodeConfigurationEntry({EConfigurationPhase::Joint,
+        2, 0, 0, original, active}));
+    history = history.Advance(2, EncodeConfigurationEntry({EConfigurationPhase::Stable,
+        3, 1, 2, original, active}));
+    const auto expectedSnapshot = history.MakeSnapshot("split configuration snapshot");
+    {
+        TDiskState state(base, 7);
+        state.CurrentTerm = 4;
+        state.VotedFor = 4;
+        state.InstallSnapshot(TSnapshot{1, 2, original, "legacy split snapshot"});
+        state.InstallSnapshot(TSnapshot{2, 3, original, "legacy split snapshot successor"});
+    }
+    const auto encoded = EncodeSnapshot(expectedSnapshot);
+    std::ofstream output(base + ".state.7.snapshot.g2", std::ios::binary | std::ios::trunc);
+    Require(bool(output), "cannot open split snapshot fixture for replacement");
+    output.write(encoded.data(), std::streamsize(encoded.size()));
+    Require(bool(output), "cannot write split snapshot fixture");
+    for (const auto& path : {base + ".entries.7.g1", base + ".index.7.g1",
+                              base + ".state.7.snapshot.g1"}) {
+        std::ofstream orphan(path, std::ios::binary | std::ios::trunc);
+        Require(bool(orphan), "cannot create stale split generation fixture");
+        orphan << "stale generation";
+        Require(bool(orphan), "cannot write stale split generation fixture");
+    }
+    return expectedSnapshot;
+}
+
 TSnapshot SeedConfigurationSnapshotStore(const std::string& base) {
     auto history = TConfigurationHistory::Stable({1, 2, 3}, 0, 0, 0, 0);
     TConfigurationRecord joint{EConfigurationPhase::Joint, 1, 0, 0, {1, 2, 3}, {1, 2, 4}};
@@ -108,6 +164,14 @@ int main(int argc, char** argv) {
             auto command = Quote(argv[1]) + " --bind-durable --durable-base " + Quote(base) +
                 " --node-id 7 --voters " + Quote(voters);
             if (!commitIndex.empty()) command += " --commit-index " + Quote(commitIndex);
+            if (dryRun) command += " --dry-run";
+            command += " > /dev/null 2>&1";
+            return std::system(command.c_str());
+        };
+        auto invokeSplit = [&](const std::string& base, const std::string& voters, bool dryRun,
+                               const std::string& commitIndex) {
+            auto command = Quote(argv[1]) + " --bind-disk-state --disk-base " + Quote(base) +
+                " --node-id 7 --voters " + Quote(voters) + " --commit-index " + Quote(commitIndex);
             if (dryRun) command += " --dry-run";
             command += " > /dev/null 2>&1";
             return std::system(command.c_str());
@@ -176,6 +240,91 @@ int main(int argc, char** argv) {
                 "configuration-snapshot binding did not preserve the snapshot and commit boundary");
         }
 
+        const auto splitBase = (directory / "split-history").string();
+        SeedUnboundSplitStore(splitBase, 4);
+        const auto readSplitFiles = [&] {
+            return std::vector<std::string>{ReadFile(splitBase + ".entries.7"),
+                ReadFile(splitBase + ".index.7"), ReadFile(splitBase + ".state.7")};
+        };
+        const auto beforeSplitDryRun = readSplitFiles();
+        Require(invokeSplit(splitBase, "1,2,3", true, "2") == 0,
+            "split-store trusted-history dry run failed");
+        Require(readSplitFiles() == beforeSplitDryRun,
+            "split-store dry run changed storage bytes");
+        {
+            TDiskState recovered(splitBase, 7);
+            Require(recovered.GetBoundVoters().empty(),
+                "split-store dry run unexpectedly bound voters");
+        }
+        Require(invokeSplit(splitBase, "1,2,3", false, "2") == 0,
+            "split-store trusted-history binding failed");
+        {
+            TDiskState recovered(splitBase, 7);
+            Require(recovered.GetBoundVoters() == std::vector<uint32_t>({1, 2, 3}),
+                "split-store binding did not preserve the original voter set");
+            Require(recovered.CurrentTerm == 5 && recovered.VotedFor == 4 &&
+                recovered.CommitIndex == 2 && recovered.LastLogIndex == 4 &&
+                recovered.LastLogTerm == 4,
+                "split-store binding changed existing Raft state");
+            const auto beforeJoint = recovered.Get(1);
+            const auto inJoint = recovered.Get(3);
+            Require(beforeJoint->Term == 2 && beforeJoint->Len == sizeof(TLogEntry) + 12 &&
+                std::string(beforeJoint->Data, 12) == "before joint" &&
+                inJoint->Term == 3 && inJoint->Len == sizeof(TLogEntry) + 8 &&
+                std::string(inJoint->Data, 8) == "in joint",
+                "split-store binding changed retained log entries");
+            const auto history = ScanCommittedConfigurationHistory(
+                recovered, TConfigurationHistory::Stable({1, 2, 3}, 0, 0, 0, 0));
+            Require(history.Committed.IsJoint() &&
+                history.Committed.OldVoters() == std::vector<uint32_t>({1, 2, 3}) &&
+                history.Committed.NewVoters() == std::vector<uint32_t>({2, 3, 4}),
+                "split-store binding did not recover committed joint membership");
+        }
+
+        const auto invalidSplitBase = (directory / "invalid-split").string();
+        SeedUnboundSplitStore(invalidSplitBase, 5);
+        const auto invalidSplitFilesBefore = std::vector<std::string>{
+            ReadFile(invalidSplitBase + ".entries.7"), ReadFile(invalidSplitBase + ".index.7"),
+            ReadFile(invalidSplitBase + ".state.7")};
+        Require(invokeSplit(invalidSplitBase, "1,2,3", false, "2") != 0,
+            "split-store binding accepted a vote outside validated membership history");
+        Require(std::vector<std::string>{ReadFile(invalidSplitBase + ".entries.7"),
+                ReadFile(invalidSplitBase + ".index.7"), ReadFile(invalidSplitBase + ".state.7")} ==
+                invalidSplitFilesBefore,
+            "rejected split-store binding changed storage bytes");
+        {
+            TDiskState recovered(invalidSplitBase, 7);
+            Require(recovered.GetBoundVoters().empty(),
+                "rejected split-store binding changed voter state");
+        }
+
+        const auto splitSnapshotBase = (directory / "split-snapshot-history").string();
+        const auto expectedSplitSnapshot = SeedUnboundSplitSnapshotStore(splitSnapshotBase);
+        const auto readSplitSnapshotFiles = [&] {
+            return std::vector<std::string>{ReadFile(splitSnapshotBase + ".entries.7"),
+                ReadFile(splitSnapshotBase + ".index.7"), ReadFile(splitSnapshotBase + ".state.7"),
+                ReadFile(splitSnapshotBase + ".entries.7.g2"), ReadFile(splitSnapshotBase + ".index.7.g2"),
+                ReadFile(splitSnapshotBase + ".state.7.snapshot.g2"),
+                ReadFile(splitSnapshotBase + ".entries.7.g1"), ReadFile(splitSnapshotBase + ".index.7.g1"),
+                ReadFile(splitSnapshotBase + ".state.7.snapshot.g1")};
+        };
+        const auto beforeSplitSnapshotDryRun = readSplitSnapshotFiles();
+        Require(invokeSplit(splitSnapshotBase, "1,2,3", true, "2") == 0,
+            "split snapshot trusted-history dry run failed");
+        Require(readSplitSnapshotFiles() == beforeSplitSnapshotDryRun,
+            "split snapshot dry run changed storage bytes");
+        Require(invokeSplit(splitSnapshotBase, "1,2,3", false, "2") == 0,
+            "split snapshot trusted-history binding failed");
+        {
+            TDiskState recovered(splitSnapshotBase, 7);
+            Require(recovered.GetBoundVoters() == std::vector<uint32_t>({1, 2, 3}) &&
+                recovered.CurrentTerm == 4 && recovered.VotedFor == 4 &&
+                recovered.CommitIndex == 2 && recovered.LastLogIndex == 2 &&
+                recovered.LastLogTerm == 3 && recovered.GetSnapshot() &&
+                *recovered.GetSnapshot() == expectedSplitSnapshot,
+                "split snapshot binding did not preserve state and validated history");
+        }
+
         const auto invalidBase = (directory / "invalid").string();
         SeedUnboundDurableStore(invalidBase, 4);
         const auto invalidImage = invalidBase + ".durable.7";
@@ -188,6 +337,15 @@ int main(int argc, char** argv) {
             TDurableState recovered(invalidBase, 7);
             Require(recovered.HasUnboundRecoveredState(), "rejected binding changed voter state");
         }
+
+        const auto missingBase = (directory / "missing-store").string();
+        Require(invoke(missingBase, "1,2,3", true) != 0 &&
+            !fs::exists(missingBase + ".durable.7"),
+            "durable dry run created a missing store");
+        Require(invokeSplit(missingBase, "1,2,3", true, "0") != 0 &&
+            !fs::exists(missingBase + ".entries.7") && !fs::exists(missingBase + ".index.7") &&
+            !fs::exists(missingBase + ".state.7"),
+            "split-store dry run created a missing store");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
