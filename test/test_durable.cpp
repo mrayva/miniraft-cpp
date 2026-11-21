@@ -399,6 +399,49 @@ void test_follower_batches_durable_append_before_ack(void**) {
     assert_string_equal(Data(recovered, 3).c_str(), "third");
 }
 
+void test_durable_append_rejects_invalid_terms_before_mutation(void**) {
+    TFiles files;
+    files.Seed();
+    auto readImage = [&] {
+        std::ifstream input(files.Image(), std::ios::binary);
+        return std::string{std::istreambuf_iterator<char>(input), {}};
+    };
+    const auto originalImage = readImage();
+    {
+        TDurableState state(files.Name, 1);
+        auto rejectsInvalid = [&](auto operation) {
+            bool rejected = false;
+            try { operation(); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            assert_true(rejected);
+            assert_int_equal(state.LastLogIndex, 2);
+            assert_int_equal(state.LastLogTerm, 2);
+            assert_int_equal(state.CommitIndex, 0);
+            assert_string_equal(Data(state, 1).c_str(), "first");
+            assert_string_equal(Data(state, 2).c_str(), "second");
+        };
+
+        rejectsInvalid([&] { state.Append(Entry(0, "zero term")); });
+        rejectsInvalid([&] { state.Append(Entry(1, "decreasing term")); });
+        rejectsInvalid([&] { state.Append(Entry(4, "future term")); });
+
+        std::vector<TMessageHolder<TLogEntry>> invalidBatch{
+            Entry(3, "valid first"), Entry(2, "decreasing second")};
+        rejectsInvalid([&] { state.AppendBatch(invalidBatch); });
+
+        std::vector<TMessageHolder<TLogEntry>> invalidReplacement{
+            Entry(2, "valid replacement"), Entry(1, "decreasing replacement")};
+        rejectsInvalid([&] { state.ReplaceSuffixAndAppendBatch(2, invalidReplacement, 0); });
+    }
+    assert_true(readImage() == originalImage);
+    TDurableState recovered(files.Name, 1);
+    assert_int_equal(recovered.LastLogIndex, 2);
+    assert_int_equal(recovered.LastLogTerm, 2);
+    assert_int_equal(recovered.CommitIndex, 0);
+    assert_string_equal(Data(recovered, 1).c_str(), "first");
+    assert_string_equal(Data(recovered, 2).c_str(), "second");
+}
+
 void test_follower_replaces_durable_suffix_in_one_publish(void**) {
     TFiles files;
     std::vector<std::string> events;
@@ -774,6 +817,7 @@ int main() {
         cmocka_unit_test(test_acknowledged_updates_survive_immediate_exit),
         cmocka_unit_test(test_follower_persists_commit_before_ack_and_recovers_it),
         cmocka_unit_test(test_follower_batches_durable_append_before_ack),
+        cmocka_unit_test(test_durable_append_rejects_invalid_terms_before_mutation),
         cmocka_unit_test(test_follower_replaces_durable_suffix_in_one_publish),
         cmocka_unit_test(test_publication_order),
         cmocka_unit_test(test_v1_v2_v3_images_recover_conservatively_and_upgrade_on_publish),

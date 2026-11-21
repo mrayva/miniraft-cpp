@@ -378,7 +378,10 @@ void TDurableState::Commit()
 void TDurableState::Append(TMessageHolder<TLogEntry> entry)
 {
     if (LastLogIndex >= uint64_t(INT64_MAX)) throw std::overflow_error("Raft log index exhausted");
-    Impl->Log.push_back(Clone(entry));
+    auto cloned = Clone(std::move(entry));
+    if (!cloned->Term || cloned->Term < LastLogTerm || cloned->Term > CurrentTerm)
+        throw std::invalid_argument("Raft log entry term outside current log range");
+    Impl->Log.push_back(std::move(cloned));
     LastLogIndex = SnapshotIndex + Impl->Log.size();
     LastLogTerm = Impl->Log.back()->Term;
     Commit();
@@ -421,7 +424,14 @@ void TDurableState::ReplaceSuffixAndAppendBatch(uint64_t firstIndex,
 
     std::vector<TMessageHolder<TLogEntry>> cloned;
     cloned.reserve(entries.size());
-    for (const auto& entry : entries) cloned.push_back(Clone(entry));
+    auto previousTerm = prefixSize ? Impl->Log[prefixSize - 1]->Term : SnapshotTerm;
+    for (const auto& entry : entries) {
+        auto copy = Clone(entry);
+        if (!copy->Term || copy->Term < previousTerm || copy->Term > CurrentTerm)
+            throw std::invalid_argument("Raft log entry term outside current log range");
+        previousTerm = copy->Term;
+        cloned.push_back(std::move(copy));
+    }
     Impl->Log.reserve(prefixSize + cloned.size());
     Impl->Log.resize(prefixSize);
     for (auto& entry : cloned) Impl->Log.push_back(std::move(entry));
