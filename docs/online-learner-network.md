@@ -1,7 +1,7 @@
 # Network server learner staging: v0.1.0-alpha.40
 
-`TRaftServer<TSocket>` exposes `RegisterPeerTarget(id, endpoint)` and
-`UnregisterPeerTarget(id)` on any Raft role, using a
+`TRaftServer<TSocket>` exposes `RegisterPeerTarget(id, endpoint)`,
+`ReplacePeerTarget(id, endpoint)`, and `UnregisterPeerTarget(id)` on any Raft role, using a
 `shared_ptr<TNode<TSocket>>` endpoint. Register the endpoint on every existing
 replica before a joint configuration introduces that voter. Each local
 registration makes the endpoint available to configuration validation and the
@@ -18,6 +18,16 @@ becomes leader. Removal drops that forwarding route along with the Raft progress
 and future server drains; the method returns the endpoint so the embedding
 application can manage its transport lifetime. The voter list and quorum
 calculations remain unchanged.
+
+For an existing voter or learner, `ReplacePeerTarget` changes only this
+replica's outbound transport and forwarding route. It does not change the
+remote member's listener or distribute an address. If the old endpoint has a
+response reader, its socket must support safe retirement; the server retains the
+old node until its I/O coroutines unwind and starts a reader for the replacement.
+Raft clears that peer's replication and capability evidence, so the replacement
+must make fresh progress before it contributes acknowledgement or snapshot
+capability proof. Apply the replacement on each replica through the embedding
+application's rollout mechanism.
 
 Construct the remote node with the right address and socket factory, and make
 sure its local Raft instance is configured as a learner with the same voter set.
