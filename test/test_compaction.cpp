@@ -1196,6 +1196,56 @@ void test_joint_snapshot_is_rejected_without_matching_history_even_if_boundary_i
     assert_true(static_cast<TStateFields>(*state) == before); assert_int_equal(app->Loads, 1);
     assert_true(Read(*app, "a") == "old");
 }
+void test_higher_term_snapshot_defers_term_change_until_split_metadata_is_validated(void**) {
+    TKv source; source.Write(source.Prepare(Command("a", "old")), 5);
+    TSnapshot fixed{5, 1, {1, 2}, source.SaveSnapshot()};
+    const auto bytes = EncodeSnapshot(fixed);
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> replies;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) {
+        replies.push_back(message.template Cast<TInstallSnapshotResponse>());
+    });
+    auto state = std::make_shared<TState>();
+    auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}});
+    auto app = std::make_shared<TApplication>(); TRequestProcessor processor(raft, app, {});
+
+    raft->Process({}, Chunk(fixed, bytes, 0, static_cast<uint32_t>(bytes.size())));
+    assert_true(replies.back()->Installed); assert_int_equal(app->Loads, 1);
+    source.Write(source.Prepare(Command("b", "new")), 6);
+    TSnapshot next{6, 1, {1, 2}, source.SaveSnapshot()};
+    const auto nextBytes = EncodeSnapshot(next);
+    const auto currentTerm = state->CurrentTerm;
+    const auto incomingTerm = currentTerm + 1;
+    raft->Become(EState::CANDIDATE);
+    const auto electionDue = raft->GetVolatileState()->ElectionDue;
+    const size_t metadataBytes = 36 + 4 * next.Voters.size();
+    for (size_t offset = 0; offset < nextBytes.size(); offset += 8) {
+        const auto count = std::min<size_t>(8, nextBytes.size() - offset);
+        auto chunk = Chunk(next, nextBytes, offset, static_cast<uint32_t>(count));
+        chunk->Term = incomingTerm;
+        raft->Process({}, chunk);
+        if (offset + count < metadataBytes) {
+            assert_int_equal(state->CurrentTerm, currentTerm);
+            assert_int_equal(raft->CurrentStateName(), EState::CANDIDATE);
+            assert_true(raft->GetVolatileState()->ElectionDue == electionDue);
+            assert_true(replies.back()->Success); assert_false(replies.back()->Installed);
+            assert_int_equal(replies.back()->NextOffset, offset + count);
+        } else if (offset + count < nextBytes.size()) {
+            assert_int_equal(state->CurrentTerm, incomingTerm);
+            assert_int_equal(raft->CurrentStateName(), EState::FOLLOWER);
+            assert_true(replies.back()->Success); assert_false(replies.back()->Installed);
+            assert_int_equal(replies.back()->NextOffset, offset + count);
+        }
+    }
+
+    assert_int_equal(state->CurrentTerm, incomingTerm);
+    assert_int_equal(raft->CurrentStateName(), EState::FOLLOWER);
+    assert_true(replies.back()->Success); assert_true(replies.back()->Installed);
+    assert_int_equal(replies.back()->NextOffset, nextBytes.size());
+    assert_int_equal(app->Loads, 2);
+    assert_int_equal(app->LastAppliedIndex, next.Index);
+    assert_true(Read(*app, "b") == "new");
+}
+
 void test_unmatched_joint_snapshot_does_not_accept_leader_contact(void**) {
     TKv source; source.Write(source.Prepare(Command("a", "joint")), 5);
     TSnapshot joint{5, 2, {1, 2}, source.SaveSnapshot()};
@@ -1821,6 +1871,7 @@ int main() {
         cmocka_unit_test(test_memory_snapshot_storage_rejects_term_regression),
         cmocka_unit_test(test_memory_snapshot_cannot_replace_committed_index_with_conflicting_term),
         cmocka_unit_test(test_joint_snapshot_is_rejected_without_matching_history_even_if_boundary_is_covered),
+        cmocka_unit_test(test_higher_term_snapshot_defers_term_change_until_split_metadata_is_validated),
         cmocka_unit_test(test_unmatched_joint_snapshot_does_not_accept_leader_contact),
         cmocka_unit_test(test_unproven_stable_configuration_snapshot_is_rejected_for_fixed_membership),
         cmocka_unit_test(test_idle_partial_snapshot_expires_on_learner_despite_heartbeats),

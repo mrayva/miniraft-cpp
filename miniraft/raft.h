@@ -402,6 +402,7 @@ private:
         uint32_t nodeId, bool snapshotBoundaryProbe = false);
     ITimeSource::Time MakeElection(ITimeSource::Time now);
     uint64_t NextSeqno();
+    void AdvanceTerm(ITimeSource::Time now, uint64_t term, bool preserveIncomingSnapshot = false);
     bool ValidateRpc(TMessageHolder<TMessage> message) const;
     bool ValidateAppendConfiguration(TMessageHolder<TAppendEntriesRequest> message) const;
     void RequireLiveConfigurationStorage() const;

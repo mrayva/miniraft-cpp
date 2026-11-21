@@ -1607,6 +1607,35 @@ void TRaft::Become(EState newStateName) {
     }
 }
 
+void TRaft::AdvanceTerm(ITimeSource::Time now, uint64_t term, bool preserveIncomingSnapshot) {
+    if (term <= State->CurrentTerm) return;
+    State->CurrentTerm = term;
+    State->VotedFor = 0;
+    State->Commit();
+    if (VolatileState->LeaderContactDue == ITimeSource::Max)
+        VolatileState->LeaderContactDue = now;
+    StateName = EState::FOLLOWER;
+    VolatileState->PreVoting = false;
+    VolatileState->PreVoteTerm = 0;
+    VolatileState->Votes.clear();
+    VolatileState->LeadershipTransfer.reset();
+    if (!preserveIncomingSnapshot) IncomingSnapshot.reset();
+    VolatileState->SnapshotRpcs.clear();
+    EncodedSnapshot.reset();
+    EncodedSnapshotIndex = 0;
+    EncodedSnapshotExtendedHistory.reset();
+    EncodedSnapshotExtendedHistoryIndex = 0;
+    EncodedSnapshotLegacyHistory.reset();
+    EncodedSnapshotLegacyHistoryIndex = 0;
+    EncodedSnapshotLineage.reset();
+    EncodedSnapshotLineageIndex = 0;
+    EncodedSnapshotBaseFormat.reset();
+    EncodedSnapshotBaseFormatIndex = 0;
+    VolatileState->LeaderId = 0;
+    if (VolatileState->ElectionDue <= now || VolatileState->ElectionDue == ITimeSource::Max)
+        VolatileState->ElectionDue = MakeElection(now);
+}
+
 void TRaft::Process(ITimeSource::Time now, TMessageHolder<TMessage> message, const std::shared_ptr<INode>& replyTo) {
     LastRaftTime = now;
     if (!ValidateRpc(message)) return;
@@ -1614,34 +1643,9 @@ void TRaft::Process(ITimeSource::Time now, TMessageHolder<TMessage> message, con
         auto messageEx = message.Cast<TMessageEx>();
         const auto type = EMessageType(message->Type);
         const bool preVote = type == EMessageType::PRE_VOTE_REQUEST || type == EMessageType::PRE_VOTE_RESPONSE;
-        if (!preVote && messageEx->Term > State->CurrentTerm) {
-            State->CurrentTerm = messageEx->Term;
-            State->VotedFor = 0;
-            State->Commit();
-            if (VolatileState->LeaderContactDue == ITimeSource::Max)
-                VolatileState->LeaderContactDue = now;
-            StateName = EState::FOLLOWER;
-            VolatileState->PreVoting = false;
-            VolatileState->PreVoteTerm = 0;
-            VolatileState->Votes.clear();
-            VolatileState->LeadershipTransfer.reset();
-            IncomingSnapshot.reset();
-            VolatileState->SnapshotRpcs.clear();
-            EncodedSnapshot.reset();
-            EncodedSnapshotIndex = 0;
-            EncodedSnapshotExtendedHistory.reset();
-            EncodedSnapshotExtendedHistoryIndex = 0;
-            EncodedSnapshotLegacyHistory.reset();
-            EncodedSnapshotLegacyHistoryIndex = 0;
-            EncodedSnapshotLineage.reset();
-            EncodedSnapshotLineageIndex = 0;
-            EncodedSnapshotBaseFormat.reset();
-            EncodedSnapshotBaseFormatIndex = 0;
-            VolatileState->LeaderId = 0;
-            if (VolatileState->ElectionDue <= now || VolatileState->ElectionDue == ITimeSource::Max) {
-                VolatileState->ElectionDue = MakeElection(now);
-            }
-        }
+        const bool snapshotRequest = type == EMessageType::INSTALL_SNAPSHOT_REQUEST;
+        if (!preVote && !snapshotRequest && messageEx->Term > State->CurrentTerm)
+            AdvanceTerm(now, messageEx->Term);
     }
 
     switch (StateName) {
@@ -1707,6 +1711,12 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
     case EMessageType::INSTALL_SNAPSHOT_REQUEST: {
         auto request = message.Cast<TInstallSnapshotRequest>();
         const auto length = request->Len - sizeof(TInstallSnapshotRequest);
+        const bool matchingIncomingSnapshot = IncomingSnapshot &&
+            IncomingSnapshot->Term == header->Term && IncomingSnapshot->Leader == request->LeaderId &&
+            IncomingSnapshot->Index == request->SnapshotIndex &&
+            IncomingSnapshot->BoundaryTerm == request->SnapshotTerm &&
+            IncomingSnapshot->Total == request->TotalBytes &&
+            request->Offset <= IncomingSnapshot->ReceivedBytes;
         // A later boundary cannot have an older term than the committed prefix.
         // For an already committed, retained boundary, the terms must match;
         // an older compacted boundary cannot have a newer term than the snapshot.
@@ -1729,7 +1739,8 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
             // the partial transfer; an initial chunk must identify a supported
             // fixed/stable format and complete metadata prefix before it can
             // establish leader contact.
-            if (header->Term > State->CurrentTerm && request->Offset != 0) return false;
+            if (header->Term > State->CurrentTerm && request->Offset != 0 && !matchingIncomingSnapshot)
+                return false;
             const auto knownSnapshot = State->GetSnapshot();
             const auto* committedConfiguration = Configuration ? &Configuration->Committed : nullptr;
             const auto* pendingConfiguration = Configuration && Configuration->HasUncommittedConfiguration()
@@ -1745,6 +1756,11 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
                     committedConfiguration, !pendingConfiguration),
                 MayRecoverMembershipFromSnapshot(Id, *State, GetVoterIds(), committedConfiguration),
                 request->LeaderId, Id);
+            // A higher-term continuation can be authenticated only against the
+            // already recognized first chunk. The receiver joins it to the
+            // bounded assembly and probes the combined metadata before contact.
+            if (header->Term > State->CurrentTerm && matchingIncomingSnapshot && request->Offset != 0)
+                return true;
             if (!probe.Complete) {
                 // Large, valid membership histories can exceed one transport
                 // chunk. Let a recognized voter start buffering a supported
@@ -2906,6 +2922,10 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     // In particular, do not demote a candidate or refresh its election timer
     // until the complete bounded metadata prefix is supported.
     auto acceptLeaderContact = [&] {
+        // Snapshot chunks may establish a higher term only after their bounded
+        // membership header has been validated. Keep the validated assembly
+        // alive while clearing all state from the previous term.
+        AdvanceTerm(now, request->Term, true);
         Become(EState::FOLLOWER);
         VolatileState->PreVoting = false;
         VolatileState->PreVoteTerm = 0;
