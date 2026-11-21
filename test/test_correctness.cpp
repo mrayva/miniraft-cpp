@@ -1231,8 +1231,8 @@ void test_partition_leader_replacement_and_heal(void**) {
     auto delayed = std::move(cluster.Packets);
     cluster.Packets.clear();
     cluster.Isolated.insert(1);
-    auto lost = NewHoldedMessage<TLogEntry>();
-    lost->Flags = 8; // Distinguish the minority's uncommitted entry.
+    auto lost = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 1);
+    lost->Data[0] = 'x'; // Distinguish the minority's uncommitted entry.
     auto minority = cluster.Nodes[0]->Append(lost);
     cluster.Replicate(1);
     assert_int_equal(cluster.Nodes[0]->GetVolatileState()->CommitIndex, committed);

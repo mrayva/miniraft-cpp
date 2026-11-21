@@ -1826,7 +1826,10 @@ bool TRaft::ValidateAppendConfiguration(TMessageHolder<TAppendEntriesRequest> me
     bool hasConfigurationEntry = false;
     for (uint32_t i = 0; i < message.PayloadSize; ++i) {
         auto entry = message.Payload[i].Cast<TLogEntry>();
-        if (!(entry->Flags & TLogEntry::EConfiguration)) continue;
+        if (entry->Flags != TLogEntry::ENone && entry->Flags != TLogEntry::EStub &&
+            entry->Flags != TLogEntry::EConfiguration)
+            return false;
+        if (entry->Flags != TLogEntry::EConfiguration) continue;
         try {
             const auto record = DecodeConfigurationEntry(entry);
             const bool leaderInOld = std::binary_search(record.OldVoters.begin(), record.OldVoters.end(), message->LeaderId);
@@ -2236,8 +2239,8 @@ uint64_t TRaft::Append(TMessageHolder<TLogEntry> entry) {
     if (!entry.HasValidExtent() || entry->Type != uint32_t(EMessageType::LOG_ENTRY))
         throw TMessageError("Invalid proposed log entry");
     ValidateMessageTree(entry);
-    if (entry->Flags & TLogEntry::EConfiguration)
-        throw TMessageError("Configuration proposals are unsupported");
+    if (entry->Flags != TLogEntry::ENone)
+        throw TMessageError("Proposed log entry has unsupported flags");
     EnsureProposalLogCapacity(entry->Len, 1);
     entry->Term = State->CurrentTerm;
     const auto bytes = entry->Len;

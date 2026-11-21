@@ -126,6 +126,16 @@ void test_invalid_proposal_does_not_mutate_persistent_state(void**) {
         assert_int_equal(state->LastLogIndex, 0);
         assert_int_equal(entry->Term, 99);
     }
+    for (uint64_t flags : {uint64_t(TLogEntry::EStub), uint64_t(TLogEntry::EConfiguration), uint64_t(1) << 40}) {
+        auto entry = NewHoldedMessage<TLogEntry>();
+        entry->Flags = flags;
+        entry->Term = 99;
+        bool rejected = false;
+        try { raft.Append(entry); } catch (const TMessageError&) { rejected = true; }
+        assert_true(rejected);
+        assert_int_equal(state->LastLogIndex, 0);
+        assert_int_equal(entry->Term, 99);
+    }
 }
 void test_declared_length_cannot_exceed_actual_proposal_buffer(void**) {
     auto state = std::make_shared<TState>();

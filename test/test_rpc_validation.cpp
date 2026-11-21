@@ -246,7 +246,7 @@ void test_invalid_peer_configuration_is_rejected(void**) {
     }
 }
 void test_invalid_requests_and_boolean_fields_are_ignored(void**) {
-    for (int invalid = 0; invalid < 8; ++invalid) {
+    for (int invalid = 0; invalid < 9; ++invalid) {
         TFixture fixture;
         fixture.Append(1);
         auto request = fixture.Request(1, 1, 0, {3});
@@ -258,6 +258,7 @@ void test_invalid_requests_and_boolean_fields_are_ignored(void**) {
         if (invalid == 5) request.Payload[0].Cast<TLogEntry>()->Term = 5;
         if (invalid == 6) request->Nentries = 2;
         if (invalid == 7) request->PrevLogIndex = uint64_t(INT64_MAX);
+        if (invalid == 8) request.Payload[0].Cast<TLogEntry>()->Flags = uint64_t(1) << 40;
         fixture.Raft.Process(fixture.Now, request);
         assert_int_equal(fixture.State->CurrentTerm, 3);
         assert_int_equal(fixture.State->LastLogIndex, 1);
