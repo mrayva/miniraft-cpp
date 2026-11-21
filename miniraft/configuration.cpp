@@ -1,4 +1,5 @@
 #include "configuration.h"
+#include "idempotency.h"
 #include "snapshot_codec.h"
 #include "state.h"
 #include <climits>
@@ -200,11 +201,14 @@ TConfigurationHistory TConfigurationHistory::Observe(uint64_t index, TMessageHol
     if (!entry.HasValidExtent() || entry->Type != uint32_t(EMessageType::LOG_ENTRY) ||
         entry->Len < sizeof(TLogEntry) || entry.PayloadSize)
         throw std::invalid_argument("Invalid ordinary log entry");
+    if (entry->Flags == TLogEntry::EIdempotent)
+        (void)DecodeIdempotentLogEntry(entry);
     return ObserveMetadata(index, entry->Term, entry->Flags);
 }
 
 TConfigurationHistory TConfigurationHistory::ObserveMetadata(uint64_t index, uint64_t term, uint64_t flags) const {
-    if ((flags != TLogEntry::ENone && flags != TLogEntry::EStub) || !term ||
+    if ((flags != TLogEntry::ENone && flags != TLogEntry::EStub &&
+         flags != TLogEntry::EIdempotent) || !term ||
         Through >= uint64_t(INT64_MAX) || index != Through + 1 || term < ThroughLogTerm)
         throw std::invalid_argument("Ordinary entry does not extend the trusted history");
     TConfigurationHistory next = *this;

@@ -90,9 +90,21 @@ struct IIdempotentRsm : IRsm {
     }
     virtual TMessageHolder<TLogEntry> PrepareIdempotent(
         TMessageHolder<TIdempotentCommandRequest>) = 0;
+    // Atomically apply/deduplicate the command, update its session record, and
+    // advance inherited LastAppliedIndex to index before returning.
     virtual TIdempotentWriteResult WriteIdempotent(
         TMessageHolder<TLogEntry>, uint64_t index,
         const TIdempotentOperationIdentity& identity) = 0;
+    TIdempotentWriteResult ApplyIdempotentLogRecord(TMessageHolder<TLogEntry> entry, uint64_t index) {
+        if (!index) throw std::invalid_argument("Idempotent log application requires a positive index");
+        auto decoded = DecodeIdempotentLogEntry(std::move(entry));
+        auto result = WriteIdempotent(std::move(decoded.ApplicationEntry), index, decoded.Identity);
+        if (LastAppliedIndex != index || result.ErrorCode > TCommandResponse::AlreadyCompleted || result.Index > index ||
+            (result.ErrorCode == TCommandResponse::Success && !result.Index) ||
+            result.Data.size() > SnapshotLimits.MaxResponseBytes)
+            throw std::logic_error("Idempotent RSM violated its atomic apply/result contract");
+        return result;
+    }
     virtual void ValidateIdempotencyControl(
         const TIdempotencyControlOperation&) const = 0;
     virtual TMessageHolder<TLogEntry> PrepareIdempotencyControl(

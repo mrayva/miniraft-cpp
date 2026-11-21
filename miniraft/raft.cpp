@@ -3958,14 +3958,26 @@ void TRequestProcessor::ProcessCommitted() {
             // Validate its control record and advance the application boundary
             // without exposing it to the state machine.
             DecodeConfigurationEntry(entry);
+            Rsm->LastAppliedIndex = i;
             continue;
         }
         if (entry->Flags == TLogEntry::EStub) {
+            Rsm->LastAppliedIndex = i;
+            continue;
+        }
+        if (entry->Flags & TLogEntry::EIdempotent) {
+            try {
+                auto* idempotentRsm = dynamic_cast<IIdempotentRsm*>(Rsm.get());
+                if (!idempotentRsm)
+                    throw std::logic_error("Idempotent log record requires an idempotent RSM");
+                (void)idempotentRsm->ApplyIdempotentLogRecord(entry, i);
+            } catch (...) { std::terminate(); }
             continue;
         }
         TMessageHolder<TMessage> reply;
         try { reply = Rsm->Write(entry, i); }
         catch (...) { std::terminate(); }
+        Rsm->LastAppliedIndex = i;
         auto pending = PendingWriteTerms.find(i);
         if (pending != PendingWriteTerms.end() && pending->second == entry->Term) {
             auto heldReply = reply ? reply : NewHoldedMessage(TCommandResponse {.Index = i});

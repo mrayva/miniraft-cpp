@@ -63,11 +63,16 @@ std::string Hex(const std::array<uint8_t, 32>& bytes) {
 struct TSnapshotRsm : IIdempotentRsm {
     TIdempotencySnapshot State;
     uint64_t ResponseBound = 64;
+    size_t IdempotentWrites = 0;
+    TIdempotentOperationIdentity LastIdentity;
+    std::string LastAppliedCommand;
 
     TMessageHolder<TMessage> Read(TMessageHolder<TCommandRequest>, uint64_t index) override {
         return NewHoldedMessage(TCommandResponse{.Index = index});
     }
     TMessageHolder<TMessage> Write(TMessageHolder<TLogEntry>, uint64_t index) override {
+        LastAppliedIndex = index;
+        State.LastAppliedIndex = index;
         return NewHoldedMessage(TCommandResponse{.Index = index});
     }
     TMessageHolder<TLogEntry> Prepare(TMessageHolder<TCommandRequest>) override {
@@ -80,8 +85,13 @@ struct TSnapshotRsm : IIdempotentRsm {
             TMessageHolder<TIdempotentCommandRequest>) override {
         return NewHoldedMessage<TLogEntry>();
     }
-    TIdempotentWriteResult WriteIdempotent(TMessageHolder<TLogEntry>, uint64_t index,
-            const TIdempotentOperationIdentity&) override {
+    TIdempotentWriteResult WriteIdempotent(TMessageHolder<TLogEntry> command, uint64_t index,
+            const TIdempotentOperationIdentity& identity) override {
+        ++IdempotentWrites;
+        LastIdentity = identity;
+        LastAppliedCommand.assign(command->Data, command->Len - sizeof(TLogEntry));
+        State.LastAppliedIndex = index;
+        LastAppliedIndex = index;
         return {.Index = index, .ErrorCode = TCommandResponse::Success, .Data = "applied"};
     }
     void ValidateIdempotencyControl(const TIdempotencyControlOperation&) const override { }
@@ -148,6 +158,9 @@ void test_idempotency_snapshot_roundtrip_preserves_dedup_state(void**) {
     limits = {};
     limits.MaxActiveSessions = 0;
     Reject([&] { (void)EncodeIdempotencySnapshot(source, limits); });
+    limits = {};
+    limits.MaxResponseBytes = TMessageLimits{}.MaxFrameBytes;
+    Reject([&] { ValidateIdempotencySnapshotLimits(limits); });
 }
 
 void test_idempotent_payload_digest_matches_sha256_vectors(void**) {
@@ -204,6 +217,37 @@ void test_idempotent_log_record_roundtrip_and_rejects_corruption(void**) {
     Reject([&] { (void)EncodeIdempotentLogEntry(identity, application); });
 }
 
+void test_committed_idempotent_log_replay_uses_identity_and_application_entry(void**) {
+    auto prepared = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 4);
+    prepared->Term = 1;
+    memcpy(prepared->Data, "work", 4);
+    TIdempotentOperationIdentity identity;
+    identity.Epoch = 3;
+    identity.SessionIdHigh = 4;
+    identity.SessionIdLow = 5;
+    identity.Sequence = 6;
+    identity.PayloadDigest = ComputeIdempotentPayloadDigest("client payload");
+    auto replicated = EncodeIdempotentLogEntry(identity, prepared);
+
+    auto legacy = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 1);
+    legacy->Term = 1;
+    legacy->Data[0] = 'x';
+    std::vector<TMessageHolder<TLogEntry>> entries{legacy, replicated};
+    auto state = std::make_shared<TState>(1, 0, entries);
+    state->CommitIndex = 2;
+    state->Commit();
+    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+    auto rsm = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor processor(raft, rsm, {});
+
+    processor.ProcessCommitted();
+    assert_int_equal(rsm->IdempotentWrites, 1);
+    assert_true(rsm->LastIdentity == identity);
+    assert_true(rsm->LastAppliedCommand == "work");
+    assert_int_equal(rsm->LastAppliedIndex, 2);
+    assert_int_equal(rsm->State.LastAppliedIndex, 2);
+}
+
 void test_idempotent_rsm_snapshot_hook_validates_before_atomic_restore(void**) {
     TSnapshotRsm source;
     auto request = NewHoldedMessage<TIdempotentCommandRequest>();
@@ -243,6 +287,7 @@ int main() {
         cmocka_unit_test(test_idempotency_snapshot_roundtrip_preserves_dedup_state),
         cmocka_unit_test(test_idempotent_payload_digest_matches_sha256_vectors),
         cmocka_unit_test(test_idempotent_log_record_roundtrip_and_rejects_corruption),
+        cmocka_unit_test(test_committed_idempotent_log_replay_uses_identity_and_application_entry),
         cmocka_unit_test(test_idempotent_rsm_snapshot_hook_validates_before_atomic_restore),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);

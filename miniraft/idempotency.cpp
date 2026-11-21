@@ -208,6 +208,7 @@ void ValidateIdempotencySnapshotLimits(const TIdempotencySnapshotLimits& limits)
         limits.MaxApplicationBytes > limits.MaxEncodedBytes ||
         limits.MaxCachedResponseBytes > limits.MaxEncodedBytes ||
         limits.MaxResponseBytes > limits.MaxEncodedBytes ||
+        limits.MaxResponseBytes > TMessageLimits{}.MaxFrameBytes - sizeof(TIdempotentCommandResponse) ||
         uint64_t(limits.MaxActiveSessions) + limits.MaxClosedSessions > UINT32_MAX)
         throw std::invalid_argument("Invalid idempotency snapshot limits");
 }
