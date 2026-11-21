@@ -48,12 +48,12 @@ both through the trusted-baseline API before Raft startup.
 ## Publication protocol
 
 Each `Append`, `RemoveLast`, and `Commit` call publishes one complete image
-containing the current term, vote, and selected log prefix. Follower
-`AppendEntries` groups the new entries from one request through `AppendBatch`,
-so a replicated batch is published once before the follower acknowledges it. If
-that same request also advances the commit index, the log suffix and commit
-boundary are published together. A commit advance learned by a later request is
-a separate publication:
+containing the current term, vote, and selected log prefix. A follower
+`AppendEntries` request that changes state is published once before the follower
+acknowledges it. This combines a new entry batch, any conflicting uncommitted
+suffix replacement, and a commit advance carried in that request. A commit
+advance learned by a later matching request is a separate publication. Other
+backends retain their existing truncation behavior:
 
 1. Serialize the complete state into a temporary file in the same directory.
 2. fsync the temporary file and check the result.

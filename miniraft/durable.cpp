@@ -392,20 +392,38 @@ void TDurableState::AppendBatch(const std::vector<TMessageHolder<TLogEntry>>& en
 void TDurableState::AppendBatchAndCommit(
         const std::vector<TMessageHolder<TLogEntry>>& entries, uint64_t commitIndex)
 {
-    if (LastLogIndex > uint64_t(INT64_MAX) ||
-        entries.size() > uint64_t(INT64_MAX) - LastLogIndex)
+    if (LastLogIndex > uint64_t(INT64_MAX))
         throw std::overflow_error("Raft log index exhausted");
-    const auto newLastLogIndex = LastLogIndex + entries.size();
-    if (commitIndex < CommitIndex || commitIndex > newLastLogIndex)
-        throw std::logic_error("Invalid batched Raft commit boundary");
-    if (entries.empty() && commitIndex == CommitIndex) return;
-    if (entries.size() > Impl->Log.max_size() - Impl->Log.size())
+    ReplaceSuffixAndAppendBatch(LastLogIndex + 1, entries, commitIndex);
+}
+
+void TDurableState::ReplaceSuffixAndAppendBatch(uint64_t firstIndex,
+        const std::vector<TMessageHolder<TLogEntry>>& entries, uint64_t commitIndex)
+{
+    if (LastLogIndex > uint64_t(INT64_MAX))
+        throw std::overflow_error("Raft log index exhausted");
+    const auto commitFloor = std::max(CommitIndex, SnapshotIndex);
+    if (firstIndex <= commitFloor || firstIndex > LastLogIndex + 1)
+        throw std::logic_error("Invalid Raft suffix replacement boundary");
+    const auto retainedLastIndex = firstIndex - 1;
+    if (entries.size() > uint64_t(INT64_MAX) - retainedLastIndex)
+        throw std::overflow_error("Raft log index exhausted");
+    const auto newLastLogIndex = retainedLastIndex + entries.size();
+    if (commitIndex < commitFloor || commitIndex > newLastLogIndex)
+        throw std::logic_error("Invalid Raft suffix replacement commit boundary");
+    if (firstIndex > LastLogIndex && entries.empty() && commitIndex == CommitIndex) return;
+
+    const auto prefixSize = size_t(firstIndex - SnapshotIndex - 1);
+    if (prefixSize > Impl->Log.size())
+        throw std::logic_error("Invalid durable Raft suffix replacement index");
+    if (entries.size() > Impl->Log.max_size() - prefixSize)
         throw std::length_error("Durable log is too large for this platform");
 
     std::vector<TMessageHolder<TLogEntry>> cloned;
     cloned.reserve(entries.size());
     for (const auto& entry : entries) cloned.push_back(Clone(entry));
-    Impl->Log.reserve(Impl->Log.size() + cloned.size());
+    Impl->Log.reserve(prefixSize + cloned.size());
+    Impl->Log.resize(prefixSize);
     for (auto& entry : cloned) Impl->Log.push_back(std::move(entry));
 
     LastLogIndex = SnapshotIndex + Impl->Log.size();

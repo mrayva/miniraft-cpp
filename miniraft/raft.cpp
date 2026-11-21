@@ -1347,15 +1347,12 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
                 auto& data = message.Payload[i];
                 auto entry = data.Cast<TLogEntry>();
                 ++index;
-                // replace or append log entries
-                if (State->LogTerm(index) != entry->Term) {
+                // Once the first term mismatch is found, the entire remaining
+                // leader suffix replaces the local suffix, even where later
+                // terms happen to match old entries.
+                if (conflictIndex && index >= conflictIndex) {
                     if (Configuration && index <= Configuration->Latest.ConfigurationIndex())
                         configurationTouched = true;
-                    while (State->LastLogIndex > index - 1) {
-                        const auto removedIndex = State->LastLogIndex;
-                        State->RemoveLast();
-                        RemoveUncommittedLogSuffix(removedIndex);
-                    }
                     appendBatch.push_back(entry);
                     if (entry->Flags & TLogEntry::EConfiguration) configurationTouched = true;
                 }
@@ -1364,7 +1361,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             if (!appendBatch.empty()) {
                 const auto batchCommitIndex = std::max({commitIndex, State->CommitIndex,
                     std::min(message->LeaderCommit, index)});
-                State->AppendBatchAndCommit(appendBatch, batchCommitIndex);
+                State->ReplaceSuffixAndAppendBatch(conflictIndex, appendBatch, batchCommitIndex);
+                RemoveUncommittedLogSuffix(conflictIndex);
                 PruneCommittedLogUsage(batchCommitIndex);
                 const auto firstAppendedIndex = State->LastLogIndex - appendBatch.size() + 1;
                 for (size_t i = 0; i < appendBatch.size(); ++i) {

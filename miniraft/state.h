@@ -33,7 +33,7 @@ struct IState: TStateFields {
             const std::vector<TMessageHolder<TLogEntry>>& entries, uint64_t commitIndex) {
         if (LastLogIndex > uint64_t(INT64_MAX) ||
             entries.size() > uint64_t(INT64_MAX) - LastLogIndex ||
-            commitIndex < CommitIndex ||
+            commitIndex < std::max(CommitIndex, SnapshotIndex) ||
             commitIndex > LastLogIndex + entries.size())
             throw std::logic_error("Invalid batched Raft commit boundary");
         AppendBatch(entries);
@@ -41,6 +41,26 @@ struct IState: TStateFields {
             CommitIndex = commitIndex;
             Commit();
         }
+    }
+    // Replace the retained suffix beginning at firstIndex, append the new
+    // entries there, and publish the commit boundary with the resulting log.
+    // The default preserves existing backend behavior; durable backends can
+    // override it to publish the rewrite atomically.
+    virtual void ReplaceSuffixAndAppendBatch(uint64_t firstIndex,
+            const std::vector<TMessageHolder<TLogEntry>>& entries, uint64_t commitIndex) {
+        if (LastLogIndex > uint64_t(INT64_MAX))
+            throw std::overflow_error("Raft log index exhausted");
+        const auto commitFloor = std::max(CommitIndex, SnapshotIndex);
+        if (firstIndex <= commitFloor || firstIndex > LastLogIndex + 1)
+            throw std::logic_error("Invalid Raft suffix replacement boundary");
+        const auto retainedLastIndex = firstIndex - 1;
+        if (entries.size() > uint64_t(INT64_MAX) - retainedLastIndex)
+            throw std::overflow_error("Raft log index exhausted");
+        const auto newLastLogIndex = retainedLastIndex + entries.size();
+        if (commitIndex < commitFloor || commitIndex > newLastLogIndex)
+            throw std::logic_error("Invalid Raft suffix replacement commit boundary");
+        while (LastLogIndex >= firstIndex) RemoveLast();
+        AppendBatchAndCommit(entries, commitIndex);
     }
     // Absolute indices; only the suffix after SnapshotIndex has log entries.
     // The boundary term remains available through LogTerm(SnapshotIndex).

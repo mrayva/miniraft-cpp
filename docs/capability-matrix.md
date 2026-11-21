@@ -51,9 +51,10 @@ design notes. This is a capability summary, not a production-readiness claim.
 - Automatic recovery when a stale store lacks an allowed history anchor, or
   its transition chain is disjoint from the sender's voter lineage.
 - An efficient WAL or cross-request group-commit storage path. `TDurableState`
-  publishes one complete image for each follower `AppendEntries` batch and any
-  commit advance carried in that request, but republishes synchronously for
-  individual proposals and commit-only advances.
+  publishes one complete image for each state-changing follower `AppendEntries`
+  request, including suffix replacement and any commit advance carried in that
+  request, but republishes synchronously for individual proposals and commit-only
+  advances.
   Legacy `TDiskState` syncs
   its log/index and atomically publishes versioned hard-state metadata. Fresh
   `TDiskState` stores checksum records; older split files and their record
