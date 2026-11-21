@@ -49,6 +49,11 @@ struct TApplication : TKv {
     size_t Loads = 0;
     void LoadSnapshot(std::string_view bytes, uint64_t index) override { TKv::LoadSnapshot(bytes, index); ++Loads; }
 };
+struct TRejectingSnapshotApplication : TApplication {
+    void ValidateSnapshot(std::string_view, uint64_t) const override {
+        throw std::runtime_error("Injected application snapshot validation failure");
+    }
+};
 struct TOversizedBoundApplication : TKv {
     mutable size_t SaveCalls = 0;
     std::optional<uint64_t> SnapshotSizeUpperBound() const override { return TSnapshot::MaxBytes; }
@@ -746,6 +751,52 @@ void test_snapshot_install_budget_is_shared_and_reclaimed_after_idle_expiry(void
     auto installed = replies.back().Cast<TInstallSnapshotResponse>();
     assert_true(installed->Success); assert_true(installed->Installed);
     assert_int_equal(budget->UsedBytes(), 0);
+}
+void test_snapshot_install_budget_releases_after_application_validation_failure(void**) {
+    auto budget = std::make_shared<TSnapshotInstallBudget>(1024);
+    TRaft::TLogLimits limits;
+    limits.SnapshotInstallBudget = budget;
+    std::vector<TMessageHolder<TMessage>> replies;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) { replies.push_back(std::move(message)); });
+    TNodeDict peers{{1, peer}};
+
+    auto raft3 = std::make_shared<TRaft>(std::make_shared<TState>(), 3, peers,
+        std::vector<uint32_t>{}, limits);
+    auto rejectingApp = std::make_shared<TRejectingSnapshotApplication>();
+    TRequestProcessor rejectingProcessor(raft3, rejectingApp, peers);
+
+    TKv source;
+    const auto image = EncodeSnapshot(TSnapshot{1, 1, {1, 3}, source.SaveSnapshot()});
+    assert_true(image.size() < budget->LimitBytes());
+    auto complete = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + image.size());
+    complete->Src = 1; complete->Dst = 3; complete->Term = 1; complete->Seqno = 1;
+    complete->SnapshotIndex = 1; complete->SnapshotTerm = 1; complete->Offset = 0;
+    complete->TotalBytes = image.size(); complete->Done = 1; complete->LeaderId = 1;
+    memcpy(complete->Data, image.data(), image.size());
+
+    raft3->Process(ITimeSource::Time{}, complete);
+    auto rejected = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_false(rejected->Success); assert_false(rejected->Installed);
+    assert_int_equal(budget->UsedBytes(), 0);
+    assert_int_equal(raft3->GetState()->SnapshotIndex, 0);
+    assert_int_equal(rejectingApp->LastAppliedIndex, 0);
+
+    auto raft2 = std::make_shared<TRaft>(std::make_shared<TState>(), 2, peers,
+        std::vector<uint32_t>{}, limits);
+    auto app2 = std::make_shared<TApplication>();
+    TRequestProcessor processor2(raft2, app2, peers);
+    constexpr size_t FirstChunkBytes = 4;
+    auto partial = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + FirstChunkBytes);
+    partial->Src = 1; partial->Dst = 2; partial->Term = 1; partial->Seqno = 2;
+    partial->SnapshotIndex = 1; partial->SnapshotTerm = 1; partial->Offset = 0;
+    partial->TotalBytes = image.size(); partial->Done = 0; partial->LeaderId = 1;
+    memcpy(partial->Data, image.data(), FirstChunkBytes);
+    replies.clear();
+    raft2->Process(ITimeSource::Time{}, partial);
+    auto accepted = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_true(accepted->Success); assert_false(accepted->Installed);
+    assert_int_equal(accepted->NextOffset, FirstChunkBytes);
+    assert_int_equal(budget->UsedBytes(), image.size());
 }
 void test_covered_snapshot_metadata_uses_shared_install_budget(void**) {
     auto budget = std::make_shared<TSnapshotInstallBudget>(200);
@@ -1572,6 +1623,7 @@ int main() {
         cmocka_unit_test(test_snapshot_history_encoding_is_negotiated_per_peer),
         cmocka_unit_test(test_idle_snapshot_transfer_discards_partial_image_and_restarts),
         cmocka_unit_test(test_snapshot_install_budget_is_shared_and_reclaimed_after_idle_expiry),
+        cmocka_unit_test(test_snapshot_install_budget_releases_after_application_validation_failure),
         cmocka_unit_test(test_covered_snapshot_metadata_uses_shared_install_budget),
         cmocka_unit_test(test_snapshot_install_accepts_every_small_fixed_chunk_size),
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),
