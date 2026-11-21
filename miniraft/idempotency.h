@@ -18,6 +18,10 @@ struct TIdempotentOperationIdentity {
     bool operator==(const TIdempotentOperationIdentity&) const = default;
 };
 
+// Stable SHA-256 of the exact application command bytes. Raft computes this
+// digest so a client cannot make two different payloads look like one retry.
+std::array<uint8_t, 32> ComputeIdempotentPayloadDigest(std::string_view payload);
+
 enum class EIdempotencyControlKind : uint32_t {
     CloseSession = 1,
     AdvanceEpoch = 2,

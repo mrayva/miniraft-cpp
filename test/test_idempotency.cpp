@@ -49,6 +49,17 @@ void RepairChecksum(std::string& bytes) {
     PutU32(bytes, bytes.size() - 4, checksum);
 }
 
+std::string Hex(const std::array<uint8_t, 32>& bytes) {
+    constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(bytes.size() * 2);
+    for (auto byte : bytes) {
+        result.push_back(digits[byte >> 4]);
+        result.push_back(digits[byte & 0x0f]);
+    }
+    return result;
+}
+
 struct TSnapshotRsm : IIdempotentRsm {
     TIdempotencySnapshot State;
     uint64_t ResponseBound = 64;
@@ -139,6 +150,18 @@ void test_idempotency_snapshot_roundtrip_preserves_dedup_state(void**) {
     Reject([&] { (void)EncodeIdempotencySnapshot(source, limits); });
 }
 
+void test_idempotent_payload_digest_matches_sha256_vectors(void**) {
+    assert_string_equal(Hex(ComputeIdempotentPayloadDigest("")).c_str(),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    assert_string_equal(Hex(ComputeIdempotentPayloadDigest("abc")).c_str(),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    assert_string_equal(Hex(ComputeIdempotentPayloadDigest(
+        "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")).c_str(),
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    assert_true(ComputeIdempotentPayloadDigest(std::string_view("a\0b", 3)) !=
+        ComputeIdempotentPayloadDigest("a"));
+}
+
 void test_idempotent_rsm_snapshot_hook_validates_before_atomic_restore(void**) {
     TSnapshotRsm source;
     auto request = NewHoldedMessage<TIdempotentCommandRequest>();
@@ -176,6 +199,7 @@ void test_idempotent_rsm_snapshot_hook_validates_before_atomic_restore(void**) {
 int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_idempotency_snapshot_roundtrip_preserves_dedup_state),
+        cmocka_unit_test(test_idempotent_payload_digest_matches_sha256_vectors),
         cmocka_unit_test(test_idempotent_rsm_snapshot_hook_validates_before_atomic_restore),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);

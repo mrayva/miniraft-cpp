@@ -48,7 +48,9 @@ falling back to a legacy envelope would remove the guarantee.
 The operation identity and a digest of the command payload are stored with the
 replicated log entry. They remain metadata owned by Raft; the application sees
 the original command bytes and the stable operation identity through an
-optional idempotent state-machine interface.
+optional idempotent state-machine interface. Raft computes SHA-256 over the
+exact request payload so callers cannot choose a digest that hides payload
+changes.
 
 The state machine maintains one committed record per open client session:
 highest completed sequence, payload digest, log index and serialized response.
