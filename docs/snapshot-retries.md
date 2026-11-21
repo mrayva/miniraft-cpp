@@ -24,8 +24,11 @@ outstanding identity.
 A correlated negative acknowledgement also invalidates the peer's cached
 capabilities. The leader first probes the compacted boundary with AppendEntries;
 the fresh response determines whether it retries InstallSnapshot or continues
-with log replication. This avoids retrying an image forever after a peer restart
-or a change to a binary without snapshot-install support.
+with log replication. The rejected transfer's pinned encoding is discarded too,
+so a retry selects its snapshot format from the refreshed capabilities. This
+avoids retrying an image forever after a peer restart or a change to a binary
+without snapshot-install support, and avoids reusing a format the peer no longer
+supports.
 
 This reuse applies only to snapshot chunks. Snapshot ACKs still cannot confirm a
 strong-read barrier; a subsequent fresh AppendEntries ACK is required. No wire

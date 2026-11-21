@@ -271,6 +271,7 @@ void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
     std::shared_ptr<TRaft> raft;
     ITimeSource::Time now{};
     std::unordered_map<uint32_t, TMessageHolder<TInstallSnapshotRequest>> sentSnapshots;
+    bool downgradePeer2AfterRejection = false;
     TNodeDict peers;
     for (const auto id : {2u, 3u, 4u, 5u, 6u, 7u}) {
         peers.emplace(id, std::make_shared<TEndpoint>([&, id](auto message) {
@@ -278,16 +279,17 @@ void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
                 auto append = message.template Cast<TAppendEntriesRequest>();
                 uint32_t features = TAppendEntriesResponse::SupportsConfigurationBarrier;
                 if (id != 5) features |= TAppendEntriesResponse::SupportsInstallSnapshot;
+                if (id == 2 && !downgradePeer2AfterRejection)
+                    features |= TAppendEntriesResponse::SupportsSnapshotHistory1024;
                 if (id == 3) features |= TAppendEntriesResponse::SupportsSnapshotHistory256;
                 if (id == 4) features |= TAppendEntriesResponse::SupportsSnapshotHistory32;
-                if (id == 2) features |= TAppendEntriesResponse::SupportsSnapshotHistory1024;
                 if (id == 6) features |= TAppendEntriesResponse::SupportsSnapshotLineage;
                 auto response = NewHoldedMessage(
                     TMessageEx{.Src = id, .Dst = 1, .Term = append->Term, .Seqno = append->Seqno},
                     TAppendEntriesResponse{.MatchIndex = 0, .Success = 0, .Padding = features});
                 raft->Process(now, std::move(response));
             } else if (message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_REQUEST)) {
-                sentSnapshots.try_emplace(id, message.template Cast<TInstallSnapshotRequest>());
+                sentSnapshots[id] = message.template Cast<TInstallSnapshotRequest>();
             } else if (id == 5 && message->Type == uint32_t(EMessageType::PRE_VOTE_REQUEST)) {
                 auto request = message.template Cast<TPreVoteRequest>();
                 auto response = NewHoldedMessage(
@@ -365,6 +367,33 @@ void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
             assert_int_equal(decoded.ConfigurationTerm, snapshot.ConfigurationTerm);
         }
     }
+
+    // A rejected transfer invalidates the old capability advertisement. If
+    // the new probe reports fewer features, the retry must select a compatible
+    // encoding instead of reusing the pinned, previously rejected encoding.
+    auto oldEncodingRequest = sentSnapshots.at(2);
+    assert_true(std::string_view(oldEncodingRequest->Data, 8) == "MRFTS010");
+    downgradePeer2AfterRejection = true;
+    raft->Process(now, NewHoldedMessage(
+        TMessageEx{.Src = 2, .Dst = 1, .Term = oldEncodingRequest->Term,
+            .Seqno = oldEncodingRequest->Seqno},
+        TInstallSnapshotResponse{.SnapshotIndex = oldEncodingRequest->SnapshotIndex}));
+    assert_false(raft->GetVolatileState()->PeerCapabilities.at(2).InstallSnapshot);
+
+    ++now;
+    raft->ProcessTimeout(now); // Boundary probe refreshes peer 2's capabilities.
+    assert_false(raft->GetVolatileState()->PeerCapabilities.at(2).SnapshotHistory1024);
+    assert_true(raft->GetVolatileState()->PeerCapabilities.at(2).InstallSnapshot);
+    now += TTimeout::Rpc;
+    raft->ProcessTimeout(now);
+    auto retry = sentSnapshots.at(2);
+    assert_true(retry->Done);
+    assert_true(std::string_view(retry->Data, 8) == "MRFTS003");
+    auto retrySnapshot = DecodeSnapshot(std::string_view(retry->Data,
+        retry->Len - sizeof(TInstallSnapshotRequest)));
+    assert_true(retrySnapshot.ConfigurationTransitions.empty());
+    assert_false(retrySnapshot.HasConfigurationLineage());
+
     std::string compactionError;
     try {
         (void)raft->Compact();

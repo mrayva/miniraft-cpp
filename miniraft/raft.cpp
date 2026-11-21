@@ -2805,8 +2805,10 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         return;
     RecordLeadershipResponse(now, response->Src);
     if (!response->Success) {
-        rpc.Offset = 0;
-        rpc.Seqno = 0;
+        // Rebuild the transfer after the capability probe. The peer may have
+        // restarted or changed binaries, so retaining this encoding could
+        // retry a format it has just rejected.
+        rpc = {};
         // A peer may have restarted or changed binaries since its last
         // AppendEntries response. Do not keep routing snapshots from that
         // cached advertisement after a rejection; the boundary probe refreshes
