@@ -32,6 +32,10 @@ template<class F> void Reject(F action) {
     try { action(); } catch (const TMessageError&) { rejected = true; }
     assert_true(rejected);
 }
+template<class F> bool IsRejected(F action) {
+    try { action(); } catch (const TMessageError&) { return true; }
+    return false;
+}
 void test_sql_prepare_rejects_short_query(void**) {
     TSql sql(":memory:", 1);
     auto command = NewHoldedMessage<TWriteSql>();
@@ -187,6 +191,32 @@ void test_sql_snapshot_roundtrip_and_rejection_are_atomic(void**) {
         assert_int_equal(restored.LastAppliedIndex, 2);
         assert_true(ReadText(restored, "SELECT count(*) FROM t") == "count(*)\n2\n");
     }
+}
+void test_sql_snapshot_truncation_rejects_before_replacement(void**) {
+    TDatabase sourceFile, targetFile;
+    TSql source(sourceFile.Path, 1);
+    Seed(source);
+    assert_true(Apply(source, "INSERT INTO t VALUES ('snapshot')", 2).empty());
+    const auto image = source.SaveSnapshot();
+
+    TSql target(targetFile.Path, 1);
+    Seed(target);
+    const std::vector<std::string> truncated{
+        std::string(image.data(), 99),
+        std::string(image.data(), 100),
+        std::string(image.data(), image.size() / 2),
+        std::string(image.data(), image.size() - 1),
+    };
+    assert_true(IsRejected([&] { target.ValidateSnapshot(truncated[0], 2); }));
+    assert_true(IsRejected([&] { target.LoadSnapshot(truncated[0], 2); }));
+    assert_true(IsRejected([&] { target.ValidateSnapshot(truncated[1], 2); }));
+    assert_true(IsRejected([&] { target.LoadSnapshot(truncated[1], 2); }));
+    assert_true(IsRejected([&] { target.ValidateSnapshot(truncated[2], 2); }));
+    assert_true(IsRejected([&] { target.LoadSnapshot(truncated[2], 2); }));
+    assert_true(IsRejected([&] { target.ValidateSnapshot(truncated[3], 2); }));
+    assert_true(IsRejected([&] { target.LoadSnapshot(truncated[3], 2); }));
+    assert_int_equal(target.LastAppliedIndex, 1);
+    assert_true(ReadText(target, "SELECT value FROM t") == "value\noriginal\n");
 }
 void test_sql_snapshot_installation_busy_failure_preserves_database(void**) {
     TDatabase sourceFile, targetFile;
@@ -549,6 +579,7 @@ int main() {
         cmocka_unit_test(test_sql_automatic_rollback_is_consumed_without_partial_data),
         cmocka_unit_test(test_sql_metadata_failure_rolls_back_data_and_does_not_advance),
         cmocka_unit_test(test_sql_snapshot_roundtrip_and_rejection_are_atomic),
+        cmocka_unit_test(test_sql_snapshot_truncation_rejects_before_replacement),
         cmocka_unit_test(test_sql_snapshot_installation_busy_failure_preserves_database),
         cmocka_unit_test(test_sql_snapshot_includes_committed_wal_pages),
         cmocka_unit_test(test_sql_snapshot_page_size_mismatch_rejects_before_replacement),

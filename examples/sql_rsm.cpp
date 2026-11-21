@@ -91,6 +91,11 @@ TSnapshotDatabase OpenSnapshotDatabase(std::string_view bytes) {
     if (!result.Buffer) throw std::bad_alloc();
     memcpy(result.Buffer.get(), bytes.data(), bytes.size());
     memset(result.Buffer.get() + bytes.size(), 0, MalformedImageReadSlack);
+    const auto encodedPageSize = (uint32_t(result.Buffer.get()[16]) << 8) | result.Buffer.get()[17];
+    const uint32_t pageSize = encodedPageSize == 1 ? 65536 : encodedPageSize;
+    if (pageSize < 512 || pageSize > 65536 || (pageSize & (pageSize - 1)) != 0 ||
+        bytes.size() % pageSize != 0)
+        throw TMessageError("SQL snapshot is not a complete SQLite page image");
     if (result.Buffer.get()[18] != 1 || result.Buffer.get()[19] != 1)
         throw TMessageError("SQL snapshot is not a standalone rollback-mode image");
 

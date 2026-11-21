@@ -29,8 +29,10 @@ The application image is captured with SQLite's backup API into an in-memory
 database and then serialized. This includes committed pages still present in a
 WAL file. Save requires a committed `LastAppliedIndex` marker and no open
 transaction. The SQL payload is capped below 64 MiB to leave room for the Raft
-snapshot header and maximum voter metadata. The decoder adds SQLite's recommended
-read slack around malformed untrusted images. Before restore or installation,
+snapshot header and maximum voter metadata. Before deserialization, SQL checks
+that the declared page size is valid and the image contains complete pages, then
+copies it into a buffer with 20 zeroed trailing guard bytes for SQLite's
+malformed-image checks. Before restore or installation,
 SQL checks that the image can be opened,
 passes `PRAGMA quick_check(1)`, and has exactly one valid progress marker equal
 to the Raft snapshot boundary. WAL-mode backup bytes are normalized to SQLite's
@@ -63,12 +65,13 @@ every node.
 
 ## Validation
 
-Deterministic tests cover round-trip capture and restore, malformed/corrupt
-images, wrong progress boundaries, preservation of existing state after
+Deterministic tests cover round-trip capture and restore, malformed/corrupt and
+truncated images, wrong progress boundaries, preservation of existing state after
 validation or backup failure, and restart recovery when durable Raft state is
 ahead of the SQL database. The regular release and ASan/UBSan CTest suites
 also exercise the library and examples.
 
-SQLite API details: [serialize](https://www.sqlite.org/c3ref/serialize.html),
+SQLite details: [database file format](https://www.sqlite.org/fileformat.html),
+[serialize](https://www.sqlite.org/c3ref/serialize.html),
 [deserialize, including the WAL-mode restriction](https://www.sqlite.org/c3ref/deserialize.html), and
 [backup completion](https://www.sqlite.org/c3ref/backup_finish.html).
