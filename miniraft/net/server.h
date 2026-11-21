@@ -299,6 +299,11 @@ public:
     { }
 
     ~TNode() {
+        // Completed suspended tasks own their coroutine frames until destroyed.
+        // The server normally reaps them from Drain(), but standalone nodes can
+        // be destroyed after their final drain without another poller turn.
+        if (Drainer && Drainer.done()) { Drainer.destroy(); Drainer = {}; }
+        if (Connector && Connector.done()) { Connector.destroy(); Connector = {}; }
         if (auto budget = QueueBudget.lock())
             budget->Release(PendingMessageCount(), PendingMessageBytes());
     }
