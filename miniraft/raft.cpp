@@ -2606,6 +2606,7 @@ void TRaft::ReplacePeerTarget(uint32_t id, std::shared_ptr<INode> node) {
     auto peer = Nodes.find(id);
     if (peer == Nodes.end() || peer->second == node)
         throw std::invalid_argument("Unknown or unchanged peer target");
+    const bool replacingVoter = IsVoter(id);
     auto nextIndex = VolatileState->NextIndex.find(id);
     if (nextIndex == VolatileState->NextIndex.end())
         throw std::logic_error("Peer target has no replication progress");
@@ -2638,11 +2639,14 @@ void TRaft::ReplacePeerTarget(uint32_t id, std::shared_ptr<INode> node) {
     if (VolatileState->LeadershipTransfer && VolatileState->LeadershipTransfer->TargetId == id)
         VolatileState->LeadershipTransfer.reset();
 
-    // The snapshot safety proof included the old endpoint's capabilities and
-    // acknowledgements. Require a fresh proof after transport replacement.
-    VolatileState->CompactionSafeConfigurationIndex = 0;
-    VolatileState->CompactionSafeConfigurationTerm = 0;
-    VolatileState->HasCompactionSafeInitialConfigurationBarrier = false;
+    if (replacingVoter) {
+        // The snapshot safety proof included every active voter's capabilities
+        // and acknowledgements. A learner is outside that proof, so replacing
+        // one must not expire an otherwise valid all-voter certificate.
+        VolatileState->CompactionSafeConfigurationIndex = 0;
+        VolatileState->CompactionSafeConfigurationTerm = 0;
+        VolatileState->HasCompactionSafeInitialConfigurationBarrier = false;
+    }
 }
 
 std::shared_ptr<INode> TRaft::RemoveLearnerTarget(uint32_t id) {

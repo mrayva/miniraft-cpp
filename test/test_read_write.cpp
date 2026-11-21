@@ -376,9 +376,18 @@ int RunServingServerMembershipReaderTest(const std::filesystem::path& dir) {
     server.Serve(); // Starts readers for voters 1/2 and staged target 3.
     if (!joiningPeer->HasResponseReader()) return 8;
 
+    auto* volatileState = const_cast<TVolatileState*>(raft->GetVolatileState());
+    volatileState->CompactionSafeConfigurationTerm = state->CurrentTerm;
+    volatileState->HasCompactionSafeInitialConfigurationBarrier = true;
+    auto replacedLearner = makePeer("replaced-learner");
+    if (server.ReplacePeerTarget(3, replacedLearner) != joiningPeer ||
+        !joiningPeer->IsRetired() || !replacedLearner->HasResponseReader() || raft->IsVoter(3) ||
+        !volatileState->HasCompactionSafeInitialConfigurationBarrier ||
+        volatileState->CompactionSafeConfigurationTerm != state->CurrentTerm) return 14;
+    joiningPeer = replacedLearner;
+
     // A replacement endpoint must not inherit replication or capability proof
     // established by the old transport, and must keep the configured voter role.
-    auto* volatileState = const_cast<TVolatileState*>(raft->GetVolatileState());
     volatileState->PeerCapabilities[2].InstallSnapshot = true;
     volatileState->MatchIndex[2] = 1;
     volatileState->CommitAckIndex[2] = 1;
