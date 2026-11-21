@@ -2837,20 +2837,28 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             auto reservation = SnapshotInstallBudget->TryReserve(request->TotalBytes);
             if (!reservation) { reply(false, false, 0); return; }
             IncomingSnapshot = TIncomingSnapshot{request->Term, request->SnapshotIndex, request->SnapshotTerm,
-                request->TotalBytes, request->LeaderId, now, {}, std::move(reservation)};
+                request->TotalBytes, request->LeaderId, now, {}, 0, false, std::move(reservation)};
         }
         auto& prefix = IncomingSnapshot->Bytes;
         const auto count = request->Len - sizeof(TInstallSnapshotRequest);
-        const bool advanced = request->Offset == prefix.size();
-        if (request->Offset > prefix.size()) { reply(false, false, 0); return; }
-        if (request->Offset < prefix.size()) {
-            if (count > prefix.size() - request->Offset ||
+        auto& receivedBytes = IncomingSnapshot->ReceivedBytes;
+        const bool advanced = request->Offset == receivedBytes;
+        if (request->Offset > receivedBytes) { reply(false, false, 0); return; }
+        if (request->Offset < receivedBytes) {
+            if (count > receivedBytes - request->Offset ||
                 std::string_view(prefix).substr(request->Offset, count) != std::string_view(request->Data, count)) {
                 IncomingSnapshot.reset(); reply(false, false, 0); return;
             }
-        } else prefix.append(request->Data, count);
+        } else {
+            if (IncomingSnapshot->Preallocated)
+                memcpy(prefix.data() + receivedBytes, request->Data, count);
+            else
+                prefix.append(request->Data, count);
+            receivedBytes += count;
+        }
         if (advanced) IncomingSnapshot->LastProgress = now;
-        if (!IsSupportedSnapshotMagicPrefix(prefix)) {
+        const std::string_view receivedPrefix(prefix.data(), size_t(receivedBytes));
+        if (!IsSupportedSnapshotMagicPrefix(receivedPrefix)) {
             IncomingSnapshot.reset(); reply(false, false, 0); return;
         }
         const auto knownSnapshot = State->GetSnapshot();
@@ -2859,12 +2867,12 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             ? &Configuration->Latest : nullptr;
         const auto snapshotVoters = committedConfiguration
             ? ConfigurationVoterUnion(*committedConfiguration) : std::vector<uint32_t>{};
-        const auto probe = ProbeSnapshotMetadata(prefix, request->TotalBytes,
+        const auto probe = ProbeSnapshotMetadata(receivedPrefix, request->TotalBytes,
             request->SnapshotIndex, request->SnapshotTerm, snapshotVoters, knownSnapshot.get(),
             committedConfiguration, pendingConfiguration,
             false, MayRecoverMembershipFromSnapshot(Id, *State, GetVoterIds(), committedConfiguration),
             request->LeaderId, Id);
-        if (!probe.Complete) { reply(true, false, prefix.size()); return; }
+        if (!probe.Complete) { reply(true, false, receivedBytes); return; }
         IncomingSnapshot.reset();
         if (probe.Supported) acceptLeaderContact();
         reply(probe.Supported, probe.Supported, probe.Supported ? request->TotalBytes : 0);
@@ -2881,21 +2889,35 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         IncomingSnapshot.reset(); // Release a superseded image before reserving its replacement.
         auto reservation = SnapshotInstallBudget->TryReserve(request->TotalBytes);
         if (!reservation) { reply(false, false, 0); return; }
+        std::string image;
+        try {
+            // Allocate the declared image once. Incremental string growth can
+            // reserve substantially more capacity than the quota accounts for.
+            image.resize(size_t(request->TotalBytes));
+        } catch (const std::exception&) {
+            reply(false, false, 0);
+            return;
+        }
         IncomingSnapshot = TIncomingSnapshot{request->Term, request->SnapshotIndex, request->SnapshotTerm,
-            request->TotalBytes, request->LeaderId, now, {}, std::move(reservation)};
+            request->TotalBytes, request->LeaderId, now, std::move(image), 0, true, std::move(reservation)};
     }
     auto& bytes = IncomingSnapshot->Bytes;
     const auto count = request->Len - sizeof(TInstallSnapshotRequest);
-    const bool advanced = request->Offset == bytes.size();
-    if (request->Offset > bytes.size()) { reply(false, false, 0); return; }
-    if (request->Offset < bytes.size()) {
-        if (count > bytes.size() - request->Offset ||
+    auto& receivedBytes = IncomingSnapshot->ReceivedBytes;
+    const bool advanced = request->Offset == receivedBytes;
+    if (request->Offset > receivedBytes) { reply(false, false, 0); return; }
+    if (request->Offset < receivedBytes) {
+        if (count > receivedBytes - request->Offset ||
             std::string_view(bytes).substr(request->Offset, count) != std::string_view(request->Data, count)) {
             IncomingSnapshot.reset(); reply(false, false, 0); return;
         }
-    } else bytes.append(request->Data, count);
+    } else {
+        memcpy(bytes.data() + receivedBytes, request->Data, count);
+        receivedBytes += count;
+    }
     if (advanced) IncomingSnapshot->LastProgress = now;
-    if (!IsSupportedSnapshotMagicPrefix(bytes)) {
+    const std::string_view receivedImage(bytes.data(), size_t(receivedBytes));
+    if (!IsSupportedSnapshotMagicPrefix(receivedImage)) {
         IncomingSnapshot.reset(); reply(false, false, 0); return;
     }
     const auto knownSnapshot = State->GetSnapshot();
@@ -2904,17 +2926,17 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         ? &Configuration->Latest : nullptr;
     const auto snapshotVoters = committedConfiguration
         ? ConfigurationVoterUnion(*committedConfiguration) : std::vector<uint32_t>{};
-    const auto probe = ProbeSnapshotMetadata(bytes, request->TotalBytes,
+    const auto probe = ProbeSnapshotMetadata(receivedImage, request->TotalBytes,
         request->SnapshotIndex, request->SnapshotTerm, snapshotVoters, knownSnapshot.get(),
         committedConfiguration, pendingConfiguration,
         CanBootstrapFreshLearnerSnapshot(Id, *State, GetVoterIds(), application.get(),
             committedConfiguration, !pendingConfiguration),
         MayRecoverMembershipFromSnapshot(Id, *State, GetVoterIds(), committedConfiguration),
         request->LeaderId, Id);
-    if (!probe.Complete) { reply(true, false, bytes.size()); return; }
+    if (!probe.Complete) { reply(true, false, receivedBytes); return; }
     if (!probe.Supported) { IncomingSnapshot.reset(); reply(false, false, 0); return; }
     acceptLeaderContact();
-    if (bytes.size() < request->TotalBytes) { reply(true, false, bytes.size()); return; }
+    if (receivedBytes < request->TotalBytes) { reply(true, false, receivedBytes); return; }
     auto installationReservation = std::move(IncomingSnapshot->MemoryReservation);
     (void)installationReservation; // Hold the aggregate reservation through validation and publication.
     TSnapshot snapshot;

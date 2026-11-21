@@ -20,8 +20,10 @@ custom `TSnapshotInstallBudget` through `TLogLimits`; a transfer that cannot
 reserve space is rejected at offset zero and can retry after capacity is
 released. Full-image transfers and covered-boundary metadata probes both
 reserve their declared image size, even though the latter retains only a
-metadata prefix. Completion, rejection, term change and idle expiry release the
-reservation. This accounts for incomplete receive buffers only; retained
+metadata prefix. Full-image receive buffers allocate their declared length
+before chunks arrive, so chunk appends do not grow the buffer geometrically.
+Completion, rejection, term change and idle expiry release the reservation.
+This accounts for incomplete receive buffers only; retained
 snapshots, outgoing pins, capture buffers, application memory and transport
 buffers remain outside this budget.
 

@@ -410,6 +410,8 @@ private:
         uint32_t Leader;
         ITimeSource::Time LastProgress;
         std::string Bytes;
+        uint64_t ReceivedBytes = 0;
+        bool Preallocated = false;
         std::shared_ptr<void> MemoryReservation;
     };
     std::optional<TIncomingSnapshot> IncomingSnapshot;
