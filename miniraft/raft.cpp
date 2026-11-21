@@ -3754,6 +3754,21 @@ void TRequestProcessor::OnCommandRequest(TMessageHolder<TCommandRequest> command
     }
 }
 
+void TRequestProcessor::OnIdempotentCommandRequest(
+        TMessageHolder<TIdempotentCommandRequest> command,
+        const std::shared_ptr<INode>& replyTo) {
+    ValidateIdempotentCommandRequest(command);
+    if (!replyTo) return;
+    auto response = NewHoldedMessage<TIdempotentCommandResponse>();
+    response->Epoch = command->Epoch;
+    response->SessionIdHigh = command->SessionIdHigh;
+    response->SessionIdLow = command->SessionIdLow;
+    response->Sequence = command->Sequence;
+    response->Cookie = command->Cookie;
+    response->ErrorCode = TCommandResponse::Unsupported;
+    replyTo->Send(std::move(response));
+}
+
 void TRequestProcessor::OnForwardedCommandRequest(TMessageHolder<TForwardedCommandRequest> message,
         const std::shared_ptr<INode>& peer) {
     if (!message.HasValidExtent() || message->Type != uint32_t(EMessageType::FORWARDED_COMMAND_REQUEST))

@@ -27,6 +27,10 @@ void ValidateMessageHeader(uint32_t type, uint32_t length, const TMessageLimits&
     case EMessageType::CONFIGURATION_BARRIER_RESPONSE: minimum = sizeof(TConfigurationBarrierResponse); break;
     case EMessageType::COMMAND_REQUEST: minimum = sizeof(TCommandRequest); fixed = false; break;
     case EMessageType::COMMAND_RESPONSE: minimum = sizeof(TCommandResponse); fixed = false; break;
+    case EMessageType::IDEMPOTENT_COMMAND_REQUEST:
+        minimum = sizeof(TIdempotentCommandRequest); fixed = false; break;
+    case EMessageType::IDEMPOTENT_COMMAND_RESPONSE:
+        minimum = sizeof(TIdempotentCommandResponse); fixed = false; break;
     case EMessageType::FORWARDED_COMMAND_REQUEST:
         minimum = sizeof(TForwardedCommandRequest); fixed = false; break;
     case EMessageType::FORWARDED_COMMAND_RESPONSE:
@@ -64,4 +68,31 @@ void ValidateMessageTree(const TMessageHolder<TMessage>& message, const TMessage
     if (count > limits.MaxEntries || count != message.PayloadSize || count > message.PayloadCapacity || (count && !message.Payload))
         throw TMessageError("Invalid AppendEntries entry count");
     for (uint32_t i = 0; i < count; ++i) validate(message.Payload[i], true);
+}
+
+void ValidateIdempotentCommandRequest(
+        const TMessageHolder<TIdempotentCommandRequest>& message,
+        const TMessageLimits& limits) {
+    if (!message.HasValidExtent() ||
+        message->Type != uint32_t(EMessageType::IDEMPOTENT_COMMAND_REQUEST))
+        throw TMessageError("Invalid idempotent command request");
+    ValidateMessageTree(message, limits);
+    if (message->Version != TIdempotentCommandRequest::CurrentVersion || message->Reserved != 0 ||
+        message->Epoch == 0 || (!message->SessionIdHigh && !message->SessionIdLow) ||
+        message->Sequence == 0 || message->Flags != TCommandRequest::EWrite)
+        throw TMessageError("Invalid idempotent command metadata");
+}
+
+void ValidateIdempotentCommandResponse(
+        const TMessageHolder<TIdempotentCommandResponse>& message,
+        const TMessageLimits& limits) {
+    if (!message.HasValidExtent() ||
+        message->Type != uint32_t(EMessageType::IDEMPOTENT_COMMAND_RESPONSE))
+        throw TMessageError("Invalid idempotent command response");
+    ValidateMessageTree(message, limits);
+    if (message->Version != TIdempotentCommandRequest::CurrentVersion || message->Reserved != 0 ||
+        message->Epoch == 0 || (!message->SessionIdHigh && !message->SessionIdLow) ||
+        message->Sequence == 0 || message->ErrorCode > TCommandResponse::Unsupported ||
+        (message->ErrorCode == TCommandResponse::Success && message->Index == 0))
+        throw TMessageError("Invalid idempotent command response metadata");
 }

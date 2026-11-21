@@ -1,8 +1,16 @@
 # Durable client write deduplication design
 
-Status: design for a future opt-in protocol. The current client request path
-does not provide durable operation identity. A timeout or lost response leaves
-the write outcome unknown; retrying a non-idempotent write may apply it twice.
+Status: protocol foundation is present, but durable deduplication is not
+implemented. The current client request path does not provide durable operation
+identity. A timeout or lost response leaves the write outcome unknown; retrying
+a non-idempotent write may apply it twice.
+
+The new request and response frame types are strictly validated. The request
+processor returns `Unsupported` before forwarding, appending, or applying the
+command because the RSM and snapshot contracts are not implemented yet. No
+capability is advertised, and clients must not treat this frame as a usable
+idempotency feature. In particular, this protocol foundation does not preserve
+identity across forwarding or replication yet.
 
 ## Goal and boundary
 
@@ -103,12 +111,13 @@ application response that exceeds its declared bound is a contract violation.
 
 ## Implementation order
 
-1. Add the versioned request and response types, capability bit, validation and
-   forwarding propagation. Keep legacy requests unchanged.
+1. Define versioned request and response types with strict validation. Keep
+   legacy requests unchanged and reject the new type until the durable contract
+   is available. (The frame types and fail-closed response have landed.)
 2. Add the optional idempotent state-machine contract and versioned session
    snapshot codec with strict limits.
-3. Wrap idempotent commands in replicated log metadata and apply duplicate
-   checks at the state-machine boundary.
+3. Carry identity through negotiated forwarding, wrap commands in replicated
+   log metadata, and apply duplicate checks at the state-machine boundary.
 4. Add end-to-end loss, retry, leadership-change, restart, compaction and
    resource-limit tests before advertising the capability.
 

@@ -44,6 +44,9 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(TSocket socket) {
                 RequestProcessor->OnForwardedCommandRequest(std::move(maybeForwardedRequest.Cast()), client);
             } else if (auto maybeForwardedResponse = mes.template Maybe<TForwardedCommandResponse>()) {
                 RequestProcessor->OnForwardedCommandResponse(std::move(maybeForwardedResponse.Cast()), client);
+            } else if (auto maybeIdempotentRequest = mes.template Maybe<TIdempotentCommandRequest>()) {
+                RequestProcessor->OnIdempotentCommandRequest(
+                    std::move(maybeIdempotentRequest.Cast()), client);
             } else if (auto maybeCommandRequest = mes.template Maybe<TCommandRequest>()) {
                 RequestProcessor->OnCommandRequest(std::move(maybeCommandRequest.Cast()), client);
             } else if (auto maybeCommandResponse = mes.template Maybe<TCommandResponse>()) {

@@ -487,6 +487,10 @@ public:
 
     void CheckStateChange();
     void OnCommandRequest(TMessageHolder<TCommandRequest> message, const std::shared_ptr<INode>& replyTo);
+    // The opt-in durable request protocol is parsed but remains fail-closed
+    // until the RSM can persist deduplication records with application state.
+    void OnIdempotentCommandRequest(TMessageHolder<TIdempotentCommandRequest> message,
+                                    const std::shared_ptr<INode>& replyTo);
     void OnForwardedCommandRequest(TMessageHolder<TForwardedCommandRequest> message,
                                    const std::shared_ptr<INode>& peer);
     void OnSessionForwardedCommandRequest(TMessageHolder<TSessionForwardedCommandRequest> message,

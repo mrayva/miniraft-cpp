@@ -42,6 +42,8 @@ enum class EMessageType : uint32_t {
     PEER_CAPABILITIES_RESPONSE = 18,
     SESSION_FORWARDED_COMMAND_REQUEST = 19,
     SESSION_FORWARDED_COMMAND_RESPONSE = 20,
+    IDEMPOTENT_COMMAND_REQUEST = 21,
+    IDEMPOTENT_COMMAND_RESPONSE = 22,
 };
 
 struct TMessage {
@@ -206,6 +208,22 @@ struct TCommandRequest: public TMessage {
 
 static_assert(sizeof(TCommandRequest) == sizeof(TMessage) + 8);
 
+// Opt-in request envelope for durable write deduplication. It remains separate
+// from TCommandRequest so legacy payloads and at-least-once semantics do not
+// change. Until a node has the durable RSM contract, it must reject this type.
+struct TIdempotentCommandRequest: public TMessage {
+    static constexpr EMessageType MessageType = EMessageType::IDEMPOTENT_COMMAND_REQUEST;
+    static constexpr uint32_t CurrentVersion = 1;
+    uint32_t Version = CurrentVersion, Reserved = 0;
+    uint64_t Epoch = 0;
+    uint64_t SessionIdHigh = 0, SessionIdLow = 0;
+    uint64_t Sequence = 0;
+    uint32_t Flags = TCommandRequest::EWrite;
+    uint32_t Cookie = 0;
+    char Data[0];
+};
+static_assert(sizeof(TIdempotentCommandRequest) == sizeof(TMessage) + 48);
+
 struct TCommandResponse: public TMessage {
     static constexpr EMessageType MessageType = EMessageType::COMMAND_RESPONSE;
     enum EErrorCode : uint32_t {
@@ -214,6 +232,7 @@ struct TCommandResponse: public TMessage {
         ApplicationReadFailed = 2,
         Overloaded = 3,
         TimedOut = 4,
+        Unsupported = 5,
     };
     uint64_t Index = 0;
     uint32_t Cookie = 0;
@@ -222,6 +241,19 @@ struct TCommandResponse: public TMessage {
 };
 
 static_assert(sizeof(TCommandResponse) == sizeof(TMessage) + 16);
+
+struct TIdempotentCommandResponse: public TMessage {
+    static constexpr EMessageType MessageType = EMessageType::IDEMPOTENT_COMMAND_RESPONSE;
+    uint32_t Version = TIdempotentCommandRequest::CurrentVersion, Reserved = 0;
+    uint64_t Index = 0;
+    uint64_t Epoch = 0;
+    uint64_t SessionIdHigh = 0, SessionIdLow = 0;
+    uint64_t Sequence = 0;
+    uint32_t Cookie = 0;
+    uint32_t ErrorCode = 0;
+    char Data[0];
+};
+static_assert(sizeof(TIdempotentCommandResponse) == sizeof(TMessage) + 56);
 
 // Internal forwarding envelope used after the legacy 32-bit command cookie
 // range is exhausted. Its opaque payload is the original TCommandRequest data.
@@ -427,6 +459,12 @@ struct TMessageHolder {
 
 // Validate the complete frame/batch before emitting any bytes.
 void ValidateMessageTree(const TMessageHolder<TMessage>& message, const TMessageLimits& limits = {});
+void ValidateIdempotentCommandRequest(
+    const TMessageHolder<TIdempotentCommandRequest>& message,
+    const TMessageLimits& limits = {});
+void ValidateIdempotentCommandResponse(
+    const TMessageHolder<TIdempotentCommandResponse>& message,
+    const TMessageLimits& limits = {});
 
 template<typename T>
 requires std::derived_from<T, TMessage>

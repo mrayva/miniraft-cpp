@@ -31,6 +31,48 @@ void test_short_wrong_type_and_empty_casts_are_rejected(void**) {
         assert_true(rejected);
     }
 }
+void test_idempotent_request_validation_is_strict_and_fail_closed(void**) {
+    auto request = NewHoldedMessage<TIdempotentCommandRequest>(sizeof(TIdempotentCommandRequest) + 3);
+    request->Epoch = 1;
+    request->SessionIdLow = 7;
+    request->Sequence = 1;
+    memcpy(request->Data, "cmd", 3);
+    ValidateIdempotentCommandRequest(request);
+
+    auto reject = [](TMessageHolder<TIdempotentCommandRequest> candidate) {
+        bool rejected = false;
+        try { ValidateIdempotentCommandRequest(candidate); }
+        catch (const TMessageError&) { rejected = true; }
+        assert_true(rejected);
+    };
+    auto invalid = NewHoldedMessage<TIdempotentCommandRequest>();
+    invalid->Epoch = 1; invalid->SessionIdLow = 7; invalid->Sequence = 1;
+    invalid->Flags = TCommandRequest::EStale;
+    reject(invalid);
+    invalid->Flags = TCommandRequest::EWrite; invalid->Version++;
+    reject(invalid);
+    invalid->Version = TIdempotentCommandRequest::CurrentVersion; invalid->Reserved = 1;
+    reject(invalid);
+    invalid->Reserved = 0;
+    invalid->Epoch = 0;
+    reject(invalid);
+    invalid->Epoch = 1; invalid->SessionIdLow = 0;
+    reject(invalid);
+    invalid->SessionIdHigh = 3; invalid->Sequence = 0;
+    reject(invalid);
+    invalid->Sequence = 1; invalid->Type = uint32_t(EMessageType::COMMAND_REQUEST);
+    reject(invalid);
+
+    auto response = NewHoldedMessage<TIdempotentCommandResponse>();
+    response->Epoch = 1; response->SessionIdLow = 7; response->Sequence = 1;
+    response->ErrorCode = TCommandResponse::Unsupported;
+    ValidateIdempotentCommandResponse(response);
+    response->ErrorCode = TCommandResponse::Success;
+    bool rejected = false;
+    try { ValidateIdempotentCommandResponse(response); }
+    catch (const TMessageError&) { rejected = true; }
+    assert_true(rejected); // A success always identifies an applied log index.
+}
 struct TEndpoint : INode {
     std::vector<TMessageHolder<TAppendEntriesRequest>> Sent;
     void Send(TMessageHolder<TMessage> message) override {
@@ -174,6 +216,7 @@ int main() {
         cmocka_unit_test(test_memory_state_copies_do_not_share_mutable_log_entries),
         cmocka_unit_test(test_typed_allocations_reject_undersized_storage),
         cmocka_unit_test(test_short_wrong_type_and_empty_casts_are_rejected),
+        cmocka_unit_test(test_idempotent_request_validation_is_strict_and_fail_closed),
         cmocka_unit_test(test_raft_batches_respect_budget_and_continue_replication),
         cmocka_unit_test(test_invalid_proposal_does_not_mutate_persistent_state),
         cmocka_unit_test(test_declared_length_cannot_exceed_actual_proposal_buffer),

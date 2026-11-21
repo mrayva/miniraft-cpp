@@ -46,6 +46,12 @@ struct TClient {
             std::string(response->Data, response->Len - sizeof(TCommandResponse))});
     });
 };
+struct TIdempotentClient {
+    std::vector<TMessageHolder<TIdempotentCommandResponse>> Replies;
+    std::shared_ptr<TEndpoint> Endpoint = std::make_shared<TEndpoint>([this](auto message) {
+        Replies.push_back(message.template Cast<TIdempotentCommandResponse>());
+    });
+};
 struct TFollower {
     std::vector<TMessageHolder<TCommandRequest>> Sent;
     std::vector<TMessageHolder<TForwardedCommandRequest>> ExtendedSent;
@@ -137,6 +143,34 @@ void test_forwarded_send_rejection_fails_client_and_discards_route(void**) {
     auto lateReply = NewHoldedMessage(TCommandResponse{.Cookie = forwarded->Cookie});
     follower.Processor.OnCommandResponse(lateReply, follower.Leader);
     assert_int_equal(client.Replies.size(), 1);
+}
+
+void test_idempotent_requests_are_explicitly_rejected_before_forwarding_or_append(void**) {
+    TFollower follower;
+    TIdempotentClient client;
+    auto request = NewHoldedMessage<TIdempotentCommandRequest>(
+        sizeof(TIdempotentCommandRequest) + 5);
+    request->Epoch = 4;
+    request->SessionIdHigh = 12;
+    request->SessionIdLow = 34;
+    request->Sequence = 9;
+    request->Cookie = 77;
+    request->Flags = TCommandRequest::EWrite;
+    memcpy(request->Data, "write", 5);
+
+    follower.Processor.OnIdempotentCommandRequest(request, client.Endpoint);
+
+    assert_int_equal(client.Replies.size(), 1);
+    const auto& response = client.Replies.front();
+    assert_int_equal(response->Epoch, 4);
+    assert_int_equal(response->SessionIdHigh, 12);
+    assert_int_equal(response->SessionIdLow, 34);
+    assert_int_equal(response->Sequence, 9);
+    assert_int_equal(response->Cookie, 77);
+    assert_int_equal(response->ErrorCode, TCommandResponse::Unsupported);
+    assert_int_equal(follower.Raft->GetState()->LastLogIndex, 0);
+    assert_true(follower.Sent.empty());
+    assert_true(follower.Leader->Rejected.empty());
 }
 
 void test_forwarded_requests_share_admission_budget_and_release_it(void**) {
@@ -560,6 +594,7 @@ int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_malformed_forwarded_reply_does_not_consume_route),
         cmocka_unit_test(test_forwarded_send_rejection_fails_client_and_discards_route),
+        cmocka_unit_test(test_idempotent_requests_are_explicitly_rejected_before_forwarding_or_append),
         cmocka_unit_test(test_forwarded_requests_share_admission_budget_and_release_it),
         cmocka_unit_test(test_forwarded_request_deadline_removes_route_and_ignores_late_reply),
         cmocka_unit_test(test_nonzero_client_cookies_are_forwarded),
