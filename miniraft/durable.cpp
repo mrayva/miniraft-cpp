@@ -386,10 +386,19 @@ void TDurableState::Append(TMessageHolder<TLogEntry> entry)
 
 void TDurableState::AppendBatch(const std::vector<TMessageHolder<TLogEntry>>& entries)
 {
-    if (entries.empty()) return;
-    if (LastLogIndex >= uint64_t(INT64_MAX) ||
+    AppendBatchAndCommit(entries, CommitIndex);
+}
+
+void TDurableState::AppendBatchAndCommit(
+        const std::vector<TMessageHolder<TLogEntry>>& entries, uint64_t commitIndex)
+{
+    if (LastLogIndex > uint64_t(INT64_MAX) ||
         entries.size() > uint64_t(INT64_MAX) - LastLogIndex)
         throw std::overflow_error("Raft log index exhausted");
+    const auto newLastLogIndex = LastLogIndex + entries.size();
+    if (commitIndex < CommitIndex || commitIndex > newLastLogIndex)
+        throw std::logic_error("Invalid batched Raft commit boundary");
+    if (entries.empty() && commitIndex == CommitIndex) return;
     if (entries.size() > Impl->Log.max_size() - Impl->Log.size())
         throw std::length_error("Durable log is too large for this platform");
 
@@ -400,7 +409,8 @@ void TDurableState::AppendBatch(const std::vector<TMessageHolder<TLogEntry>>& en
     for (auto& entry : cloned) Impl->Log.push_back(std::move(entry));
 
     LastLogIndex = SnapshotIndex + Impl->Log.size();
-    LastLogTerm = Impl->Log.back()->Term;
+    LastLogTerm = Impl->Log.empty() ? SnapshotTerm : Impl->Log.back()->Term;
+    CommitIndex = commitIndex;
     Commit();
 }
 

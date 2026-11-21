@@ -26,6 +26,22 @@ struct IState: TStateFields {
     virtual void AppendBatch(const std::vector<TMessageHolder<TLogEntry>>& entries) {
         for (const auto& entry : entries) Append(entry);
     }
+    // Publish a replicated batch and its newly learned commit boundary as one
+    // storage update when the backend supports it. The default preserves the
+    // existing append-then-commit behavior.
+    virtual void AppendBatchAndCommit(
+            const std::vector<TMessageHolder<TLogEntry>>& entries, uint64_t commitIndex) {
+        if (LastLogIndex > uint64_t(INT64_MAX) ||
+            entries.size() > uint64_t(INT64_MAX) - LastLogIndex ||
+            commitIndex < CommitIndex ||
+            commitIndex > LastLogIndex + entries.size())
+            throw std::logic_error("Invalid batched Raft commit boundary");
+        AppendBatch(entries);
+        if (CommitIndex < commitIndex) {
+            CommitIndex = commitIndex;
+            Commit();
+        }
+    }
     // Absolute indices; only the suffix after SnapshotIndex has log entries.
     // The boundary term remains available through LogTerm(SnapshotIndex).
     virtual TMessageHolder<TLogEntry> Get(int64_t index) const = 0;

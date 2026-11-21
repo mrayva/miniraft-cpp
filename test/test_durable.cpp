@@ -349,7 +349,7 @@ void test_follower_persists_commit_before_ack_and_recovers_it(void**) {
         assert_int_equal(state->CommitIndex, 1);
         assert_int_equal(peer->Sent.size(), 1);
         assert_true(peer->Sent.back().Cast<TAppendEntriesResponse>()->Success);
-        assert_true((events == std::vector<std::string>{"durable", "durable", "ack"}));
+        assert_true((events == std::vector<std::string>{"durable", "ack"}));
     }
     TDurableState recovered(files.Name, 1);
     assert_int_equal(recovered.CommitIndex, 1);
@@ -374,7 +374,7 @@ void test_follower_batches_durable_append_before_ack(void**) {
         events.clear();
 
         auto request = NewHoldedMessage(TMessageEx{.Src = 2, .Dst = 1, .Term = 1},
-            TAppendEntriesRequest{.PrevLogIndex = 0, .PrevLogTerm = 0, .LeaderCommit = 0,
+            TAppendEntriesRequest{.PrevLogIndex = 0, .PrevLogTerm = 0, .LeaderCommit = 2,
                                   .LeaderId = 2, .Nentries = 3});
         request.InitPayload(3);
         request.Payload[0] = Entry(1, "first");
@@ -383,6 +383,7 @@ void test_follower_batches_durable_append_before_ack(void**) {
         raft.Process(ITimeSource::Time{}, request);
 
         assert_int_equal(state->LastLogIndex, 3);
+        assert_int_equal(state->CommitIndex, 2);
         assert_int_equal(peer->Sent.size(), 1);
         const auto response = peer->Sent.back().Cast<TAppendEntriesResponse>();
         assert_true(response->Success);
@@ -392,6 +393,7 @@ void test_follower_batches_durable_append_before_ack(void**) {
 
     TDurableState recovered(files.Name, 1);
     assert_int_equal(recovered.LastLogIndex, 3);
+    assert_int_equal(recovered.CommitIndex, 2);
     assert_string_equal(Data(recovered, 1).c_str(), "first");
     assert_string_equal(Data(recovered, 2).c_str(), "second");
     assert_string_equal(Data(recovered, 3).c_str(), "third");

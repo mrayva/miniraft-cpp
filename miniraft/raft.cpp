@@ -1362,10 +1362,16 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             }
 
             if (!appendBatch.empty()) {
-                State->AppendBatch(appendBatch);
+                const auto batchCommitIndex = std::max({commitIndex, State->CommitIndex,
+                    std::min(message->LeaderCommit, index)});
+                State->AppendBatchAndCommit(appendBatch, batchCommitIndex);
+                PruneCommittedLogUsage(batchCommitIndex);
                 const auto firstAppendedIndex = State->LastLogIndex - appendBatch.size() + 1;
-                for (size_t i = 0; i < appendBatch.size(); ++i)
-                    RecordUncommittedLogEntry(firstAppendedIndex + i, appendBatch[i]->Len);
+                for (size_t i = 0; i < appendBatch.size(); ++i) {
+                    const auto appendedIndex = firstAppendedIndex + i;
+                    if (appendedIndex > batchCommitIndex)
+                        RecordUncommittedLogEntry(appendedIndex, appendBatch[i]->Len);
+                }
             }
 
             matchIndex = index;
