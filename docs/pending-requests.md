@@ -89,8 +89,10 @@ commands still apply even if their client disconnected or their leader changed.
 An error can therefore mean UNKNOWN OUTCOME: the write may already have
 committed. It is not a rollback indication and must not trigger a blind retry of
 a non-idempotent operation. Request IDs and replicated deduplication are not
-implemented. The KV, SQL and debug clients now display errors rather than
-printing a successful commit for nonzero ErrorCode responses.
+implemented; the planned opt-in protocol and recovery contract are described
+in [durable client write deduplication](client-idempotency-design.md). The KV,
+SQL and debug clients now display errors rather than printing a successful
+commit for nonzero ErrorCode responses.
 
 CleanUp removes a disconnected endpoint from ordinary, strong-read and
 leader-wait queues, plus forwarded-request routing. Disconnect cleanup sends no
