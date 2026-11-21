@@ -909,6 +909,59 @@ void test_joint_configuration_readiness_reports_log_and_index_capacity(void**) {
     std::filesystem::remove_all(dir, ignored);
 #endif
 }
+void test_compaction_membership_readiness_reports_acknowledgement_blockers(void**) {
+#ifdef __linux__
+    const std::vector<uint32_t> originalVoters{1, 2, 3};
+    const std::vector<uint32_t> activeVoters{1, 2};
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-compaction-readiness-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    {
+        auto state = std::make_shared<TDurableState>((dir / "raft").string(), 1);
+        state->BindVoters(originalVoters);
+        state->Commit();
+        state->CurrentTerm = 2;
+        state->Append(Ordinary(1));
+        state->Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Joint, 1, 0, 0, originalVoters, activeVoters}));
+        state->Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Stable, 1, 2, 1, originalVoters, activeVoters}));
+        state->CommitIndex = state->LastLogIndex;
+        state->Commit();
+
+        TNodeDict peers{{2, std::make_shared<TEndpoint>()}, {3, std::make_shared<TEndpoint>()}};
+        TRaft raft(state, 1, peers);
+        raft.Become(EState::LEADER);
+        auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
+        volatileState->CommitAckIndex[2] = 2;
+
+        auto readiness = raft.CheckCompactionMembershipReadiness();
+        assert_int_equal(readiness.ConfigurationIndex, 3);
+        assert_true(readiness.IsLeader);
+        assert_true(readiness.IsActiveVoter);
+        assert_false(readiness.RequiresLeaderAcknowledgementBarrier);
+        assert_true(readiness.ActiveVotersWithoutConfigurationAck == (std::vector<uint32_t>{2}));
+        assert_false(readiness.Ready());
+
+        volatileState->CommitAckIndex[2] = 3;
+        readiness = raft.CheckCompactionMembershipReadiness();
+        assert_true(readiness.ActiveVotersWithoutConfigurationAck.empty());
+        assert_true(readiness.Ready());
+
+        raft.Become(EState::FOLLOWER);
+        readiness = raft.CheckCompactionMembershipReadiness();
+        assert_true(readiness.RequiresLeaderAcknowledgementBarrier);
+        assert_false(readiness.HasLeaderAcknowledgementBarrier);
+        assert_false(readiness.Ready());
+        volatileState->CompactionSafeConfigurationIndex = 3;
+        readiness = raft.CheckCompactionMembershipReadiness();
+        assert_true(readiness.HasLeaderAcknowledgementBarrier);
+        assert_true(readiness.Ready());
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
 void test_new_voter_requires_snapshot_install_capability(void**) {
 #ifdef __linux__
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-readiness-snapshot-" +
@@ -5002,6 +5055,7 @@ int main() {
         cmocka_unit_test(test_configuration_rpc_and_proposal_are_rejected_before_mutation),
         cmocka_unit_test(test_follower_can_register_future_voter_endpoint_before_joint_entry),
         cmocka_unit_test(test_joint_configuration_readiness_reports_log_and_index_capacity),
+        cmocka_unit_test(test_compaction_membership_readiness_reports_acknowledgement_blockers),
         cmocka_unit_test(test_new_voter_requires_snapshot_install_capability),
         cmocka_unit_test(test_existing_voter_must_advertise_joint_consensus_support),
         cmocka_unit_test(test_versioned_disk_state_can_start_voter_removal),

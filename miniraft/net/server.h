@@ -515,6 +515,10 @@ public:
         const std::vector<uint32_t>& newVoters) const {
         return Raft->CheckJointConfigurationReadiness(newVoters);
     }
+    // Calls must be serialized with the poller loop and Raft work.
+    TCompactionMembershipReadiness CheckCompactionMembershipReadiness() const {
+        return Raft->CheckCompactionMembershipReadiness();
+    }
 
 private:
     NNet::TVoidTask InboundServe();

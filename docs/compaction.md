@@ -111,6 +111,14 @@ its persisted original voter binding; it rejoins as a learner and must be
 explicitly promoted again. This does not permit compaction while the node is
 still an active voter.
 
+`TRaft::CheckCompactionMembershipReadiness()` reports the active voter IDs that
+still need to acknowledge the committed configuration on a leader. On a
+follower, it reports whether the leader's all-voter acknowledgement barrier has
+arrived. This point-in-time result covers only the membership guard; a ready
+result does not guarantee that storage or the application can create and
+validate the snapshot. Serialize the check with Raft work, as with
+`CompactShared()`.
+
 ## Transfer protocol
 
 The previously reserved message types 6/7 now carry InstallSnapshot requests and

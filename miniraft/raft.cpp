@@ -2531,6 +2531,31 @@ TConfigurationScan TRaft::GetConfigurationState() const {
     return *Configuration;
 }
 
+TCompactionMembershipReadiness TRaft::CheckCompactionMembershipReadiness() const {
+    TCompactionMembershipReadiness readiness;
+    readiness.IsLeader = StateName == EState::LEADER;
+    readiness.IsActiveVoter = IsVoter(Id);
+    if (!Configuration || !readiness.IsActiveVoter) return readiness;
+
+    readiness.ConfigurationIndex = Configuration->Committed.ConfigurationIndex();
+    if (!readiness.ConfigurationIndex) return readiness;
+
+    if (readiness.IsLeader) {
+        for (auto voter : Voters) {
+            if (voter == Id) continue;
+            const auto ack = VolatileState->CommitAckIndex.find(voter);
+            if (ack == VolatileState->CommitAckIndex.end() ||
+                ack->second < readiness.ConfigurationIndex)
+                readiness.ActiveVotersWithoutConfigurationAck.push_back(voter);
+        }
+    } else {
+        readiness.RequiresLeaderAcknowledgementBarrier = true;
+        readiness.HasLeaderAcknowledgementBarrier =
+            VolatileState->CompactionSafeConfigurationIndex >= readiness.ConfigurationIndex;
+    }
+    return readiness;
+}
+
 bool TRaft::IsVoter(uint32_t id) const { return std::binary_search(Voters.begin(), Voters.end(), id); }
 
 void TRaft::AddLearnerTarget(uint32_t id, std::shared_ptr<INode> node) {
@@ -2620,19 +2645,12 @@ std::shared_ptr<const TSnapshot> TRaft::CompactShared() {
                 throw std::logic_error("Compaction is unsafe while an active voter lacks snapshot-install support");
         }
     }
-    if (Configuration && Configuration->Committed.ConfigurationIndex()) {
-        const auto configurationIndex = Configuration->Committed.ConfigurationIndex();
-        if (IsVoter(Id) && StateName == EState::LEADER) {
-            for (auto voter : Voters) {
-                if (voter == Id) continue;
-                const auto ack = VolatileState->CommitAckIndex.find(voter);
-                if (ack == VolatileState->CommitAckIndex.end() || ack->second < configurationIndex)
-                    throw std::logic_error("Compaction requires every active voter to acknowledge the committed configuration");
-            }
-        } else if (IsVoter(Id) && VolatileState->CompactionSafeConfigurationIndex < configurationIndex) {
-            throw std::logic_error("Compaction requires the leader's all-voter configuration acknowledgement barrier");
-        }
-    }
+    const auto membershipReadiness = CheckCompactionMembershipReadiness();
+    if (!membershipReadiness.ActiveVotersWithoutConfigurationAck.empty())
+        throw std::logic_error("Compaction requires every active voter to acknowledge the committed configuration");
+    if (membershipReadiness.RequiresLeaderAcknowledgementBarrier &&
+        !membershipReadiness.HasLeaderAcknowledgementBarrier)
+        throw std::logic_error("Compaction requires the leader's all-voter configuration acknowledgement barrier");
     auto application = SnapshotApplication.lock();
     if (!application) throw std::logic_error("Compaction requires a bound application");
     if (application->LastAppliedIndex == State->SnapshotIndex && State->GetSnapshot()) return State->GetSnapshot();

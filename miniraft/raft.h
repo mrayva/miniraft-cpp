@@ -92,6 +92,25 @@ struct TJointConfigurationReadiness {
     }
 };
 
+// Reports only the membership acknowledgement barrier used by CompactShared.
+// A ready result does not guarantee that storage or the application can create
+// and validate a snapshot.
+struct TCompactionMembershipReadiness {
+    // Zero means the committed configuration does not require this barrier.
+    uint64_t ConfigurationIndex = 0;
+    bool IsLeader = false;
+    bool IsActiveVoter = false;
+    bool RequiresLeaderAcknowledgementBarrier = false;
+    bool HasLeaderAcknowledgementBarrier = false;
+    // Populated on leaders with active voters still behind the committed config.
+    std::vector<uint32_t> ActiveVotersWithoutConfigurationAck;
+
+    bool Ready() const {
+        return ActiveVotersWithoutConfigurationAck.empty() &&
+            (!RequiresLeaderAcknowledgementBarrier || HasLeaderAcknowledgementBarrier);
+    }
+};
+
 class TRaftLogCapacityExceeded : public std::runtime_error {
 public:
     TRaftLogCapacityExceeded() : std::runtime_error("Uncommitted Raft log capacity exceeded") {}
@@ -259,6 +278,9 @@ public:
     // Snapshot of validated committed and latest log configurations. This
     // distinguishes the active joint quorum from an uncommitted transition.
     TConfigurationScan GetConfigurationState() const;
+    // Point-in-time report of the membership-specific compaction barrier.
+    // Serialize this call with Raft work, like CompactShared().
+    TCompactionMembershipReadiness CheckCompactionMembershipReadiness() const;
     std::vector<uint32_t> GetLearnerIds() const { return Learners; }
     bool IsVoter(uint32_t id) const;
     // Leader-only, point-in-time log catch-up; not permission to promote.
