@@ -71,16 +71,20 @@ completeness of `voters` still require independent records.
 New `TDiskState` metadata versions persist a CRC-protected commit boundary and
 original voter binding, so fresh split-format stores can use live membership.
 For a recovered old 20-byte metadata store, call
-`TDiskState::ValidateTrustedLegacyVoterBaseline(voters, commitIndex)` before
-constructing Raft. It requires an independently verified voter set and commit
-index, checks the stored vote and term/log bounds, and refuses compacted state
-or any retained configuration entry. A successful call atomically writes the
-new metadata before startup. Recovered unbound state otherwise fails Raft
-startup. For retained membership entries or a compacted snapshot, use the
-full-history offline `--bind-disk-state` path below. Split `TDiskState` supports
-snapshot installation and compaction with versioned metadata. The separate
-Linux [offline converter](legacy-disk-state-migration.md) remains the path to
-move a split-format store to `TDurableState`.
+`TDiskState::CanBindVotersFromTrustedBaseline(voters, commitIndex, &reason)` to
+preflight a simple baseline, then call
+`TDiskState::BindVotersFromTrustedBaseline(voters, commitIndex)` before
+constructing Raft. These methods require an independently verified voter set
+and commit index, check the stored vote and term/log bounds, and refuse
+compacted state or any retained configuration entry. Binding atomically writes
+the new metadata before startup. The older
+`ValidateTrustedLegacyVoterBaseline` name remains as a mutating compatibility
+wrapper. Recovered unbound state otherwise fails Raft startup. For retained
+membership entries or a compacted snapshot, use the full-history offline
+`--bind-disk-state` path below. Split `TDiskState` supports snapshot installation
+and compaction with versioned metadata. The separate Linux [offline
+converter](legacy-disk-state-migration.md) remains the path to move a split-format
+store to `TDurableState`.
 
 Tests cover MRFTD001, MRFTD002 and MRFTD003 recovery, rejection of inconsistent
 vote/snapshot baselines and unanchored configuration history without rewriting

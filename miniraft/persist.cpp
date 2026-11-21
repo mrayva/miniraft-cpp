@@ -1057,8 +1057,8 @@ void TDiskState::BindVoters(const std::vector<uint32_t>& voters) {
     Commit();
 }
 
-void TDiskState::ValidateTrustedLegacyVoterBaseline(const std::vector<uint32_t>& voters,
-        uint64_t commitIndex) {
+void TDiskState::CheckTrustedLegacyVoterBaseline(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex) const {
     ValidateFixedVoters(voters);
     if (RaftStarted)
         throw std::invalid_argument("Trusted legacy voter migration must happen before Raft startup");
@@ -1081,10 +1081,36 @@ void TDiskState::ValidateTrustedLegacyVoterBaseline(const std::vector<uint32_t>&
         if (entry->Flags & TLogEntry::EConfiguration)
             throw std::invalid_argument("Legacy disk voter binding requires a log without configuration entries");
     }
+}
+
+bool TDiskState::CanBindVotersFromTrustedBaseline(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex, std::string* reason) const {
+    if (reason) reason->clear();
+    try {
+        CheckTrustedLegacyVoterBaseline(voters, commitIndex);
+        return true;
+    } catch (const std::exception& error) {
+        if (reason) *reason = error.what();
+        return false;
+    } catch (...) {
+        if (reason) *reason = "Unknown trusted legacy voter baseline validation failure";
+        return false;
+    }
+}
+
+void TDiskState::BindVotersFromTrustedBaseline(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex) {
+    CheckTrustedLegacyVoterBaseline(voters, commitIndex);
+    if (Voters == voters) return;
     Voters = voters;
     CommitIndex = commitIndex;
     CommitIndexTrusted = true;
     Commit();
+}
+
+void TDiskState::ValidateTrustedLegacyVoterBaseline(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex) {
+    BindVotersFromTrustedBaseline(voters, commitIndex);
 }
 
 void TDiskState::ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t>& voters,

@@ -302,7 +302,26 @@ void test_versioned_metadata_persists_commit_and_voter_baseline(void**) {
         try { state.BindVoters({1, 2, 3}); }
         catch (const std::exception&) { directBindRejected = true; }
         assert_true(directBindRejected);
-        state.ValidateTrustedLegacyVoterBaseline({1, 2, 3}, 1);
+        const auto beforePreflight = static_cast<TStateFields>(state);
+        std::ifstream metadataBeforeInput(files.Path("state"), std::ios::binary);
+        const std::string metadataBefore(std::istreambuf_iterator<char>(metadataBeforeInput), {});
+        std::string reason = "stale diagnostic";
+        assert_false(state.CanBindVotersFromTrustedBaseline({1, 3}, 1, &reason));
+        assert_true(!reason.empty());
+        assert_true(static_cast<TStateFields>(state) == beforePreflight);
+        assert_true(state.GetBoundVoters().empty());
+        std::ifstream metadataAfterRejectedInput(files.Path("state"), std::ios::binary);
+        assert_true(std::string(std::istreambuf_iterator<char>(metadataAfterRejectedInput), {}) == metadataBefore);
+
+        reason = "stale diagnostic";
+        assert_true(state.CanBindVotersFromTrustedBaseline({1, 2, 3}, 1, &reason));
+        assert_true(reason.empty());
+        assert_true(static_cast<TStateFields>(state) == beforePreflight);
+        assert_true(state.GetBoundVoters().empty());
+        std::ifstream metadataAfterPreflightInput(files.Path("state"), std::ios::binary);
+        assert_true(std::string(std::istreambuf_iterator<char>(metadataAfterPreflightInput), {}) == metadataBefore);
+
+        state.BindVotersFromTrustedBaseline({1, 2, 3}, 1);
         assert_int_equal(state.CommitIndex, 1);
         assert_true(state.GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
         assert_false(state.HasUnboundRecoveredState());
@@ -333,10 +352,9 @@ void test_versioned_metadata_persists_commit_and_voter_baseline(void**) {
     }
     {
         TDiskState state(configured.Name, 1);
-        bool configurationHistoryRejected = false;
-        try { state.ValidateTrustedLegacyVoterBaseline({1, 2}, 0); }
-        catch (const std::invalid_argument&) { configurationHistoryRejected = true; }
-        assert_true(configurationHistoryRejected);
+        std::string reason;
+        assert_false(state.CanBindVotersFromTrustedBaseline({1, 2}, 0, &reason));
+        assert_true(reason.find("configuration entries") != std::string::npos);
         assert_true(state.GetBoundVoters().empty());
     }
 }

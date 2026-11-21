@@ -49,9 +49,15 @@ struct TDiskState : IState {
     bool HasUnboundRecoveredState() const override;
     std::vector<uint32_t> GetBoundVoters() const override;
     void BindVoters(const std::vector<uint32_t>& voters) override;
-    // Recovered split-format stores have no saved commit boundary or voter
-    // binding. This startup-only path requires a trusted operator baseline and
-    // rejects logs that already contain configuration entries.
+    // Read-only preflight for a recovered split-format store with no saved
+    // commit boundary or voter binding. This simple baseline path rejects
+    // compacted state and logs that already contain configuration entries.
+    bool CanBindVotersFromTrustedBaseline(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex, std::string* reason = nullptr) const;
+    void BindVotersFromTrustedBaseline(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex);
+    // Compatibility spelling retained for callers that used this mutating
+    // operation. New code should call CanBind... and Bind... explicitly.
     void ValidateTrustedLegacyVoterBaseline(const std::vector<uint32_t>& voters,
         uint64_t commitIndex);
     // Full-history variant for operators migrating recovered stores that have
@@ -65,6 +71,8 @@ struct TDiskState : IState {
     void MarkRaftStarted() override { RaftStarted = true; }
 
 private:
+    void CheckTrustedLegacyVoterBaseline(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex) const;
     void ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t>& voters,
         uint64_t commitIndex) const;
     void ValidateStoredVoteMembershipHistory() const;
