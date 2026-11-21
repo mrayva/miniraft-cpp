@@ -204,7 +204,7 @@ TConfigurationHistory TConfigurationHistory::Observe(uint64_t index, TMessageHol
 }
 
 TConfigurationHistory TConfigurationHistory::ObserveMetadata(uint64_t index, uint64_t term, uint64_t flags) const {
-    if ((flags & TLogEntry::EConfiguration) || !term ||
+    if ((flags != TLogEntry::ENone && flags != TLogEntry::EStub) || !term ||
         Through >= uint64_t(INT64_MAX) || index != Through + 1 || term < ThroughLogTerm)
         throw std::invalid_argument("Ordinary entry does not extend the trusted history");
     TConfigurationHistory next = *this;

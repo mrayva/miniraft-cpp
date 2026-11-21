@@ -581,6 +581,14 @@ void test_scan_separates_commit_and_replaced_suffix(void**) {
     Reject([&] { ScanConfigurationHistory(state, base, 1); });
     Reject([&] { base.ObserveMetadata(1, 1, TLogEntry::EConfiguration); });
     Reject([&] { base.ObserveMetadata(2, 1, 0); });
+    assert_int_equal(base.ObserveMetadata(1, 1, TLogEntry::EStub).ThroughIndex(), 1);
+
+    TState unknownFlags;
+    unknownFlags.CurrentTerm = 2;
+    auto unknown = Ordinary(1);
+    unknown->Flags = uint64_t(1) << 40;
+    unknownFlags.Append(std::move(unknown));
+    Reject([&] { ScanConfigurationHistory(unknownFlags, base, 0); });
 }
 void test_scan_from_joint_snapshot_and_rejects_mismatched_baselines(void**) {
     TSnapshot snapshot{2, 2, {1, 2}, "image"};
