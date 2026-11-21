@@ -602,8 +602,8 @@ public:
 
     void CheckStateChange();
     void OnCommandRequest(TMessageHolder<TCommandRequest> message, const std::shared_ptr<INode>& replyTo);
-    // The opt-in durable request protocol is parsed but remains fail-closed
-    // until the RSM can persist deduplication records with application state.
+    // Direct idempotent writes are accepted by the current leader when the RSM
+    // and all replication targets support the durable deduplication contract.
     void OnIdempotentCommandRequest(TMessageHolder<TIdempotentCommandRequest> message,
                                     const std::shared_ptr<INode>& replyTo);
     void OnForwardedCommandRequest(TMessageHolder<TForwardedCommandRequest> message,
@@ -631,8 +631,10 @@ private:
     friend struct TRequestProcessorTestAccess;
     bool TryAdmit(const TMessageHolder<TCommandRequest>& message, const std::shared_ptr<INode>& replyTo,
                   uint64_t& admissionId);
+    bool TryAdmit(uint64_t bytes, const std::shared_ptr<INode>& replyTo, uint64_t& admissionId);
     bool AdmissionExpired(uint64_t admissionId, ITimeSource::Time now) const;
     void ReleaseAdmission(uint64_t admissionId) noexcept;
+    void ReleaseIdempotentPending(uint64_t index) noexcept;
     void EraseWriteAnswer(uint64_t index) noexcept;
     void DispatchCommandRequest(TMessageHolder<TCommandRequest> message,
                                 const std::shared_ptr<INode>& replyTo, uint64_t admissionId);
@@ -678,6 +680,15 @@ private:
     // and term. An overwritten index must never redeem an older request.
     std::unordered_map<uint64_t, uint64_t> PendingWriteTerms;
     std::unordered_map<uint64_t, TAnswer> WriteAnswers;
+    struct TIdempotentPending {
+        uint64_t Term = 0;
+        TIdempotentOperationIdentity Identity;
+        uint32_t Cookie = 0;
+        std::shared_ptr<INode> ReplyTo;
+        uint64_t AdmissionId = 0;
+        uint64_t ReservedReplyBytes = 0;
+    };
+    std::unordered_map<uint64_t, TIdempotentPending> PendingIdempotentWrites;
     uint64_t RequestsTerm = 0;
     EState RequestsState = EState::NONE;
     uint32_t RequestsLeaderId = 0;

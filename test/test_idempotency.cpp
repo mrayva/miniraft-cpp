@@ -82,8 +82,11 @@ struct TSnapshotRsm : IIdempotentRsm {
     uint64_t CachedResponseDataUpperBound(
             TMessageHolder<TIdempotentCommandRequest>) const override { return ResponseBound; }
     TMessageHolder<TLogEntry> PrepareIdempotent(
-            TMessageHolder<TIdempotentCommandRequest>) override {
-        return NewHoldedMessage<TLogEntry>();
+            TMessageHolder<TIdempotentCommandRequest> request) override {
+        const auto payloadBytes = request->Len - sizeof(TIdempotentCommandRequest);
+        auto entry = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + payloadBytes);
+        if (payloadBytes) memcpy(entry->Data, request->Data, payloadBytes);
+        return entry;
     }
     TIdempotentWriteResult WriteIdempotent(TMessageHolder<TLogEntry> command, uint64_t index,
             const TIdempotentOperationIdentity& identity) override {
@@ -117,6 +120,11 @@ struct TIdempotencyPeer : INode {
     std::vector<TMessageHolder<TMessage>> Sent;
     void Send(TMessageHolder<TMessage> message) override { Sent.push_back(std::move(message)); }
     void Drain() override { }
+};
+
+struct TIdempotencyManualTimeSource : ITimeSource {
+    Time Value{};
+    Time Now() override { return Value; }
 };
 
 void test_idempotency_snapshot_roundtrip_preserves_dedup_state(void**) {
@@ -254,6 +262,109 @@ void test_committed_idempotent_log_replay_uses_identity_and_application_entry(vo
     assert_int_equal(rsm->State.LastAppliedIndex, 2);
 }
 
+void test_idempotent_request_is_proposed_and_replied_after_application(void**) {
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 1;
+    state->BindVoters({1});
+    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+    auto rsm = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor processor(raft, rsm, {});
+    auto client = std::make_shared<TIdempotencyPeer>();
+    raft->Become(EState::LEADER);
+
+    auto request = NewHoldedMessage<TIdempotentCommandRequest>(
+        sizeof(TIdempotentCommandRequest) + 4);
+    request->Epoch = 3;
+    request->SessionIdHigh = 4;
+    request->SessionIdLow = 5;
+    request->Sequence = 6;
+    request->Cookie = 7;
+    memcpy(request->Data, "work", 4);
+    processor.OnIdempotentCommandRequest(request, client);
+
+    assert_int_equal(state->LastLogIndex, 1);
+    assert_int_equal(state->Get(1)->Flags, TLogEntry::EIdempotent);
+    assert_true(client->Sent.empty());
+
+    auto* volatileState = const_cast<TVolatileState*>(raft->GetVolatileState());
+    volatileState->CommitIndex = 1;
+    processor.ProcessCommitted();
+
+    assert_int_equal(client->Sent.size(), 1);
+    auto response = client->Sent.back().Cast<TIdempotentCommandResponse>();
+    ValidateIdempotentCommandResponse(response);
+    assert_int_equal(response->Index, 1);
+    assert_int_equal(response->Epoch, request->Epoch);
+    assert_int_equal(response->SessionIdHigh, request->SessionIdHigh);
+    assert_int_equal(response->SessionIdLow, request->SessionIdLow);
+    assert_int_equal(response->Sequence, request->Sequence);
+    assert_int_equal(response->Cookie, request->Cookie);
+    assert_int_equal(response->ErrorCode, TCommandResponse::Success);
+    assert_true(std::string(response->Data, response->Len - sizeof(TIdempotentCommandResponse)) == "applied");
+    assert_int_equal(rsm->IdempotentWrites, 1);
+    assert_true(rsm->LastAppliedCommand == "work");
+    assert_true(rsm->LastIdentity.PayloadDigest == ComputeIdempotentPayloadDigest("work"));
+}
+
+void test_idempotent_request_without_idempotent_rsm_is_rejected(void**) {
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 1;
+    state->BindVoters({1});
+    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+    auto rsm = std::make_shared<TDummyRsm>();
+    TRequestProcessor processor(raft, rsm, {});
+    auto client = std::make_shared<TIdempotencyPeer>();
+
+    auto request = NewHoldedMessage<TIdempotentCommandRequest>(
+        sizeof(TIdempotentCommandRequest) + 1);
+    request->Epoch = 1;
+    request->SessionIdLow = 1;
+    request->Sequence = 1;
+    request->Data[0] = 'x';
+    processor.OnIdempotentCommandRequest(request, client);
+
+    assert_int_equal(state->LastLogIndex, 0);
+    assert_int_equal(client->Sent.size(), 1);
+    const auto response = client->Sent.back().Cast<TIdempotentCommandResponse>();
+    assert_int_equal(response->ErrorCode, TCommandResponse::Unsupported);
+}
+
+void test_idempotent_request_timeout_releases_reply_but_keeps_log_entry(void**) {
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 1;
+    state->BindVoters({1});
+    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+    auto rsm = std::make_shared<TSnapshotRsm>();
+    auto timeSource = std::make_shared<TIdempotencyManualTimeSource>();
+    TRequestProcessor::TAdmissionLimits limits;
+    limits.RequestTimeout = std::chrono::milliseconds(5);
+    TRequestProcessor processor(raft, rsm, {}, limits, timeSource);
+    auto client = std::make_shared<TIdempotencyPeer>();
+    raft->Become(EState::LEADER);
+
+    auto request = NewHoldedMessage<TIdempotentCommandRequest>(
+        sizeof(TIdempotentCommandRequest) + 1);
+    request->Epoch = 1;
+    request->SessionIdLow = 1;
+    request->Sequence = 1;
+    request->Data[0] = 'x';
+    processor.OnIdempotentCommandRequest(request, client);
+    assert_int_equal(state->LastLogIndex, 1);
+    assert_true(client->Sent.empty());
+
+    timeSource->Value += std::chrono::milliseconds(6);
+    processor.ProcessWaiting();
+    assert_int_equal(client->Sent.size(), 1);
+    const auto timeout = client->Sent.back().Cast<TIdempotentCommandResponse>();
+    assert_int_equal(timeout->ErrorCode, TCommandResponse::TimedOut);
+
+    const_cast<TVolatileState*>(raft->GetVolatileState())->CommitIndex = 1;
+    processor.ProcessCommitted();
+    assert_int_equal(rsm->LastAppliedIndex, 1);
+    assert_int_equal(rsm->IdempotentWrites, 1);
+    assert_int_equal(client->Sent.size(), 1);
+}
+
 void test_idempotent_log_requires_every_member_capability_including_joint_additions(void**) {
     auto state = std::make_shared<TState>();
     state->CurrentTerm = 1;
@@ -370,6 +481,9 @@ int main() {
         cmocka_unit_test(test_idempotent_payload_digest_matches_sha256_vectors),
         cmocka_unit_test(test_idempotent_log_record_roundtrip_and_rejects_corruption),
         cmocka_unit_test(test_committed_idempotent_log_replay_uses_identity_and_application_entry),
+        cmocka_unit_test(test_idempotent_request_is_proposed_and_replied_after_application),
+        cmocka_unit_test(test_idempotent_request_without_idempotent_rsm_is_rejected),
+        cmocka_unit_test(test_idempotent_request_timeout_releases_reply_but_keeps_log_entry),
         cmocka_unit_test(test_idempotent_log_requires_every_member_capability_including_joint_additions),
         cmocka_unit_test(test_rsm_without_idempotency_rejects_tagged_append_entries),
         cmocka_unit_test(test_idempotent_rsm_snapshot_hook_validates_before_atomic_restore),

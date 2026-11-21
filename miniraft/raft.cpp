@@ -29,6 +29,26 @@ uint64_t AllocateForwardingSession() {
     throw std::overflow_error("Forwarding session IDs exhausted");
 }
 
+TMessageHolder<TIdempotentCommandResponse> MakeIdempotentResponse(
+        const TIdempotentOperationIdentity& identity, uint32_t cookie, uint64_t index,
+        uint32_t errorCode, std::string_view data = {}) {
+    const auto maxDataBytes = std::min<uint64_t>(TMessageLimits{}.MaxFrameBytes,
+        UINT32_MAX) - sizeof(TIdempotentCommandResponse);
+    if (data.size() > maxDataBytes)
+        throw TMessageError("Idempotent response exceeds the frame limit");
+    auto response = NewHoldedMessage<TIdempotentCommandResponse>(
+        sizeof(TIdempotentCommandResponse) + data.size());
+    response->Index = index;
+    response->Epoch = identity.Epoch;
+    response->SessionIdHigh = identity.SessionIdHigh;
+    response->SessionIdLow = identity.SessionIdLow;
+    response->Sequence = identity.Sequence;
+    response->Cookie = cookie;
+    response->ErrorCode = errorCode;
+    if (!data.empty()) memcpy(response->Data, data.data(), data.size());
+    return response;
+}
+
 class TForwardedCommandReplyNode final : public INode {
 public:
     TForwardedCommandReplyNode(std::shared_ptr<INode> peer, uint64_t forwardCookie,
@@ -3476,9 +3496,13 @@ TRequestProcessor::TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_pt
 
 bool TRequestProcessor::TryAdmit(const TMessageHolder<TCommandRequest>& message,
         const std::shared_ptr<INode>& replyTo, uint64_t& admissionId) {
+    return TryAdmit(message->Len, replyTo, admissionId);
+}
+
+bool TRequestProcessor::TryAdmit(uint64_t bytes, const std::shared_ptr<INode>& replyTo,
+        uint64_t& admissionId) {
     admissionId = 0;
     if (!replyTo) return true;
-    const uint64_t bytes = message->Len;
     if (Admissions.size() >= AdmissionLimits.MaxPendingRequests ||
         PendingRequestBytes > AdmissionLimits.MaxPendingRequestBytes ||
         bytes > AdmissionLimits.MaxPendingRequestBytes - PendingRequestBytes)
@@ -3513,6 +3537,15 @@ void TRequestProcessor::ReleaseAdmission(uint64_t admissionId) noexcept {
     if (it->second.Bytes > PendingRequestBytes) std::terminate();
     PendingRequestBytes -= it->second.Bytes;
     Admissions.erase(it);
+}
+
+void TRequestProcessor::ReleaseIdempotentPending(uint64_t index) noexcept {
+    auto it = PendingIdempotentWrites.find(index);
+    if (it == PendingIdempotentWrites.end()) return;
+    if (it->second.ReservedReplyBytes > PendingReplyBytes) std::terminate();
+    PendingReplyBytes -= it->second.ReservedReplyBytes;
+    ReleaseAdmission(it->second.AdmissionId);
+    PendingIdempotentWrites.erase(it);
 }
 
 void TRequestProcessor::EraseWriteAnswer(uint64_t index) noexcept {
@@ -3702,6 +3735,12 @@ void TRequestProcessor::PruneRequests(const std::shared_ptr<INode>& disconnected
         RequestsLeaderId = leaderId;
     }
     std::vector<std::pair<std::shared_ptr<INode>, uint32_t>> rejected;
+    struct TRejectedIdempotent {
+        std::shared_ptr<INode> ReplyTo;
+        TIdempotentOperationIdentity Identity;
+        uint32_t Cookie;
+    };
+    std::vector<TRejectedIdempotent> rejectedIdempotent;
     for (auto* queue : {&Waiting, &StrongWaiting, &WaitingStateChange}) {
         std::queue<TWaiting> retained;
         while (!queue->empty()) {
@@ -3723,10 +3762,25 @@ void TRequestProcessor::PruneRequests(const std::shared_ptr<INode>& disconnected
         }
         queue->swap(retained);
     }
+    for (auto it = PendingIdempotentWrites.begin(); it != PendingIdempotentWrites.end();) {
+        const bool remove = disconnected ? it->second.ReplyTo == disconnected :
+            it->second.Term != 0 && (!leader || it->second.Term != term);
+        if (!remove) { ++it; continue; }
+        auto pending = std::move(it->second);
+        it = PendingIdempotentWrites.erase(it);
+        if (pending.ReservedReplyBytes > PendingReplyBytes) std::terminate();
+        PendingReplyBytes -= pending.ReservedReplyBytes;
+        ReleaseAdmission(pending.AdmissionId);
+        if (!disconnected && pending.ReplyTo)
+            rejectedIdempotent.push_back({pending.ReplyTo, pending.Identity, pending.Cookie});
+    }
     CancelForwarded(disconnected);
     for (auto& [replyTo, cookie] : rejected)
         replyTo->Send(NewHoldedMessage(TCommandResponse{
             .Cookie = cookie, .ErrorCode = TCommandResponse::Failed}));
+    for (auto& pending : rejectedIdempotent)
+        pending.ReplyTo->Send(MakeIdempotentResponse(pending.Identity, pending.Cookie,
+            0, TCommandResponse::Failed));
 }
 
 void TRequestProcessor::ExpireRequests(ITimeSource::Time now,
@@ -3737,6 +3791,12 @@ void TRequestProcessor::ExpireRequests(ITimeSource::Time now,
     if (expired.empty()) return;
 
     std::vector<std::pair<std::shared_ptr<INode>, uint32_t>> rejected;
+    struct TExpiredIdempotent {
+        std::shared_ptr<INode> ReplyTo;
+        TIdempotentOperationIdentity Identity;
+        uint32_t Cookie;
+    };
+    std::vector<TExpiredIdempotent> rejectedIdempotent;
     for (auto* queue : {&Waiting, &StrongWaiting, &WaitingStateChange}) {
         std::queue<TWaiting> retained;
         while (!queue->empty()) {
@@ -3756,6 +3816,16 @@ void TRequestProcessor::ExpireRequests(ITimeSource::Time now,
         queue->swap(retained);
     }
 
+    for (auto it = PendingIdempotentWrites.begin(); it != PendingIdempotentWrites.end();) {
+        if (!expired.contains(it->second.AdmissionId)) { ++it; continue; }
+        auto pending = std::move(it->second);
+        it = PendingIdempotentWrites.erase(it);
+        if (pending.ReservedReplyBytes > PendingReplyBytes) std::terminate();
+        PendingReplyBytes -= pending.ReservedReplyBytes;
+        if (pending.ReplyTo && pending.ReplyTo != disconnected)
+            rejectedIdempotent.push_back({pending.ReplyTo, pending.Identity, pending.Cookie});
+    }
+
     for (auto it = Forwarded.begin(); it != Forwarded.end();) {
         if (!expired.contains(it->second.AdmissionId)) { ++it; continue; }
         auto pending = std::move(it->second);
@@ -3768,6 +3838,9 @@ void TRequestProcessor::ExpireRequests(ITimeSource::Time now,
     for (auto& [replyTo, cookie] : rejected)
         replyTo->Send(NewHoldedMessage(TCommandResponse{
             .Cookie = cookie, .ErrorCode = TCommandResponse::TimedOut}));
+    for (auto& pending : rejectedIdempotent)
+        pending.ReplyTo->Send(MakeIdempotentResponse(pending.Identity, pending.Cookie,
+            0, TCommandResponse::TimedOut));
 }
 
 void TRequestProcessor::CancelForwarded(const std::shared_ptr<INode>& disconnected, bool peerFailure) {
@@ -3858,15 +3931,116 @@ void TRequestProcessor::OnIdempotentCommandRequest(
         TMessageHolder<TIdempotentCommandRequest> command,
         const std::shared_ptr<INode>& replyTo) {
     ValidateIdempotentCommandRequest(command);
-    if (!replyTo) return;
-    auto response = NewHoldedMessage<TIdempotentCommandResponse>();
-    response->Epoch = command->Epoch;
-    response->SessionIdHigh = command->SessionIdHigh;
-    response->SessionIdLow = command->SessionIdLow;
-    response->Sequence = command->Sequence;
-    response->Cookie = command->Cookie;
-    response->ErrorCode = TCommandResponse::Unsupported;
-    replyTo->Send(std::move(response));
+    TIdempotentOperationIdentity identity{
+        .Epoch = command->Epoch,
+        .SessionIdHigh = command->SessionIdHigh,
+        .SessionIdLow = command->SessionIdLow,
+        .Sequence = command->Sequence,
+    };
+    auto respond = [&](uint32_t errorCode) {
+        if (replyTo) replyTo->Send(MakeIdempotentResponse(identity, command->Cookie, 0, errorCode));
+    };
+    auto* idempotentRsm = dynamic_cast<IIdempotentRsm*>(Rsm.get());
+    if (!idempotentRsm) {
+        respond(TCommandResponse::Unsupported);
+        return;
+    }
+
+    PruneRequests();
+    const auto cookie = command->Cookie;
+    uint64_t admissionId = 0;
+    if (!TryAdmit(command->Len, replyTo, admissionId)) {
+        respond(TCommandResponse::Overloaded);
+        return;
+    }
+
+    uint64_t reservedReplyBytes = 0;
+    try {
+        idempotentRsm->ValidateIdempotent(command);
+        identity.PayloadDigest = ComputeIdempotentPayloadDigest(std::string_view(
+            command->Data, command->Len - sizeof(TIdempotentCommandRequest)));
+        if (Raft->CurrentStateName() != EState::LEADER) {
+            ReleaseAdmission(admissionId);
+            respond(TCommandResponse::Failed);
+            return;
+        }
+        if (!Raft->CanAppendIdempotentLogEntries()) {
+            ReleaseAdmission(admissionId);
+            respond(TCommandResponse::Unsupported);
+            return;
+        }
+        if (AdmissionExpired(admissionId, TimeSource->Now())) {
+            ReleaseAdmission(admissionId);
+            respond(TCommandResponse::TimedOut);
+            return;
+        }
+
+        if (replyTo) {
+            const auto responseDataBound = idempotentRsm->IdempotentResponseSizeUpperBound(command);
+            const auto maxResponseDataBytes = TMessageLimits{}.MaxFrameBytes -
+                sizeof(TIdempotentCommandResponse);
+            if (responseDataBound > maxResponseDataBytes) {
+                ReleaseAdmission(admissionId);
+                respond(TCommandResponse::Overloaded);
+                return;
+            }
+            reservedReplyBytes = sizeof(TIdempotentCommandResponse) + responseDataBound;
+            if (PendingReplyBytes > AdmissionLimits.MaxPendingReplyBytes ||
+                reservedReplyBytes > AdmissionLimits.MaxPendingReplyBytes - PendingReplyBytes) {
+                reservedReplyBytes = 0;
+                ReleaseAdmission(admissionId);
+                respond(TCommandResponse::Overloaded);
+                return;
+            }
+            PendingReplyBytes += reservedReplyBytes;
+        }
+
+        auto applicationEntry = idempotentRsm->PrepareIdempotent(command);
+        if (!applicationEntry.HasValidExtent() ||
+            applicationEntry->Type != uint32_t(EMessageType::LOG_ENTRY))
+            throw TMessageError("Idempotent RSM returned an invalid prepared log entry");
+        applicationEntry->Term = Raft->GetState()->CurrentTerm;
+        auto entry = EncodeIdempotentLogEntry(identity, std::move(applicationEntry));
+        uint64_t index;
+        try {
+            index = Raft->Append(std::move(entry));
+        } catch (const TRaftLogCapacityExceeded&) {
+            const bool expired = AdmissionExpired(admissionId, TimeSource->Now());
+            if (reservedReplyBytes) {
+                PendingReplyBytes -= reservedReplyBytes;
+                reservedReplyBytes = 0;
+            }
+            ReleaseAdmission(admissionId);
+            respond(expired ? TCommandResponse::TimedOut : TCommandResponse::Overloaded);
+            return;
+        }
+
+        if (!replyTo) return;
+        if (AdmissionExpired(admissionId, TimeSource->Now())) {
+            PendingReplyBytes -= reservedReplyBytes;
+            reservedReplyBytes = 0;
+            ReleaseAdmission(admissionId);
+            respond(TCommandResponse::TimedOut);
+            return;
+        }
+        auto [pending, inserted] = PendingIdempotentWrites.emplace(index, TIdempotentPending{
+            .Term = Raft->GetState()->CurrentTerm,
+            .Identity = identity,
+            .Cookie = cookie,
+            .ReplyTo = replyTo,
+            .AdmissionId = admissionId,
+            .ReservedReplyBytes = reservedReplyBytes,
+        });
+        if (!inserted) throw std::logic_error("Duplicate pending idempotent log index");
+        (void)pending;
+    } catch (...) {
+        if (reservedReplyBytes) {
+            if (reservedReplyBytes > PendingReplyBytes) std::terminate();
+            PendingReplyBytes -= reservedReplyBytes;
+        }
+        ReleaseAdmission(admissionId);
+        throw;
+    }
 }
 
 void TRequestProcessor::OnForwardedCommandRequest(TMessageHolder<TForwardedCommandRequest> message,
@@ -4025,12 +4199,27 @@ void TRequestProcessor::ProcessCommitted() {
             continue;
         }
         if (entry->Flags & TLogEntry::EIdempotent) {
+            TIdempotentWriteResult result;
             try {
                 auto* idempotentRsm = dynamic_cast<IIdempotentRsm*>(Rsm.get());
                 if (!idempotentRsm)
                     throw std::logic_error("Idempotent log record requires an idempotent RSM");
-                (void)idempotentRsm->ApplyIdempotentLogRecord(entry, i);
+                result = idempotentRsm->ApplyIdempotentLogRecord(entry, i);
             } catch (...) { std::terminate(); }
+            auto pending = PendingIdempotentWrites.find(i);
+            if (pending != PendingIdempotentWrites.end() && pending->second.Term == entry->Term) {
+                if (pending->second.ReservedReplyBytes < sizeof(TIdempotentCommandResponse) ||
+                    result.Data.size() > pending->second.ReservedReplyBytes - sizeof(TIdempotentCommandResponse))
+                    std::terminate();
+                TMessageHolder<TIdempotentCommandResponse> response;
+                try {
+                    response = MakeIdempotentResponse(pending->second.Identity,
+                        pending->second.Cookie, result.Index, result.ErrorCode, result.Data);
+                } catch (...) { std::terminate(); }
+                auto replyTo = pending->second.ReplyTo;
+                ReleaseIdempotentPending(i);
+                if (replyTo) replyTo->Send(std::move(response));
+            }
             continue;
         }
         TMessageHolder<TMessage> reply;
