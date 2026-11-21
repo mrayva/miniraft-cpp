@@ -368,7 +368,8 @@ int RunServingServerMembershipReaderTest(const std::filesystem::path& dir) {
     rawListener.Bind();
     rawListener.Listen();
     TRaftServer<TTlsSocket> server(loop.Poller(), TTlsSocket(std::move(rawListener), serverContext),
-        raft, std::make_shared<TDummyRsm>(), peers, timeSource);
+        raft, std::make_shared<TDummyRsm>(), peers, timeSource,
+        TRequestProcessor::TAdmissionLimits{}, TOutboundQueueLimits{0, 0});
 
     auto joiningPeer = makePeer("joining-voter");
     server.RegisterPeerTarget(3, joiningPeer);
@@ -386,6 +387,20 @@ int RunServingServerMembershipReaderTest(const std::filesystem::path& dir) {
     auto oldVoter = std::dynamic_pointer_cast<TNode<TTlsSocket>>(peers.at(2));
     auto movedVoter = makePeer("moved-voter");
     if (!oldVoter || !oldVoter->HasResponseReader()) return 10;
+
+    // A queue-budget rejection occurs before routing or Raft state changes.
+    auto blockedReplacement = makePeer("blocked-replacement");
+    blockedReplacement->Send(NewHoldedMessage<TCommandResponse>());
+    bool replacementRejected = false;
+    try {
+        server.ReplacePeerTarget(2, blockedReplacement);
+    } catch (const TNodeQueueFull&) {
+        replacementRejected = true;
+    }
+    if (!replacementRejected || oldVoter->IsRetired() || !oldVoter->HasResponseReader() ||
+        !raft->GetVolatileState()->PeerCapabilities.contains(2) ||
+        !raft->GetVolatileState()->CommitAckIndex.contains(2)) return 13;
+
     if (server.ReplacePeerTarget(2, movedVoter) != oldVoter || !oldVoter->IsRetired() ||
         !movedVoter->HasResponseReader() || !raft->IsVoter(2) ||
         raft->GetVoterIds() != std::vector<uint32_t>({1, 2})) return 11;
