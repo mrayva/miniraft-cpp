@@ -302,6 +302,9 @@ public:
     // membership or persist/distribute the endpoint. A registered nonvoter
     // is treated as a learner locally. Calls must be serialized with Raft work.
     void RegisterPeerTarget(uint32_t id, std::shared_ptr<INode> node);
+    // Replace a configured endpoint without changing its local voter role.
+    // All replication and capability evidence for that peer is discarded.
+    void ReplacePeerTarget(uint32_t id, std::shared_ptr<INode> node);
     std::shared_ptr<INode> UnregisterPeerTarget(uint32_t id);
     // Leader-local replication staging; requires bound voter storage. Caller
     // owns endpoint lifecycle and reconciles targets after failover/restart.
@@ -496,6 +499,8 @@ public:
     void OnPeerDisconnected(const std::shared_ptr<INode>& peer);
     // Keep command forwarding aligned with runtime peer endpoint changes.
     void AddPeerEndpoint(uint32_t id, std::shared_ptr<INode> peer);
+    bool ReplacePeerEndpoint(uint32_t id, const std::shared_ptr<INode>& oldPeer,
+                             const std::shared_ptr<INode>& newPeer) noexcept;
     void RemovePeerEndpoint(uint32_t id, const std::shared_ptr<INode>& peer) noexcept;
     void ProcessCommitted();
     void ProcessWaiting();

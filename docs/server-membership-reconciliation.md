@@ -30,6 +30,16 @@ The built-in TCP socket supports this shutdown path. Socket wrappers that do
 not expose a nonthrowing shutdown or native descriptor, including the current
 coroio TLS wrapper, still reject live removal after a response reader starts.
 
+`TRaftServer::ReplacePeerTarget(id, endpoint)` replaces the local transport for
+an existing voter or learner without changing its Raft role. When the old
+endpoint has a response reader, replacement requires a safely retireable socket;
+the server retires that reader, retains the old node until its coroutines unwind,
+and starts a reader for the new endpoint. Raft discards that peer's replication,
+capability, and acknowledgement evidence, so the new transport must establish
+fresh progress before it can support reads, commits, or snapshot safety proofs.
+Endpoint replacement remains local to each replica and does not distribute
+addresses to other members.
+
 Before proposing a joint voter change, call
 `TRaftServer::CheckJointConfigurationReadiness(newVoters)` (or the underlying
 `TRaft` method) on each replica and compare the reports. `MissingPeerTargets`
@@ -61,5 +71,7 @@ demotion. It checks that the retirable TLS endpoint is shut down on removal,
 which proves the server started and tracked the promoted peer's response reader.
 The schedule then reuses the peer ID with a fresh endpoint, promotes it again,
 and removes it to check that the replacement's reader is independently tracked
-while the old endpoint retires. The test runs in a child process because the
-server's serving coroutines are intentionally long-lived.
+while the old endpoint retires. It also replaces an active voter's endpoint and
+checks that the role is preserved, the previous reader retires, and stale
+capability and acknowledgement evidence is cleared. The test runs in a child
+process because the server's serving coroutines are intentionally long-lived.

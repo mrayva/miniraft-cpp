@@ -2600,6 +2600,51 @@ void TRaft::RegisterPeerTarget(uint32_t id, std::shared_ptr<INode> node) {
     Npeers = int(Nodes.size());
 }
 
+void TRaft::ReplacePeerTarget(uint32_t id, std::shared_ptr<INode> node) {
+    if (!id || id == Id || !node)
+        throw std::invalid_argument("Invalid replacement peer target");
+    auto peer = Nodes.find(id);
+    if (peer == Nodes.end() || peer->second == node)
+        throw std::invalid_argument("Unknown or unchanged peer target");
+    auto nextIndex = VolatileState->NextIndex.find(id);
+    if (nextIndex == VolatileState->NextIndex.end())
+        throw std::logic_error("Peer target has no replication progress");
+
+    // Allocate timer entries before publishing the endpoint. A failed
+    // allocation cannot publish the new endpoint or discard peer evidence.
+    auto heartbeatDue = VolatileState->HeartbeatDue.try_emplace(id).first;
+    auto rpcDue = VolatileState->RpcDue.try_emplace(id).first;
+    auto batchSize = VolatileState->BatchSize.try_emplace(id, 1).first;
+    auto backOff = VolatileState->BackOff.try_emplace(id, 1).first;
+
+    peer->second = std::move(node);
+    nextIndex->second = State->LastLogIndex + 1;
+    heartbeatDue->second = ITimeSource::Time{};
+    rpcDue->second = ITimeSource::Time{};
+    batchSize->second = 1;
+    backOff->second = 1;
+    VolatileState->MatchIndex.erase(id);
+    VolatileState->CommitAckIndex.erase(id);
+    VolatileState->ReadAckSeqno.erase(id);
+    VolatileState->LastSentSeqno.erase(id);
+    VolatileState->PendingAppendRpcs.erase(id);
+    VolatileState->SnapshotRpcs.erase(id);
+    VolatileState->ConfigurationBarrierRpcs.erase(id);
+    VolatileState->ConfigurationBarrierAckIndex.erase(id);
+    VolatileState->ConfigurationBarrierAckDue.erase(id);
+    VolatileState->PeerCapabilities.erase(id);
+    VolatileState->QuorumResponseTime.erase(id);
+    VolatileState->Votes.erase(id);
+    if (VolatileState->LeadershipTransfer && VolatileState->LeadershipTransfer->TargetId == id)
+        VolatileState->LeadershipTransfer.reset();
+
+    // The snapshot safety proof included the old endpoint's capabilities and
+    // acknowledgements. Require a fresh proof after transport replacement.
+    VolatileState->CompactionSafeConfigurationIndex = 0;
+    VolatileState->CompactionSafeConfigurationTerm = 0;
+    VolatileState->HasCompactionSafeInitialConfigurationBarrier = false;
+}
+
 std::shared_ptr<INode> TRaft::RemoveLearnerTarget(uint32_t id) {
     if (StateName != EState::LEADER) throw std::logic_error("Only a leader can remove a learner target");
     return UnregisterPeerTarget(id);
@@ -3788,6 +3833,15 @@ void TRequestProcessor::AddPeerEndpoint(uint32_t id, std::shared_ptr<INode> peer
         throw std::invalid_argument("Invalid request-routing peer endpoint");
     if (!Nodes.emplace(id, std::move(peer)).second)
         throw std::invalid_argument("Duplicate request-routing peer ID");
+}
+
+bool TRequestProcessor::ReplacePeerEndpoint(uint32_t id, const std::shared_ptr<INode>& oldPeer,
+        const std::shared_ptr<INode>& newPeer) noexcept {
+    if (!id || !oldPeer || !newPeer) return false;
+    auto peer = Nodes.find(id);
+    if (peer == Nodes.end() || peer->second != oldPeer) return false;
+    peer->second = newPeer;
+    return true;
 }
 
 void TRequestProcessor::RemovePeerEndpoint(uint32_t id, const std::shared_ptr<INode>& peer) noexcept {

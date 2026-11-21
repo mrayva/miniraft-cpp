@@ -510,6 +510,10 @@ public:
     // communicate with future voters. This does not change quorum membership.
     // Calls must be serialized with the poller loop and Raft work.
     void RegisterPeerTarget(uint32_t id, std::shared_ptr<TNode<TSocket>> node);
+    // Replace a local transport without changing the peer's Raft role. Active
+    // response readers are retired before a reader starts for the new endpoint.
+    std::shared_ptr<TNode<TSocket>> ReplacePeerTarget(
+        uint32_t id, std::shared_ptr<TNode<TSocket>> node);
     std::shared_ptr<TNode<TSocket>> UnregisterPeerTarget(uint32_t id);
     // Leader-only catch-up staging and endpoint removal wrappers.
     void AddLearnerTarget(uint32_t id, std::shared_ptr<TNode<TSocket>> node);

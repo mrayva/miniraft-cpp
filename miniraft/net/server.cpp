@@ -110,6 +110,54 @@ void TRaftServer<TSocket>::RegisterPeerTarget(uint32_t id, std::shared_ptr<TNode
 }
 
 template<typename TSocket>
+std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::ReplacePeerTarget(
+        uint32_t id, std::shared_ptr<TNode<TSocket>> node) {
+    if (!node || node->IsRetired()) throw std::invalid_argument("Invalid replacement peer endpoint");
+    auto peer = PeerNodes.find(id);
+    if (peer == PeerNodes.end()) throw std::invalid_argument("Unknown network peer target");
+    auto previous = peer->second;
+    if (previous == node) throw std::invalid_argument("Peer endpoint is already registered");
+
+    const bool readerStarted = PeerResponseReaders.contains(id);
+    if (readerStarted && !previous->SupportsRetirement())
+        throw std::logic_error("Socket type does not support safe response-reader retirement");
+    if (Nodes.contains(node)) throw std::invalid_argument("Peer endpoint is already registered");
+
+    // Prepare every allocating server-side update before changing the live
+    // routing maps. This also retains the old node until its reader unwinds.
+    auto nodes = Nodes;
+    nodes.erase(previous);
+    if (!nodes.insert(node).second) throw std::invalid_argument("Peer endpoint is already registered");
+    auto peerNodes = PeerNodes;
+    peerNodes.at(id) = node;
+    auto retiredPeerNodes = RetiredPeerNodes;
+    if (readerStarted) retiredPeerNodes.insert(previous);
+
+    const bool attachedQueueBudget = node->AttachQueueBudget(OutboundQueueBudget);
+    if (!RequestProcessor->ReplacePeerEndpoint(id, previous, node)) {
+        if (attachedQueueBudget) node->DetachQueueBudget(OutboundQueueBudget);
+        throw std::logic_error("Request-routing peer endpoint is out of sync");
+    }
+    try {
+        Raft->ReplacePeerTarget(id, node);
+    } catch (...) {
+        RequestProcessor->ReplacePeerEndpoint(id, node, previous);
+        if (attachedQueueBudget) node->DetachQueueBudget(OutboundQueueBudget);
+        throw;
+    }
+
+    Nodes.swap(nodes);
+    PeerNodes.swap(peerNodes);
+    RetiredPeerNodes.swap(retiredPeerNodes);
+    PeerResponseReaders.erase(id);
+    previous->DetachQueueBudget(OutboundQueueBudget);
+    if (readerStarted) previous->Retire();
+    RequestProcessor->OnPeerDisconnected(previous);
+    ReconcilePeerReaders();
+    return previous;
+}
+
+template<typename TSocket>
 void TRaftServer<TSocket>::AddLearnerTarget(uint32_t id, std::shared_ptr<TNode<TSocket>> node) {
     RegisterPeerTargetImpl(id, std::move(node), true);
 }

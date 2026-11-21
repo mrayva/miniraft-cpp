@@ -375,6 +375,26 @@ int RunServingServerMembershipReaderTest(const std::filesystem::path& dir) {
     server.Serve(); // Starts readers for voters 1/2 and staged target 3.
     if (!joiningPeer->HasResponseReader()) return 8;
 
+    // A replacement endpoint must not inherit replication or capability proof
+    // established by the old transport, and must keep the configured voter role.
+    auto* volatileState = const_cast<TVolatileState*>(raft->GetVolatileState());
+    volatileState->PeerCapabilities[2].InstallSnapshot = true;
+    volatileState->MatchIndex[2] = 1;
+    volatileState->CommitAckIndex[2] = 1;
+    volatileState->CompactionSafeConfigurationIndex = 1;
+    volatileState->CompactionSafeConfigurationTerm = state->CurrentTerm;
+    auto oldVoter = std::dynamic_pointer_cast<TNode<TTlsSocket>>(peers.at(2));
+    auto movedVoter = makePeer("moved-voter");
+    if (!oldVoter || !oldVoter->HasResponseReader()) return 10;
+    if (server.ReplacePeerTarget(2, movedVoter) != oldVoter || !oldVoter->IsRetired() ||
+        !movedVoter->HasResponseReader() || !raft->IsVoter(2) ||
+        raft->GetVoterIds() != std::vector<uint32_t>({1, 2})) return 11;
+    const auto* replacedState = raft->GetVolatileState();
+    if (replacedState->PeerCapabilities.contains(2) || replacedState->MatchIndex.contains(2) ||
+        replacedState->CommitAckIndex.contains(2) || replacedState->CompactionSafeConfigurationIndex ||
+        replacedState->CompactionSafeConfigurationTerm ||
+        replacedState->HasCompactionSafeInitialConfigurationBarrier) return 12;
+
     TConfigurationRecord addJoint{EConfigurationPhase::Joint, 2, 0, 0, {1, 2}, {1, 2, 3}};
     auto addRequest = NewHoldedMessage(
         TMessageEx{.Src = 2, .Dst = 1, .Term = 2},
