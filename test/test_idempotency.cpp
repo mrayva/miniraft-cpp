@@ -113,6 +113,12 @@ struct TSnapshotRsm : IIdempotentRsm {
     }
 };
 
+struct TIdempotencyPeer : INode {
+    std::vector<TMessageHolder<TMessage>> Sent;
+    void Send(TMessageHolder<TMessage> message) override { Sent.push_back(std::move(message)); }
+    void Drain() override { }
+};
+
 void test_idempotency_snapshot_roundtrip_preserves_dedup_state(void**) {
     const auto source = MakeSnapshot();
     const auto bytes = EncodeIdempotencySnapshot(source);
@@ -248,6 +254,82 @@ void test_committed_idempotent_log_replay_uses_identity_and_application_entry(vo
     assert_int_equal(rsm->State.LastAppliedIndex, 2);
 }
 
+void test_idempotent_log_requires_every_member_capability_including_joint_additions(void**) {
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 1;
+    state->BindVoters({1, 2, 3});
+    TNodeDict peers{
+        {2, std::make_shared<TIdempotencyPeer>()},
+        {3, std::make_shared<TIdempotencyPeer>()},
+        {4, std::make_shared<TIdempotencyPeer>()},
+    };
+    auto raft = std::make_shared<TRaft>(state, 1, peers, std::vector<uint32_t>{4});
+    auto rsm = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor processor(raft, rsm, peers);
+    raft->Become(EState::LEADER);
+
+    auto* volatileState = const_cast<TVolatileState*>(raft->GetVolatileState());
+    volatileState->PeerCapabilities[2] = {
+        .AppendAckSeqno = 1, .Term = state->CurrentTerm, .IdempotentLogEntries = true};
+    volatileState->PeerCapabilities[3] = {
+        .AppendAckSeqno = 1, .Term = state->CurrentTerm, .IdempotentLogEntries = true};
+    assert_false(raft->CanAppendIdempotentLogEntries());
+
+    auto readiness = raft->CheckJointConfigurationReadiness({1, 2, 4});
+    assert_true(readiness.MembersWithoutIdempotentLogSupport == (std::vector<uint32_t>{4}));
+
+    volatileState->PeerCapabilities[4] = {
+        .AppendAckSeqno = 1, .Term = state->CurrentTerm, .IdempotentLogEntries = true};
+    assert_true(raft->CanAppendIdempotentLogEntries());
+    readiness = raft->CheckJointConfigurationReadiness({1, 2, 4});
+    assert_true(readiness.MembersWithoutIdempotentLogSupport.empty());
+
+    auto application = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 1);
+    application->Term = state->CurrentTerm;
+    application->Data[0] = 'x';
+    TIdempotentOperationIdentity identity;
+    identity.Epoch = 1;
+    identity.SessionIdHigh = 2;
+    identity.SessionIdLow = 3;
+    identity.Sequence = 1;
+    identity.PayloadDigest = ComputeIdempotentPayloadDigest("x");
+    auto replicated = EncodeIdempotentLogEntry(identity, application);
+    assert_int_equal(raft->Append(replicated), 1);
+    assert_int_equal(state->Get(1)->Flags, TLogEntry::EIdempotent);
+}
+
+void test_rsm_without_idempotency_rejects_tagged_append_entries(void**) {
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 1;
+    auto leader = std::make_shared<TIdempotencyPeer>();
+    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{{2, leader}});
+
+    auto application = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 1);
+    application->Term = 1;
+    application->Data[0] = 'x';
+    TIdempotentOperationIdentity identity;
+    identity.Epoch = 1;
+    identity.SessionIdHigh = 2;
+    identity.SessionIdLow = 3;
+    identity.Sequence = 1;
+    identity.PayloadDigest = ComputeIdempotentPayloadDigest("x");
+    auto replicated = EncodeIdempotentLogEntry(identity, application);
+
+    auto request = NewHoldedMessage(
+        TMessageEx{.Src = 2, .Dst = 1, .Term = 1, .Seqno = 1},
+        TAppendEntriesRequest{
+            .PrevLogIndex = 0, .PrevLogTerm = 0, .LeaderCommit = 1, .LeaderId = 2, .Nentries = 1});
+    request.InitPayload(1);
+    request.Payload[0] = replicated;
+
+    raft->Process(ITimeSource::Time{}, std::move(request));
+    assert_int_equal(state->LastLogIndex, 0);
+    assert_int_equal(leader->Sent.size(), 1);
+    const auto response = leader->Sent.back().Cast<TAppendEntriesResponse>();
+    assert_false(response->Success);
+    assert_false(response->Padding & TAppendEntriesResponse::SupportsIdempotentLogEntries);
+}
+
 void test_idempotent_rsm_snapshot_hook_validates_before_atomic_restore(void**) {
     TSnapshotRsm source;
     auto request = NewHoldedMessage<TIdempotentCommandRequest>();
@@ -288,6 +370,8 @@ int main() {
         cmocka_unit_test(test_idempotent_payload_digest_matches_sha256_vectors),
         cmocka_unit_test(test_idempotent_log_record_roundtrip_and_rejects_corruption),
         cmocka_unit_test(test_committed_idempotent_log_replay_uses_identity_and_application_entry),
+        cmocka_unit_test(test_idempotent_log_requires_every_member_capability_including_joint_additions),
+        cmocka_unit_test(test_rsm_without_idempotency_rejects_tagged_append_entries),
         cmocka_unit_test(test_idempotent_rsm_snapshot_hook_validates_before_atomic_restore),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);

@@ -187,12 +187,15 @@ struct TJointConfigurationReadiness {
     std::vector<uint32_t> AddedVotersWithoutSnapshotInstallSupport;
     // Every current and proposed voter must understand joint-consensus entries.
     std::vector<uint32_t> VotersWithoutJointConsensusSupport;
+    // When this RSM enables idempotent writes, every replication target must
+    // understand tagged idempotent log records before membership can change.
+    std::vector<uint32_t> MembersWithoutIdempotentLogSupport;
 
     bool Ready() const {
         return IsLeader && HasDurableMembershipStorage && HasStableConfiguration &&
             HasCommittedCurrentTermEntry && ChangesVoterSet && HasLogCapacity && MissingPeerTargets.empty() &&
             AddedVotersWithoutCommitAck.empty() && AddedVotersWithoutSnapshotInstallSupport.empty() &&
-            VotersWithoutJointConsensusSupport.empty();
+            VotersWithoutJointConsensusSupport.empty() && MembersWithoutIdempotentLogSupport.empty();
     }
 };
 
@@ -261,6 +264,7 @@ struct TVolatileState {
         bool SnapshotHistory1024 = false;
         bool InstallSnapshot = false;
         bool JointConsensus = false;
+        bool IdempotentLogEntries = false;
     };
     std::unordered_map<uint32_t, TPeerCapabilities> PeerCapabilities;
     struct TLeadershipTransfer {
@@ -369,6 +373,12 @@ public:
     // Local proposals require leader state. Role rejection leaves storage and
     // the supplied entry unchanged; followers receive entries through Process.
     uint64_t Append(TMessageHolder<TLogEntry> entry);
+    // Set from the request processor's actual RSM contract before serving
+    // traffic. Peers advertise the capability only when their RSM can apply it.
+    void SetLocalIdempotentLogSupport(bool supported) noexcept {
+        LocalIdempotentLogSupport = supported;
+    }
+    bool CanAppendIdempotentLogEntries() const;
     // Start a joint-consensus transition. Every newly added voter must already
     // be staged as a learner and have acknowledged this leader's committed
     // boundary. A transition may exclude the leader; transfer leadership to a
@@ -527,6 +537,7 @@ private:
     // voting union (the union of both sets while a joint configuration is in
     // force); Learners is derived from that active membership.
     std::vector<uint32_t> InitialVoters, Voters, Learners;
+    bool LocalIdempotentLogSupport = false;
     std::optional<TConfigurationHistory> ConfigurationBaseline;
     std::optional<TConfigurationScan> Configuration;
     bool ConfigurationScanRequired = false;

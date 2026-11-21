@@ -1303,7 +1303,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
                     (State->SupportsInstallSnapshot() ? TAppendEntriesResponse::SupportsInstallSnapshot : 0u) |
                     TAppendEntriesResponse::SupportsSnapshotHistory32 |
                     TAppendEntriesResponse::SupportsSnapshotLineage |
-                    TAppendEntriesResponse::SupportsJointConsensus,
+                    TAppendEntriesResponse::SupportsJointConsensus |
+                    (LocalIdempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotentLogEntries : 0u),
             });
         (void)Nodes[reply->Dst]->TrySend(std::move(reply));
         return;
@@ -1316,6 +1317,14 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
     uint64_t commitIndex = VolatileState->CommitIndex;
     bool success = false;
     bool configurationTouched = false;
+    bool supportsIncomingEntries = true;
+    for (uint32_t i = 0; i < message.PayloadSize; ++i) {
+        auto entry = message.Payload[i].Cast<TLogEntry>();
+        if (entry->Flags & TLogEntry::EIdempotent) {
+            (void)DecodeIdempotentLogEntry(entry);
+            if (!LocalIdempotentLogSupport) supportsIncomingEntries = false;
+        }
+    }
     if (message->PrevLogIndex >= State->SnapshotIndex && (message->PrevLogIndex == 0 ||
         (message->PrevLogIndex <= State->LastLogIndex
             && State->LogTerm(message->PrevLogIndex) == message->PrevLogTerm)))
@@ -1333,7 +1342,7 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             }
         }
 
-        bool fits = true;
+        bool fits = supportsIncomingEntries;
         if (conflictIndex) {
             // Refuse a conflicting leader suffix at or below a commit boundary
             // before touching storage. Storage removal methods also guard this,
@@ -1355,7 +1364,7 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
                 const auto retainedBytes = UncommittedLogBytes - replacedBytes;
                 const auto retainedEntries = UncommittedLog.size() - replacedEntries;
                 const auto incomingEntries = size_t(message.PayloadSize - conflictOffset);
-                fits = retainedBytes <= LogLimits.MaxUncommittedBytes &&
+                fits = supportsIncomingEntries && retainedBytes <= LogLimits.MaxUncommittedBytes &&
                     incomingBytes <= LogLimits.MaxUncommittedBytes - retainedBytes &&
                     retainedEntries <= LogLimits.MaxUncommittedEntries &&
                     incomingEntries <= LogLimits.MaxUncommittedEntries - retainedEntries;
@@ -1412,7 +1421,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
                 (State->SupportsInstallSnapshot() ? TAppendEntriesResponse::SupportsInstallSnapshot : 0u) |
                 TAppendEntriesResponse::SupportsSnapshotHistory32 |
                 TAppendEntriesResponse::SupportsSnapshotLineage |
-                TAppendEntriesResponse::SupportsJointConsensus,
+                TAppendEntriesResponse::SupportsJointConsensus |
+                (LocalIdempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotentLogEntries : 0u),
         });
 
     AdvanceCommitIndex(commitIndex);
@@ -1463,6 +1473,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             message->Padding & TAppendEntriesResponse::SupportsInstallSnapshot;
         capabilities.JointConsensus =
             message->Padding & TAppendEntriesResponse::SupportsJointConsensus;
+        capabilities.IdempotentLogEntries =
+            message->Padding & TAppendEntriesResponse::SupportsIdempotentLogEntries;
     }
     const auto acknowledgedLeaderCommit = request->LeaderCommit;
     // A newer response supersedes older RPCs. Reordered/duplicate failures
@@ -1867,6 +1879,11 @@ bool TRaft::ValidateAppendConfiguration(TMessageHolder<TAppendEntriesRequest> me
     bool hasConfigurationEntry = false;
     for (uint32_t i = 0; i < message.PayloadSize; ++i) {
         auto entry = message.Payload[i].Cast<TLogEntry>();
+        if (entry->Flags == TLogEntry::EIdempotent) {
+            try { (void)DecodeIdempotentLogEntry(entry); }
+            catch (const std::exception&) { return false; }
+            continue;
+        }
         if (entry->Flags != TLogEntry::ENone && entry->Flags != TLogEntry::EStub &&
             entry->Flags != TLogEntry::EConfiguration)
             return false;
@@ -2280,14 +2297,35 @@ uint64_t TRaft::Append(TMessageHolder<TLogEntry> entry) {
     if (!entry.HasValidExtent() || entry->Type != uint32_t(EMessageType::LOG_ENTRY))
         throw TMessageError("Invalid proposed log entry");
     ValidateMessageTree(entry);
-    if (entry->Flags != TLogEntry::ENone)
+    if (entry->Flags == TLogEntry::EIdempotent) {
+        if (!CanAppendIdempotentLogEntries())
+            throw std::logic_error("Idempotent log entries require support from every replication target");
+        (void)DecodeIdempotentLogEntry(entry);
+    } else if (entry->Flags != TLogEntry::ENone) {
         throw TMessageError("Proposed log entry has unsupported flags");
+    }
     EnsureProposalLogCapacity(entry->Len, 1);
     entry->Term = State->CurrentTerm;
     const auto bytes = entry->Len;
     State->Append(std::move(entry));
     RecordUncommittedLogEntry(State->LastLogIndex, bytes);
     return State->LastLogIndex;
+}
+
+bool TRaft::CanAppendIdempotentLogEntries() const {
+    if (!LocalIdempotentLogSupport) return false;
+    std::vector<uint32_t> members = Voters;
+    members.insert(members.end(), Learners.begin(), Learners.end());
+    std::sort(members.begin(), members.end());
+    members.erase(std::unique(members.begin(), members.end()), members.end());
+    for (auto id : members) {
+        if (id == Id) continue;
+        const auto capability = VolatileState->PeerCapabilities.find(id);
+        if (capability == VolatileState->PeerCapabilities.end() ||
+            capability->second.Term != State->CurrentTerm || !capability->second.IdempotentLogEntries)
+            return false;
+    }
+    return true;
 }
 
 void TRaft::RequireLiveConfigurationStorage() const {
@@ -2353,6 +2391,19 @@ TJointConfigurationReadiness TRaft::CheckJointConfigurationReadiness(
                 capability->second.Term != State->CurrentTerm || !capability->second.JointConsensus)
                 readiness.VotersWithoutJointConsensusSupport.push_back(id);
         }
+    if (LocalIdempotentLogSupport) {
+        std::vector<uint32_t> requiredMembers = requiredVoters;
+        requiredMembers.insert(requiredMembers.end(), Learners.begin(), Learners.end());
+        std::sort(requiredMembers.begin(), requiredMembers.end());
+        requiredMembers.erase(std::unique(requiredMembers.begin(), requiredMembers.end()), requiredMembers.end());
+        for (auto id : requiredMembers) {
+            if (id == Id) continue;
+            const auto capability = VolatileState->PeerCapabilities.find(id);
+            if (capability == VolatileState->PeerCapabilities.end() ||
+                capability->second.Term != State->CurrentTerm || !capability->second.IdempotentLogEntries)
+                readiness.MembersWithoutIdempotentLogSupport.push_back(id);
+        }
+    }
     return readiness;
 }
 
@@ -3411,6 +3462,14 @@ TRequestProcessor::TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_pt
         RestoreSnapshot(*snapshot, *Raft, *Rsm);
     if (Rsm->LastAppliedIndex < Raft->GetState()->SnapshotIndex)
         throw std::invalid_argument("Application progress precedes compacted log");
+    const bool supportsIdempotentLog = dynamic_cast<IIdempotentRsm*>(Rsm.get()) != nullptr;
+    if (!supportsIdempotentLog) {
+        const auto state = Raft->GetState();
+        for (uint64_t index = state->SnapshotIndex + 1; index <= state->LastLogIndex; ++index)
+            if (state->RetainedLogFlags(index) & TLogEntry::EIdempotent)
+                throw std::invalid_argument("Retained idempotent log entries require an idempotent RSM");
+    }
+    Raft->SetLocalIdempotentLogSupport(supportsIdempotentLog);
     Raft->RestoreAppliedIndex(Rsm->LastAppliedIndex);
     Raft->SnapshotApplication = Rsm;
 }

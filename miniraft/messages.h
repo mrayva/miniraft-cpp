@@ -137,6 +137,7 @@ struct TAppendEntriesResponse: public TMessageEx {
     static constexpr uint32_t SupportsSnapshotHistory32 = 1u << 4;
     static constexpr uint32_t SupportsSnapshotLineage = 1u << 5;
     static constexpr uint32_t SupportsJointConsensus = 1u << 6;
+    static constexpr uint32_t SupportsIdempotentLogEntries = 1u << 7;
     // Success: matched index. Failure: zero or a compacted-boundary probe hint;
     // a hint never advances MatchIndex or confirms a read.
     uint64_t MatchIndex;
