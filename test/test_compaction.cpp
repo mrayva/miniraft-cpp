@@ -798,6 +798,55 @@ void test_snapshot_install_budget_releases_after_application_validation_failure(
     assert_int_equal(accepted->NextOffset, FirstChunkBytes);
     assert_int_equal(budget->UsedBytes(), image.size());
 }
+void test_snapshot_install_budget_releases_after_conflicting_duplicate(void**) {
+    auto budget = std::make_shared<TSnapshotInstallBudget>(1024);
+    TRaft::TLogLimits limits;
+    limits.SnapshotInstallBudget = budget;
+    std::vector<TMessageHolder<TMessage>> replies;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) { replies.push_back(std::move(message)); });
+    TNodeDict peers{{1, peer}};
+
+    auto raft3 = std::make_shared<TRaft>(std::make_shared<TState>(), 3, peers,
+        std::vector<uint32_t>{}, limits);
+    auto app3 = std::make_shared<TApplication>();
+    TRequestProcessor processor3(raft3, app3, peers);
+    auto raft2 = std::make_shared<TRaft>(std::make_shared<TState>(), 2, peers,
+        std::vector<uint32_t>{}, limits);
+    auto app2 = std::make_shared<TApplication>();
+    TRequestProcessor processor2(raft2, app2, peers);
+
+    TKv source;
+    const auto image = EncodeSnapshot(TSnapshot{1, 1, {1, 3}, source.SaveSnapshot()});
+    constexpr size_t FirstChunkBytes = 4;
+    auto request = [&](uint32_t target, uint32_t seqno, bool corrupt) {
+        auto chunk = NewHoldedMessage<TInstallSnapshotRequest>(
+            sizeof(TInstallSnapshotRequest) + FirstChunkBytes);
+        chunk->Src = 1; chunk->Dst = target; chunk->Term = 1; chunk->Seqno = seqno;
+        chunk->SnapshotIndex = 1; chunk->SnapshotTerm = 1; chunk->Offset = 0;
+        chunk->TotalBytes = image.size(); chunk->Done = 0; chunk->LeaderId = 1;
+        memcpy(chunk->Data, image.data(), FirstChunkBytes);
+        if (corrupt) chunk->Data[0] ^= 1;
+        return chunk;
+    };
+
+    raft3->Process(ITimeSource::Time{}, request(3, 1, false));
+    auto accepted = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_true(accepted->Success); assert_int_equal(accepted->NextOffset, FirstChunkBytes);
+    assert_int_equal(budget->UsedBytes(), image.size());
+
+    replies.clear();
+    raft3->Process(ITimeSource::Time{}, request(3, 2, true));
+    auto rejected = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_false(rejected->Success); assert_false(rejected->Installed);
+    assert_int_equal(rejected->NextOffset, 0);
+    assert_int_equal(budget->UsedBytes(), 0);
+
+    replies.clear();
+    raft2->Process(ITimeSource::Time{}, request(2, 3, false));
+    auto retried = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_true(retried->Success); assert_int_equal(retried->NextOffset, FirstChunkBytes);
+    assert_int_equal(budget->UsedBytes(), image.size());
+}
 void test_covered_snapshot_metadata_uses_shared_install_budget(void**) {
     auto budget = std::make_shared<TSnapshotInstallBudget>(200);
     TRaft::TLogLimits limits;
@@ -1638,6 +1687,7 @@ int main() {
         cmocka_unit_test(test_idle_snapshot_transfer_discards_partial_image_and_restarts),
         cmocka_unit_test(test_snapshot_install_budget_is_shared_and_reclaimed_after_idle_expiry),
         cmocka_unit_test(test_snapshot_install_budget_releases_after_application_validation_failure),
+        cmocka_unit_test(test_snapshot_install_budget_releases_after_conflicting_duplicate),
         cmocka_unit_test(test_covered_snapshot_metadata_uses_shared_install_budget),
         cmocka_unit_test(test_snapshot_install_accepts_every_small_fixed_chunk_size),
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),
