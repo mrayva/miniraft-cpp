@@ -26,6 +26,8 @@ struct TDiskState : IState {
     void AppendBatch(const std::vector<TMessageHolder<TLogEntry>>& entries) override;
     void AppendBatchAndCommit(
         const std::vector<TMessageHolder<TLogEntry>>& entries, uint64_t commitIndex) override;
+    void ReplaceSuffixAndAppendBatch(uint64_t firstIndex,
+        const std::vector<TMessageHolder<TLogEntry>>& entries, uint64_t commitIndex) override;
     TMessageHolder<TLogEntry> Get(int64_t index) const override;
     void Commit() override;
     bool SupportsCommitIndexPersistence() const override { return true; }
@@ -81,7 +83,8 @@ private:
     void InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snapshot);
     void WriteSnapshotGenerationFile(const std::string& path, const TSnapshot& snapshot);
     uint64_t WriteCompactedLogGeneration(const std::string& entriesPath, const std::string& indexPath,
-        uint64_t firstIndex, uint64_t lastIndex, uint64_t& lastTerm);
+        uint64_t firstIndex, uint64_t lastIndex, uint64_t& lastTerm,
+        const std::vector<TMessageHolder<TLogEntry>>& appended = {});
     void ReclaimPreviousGeneration(uint64_t previousEntriesGeneration, uint64_t previousIndexGeneration);
 
     std::string EntriesPath;

@@ -2,6 +2,7 @@
 #include <miniraft/configuration.h>
 #include <miniraft/raft.h>
 #include <miniraft/snapshot_codec.h>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <chrono>
@@ -93,7 +94,9 @@ struct TFiles {
         std::ifstream input(Path("state"), std::ios::binary);
         std::string bytes{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
         if (bytes.size() < 4 ||
-            (bytes.substr(0, 8) != "MRFTL001" && bytes.substr(0, 8) != "MRFTL002")) return;
+            (bytes.substr(0, 8) != "MRFTL001" && bytes.substr(0, 8) != "MRFTL002" &&
+                bytes.substr(0, 8) != "MRFTL003" && bytes.substr(0, 8) != "MRFTL004" &&
+                bytes.substr(0, 8) != "MRFTL005")) return;
         const auto checksum = NSnapshotCodec::Checksum(std::string_view(bytes).substr(0, bytes.size() - 4));
         for (unsigned i = 0; i < 4; ++i) bytes[bytes.size() - 4 + i] = char(checksum >> (8 * i));
         input.close();
@@ -252,7 +255,7 @@ void test_checksums_detect_log_and_index_record_corruption(void**) {
         std::ifstream metadata(files.Path("state"), std::ios::binary);
         std::string magic(8, '\0');
         assert_true(bool(metadata.read(magic.data(), magic.size())));
-        assert_true(magic == "MRFTL004");
+        assert_true(magic == "MRFTL005");
         uint32_t flags = 0;
         metadata.seekg(44);
         assert_true(bool(metadata.read(reinterpret_cast<char*>(&flags), sizeof(flags))));
@@ -514,6 +517,90 @@ void test_disk_snapshot_generation_recovers_suffix_and_replaces_conflict(void**)
     assert_int_equal(afterAppend.LastLogTerm, 7);
     assert_int_equal(afterAppend.Get(3)->Term, 7);
 }
+void test_disk_suffix_replacement_publishes_one_generation(void**) {
+    TFiles files;
+    {
+        TDiskState state(files.Name, 1);
+        state.CurrentTerm = 7;
+        state.VotedFor = 2;
+        for (uint64_t term : {2, 5}) {
+            auto entry = NewHoldedMessage<TLogEntry>();
+            entry->Term = term;
+            state.Append(entry);
+        }
+        state.CommitIndex = 1;
+        state.Commit();
+    }
+
+    std::array<uint32_t, 7> stageCounts{};
+    {
+        TDiskState state(files.Name, 1, [&](TDiskState::ECommitStage stage) {
+            ++stageCounts.at(static_cast<size_t>(stage));
+        });
+        std::vector<TMessageHolder<TLogEntry>> replacement;
+        for (uint64_t term : {6, 7}) {
+            auto entry = NewHoldedMessage<TLogEntry>();
+            entry->Term = term;
+            replacement.push_back(std::move(entry));
+        }
+        state.ReplaceSuffixAndAppendBatch(2, replacement, 3);
+        assert_int_equal(state.LastLogIndex, 3);
+        assert_int_equal(state.LastLogTerm, 7);
+        assert_int_equal(state.CommitIndex, 3);
+        assert_int_equal(state.Get(1)->Term, 2);
+        assert_int_equal(state.Get(2)->Term, 6);
+        assert_int_equal(state.Get(3)->Term, 7);
+    }
+    assert_int_equal(stageCounts[static_cast<size_t>(TDiskState::ECommitStage::EntriesPublished)], 1);
+    assert_int_equal(stageCounts[static_cast<size_t>(TDiskState::ECommitStage::SnapshotIndexPublished)], 1);
+    assert_int_equal(stageCounts[static_cast<size_t>(TDiskState::ECommitStage::SnapshotImagePublished)], 0);
+    assert_int_equal(stageCounts[static_cast<size_t>(TDiskState::ECommitStage::LogFilesSynced)], 1);
+    assert_int_equal(stageCounts[static_cast<size_t>(TDiskState::ECommitStage::MetadataFileSynced)], 1);
+    assert_int_equal(stageCounts[static_cast<size_t>(TDiskState::ECommitStage::MetadataRenamed)], 1);
+    assert_int_equal(stageCounts[static_cast<size_t>(TDiskState::ECommitStage::DirectorySynced)], 1);
+
+    TDiskState recovered(files.Name, 1);
+    assert_int_equal(recovered.LastLogIndex, 3);
+    assert_int_equal(recovered.LastLogTerm, 7);
+    assert_int_equal(recovered.CommitIndex, 3);
+    assert_int_equal(recovered.Get(1)->Term, 2);
+    assert_int_equal(recovered.Get(2)->Term, 6);
+    assert_int_equal(recovered.Get(3)->Term, 7);
+    assert_false(bool(recovered.GetSnapshot()));
+}
+void test_disk_suffix_replacement_preserves_installed_snapshot(void**) {
+    TFiles files;
+    {
+        TDiskState state(files.Name, 1);
+        state.CurrentTerm = 7;
+        state.VotedFor = 2;
+        for (uint64_t term : {2, 5}) {
+            auto entry = NewHoldedMessage<TLogEntry>();
+            entry->Term = term;
+            state.Append(entry);
+        }
+        state.CommitIndex = 1;
+        state.Commit();
+        state.InstallSnapshot(TSnapshot{1, 2, {1, 2}, "retained checkpoint"});
+        std::vector<TMessageHolder<TLogEntry>> replacement;
+        auto entry = NewHoldedMessage<TLogEntry>();
+        entry->Term = 7;
+        replacement.push_back(std::move(entry));
+        state.ReplaceSuffixAndAppendBatch(2, replacement, 2);
+        assert_int_equal(state.SnapshotIndex, 1);
+        assert_int_equal(state.LastLogIndex, 2);
+        assert_int_equal(state.CommitIndex, 2);
+        assert_int_equal(state.Get(2)->Term, 7);
+    }
+    TDiskState recovered(files.Name, 1);
+    assert_true(bool(recovered.GetSnapshot()));
+    assert_int_equal(recovered.GetSnapshot()->Index, 1);
+    assert_true(recovered.GetSnapshot()->Data == "retained checkpoint");
+    assert_int_equal(recovered.SnapshotIndex, 1);
+    assert_int_equal(recovered.LastLogIndex, 2);
+    assert_int_equal(recovered.CommitIndex, 2);
+    assert_int_equal(recovered.Get(2)->Term, 7);
+}
 void test_disk_snapshot_generation_rejects_corrupt_image_without_rewriting(void**) {
     TFiles files;
     files.Seed();
@@ -715,6 +802,50 @@ void test_previous_snapshot_metadata_version_remains_readable(void**) {
     assert_int_equal(recovered.LastLogIndex, 2);
     assert_int_equal(recovered.Get(2)->Term, 5);
 }
+void test_mrtfl004_metadata_remains_readable(void**) {
+    TFiles files;
+    files.Seed();
+    std::ifstream originalInput(files.Path("entries"), std::ios::binary);
+    std::string originalEntries{std::istreambuf_iterator<char>(originalInput), std::istreambuf_iterator<char>()};
+    {
+        TDiskState state(files.Name, 1);
+        state.InstallSnapshot(TSnapshot{1, 2, {1, 2}, "MRFTL004 snapshot"});
+    }
+    files.Rewrite("entries", originalEntries);
+    const uint64_t retainedOffset = sizeof(TLogEntry) + sizeof(uint32_t);
+    std::string previousIndex;
+    previousIndex.append(reinterpret_cast<const char*>(&retainedOffset), sizeof(retainedOffset));
+    NSnapshotCodec::Put(previousIndex,
+        NSnapshotCodec::Checksum(std::string_view(reinterpret_cast<const char*>(&retainedOffset), sizeof(retainedOffset))),
+        sizeof(uint32_t));
+    {
+        std::ofstream index(files.Name + ".index.1.g1", std::ios::binary | std::ios::trunc);
+        index.write(previousIndex.data(), previousIndex.size());
+        assert_true(bool(index));
+    }
+    std::string metadata;
+    NSnapshotCodec::Append(metadata, "MRFTL004");
+    NSnapshotCodec::Put(metadata, 4, 4);
+    NSnapshotCodec::Put(metadata, 2, 8); // Last log index.
+    NSnapshotCodec::Put(metadata, 7, 8); // Current term.
+    NSnapshotCodec::Put(metadata, 2, 4); // Voted for.
+    NSnapshotCodec::Put(metadata, 1, 8); // Commit index.
+    NSnapshotCodec::Put(metadata, 0, 4); // No voter binding.
+    NSnapshotCodec::Put(metadata, 3, 4); // Trusted commit + checksummed records.
+    NSnapshotCodec::Put(metadata, 0, 8); // MRFTL004 has no entries generation.
+    NSnapshotCodec::Put(metadata, 1, 8); // Index/snapshot generation.
+    NSnapshotCodec::Put(metadata, 2, 8); // First retained index.
+    NSnapshotCodec::Put(metadata, 1, 8); // Snapshot index.
+    NSnapshotCodec::Put(metadata, 2, 8); // Snapshot term.
+    NSnapshotCodec::Put(metadata, NSnapshotCodec::Checksum(metadata), 4);
+    files.Rewrite("state", metadata);
+
+    TDiskState recovered(files.Name, 1);
+    const TSnapshot expected{1, 2, {1, 2}, "MRFTL004 snapshot"};
+    assert_true(recovered.GetSnapshot() && *recovered.GetSnapshot() == expected);
+    assert_int_equal(recovered.LastLogIndex, 2);
+    assert_int_equal(recovered.Get(2)->Term, 5);
+}
 void test_disk_append_rejects_invalid_or_nonmonotonic_terms_before_mutation(void**) {
     TFiles files;
     files.Seed();
@@ -847,6 +978,57 @@ void test_snapshot_generation_crashes_publish_old_or_new_complete_image(void**) 
         assert_int_equal(recovered.LastLogIndex, 2);
         assert_int_equal(recovered.Get(2)->Term, 5);
         assert_true(bool(recovered.GetSnapshot()) == published);
+    }
+}
+
+void test_disk_suffix_generation_crashes_recover_old_or_new_complete_log(void**) {
+    const TDiskState::ECommitStage stages[] = {
+        TDiskState::ECommitStage::EntriesPublished,
+        TDiskState::ECommitStage::SnapshotIndexPublished,
+        TDiskState::ECommitStage::LogFilesSynced,
+        TDiskState::ECommitStage::MetadataFileSynced,
+        TDiskState::ECommitStage::MetadataRenamed,
+        TDiskState::ECommitStage::DirectorySynced,
+    };
+    for (const auto stage : stages) {
+        TFiles files;
+        files.Seed();
+        {
+            TDiskState state(files.Name, 1);
+            state.CommitIndex = 1;
+            state.Commit();
+        }
+        const auto child = fork();
+        assert_true(child >= 0);
+        if (child == 0) {
+            try {
+                TDiskState state(files.Name, 1, [stage](TDiskState::ECommitStage reached) {
+                    if (reached == stage) _exit(120 + static_cast<int>(stage));
+                });
+                std::vector<TMessageHolder<TLogEntry>> replacement;
+                for (uint64_t term : {6, 7}) {
+                    auto entry = NewHoldedMessage<TLogEntry>();
+                    entry->Term = term;
+                    replacement.push_back(std::move(entry));
+                }
+                state.ReplaceSuffixAndAppendBatch(2, replacement, 3);
+            } catch (...) { _exit(130); }
+            _exit(131);
+        }
+        int status = 0;
+        assert_int_equal(waitpid(child, &status, 0), child);
+        assert_true(WIFEXITED(status));
+        assert_int_equal(WEXITSTATUS(status), 120 + static_cast<int>(stage));
+
+        TDiskState recovered(files.Name, 1);
+        const bool replacementPublished = stage == TDiskState::ECommitStage::MetadataRenamed ||
+            stage == TDiskState::ECommitStage::DirectorySynced;
+        assert_int_equal(recovered.LastLogIndex, replacementPublished ? 3 : 2);
+        assert_int_equal(recovered.CommitIndex, replacementPublished ? 3 : 1);
+        assert_int_equal(recovered.Get(1)->Term, 2);
+        assert_int_equal(recovered.Get(2)->Term, replacementPublished ? 6 : 5);
+        if (replacementPublished) assert_int_equal(recovered.Get(3)->Term, 7);
+        assert_false(bool(recovered.GetSnapshot()));
     }
 }
 #endif
@@ -1146,6 +1328,8 @@ int main() {
         cmocka_unit_test(test_disk_legacy_membership_history_can_be_bound_and_recovered),
         cmocka_unit_test(test_disk_vote_outside_original_binding_requires_committed_membership_proof),
         cmocka_unit_test(test_disk_snapshot_generation_recovers_suffix_and_replaces_conflict),
+        cmocka_unit_test(test_disk_suffix_replacement_publishes_one_generation),
+        cmocka_unit_test(test_disk_suffix_replacement_preserves_installed_snapshot),
         cmocka_unit_test(test_disk_snapshot_generation_rejects_corrupt_image_without_rewriting),
 #ifndef _WIN32
         cmocka_unit_test(test_snapshot_generation_temp_symlinks_do_not_modify_targets),
@@ -1154,11 +1338,13 @@ int main() {
 #endif
         cmocka_unit_test(test_disk_compacted_entries_keep_record_checksums),
         cmocka_unit_test(test_previous_snapshot_metadata_version_remains_readable),
+        cmocka_unit_test(test_mrtfl004_metadata_remains_readable),
         cmocka_unit_test(test_disk_append_rejects_invalid_or_nonmonotonic_terms_before_mutation),
         cmocka_unit_test(test_disk_append_batch_publishes_once_and_recovers_commit_boundary),
 #ifndef _WIN32
         cmocka_unit_test(test_disk_append_batch_crash_publishes_old_or_new_prefix),
         cmocka_unit_test(test_snapshot_generation_crashes_publish_old_or_new_complete_image),
+        cmocka_unit_test(test_disk_suffix_generation_crashes_recover_old_or_new_complete_log),
 #endif
         cmocka_unit_test(test_missing_storage_is_not_recreated),
         cmocka_unit_test(test_short_index_is_rejected),

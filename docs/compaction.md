@@ -11,11 +11,12 @@ support is described in [the SQL snapshot follow-up](sql-snapshots.md); the dumm
 state machine remains unsupported for compaction and installation.
 
 Current split-format `TDiskState` stores also support snapshot publication and
-InstallSnapshot. MRFTL004 metadata atomically selects a snapshot sidecar and
-matching compacted entries/index generation. After publication, the previous
-entries generation is reclaimed. MRFTL003 stores remain readable; their old
-entries file is reclaimed at the next snapshot installation. MRFTL001,
-MRFTL002 and 20-byte metadata remain readable.
+InstallSnapshot. MRFTL005 metadata atomically selects a snapshot sidecar, when
+present, and matching entries/index generation. After publication, the previous
+entries generation is reclaimed. MRFTL003 and MRFTL004 stores remain readable;
+their old entries file moves into a versioned generation at the next suffix
+replacement or snapshot installation. MRFTL001, MRFTL002 and 20-byte metadata
+remain readable.
 The disk backend writes the encoded snapshot sidecar in 64 KiB ranges, avoiding
 an additional full-size encoded string. Recovery decodes the owned sidecar
 buffer in place, avoiding a second heap allocation for the application payload.

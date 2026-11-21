@@ -65,12 +65,14 @@ Recovery rejection requires restoring verified state or deliberately rebuilding
 the node through a safe cluster procedure; never delete metadata alone to force
 startup. Previously created empty or partial file sets are deliberately rejected.
 
-Fresh `TDiskState` stores use MRFTL004 with CRC32 for hard-state metadata, log
+Fresh `TDiskState` stores use MRFTL005 with CRC32 for hard-state metadata, log
 entries and index offsets, plus snapshot and log-generation references.
-MRFTL001, MRFTL002, MRFTL003 and old 20-byte stores remain readable. MRFTL002's
-metadata flag selects whether its records are checksummed; MRFTL001 and 20-byte
-stores have unchecked records. CRCs detect accidental corruption, not a
-malicious rewrite.
+MRFTL001 through MRFTL004 and old 20-byte stores remain readable. MRFTL005 can
+select a versioned entries/index generation before the first snapshot, which
+lets follower suffix replacement publish the retained prefix, replacement
+entries and commit boundary with one metadata switch. MRFTL002's metadata flag
+selects whether its records are checksummed; MRFTL001 and 20-byte stores have
+unchecked records. CRCs detect accidental corruption, not a malicious rewrite.
 The alpha.2 follow-up added ordered log/index synchronization, temporary
 hard-state metadata, atomic replacement and directory synchronization. Its
 deterministic process-crash test checks recovery before and after the rename;
@@ -79,8 +81,9 @@ predates the later durable-image crash-boundary tests, snapshot/compaction
 support, live joint membership and fresh-quorum read confirmation. Current
 limits are documented in [durable state](durable-state.md),
 [compaction](compaction.md), [live membership](configuration-entries.md) and
-[strong reads](strong-reads.md). MRFTL004 snapshot install publishes a snapshot,
-compacted entries file and retained-suffix index atomically with the commit
-boundary, then reclaims the prior entries file. MRFTL003 stores remain readable
-and reclaim their old prefix on their next snapshot install. The strong-read
-protocol still does not claim end-to-end application linearizability.
+[strong reads](strong-reads.md). MRFTL004 and MRFTL005 snapshot installs publish
+a snapshot, compacted entries file and retained-suffix index atomically with the
+commit boundary, then reclaim the prior entries file. MRFTL003 and MRFTL004
+stores remain readable; their old entries files move into a generation on the
+next suffix replacement or snapshot install. The strong-read protocol still
+does not claim end-to-end application linearizability.

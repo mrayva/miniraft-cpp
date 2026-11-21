@@ -37,11 +37,11 @@ the filesystem assumptions below. `TDiskState` syncs its split log/index files
 before atomically replacing hard-state metadata. It supports snapshot install
 and compaction through generation-specific snapshot, entries and retained-suffix
 index files; metadata switches generations before the covered prefix is
-reclaimed. Fresh stores use checksummed log/index records and MRFTL004 metadata
-that includes CRC32, the commit boundary, original voter binding and snapshot
-generation. MRFTL001/MRFTL002/MRFTL003 and old 20-byte stores remain readable;
+reclaimed. Fresh stores use checksummed log/index records and MRFTL005 metadata
+that includes CRC32, the commit boundary, original voter binding and log
+generation. MRFTL001 through MRFTL004 and old 20-byte stores remain readable;
 after binding an old store, its existing records keep the legacy encoding
-selected by their metadata.
+selected by their metadata until a generation rewrite.
 An old 20-byte metadata record has no commit boundary or voter binding; supply
 both through the trusted-baseline API before Raft startup.
 
