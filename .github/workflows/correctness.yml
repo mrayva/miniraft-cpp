@@ -9,7 +9,7 @@ jobs:
       matrix:
         build_type: [Debug, Release]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y libcmocka-dev libsqlite3-dev
       - name: Configure core without networking dependencies
         run: >-
@@ -21,7 +21,7 @@ jobs:
   sanitizers:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - run: sudo apt-get update && sudo apt-get install -y libcmocka-dev liburing-dev libssl-dev libsqlite3-dev
