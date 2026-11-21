@@ -330,7 +330,7 @@ void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
         compactionError = error.what();
     }
     assert_string_equal(compactionError.c_str(),
-        "Compaction is unsafe while an active voter lacks snapshot-install support");
+        "Compaction requires every active voter to advertise InstallSnapshot support");
 }
 void test_compaction_lagging_follower_installs_snapshot_then_tail(void**) {
     TCluster cluster; cluster.Prepare();

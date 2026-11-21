@@ -59,7 +59,7 @@ def main():
 
         try:
             start(0)
-            start(1)  # two voters form a majority; node 3 starts with no log later
+            start(1)  # Two of the three voters can elect a leader and keep it in place.
             values = {b"a": b"a" * 60000, b"b": b"b" * 60000, b"c": b"c" * 60000}
             last = [0]
             for key, value in values.items():
@@ -67,6 +67,11 @@ def main():
                     last[0], _ = call(0, key, value)
                     return last[0] > 0
                 wait_for(write, 30)
+                if key == b"a":
+                    start(2)  # The established leader learns voter 3's snapshot support.
+                    wait_for(lambda: call(2, key)[1] == value, 15)
+                    processes[2].terminate()
+                    processes[2].wait(timeout=5)
 
             def compacted():
                 for index in (0, 1):

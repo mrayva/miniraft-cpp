@@ -2486,6 +2486,7 @@ void TRaft::MaybeDistributeConfigurationBarrier(ITimeSource::Time now) {
         if (capability == VolatileState->PeerCapabilities.end() ||
             lastSent == VolatileState->LastSentSeqno.end() ||
             !capability->second.ConfigurationBarrier ||
+            !capability->second.InstallSnapshot ||
             capability->second.AppendAckSeqno != lastSent->second) return;
     }
 
@@ -2538,6 +2539,14 @@ TCompactionMembershipReadiness TRaft::CheckCompactionMembershipReadiness() const
     if (!Configuration || !readiness.IsActiveVoter) return readiness;
 
     readiness.ConfigurationIndex = Configuration->Committed.ConfigurationIndex();
+    if (readiness.IsLeader) {
+        for (auto voter : Voters) {
+            if (voter == Id) continue;
+            const auto capability = VolatileState->PeerCapabilities.find(voter);
+            if (capability == VolatileState->PeerCapabilities.end() || !capability->second.InstallSnapshot)
+                readiness.ActiveVotersWithoutSnapshotInstallSupport.push_back(voter);
+        }
+    }
     if (!readiness.ConfigurationIndex) return readiness;
 
     if (readiness.IsLeader) {
@@ -2637,15 +2646,9 @@ TSnapshot TRaft::Compact() {
 
 std::shared_ptr<const TSnapshot> TRaft::CompactShared() {
     if (!State->SupportsSnapshots()) throw std::logic_error("Storage cannot compact snapshots");
-    if (StateName == EState::LEADER) {
-        for (auto voterId : Voters) {
-            if (voterId == Id) continue;
-            const auto capability = VolatileState->PeerCapabilities.find(voterId);
-            if (capability != VolatileState->PeerCapabilities.end() && !capability->second.InstallSnapshot)
-                throw std::logic_error("Compaction is unsafe while an active voter lacks snapshot-install support");
-        }
-    }
     const auto membershipReadiness = CheckCompactionMembershipReadiness();
+    if (!membershipReadiness.ActiveVotersWithoutSnapshotInstallSupport.empty())
+        throw std::logic_error("Compaction requires every active voter to advertise InstallSnapshot support");
     if (!membershipReadiness.ActiveVotersWithoutConfigurationAck.empty())
         throw std::logic_error("Compaction requires every active voter to acknowledge the committed configuration");
     if (membershipReadiness.RequiresLeaderAcknowledgementBarrier &&

@@ -92,9 +92,9 @@ struct TJointConfigurationReadiness {
     }
 };
 
-// Reports only the membership acknowledgement barrier used by CompactShared.
-// A ready result does not guarantee that storage or the application can create
-// and validate a snapshot.
+// Reports the membership and remote-install capability barriers used by
+// CompactShared. A ready result does not guarantee that storage or the
+// application can create and validate a snapshot.
 struct TCompactionMembershipReadiness {
     // Zero means the committed configuration does not require this barrier.
     uint64_t ConfigurationIndex = 0;
@@ -104,9 +104,12 @@ struct TCompactionMembershipReadiness {
     bool HasLeaderAcknowledgementBarrier = false;
     // Populated on leaders with active voters still behind the committed config.
     std::vector<uint32_t> ActiveVotersWithoutConfigurationAck;
+    // Remote active voters whose InstallSnapshot support is not positively known.
+    std::vector<uint32_t> ActiveVotersWithoutSnapshotInstallSupport;
 
     bool Ready() const {
         return ActiveVotersWithoutConfigurationAck.empty() &&
+            ActiveVotersWithoutSnapshotInstallSupport.empty() &&
             (!RequiresLeaderAcknowledgementBarrier || HasLeaderAcknowledgementBarrier);
     }
 };
