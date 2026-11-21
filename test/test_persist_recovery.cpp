@@ -733,7 +733,80 @@ void test_disk_append_rejects_invalid_or_nonmonotonic_terms_before_mutation(void
     assert_int_equal(recovered.LastLogIndex, 2);
     assert_int_equal(recovered.LastLogTerm, 5);
 }
+void test_disk_append_batch_publishes_once_and_recovers_commit_boundary(void**) {
+    TFiles files;
+    files.Seed();
+    std::vector<TDiskState::ECommitStage> stages;
+    {
+        TDiskState state(files.Name, 1, [&](auto stage) { stages.push_back(stage); });
+        stages.clear();
+        std::vector<TMessageHolder<TLogEntry>> entries;
+        for (unsigned i = 0; i < 3; ++i) {
+            auto entry = NewHoldedMessage<TLogEntry>();
+            entry->Term = 7;
+            entries.push_back(entry);
+        }
+        state.AppendBatchAndCommit(entries, 3);
+        assert_int_equal(state.LastLogIndex, 5);
+        assert_int_equal(state.CommitIndex, 3);
+        assert_true((stages == std::vector<TDiskState::ECommitStage>{
+            TDiskState::ECommitStage::LogFilesSynced,
+            TDiskState::ECommitStage::MetadataFileSynced,
+            TDiskState::ECommitStage::MetadataRenamed,
+            TDiskState::ECommitStage::DirectorySynced}));
+    }
+    TDiskState recovered(files.Name, 1);
+    assert_int_equal(recovered.LastLogIndex, 5);
+    assert_int_equal(recovered.CommitIndex, 3);
+    for (uint64_t index = 3; index <= 5; ++index)
+        assert_int_equal(recovered.Get(index)->Term, 7);
+}
 #ifndef _WIN32
+void test_disk_append_batch_crash_publishes_old_or_new_prefix(void**) {
+    const TDiskState::ECommitStage stages[] = {
+        TDiskState::ECommitStage::LogFilesSynced,
+        TDiskState::ECommitStage::MetadataFileSynced,
+        TDiskState::ECommitStage::MetadataRenamed,
+        TDiskState::ECommitStage::DirectorySynced,
+    };
+    for (const auto stage : stages) {
+        TFiles files;
+        files.Seed();
+        const auto child = fork();
+        assert_true(child >= 0);
+        if (child == 0) {
+            try {
+                TDiskState state(files.Name, 1, [stage](auto reached) {
+                    if (reached == stage) _exit(80 + static_cast<int>(stage));
+                });
+                std::vector<TMessageHolder<TLogEntry>> entries;
+                for (unsigned i = 0; i < 2; ++i) {
+                    auto entry = NewHoldedMessage<TLogEntry>();
+                    entry->Term = 7;
+                    entries.push_back(entry);
+                }
+                state.AppendBatchAndCommit(entries, 3);
+            } catch (...) { _exit(90); }
+            _exit(91);
+        }
+        int status = 0;
+        assert_int_equal(waitpid(child, &status, 0), child);
+        assert_true(WIFEXITED(status));
+        assert_int_equal(WEXITSTATUS(status), 80 + static_cast<int>(stage));
+
+        TDiskState recovered(files.Name, 1);
+        const bool published = stage == TDiskState::ECommitStage::MetadataRenamed ||
+            stage == TDiskState::ECommitStage::DirectorySynced;
+        assert_int_equal(recovered.LastLogIndex, published ? 4 : 2);
+        assert_int_equal(recovered.CommitIndex, published ? 3 : 0);
+        assert_int_equal(recovered.LastLogTerm, published ? 7 : 5);
+        if (published) {
+            assert_int_equal(recovered.Get(3)->Term, 7);
+            assert_int_equal(recovered.Get(4)->Term, 7);
+        }
+    }
+}
+
 void test_snapshot_generation_crashes_publish_old_or_new_complete_image(void**) {
     const TDiskState::ECommitStage stages[] = {
         TDiskState::ECommitStage::EntriesPublished,
@@ -1082,7 +1155,9 @@ int main() {
         cmocka_unit_test(test_disk_compacted_entries_keep_record_checksums),
         cmocka_unit_test(test_previous_snapshot_metadata_version_remains_readable),
         cmocka_unit_test(test_disk_append_rejects_invalid_or_nonmonotonic_terms_before_mutation),
+        cmocka_unit_test(test_disk_append_batch_publishes_once_and_recovers_commit_boundary),
 #ifndef _WIN32
+        cmocka_unit_test(test_disk_append_batch_crash_publishes_old_or_new_prefix),
         cmocka_unit_test(test_snapshot_generation_crashes_publish_old_or_new_complete_image),
 #endif
         cmocka_unit_test(test_missing_storage_is_not_recreated),

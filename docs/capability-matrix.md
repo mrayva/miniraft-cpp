@@ -55,8 +55,9 @@ design notes. This is a capability summary, not a production-readiness claim.
   request, including suffix replacement and any commit advance carried in that
   request, but republishes synchronously for individual proposals and commit-only
   advances.
-  Legacy `TDiskState` syncs
-  its log/index and atomically publishes versioned hard-state metadata. Fresh
+  Legacy `TDiskState` writes append-only follower batches before one log/index
+  sync and versioned metadata publication; conflicting suffix truncations still
+  publish separately. Fresh
   `TDiskState` stores checksum records; older split files and their record
   encoding remain readable after trusted-baseline migration.
 

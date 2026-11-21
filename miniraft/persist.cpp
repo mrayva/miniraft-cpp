@@ -619,28 +619,70 @@ void TDiskState::RemoveLast()
 
 void TDiskState::Append(TMessageHolder<TLogEntry> entry)
 {
-    if (!entry.HasValidExtent() || entry->Type != uint32_t(EMessageType::LOG_ENTRY) ||
-        entry->Len < sizeof(TLogEntry))
-        throw std::invalid_argument("Invalid Raft log entry");
-    if (LastLogIndex >= uint64_t(INT64_MAX)) throw std::overflow_error("Raft log index exhausted");
-    if (!entry->Term || entry->Term < LastLogTerm || entry->Term > CurrentTerm)
-        throw std::invalid_argument("Raft log entry term outside current log range");
-    uint64_t offset = 0;
-    if (LastLogIndex > SnapshotIndex && Get(LastLogIndex)) {
-        offset = Entries.tellg();
-    } else {
-        Entries.seekg(0, std::ios::end);
-        const auto end = Entries.tellg();
-        if (end < 0) Fail("Cannot determine Raft log end");
-        offset = uint64_t(end);
+    std::vector<TMessageHolder<TLogEntry>> entries;
+    entries.push_back(std::move(entry));
+    AppendBatchAndCommit(entries, CommitIndex);
+}
+
+void TDiskState::AppendBatch(const std::vector<TMessageHolder<TLogEntry>>& entries)
+{
+    AppendBatchAndCommit(entries, CommitIndex);
+}
+
+void TDiskState::AppendBatchAndCommit(
+        const std::vector<TMessageHolder<TLogEntry>>& entries, uint64_t commitIndex)
+{
+    if (LastLogIndex > uint64_t(INT64_MAX) ||
+        entries.size() > uint64_t(INT64_MAX) - LastLogIndex)
+        throw std::overflow_error("Raft log index exhausted");
+    const auto newLastLogIndex = LastLogIndex + entries.size();
+    const auto commitFloor = std::max(CommitIndex, SnapshotIndex);
+    if (commitIndex < commitFloor || commitIndex > newLastLogIndex)
+        throw std::logic_error("Invalid batched Raft commit boundary");
+
+    auto previousTerm = LastLogTerm;
+    for (const auto& entry : entries) {
+        if (!entry.HasValidExtent() || entry->Type != uint32_t(EMessageType::LOG_ENTRY) ||
+            entry->Len < sizeof(TLogEntry))
+            throw std::invalid_argument("Invalid Raft log entry");
+        if (!entry->Term || entry->Term < previousTerm || entry->Term > CurrentTerm)
+            throw std::invalid_argument("Raft log entry term outside current log range");
+        previousTerm = entry->Term;
     }
-    // In particular, after truncation to zero the stream may still point into
-    // the old suffix. Always position the output explicitly.
-    Entries.seekp(offset);
-    Write(entry);
-    WriteOffset(LastLogIndex, offset);
-    LastLogTerm = entry->Term;
-    ++LastLogIndex;
+    if (entries.empty() && commitIndex == CommitIndex) return;
+
+    uint64_t offset = 0;
+    if (!entries.empty()) {
+        if (LastLogIndex > SnapshotIndex && Get(LastLogIndex)) {
+            const auto end = Entries.tellg();
+            if (end < 0) Fail("Cannot determine Raft log end");
+            offset = uint64_t(end);
+        } else {
+            Entries.seekg(0, std::ios::end);
+            const auto end = Entries.tellg();
+            if (end < 0) Fail("Cannot determine Raft log end");
+            offset = uint64_t(end);
+        }
+
+        auto index = LastLogIndex;
+        for (const auto& entry : entries) {
+            const auto recordBytes = uint64_t(entry->Len) +
+                (ChecksummedRecords ? sizeof(uint32_t) : 0);
+            if (offset > uint64_t(INT64_MAX) - recordBytes)
+                throw std::overflow_error("Raft log file size exhausted");
+            Entries.seekp(std::streamoff(offset));
+            Write(entry);
+            WriteOffset(index, offset);
+            const auto end = Entries.tellp();
+            if (end < 0) Fail("Cannot determine Raft log end");
+            offset = uint64_t(end);
+            ++index;
+        }
+    }
+
+    LastLogIndex = newLastLogIndex;
+    LastLogTerm = previousTerm;
+    CommitIndex = commitIndex;
     Commit();
 }
 
