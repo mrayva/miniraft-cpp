@@ -953,6 +953,8 @@ void TDiskState::ReclaimPreviousGeneration(uint64_t previousEntriesGeneration,
         changed |= std::filesystem::remove(GenerationPath(previousIndexGeneration), ignored);
         ignored.clear();
         changed |= std::filesystem::remove(SnapshotPath(previousIndexGeneration), ignored);
+    } else {
+        changed |= TruncateAndSyncRegularFileNoFollow(IndexBasePath);
     }
     if (changed) (void)SyncDirectory(StatePath);
 }

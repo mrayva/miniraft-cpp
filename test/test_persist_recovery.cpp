@@ -463,6 +463,7 @@ void test_disk_snapshot_generation_recovers_suffix_and_replaces_conflict(void**)
         assert_false(state.Get(1));
         assert_int_equal(state.Get(2)->Term, 5);
         assert_int_equal(fs::file_size(files.Path("entries")), 0);
+        assert_int_equal(fs::file_size(files.Path("index")), 0);
         assert_int_equal(fs::file_size(files.Name + ".entries.1.g1"), sizeof(TLogEntry) + sizeof(uint32_t));
         std::ifstream storedSnapshot(files.Name + ".state.1.snapshot.g1", std::ios::binary);
         const std::string storedBytes{std::istreambuf_iterator<char>(storedSnapshot),
