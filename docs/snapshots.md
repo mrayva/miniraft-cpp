@@ -104,23 +104,23 @@ commit-floor initialization, fsync/rename order, publication failure semantics,
 and retention of all logs. No independent reviewer approval is claimed. Process
 crash injection does not substitute for hardware power-cut/storage fault testing.
 
-## Next snapshot and membership milestones
+## Current snapshot and membership status
 
-1. Introduce snapshot-boundary-aware log indexing and atomic durable publication
-   of snapshot plus retained suffix. Validate votes, AppendEntries consistency,
-   current-term commitment and strong reads at the compacted boundary.
-2. Add bounded, resumable InstallSnapshot transfer. Test interrupted/reordered/
-   duplicate chunks, leadership changes, concurrent tail replication, stale
-   snapshots and follower restart. Enable prefix deletion only once lagging
-   followers have a verified recovery path.
-3. Add non-voting learners and catch-up gates, then replicated configuration
-   entries with joint consensus. Elections, commits and strong-read confirmation
-   must honor both old and new majorities during transition. Persist configuration
-   state in logs/snapshots and test rollback, restart and leader removal.
+The original milestones for snapshot-boundary-aware log indexing and durable
+publication, bounded chunked `InstallSnapshot`, non-voting learners, and
+replicated joint-consensus membership are implemented. The current support
+matrix and operational constraints are in [capability matrix](capability-matrix.md).
 
-These follow the snapshot metadata/state-transfer requirements in
+The remaining work includes disk-streamed application snapshots and a shared
+heap budget across capture, storage, application state and transport. Partial
+incoming transfers are not persisted, so a follower restart begins again at
+offset zero. Cluster-wide endpoint discovery and rollout, plus automatic stale
+store recovery without an accepted membership-history anchor, also remain open.
+See the [streaming design](snapshot-streaming-design.md) for the proposed
+storage contract. Snapshot capture can still block the event loop, and
+independent review remains an open release gate.
+
+These features follow the snapshot metadata/state-transfer requirements in
 [Raft section 7](https://raft.github.io/raft.pdf) and the overlapping-quorum
 configuration protocol in section 6. Editing the static `--node` list is not a
-membership-change protocol. Snapshots do not make such edits safe. This release
-keeps fixed membership. Background capture and independent review remain open
-release gates.
+membership-change protocol; use the replicated joint-consensus API instead.
