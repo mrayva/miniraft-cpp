@@ -174,6 +174,22 @@ struct TState: IState {
         memcpy(copy.Mes, entry.Mes, entry->Len);
         return copy;
     }
+    static void ValidateLogTerm(uint64_t term, uint64_t previousTerm, uint64_t currentTerm) {
+        if (!term || term < previousTerm || term > currentTerm)
+            throw std::invalid_argument("Raft log entry term outside current log range");
+    }
+    std::vector<TMessageHolder<TLogEntry>> CloneEntries(
+            const std::vector<TMessageHolder<TLogEntry>>& entries, uint64_t previousTerm) const {
+        std::vector<TMessageHolder<TLogEntry>> cloned;
+        cloned.reserve(entries.size());
+        for (const auto& entry : entries) {
+            auto copy = CloneEntry(entry);
+            ValidateLogTerm(copy->Term, previousTerm, CurrentTerm);
+            previousTerm = copy->Term;
+            cloned.push_back(std::move(copy));
+        }
+        return cloned;
+    }
     std::vector<TMessageHolder<TLogEntry>> Log;
     std::shared_ptr<const TSnapshot> Snapshot;
     std::vector<uint32_t> BoundVoters;
@@ -181,12 +197,12 @@ struct TState: IState {
     TState() = default;
     TState(uint64_t currentTerm, uint32_t votedFor, const std::vector<TMessageHolder<TLogEntry>>& log)
     {
-        for (const auto& entry : log) Log.push_back(CloneEntry(entry));
         CurrentTerm = currentTerm;
         VotedFor = votedFor;
+        Log = CloneEntries(log, SnapshotTerm);
         if (!log.empty()) {
             LastLogIndex = log.size();
-            LastLogTerm = log.back()->Term;
+            LastLogTerm = Log.back()->Term;
         }
     }
     TState(const TState& other) : IState(other), Snapshot(other.Snapshot), BoundVoters(other.BoundVoters) {
@@ -212,9 +228,55 @@ struct TState: IState {
 
     void Append(TMessageHolder<TLogEntry> entry) override {
         if (LastLogIndex >= uint64_t(INT64_MAX)) throw std::overflow_error("Raft log index exhausted");
-        Log.emplace_back(CloneEntry(entry));
+        auto copy = CloneEntry(std::move(entry));
+        ValidateLogTerm(copy->Term, LastLogTerm, CurrentTerm);
+        Log.emplace_back(std::move(copy));
         LastLogIndex = SnapshotIndex + Log.size();
         LastLogTerm = Log.back()->Term;
+    }
+
+    void AppendBatch(const std::vector<TMessageHolder<TLogEntry>>& entries) override {
+        if (LastLogIndex > uint64_t(INT64_MAX) ||
+            entries.size() > uint64_t(INT64_MAX) - LastLogIndex)
+            throw std::overflow_error("Raft log index exhausted");
+        if (entries.size() > Log.max_size() - Log.size())
+            throw std::length_error("In-memory log is too large for this platform");
+        auto cloned = CloneEntries(entries, LastLogTerm);
+        Log.reserve(Log.size() + cloned.size());
+        for (auto& entry : cloned) Log.push_back(std::move(entry));
+        LastLogIndex = SnapshotIndex + Log.size();
+        if (!cloned.empty()) LastLogTerm = Log.back()->Term;
+    }
+
+    void ReplaceSuffixAndAppendBatch(uint64_t firstIndex,
+            const std::vector<TMessageHolder<TLogEntry>>& entries, uint64_t commitIndex) override {
+        if (LastLogIndex > uint64_t(INT64_MAX))
+            throw std::overflow_error("Raft log index exhausted");
+        const auto commitFloor = std::max(CommitIndex, SnapshotIndex);
+        if (firstIndex <= commitFloor || firstIndex > LastLogIndex + 1)
+            throw std::logic_error("Invalid Raft suffix replacement boundary");
+        const auto retainedLastIndex = firstIndex - 1;
+        if (entries.size() > uint64_t(INT64_MAX) - retainedLastIndex)
+            throw std::overflow_error("Raft log index exhausted");
+        const auto newLastLogIndex = retainedLastIndex + entries.size();
+        if (commitIndex < commitFloor || commitIndex > newLastLogIndex)
+            throw std::logic_error("Invalid Raft suffix replacement commit boundary");
+
+        const auto prefixSize = size_t(firstIndex - SnapshotIndex - 1);
+        if (prefixSize > Log.size())
+            throw std::logic_error("Invalid in-memory Raft suffix replacement index");
+        if (entries.size() > Log.max_size() - prefixSize)
+            throw std::length_error("In-memory log is too large for this platform");
+        const auto previousTerm = prefixSize ? Log[prefixSize - 1]->Term : SnapshotTerm;
+        auto cloned = CloneEntries(entries, previousTerm);
+        Log.reserve(prefixSize + cloned.size());
+        Log.resize(prefixSize);
+        for (auto& entry : cloned) Log.push_back(std::move(entry));
+        LastLogIndex = SnapshotIndex + Log.size();
+        LastLogTerm = Log.empty() ? SnapshotTerm : Log.back()->Term;
+        const bool advancesCommit = CommitIndex < commitIndex;
+        CommitIndex = commitIndex;
+        if (advancesCommit) Commit();
     }
 
     TMessageHolder<TLogEntry> Get(int64_t index) const override {

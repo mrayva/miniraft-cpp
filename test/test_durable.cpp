@@ -442,6 +442,42 @@ void test_durable_append_rejects_invalid_terms_before_mutation(void**) {
     assert_string_equal(Data(recovered, 2).c_str(), "second");
 }
 
+void test_in_memory_state_rejects_invalid_terms_before_mutation(void**) {
+    std::vector<TMessageHolder<TLogEntry>> original{Entry(1, "first"), Entry(2, "second")};
+    TState state(3, 0, original);
+    auto rejectsInvalid = [&](auto operation) {
+        bool rejected = false;
+        try { operation(); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        assert_true(rejected);
+        assert_int_equal(state.LastLogIndex, 2);
+        assert_int_equal(state.LastLogTerm, 2);
+        assert_int_equal(state.CommitIndex, 0);
+        auto first = state.Get(1);
+        auto second = state.Get(2);
+        assert_string_equal(std::string(first->Data, first->Len - sizeof(TLogEntry)).c_str(), "first");
+        assert_string_equal(std::string(second->Data, second->Len - sizeof(TLogEntry)).c_str(), "second");
+    };
+
+    rejectsInvalid([&] { state.Append(Entry(0, "zero term")); });
+    rejectsInvalid([&] { state.Append(Entry(1, "decreasing term")); });
+    rejectsInvalid([&] { state.Append(Entry(4, "future term")); });
+
+    std::vector<TMessageHolder<TLogEntry>> invalidBatch{
+        Entry(3, "valid first"), Entry(2, "decreasing second")};
+    rejectsInvalid([&] { state.AppendBatch(invalidBatch); });
+    rejectsInvalid([&] { state.AppendBatchAndCommit(invalidBatch, 3); });
+
+    std::vector<TMessageHolder<TLogEntry>> invalidReplacement{
+        Entry(2, "valid replacement"), Entry(1, "decreasing replacement")};
+    rejectsInvalid([&] { state.ReplaceSuffixAndAppendBatch(2, invalidReplacement, 0); });
+
+    bool rejected = false;
+    try { TState malformed(3, 0, {Entry(1, "first"), Entry(0, "zero term")}); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    assert_true(rejected);
+}
+
 void test_follower_replaces_durable_suffix_in_one_publish(void**) {
     TFiles files;
     std::vector<std::string> events;
@@ -818,6 +854,7 @@ int main() {
         cmocka_unit_test(test_follower_persists_commit_before_ack_and_recovers_it),
         cmocka_unit_test(test_follower_batches_durable_append_before_ack),
         cmocka_unit_test(test_durable_append_rejects_invalid_terms_before_mutation),
+        cmocka_unit_test(test_in_memory_state_rejects_invalid_terms_before_mutation),
         cmocka_unit_test(test_follower_replaces_durable_suffix_in_one_publish),
         cmocka_unit_test(test_publication_order),
         cmocka_unit_test(test_v1_v2_v3_images_recover_conservatively_and_upgrade_on_publish),

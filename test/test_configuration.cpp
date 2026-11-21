@@ -641,9 +641,9 @@ void test_scan_fails_closed_on_invalid_suffix(void**) {
     const auto fields = static_cast<TStateFields>(state);
     Reject([&] { ScanConfigurationHistory(state, base, 1); });
     assert_true(static_cast<TStateFields>(state) == fields); assert_int_equal(base.ThroughIndex(), 0);
-    state.RemoveLast(); state.Append(Ordinary(1));
+    state.Log.back() = Ordinary(1); state.LastLogTerm = 1;
     Reject([&] { ScanConfigurationHistory(state, base, 1); });
-    state.RemoveLast(); state.Append(Ordinary(3));
+    state.Log.back() = Ordinary(3); state.LastLogTerm = 3;
     state.BoundVoters = {2};
     Reject([&] { ScanConfigurationHistory(state, base, 1); });
     state.BoundVoters.clear(); state.CurrentTerm = 2;
@@ -3908,8 +3908,9 @@ void test_configuration_application_advances_without_calling_state_machine(void*
     assert_int_equal(app->Writes, 0);
     auto compacted = std::make_shared<TState>();
     { TRaft bootstrap(compacted, 1, {}); }
-    compacted->Append(NewHoldedMessage<TLogEntry>());
+    compacted->Append(Ordinary(1));
     compacted->InstallSnapshot({1, 1, {1}, "fixed image"});
+    compacted->CurrentTerm = record.Term;
     compacted->Append(EncodeConfigurationEntry(record));
     const auto fields = static_cast<TStateFields>(*compacted);
     Reject([&] { TRaft invalid(compacted, 1, {}); });

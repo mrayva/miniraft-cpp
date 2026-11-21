@@ -1081,15 +1081,13 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
         throw std::invalid_argument("Recovered durable state requires voter proof before Raft startup");
     auto previousTerm = State->SnapshotTerm;
     for (uint64_t index = State->SnapshotIndex + 1; index <= State->LastLogIndex; ++index) {
-        if (snapshot) {
-            const auto term = State->RetainedLogTerm(index);
-            if (!term || term < previousTerm || term > State->CurrentTerm)
-                throw std::invalid_argument("Invalid compacted log term sequence");
-            previousTerm = term;
-        }
+        const auto term = State->RetainedLogTerm(index);
+        if (!term || term < previousTerm || term > State->CurrentTerm)
+            throw std::invalid_argument("Invalid retained log term sequence");
+        previousTerm = term;
     }
-    if (snapshot && previousTerm != State->LastLogTerm)
-        throw std::invalid_argument("Compacted log last term mismatch");
+    if (previousTerm != State->LastLogTerm)
+        throw std::invalid_argument("Retained log last term mismatch");
     const bool fresh = State->CurrentTerm == 1 && !State->VotedFor && !State->LastLogIndex;
     if (!bound.empty()) {
         if (bound != InitialVoters)

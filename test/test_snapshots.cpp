@@ -310,7 +310,10 @@ void test_startup_rejects_inconsistent_snapshot_boundaries_before_binding(void**
         if (mode == 8) image.Voters = {1, 3};
         if (mode != 0 && mode != 6) state->Snapshot = std::make_shared<TSnapshot>(image);
         if (mode == 9 || mode == 10) {
-            auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = mode == 9 ? 1 : 3; state->Append(entry);
+            auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = mode == 9 ? 1 : 3;
+            state->Log.push_back(std::move(entry));
+            ++state->LastLogIndex;
+            state->LastLogTerm = mode == 9 ? 1 : 3;
         }
         const auto before = static_cast<TStateFields>(*state);
         Reject([&] { TRaft invalid(state, 1, {{2, std::make_shared<TSink>()}}); });
@@ -334,7 +337,10 @@ void test_startup_rejects_invalid_compacted_suffix_terms(void**) {
         state->Snapshot = std::make_shared<TSnapshot>(TSnapshot{5, 2, {1, 2}, "opaque"});
         auto first = NewHoldedMessage<TLogEntry>(); first->Term = mode == 0 ? 1 : mode == 2 ? 0 : mode == 3 ? 4 : 2;
         auto last = NewHoldedMessage<TLogEntry>(); last->Term = mode == 1 ? 3 : 2;
-        state->Append(first); state->Append(last);
+        state->Log.push_back(std::move(first));
+        state->Log.push_back(std::move(last));
+        state->LastLogIndex += 2;
+        state->LastLogTerm = state->Log.back()->Term;
         if (mode == 1) state->LastLogTerm = 2; // in range but differs from the actual last entry
         const auto before = static_cast<TStateFields>(*state);
         Reject([&] { TRaft invalid(state, 1, {{2, std::make_shared<TSink>()}}); });
