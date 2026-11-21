@@ -215,6 +215,27 @@ void test_sql_snapshot_truncation_rejects_before_replacement(void**) {
     assert_true(IsRejected([&] { target.LoadSnapshot(truncated[2], 2); }));
     assert_true(IsRejected([&] { target.ValidateSnapshot(truncated[3], 2); }));
     assert_true(IsRejected([&] { target.LoadSnapshot(truncated[3], 2); }));
+
+    const auto readBigEndian = [&](size_t offset) {
+        return (uint32_t(static_cast<unsigned char>(image[offset])) << 24) |
+            (uint32_t(static_cast<unsigned char>(image[offset + 1])) << 16) |
+            (uint32_t(static_cast<unsigned char>(image[offset + 2])) << 8) |
+            uint32_t(static_cast<unsigned char>(image[offset + 3]));
+    };
+    const auto writeBigEndian = [](std::string& bytes, size_t offset, uint32_t value) {
+        for (size_t i = 0; i != 4; ++i)
+            bytes[offset + i] = char(value >> ((3 - i) * 8));
+    };
+    auto inconsistentPageCount = image;
+    const auto pageSize = (uint32_t(static_cast<unsigned char>(image[16])) << 8) |
+        static_cast<unsigned char>(image[17]);
+    const auto actualPageSize = pageSize == 1 ? 65536 : pageSize;
+    const auto pageCount = uint32_t(image.size() / actualPageSize);
+    writeBigEndian(inconsistentPageCount, 28, pageCount + 1);
+    writeBigEndian(inconsistentPageCount, 92, readBigEndian(24));
+    assert_true(IsRejected([&] { target.ValidateSnapshot(inconsistentPageCount, 2); }));
+    assert_true(IsRejected([&] { target.LoadSnapshot(inconsistentPageCount, 2); }));
+
     assert_int_equal(target.LastAppliedIndex, 1);
     assert_true(ReadText(target, "SELECT value FROM t") == "value\noriginal\n");
 }

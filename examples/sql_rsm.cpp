@@ -85,19 +85,34 @@ struct TSnapshotDatabase {
 TSnapshotDatabase OpenSnapshotDatabase(std::string_view bytes) {
     if (bytes.size() < 100 || bytes.size() > MaxSqlSnapshotBytes)
         throw TMessageError("Invalid SQL snapshot size");
+    if (bytes.substr(0, 16) != std::string_view("SQLite format 3\0", 16))
+        throw TMessageError("Invalid SQL snapshot database header");
+    const auto readBigEndian = [&](size_t offset) {
+        return (uint32_t(static_cast<unsigned char>(bytes[offset])) << 24) |
+            (uint32_t(static_cast<unsigned char>(bytes[offset + 1])) << 16) |
+            (uint32_t(static_cast<unsigned char>(bytes[offset + 2])) << 8) |
+            uint32_t(static_cast<unsigned char>(bytes[offset + 3]));
+    };
+    const auto encodedPageSize = (uint32_t(static_cast<unsigned char>(bytes[16])) << 8) |
+        static_cast<unsigned char>(bytes[17]);
+    const uint32_t pageSize = encodedPageSize == 1 ? 65536 : encodedPageSize;
+    if (pageSize < 512 || pageSize > 65536 || (pageSize & (pageSize - 1)) != 0 ||
+        bytes.size() % pageSize != 0)
+        throw TMessageError("SQL snapshot is not a complete SQLite page image");
+    if (static_cast<unsigned char>(bytes[18]) != 1 || static_cast<unsigned char>(bytes[19]) != 1)
+        throw TMessageError("SQL snapshot is not a standalone rollback-mode image");
+    const auto headerPageCount = readBigEndian(28);
+    const auto actualPageCount = uint64_t(bytes.size() / pageSize);
+    if (headerPageCount && readBigEndian(24) == readBigEndian(92) &&
+        headerPageCount != actualPageCount)
+        throw TMessageError("SQL snapshot page count does not match its image length");
+
     TSnapshotDatabase result;
     constexpr size_t MalformedImageReadSlack = 20;
     result.Buffer.reset(static_cast<unsigned char*>(sqlite3_malloc64(bytes.size() + MalformedImageReadSlack)));
     if (!result.Buffer) throw std::bad_alloc();
     memcpy(result.Buffer.get(), bytes.data(), bytes.size());
     memset(result.Buffer.get() + bytes.size(), 0, MalformedImageReadSlack);
-    const auto encodedPageSize = (uint32_t(result.Buffer.get()[16]) << 8) | result.Buffer.get()[17];
-    const uint32_t pageSize = encodedPageSize == 1 ? 65536 : encodedPageSize;
-    if (pageSize < 512 || pageSize > 65536 || (pageSize & (pageSize - 1)) != 0 ||
-        bytes.size() % pageSize != 0)
-        throw TMessageError("SQL snapshot is not a complete SQLite page image");
-    if (result.Buffer.get()[18] != 1 || result.Buffer.get()[19] != 1)
-        throw TMessageError("SQL snapshot is not a standalone rollback-mode image");
 
     sqlite3* raw = nullptr;
     const int opened = sqlite3_open_v2(":memory:", &raw,

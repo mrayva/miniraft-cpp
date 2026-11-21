@@ -29,10 +29,11 @@ The application image is captured with SQLite's backup API into an in-memory
 database and then serialized. This includes committed pages still present in a
 WAL file. Save requires a committed `LastAppliedIndex` marker and no open
 transaction. The SQL payload is capped below 64 MiB to leave room for the Raft
-snapshot header and maximum voter metadata. Before deserialization, SQL checks
-that the declared page size is valid and the image contains complete pages, then
-copies it into a buffer with 20 zeroed trailing guard bytes for SQLite's
-malformed-image checks. Before restore or installation,
+snapshot header and maximum voter metadata. Before allocating the padded image,
+SQL checks the format signature, rollback mode, page size, page alignment and
+the in-header page count when SQLite's header counters make it authoritative.
+It then copies the image into a buffer with 20 zeroed trailing guard bytes for
+SQLite's malformed-image checks. Before restore or installation,
 SQL checks that the image can be opened,
 passes `PRAGMA quick_check(1)`, and has exactly one valid progress marker equal
 to the Raft snapshot boundary. WAL-mode backup bytes are normalized to SQLite's
