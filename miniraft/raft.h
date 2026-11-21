@@ -96,7 +96,8 @@ struct TJointConfigurationReadiness {
 // CompactShared. A ready result does not guarantee that storage or the
 // application can create and validate a snapshot.
 struct TCompactionMembershipReadiness {
-    // Zero means the committed configuration does not require this barrier.
+    // Zero identifies the fixed initial voter set; followers still require an
+    // explicit capability barrier for that baseline.
     uint64_t ConfigurationIndex = 0;
     bool IsLeader = false;
     bool IsActiveVoter = false;
@@ -166,9 +167,11 @@ struct TVolatileState {
         ITimeSource::Time RetryDue{};
     };
     std::optional<TLeadershipTransfer> LeadershipTransfer;
-    // A follower may compact a membership-bearing boundary only after the
-    // current leader certifies that every active voter acknowledged it.
+    // A follower may compact only after the current leader certifies that all
+    // active voters support snapshot installation. The zero-index baseline
+    // needs a separate marker because its configuration index cannot encode it.
     uint64_t CompactionSafeConfigurationIndex = 0;
+    bool HasCompactionSafeInitialConfigurationBarrier = false;
     uint32_t LeaderId = 0;
     std::unordered_map<uint32_t, uint64_t> NextIndex;
     std::unordered_map<uint32_t, uint64_t> MatchIndex;

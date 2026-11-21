@@ -1783,13 +1783,14 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
         auto request = message.Cast<TConfigurationBarrierRequest>();
         return header->Term == State->CurrentTerm && request->LeaderId == header->Src &&
             request->Padding == 0 &&
-            request->ConfigurationIndex > 0 && request->ConfigurationIndex <= maxIndex &&
-            request->ConfigurationTerm > 0 && request->ConfigurationTerm <= header->Term;
+            request->ConfigurationIndex <= maxIndex &&
+            request->ConfigurationTerm <= header->Term &&
+            ((request->ConfigurationIndex == 0) == (request->ConfigurationTerm == 0));
     }
     case EMessageType::CONFIGURATION_BARRIER_RESPONSE: {
         auto response = message.Cast<TConfigurationBarrierResponse>();
-        return response->ConfigurationIndex > 0 && response->ConfigurationIndex <= maxIndex &&
-            response->ConfigurationTerm > 0 && response->ConfigurationTerm <= header->Term &&
+        return response->ConfigurationIndex <= maxIndex && response->ConfigurationTerm <= header->Term &&
+            ((response->ConfigurationIndex == 0) == (response->ConfigurationTerm == 0)) &&
             response->Accepted <= 1 && response->Padding == 0;
     }
     case EMessageType::APPEND_ENTRIES_REQUEST: {
@@ -2437,8 +2438,12 @@ void TRaft::OnConfigurationBarrier(TMessageHolder<TConfigurationBarrierRequest> 
         Configuration->Committed.ConfigurationIndex() == request->ConfigurationIndex &&
         Configuration->Committed.ConfigurationTerm() == request->ConfigurationTerm;
     if (accepted) {
-        VolatileState->CompactionSafeConfigurationIndex = std::max(
-            VolatileState->CompactionSafeConfigurationIndex, request->ConfigurationIndex);
+        if (!request->ConfigurationIndex) {
+            VolatileState->HasCompactionSafeInitialConfigurationBarrier = true;
+        } else {
+            VolatileState->CompactionSafeConfigurationIndex = std::max(
+                VolatileState->CompactionSafeConfigurationIndex, request->ConfigurationIndex);
+        }
     }
     auto reply = NewHoldedMessage(
         TMessageEx{.Src = Id, .Dst = request->Src, .Term = State->CurrentTerm, .Seqno = request->Seqno},
@@ -2476,7 +2481,6 @@ void TRaft::MaybeDistributeConfigurationBarrier(ITimeSource::Time now) {
         Configuration->HasUncommittedConfiguration()) return;
     const auto index = Configuration->Committed.ConfigurationIndex();
     const auto term = Configuration->Committed.ConfigurationTerm();
-    if (!index || !term) return;
     for (auto voter : Voters) {
         if (voter == Id) continue;
         const auto ack = VolatileState->CommitAckIndex.find(voter);
@@ -2547,20 +2551,23 @@ TCompactionMembershipReadiness TRaft::CheckCompactionMembershipReadiness() const
                 readiness.ActiveVotersWithoutSnapshotInstallSupport.push_back(voter);
         }
     }
-    if (!readiness.ConfigurationIndex) return readiness;
-
     if (readiness.IsLeader) {
-        for (auto voter : Voters) {
-            if (voter == Id) continue;
-            const auto ack = VolatileState->CommitAckIndex.find(voter);
-            if (ack == VolatileState->CommitAckIndex.end() ||
-                ack->second < readiness.ConfigurationIndex)
-                readiness.ActiveVotersWithoutConfigurationAck.push_back(voter);
+        if (readiness.ConfigurationIndex) {
+            for (auto voter : Voters) {
+                if (voter == Id) continue;
+                const auto ack = VolatileState->CommitAckIndex.find(voter);
+                if (ack == VolatileState->CommitAckIndex.end() ||
+                    ack->second < readiness.ConfigurationIndex)
+                    readiness.ActiveVotersWithoutConfigurationAck.push_back(voter);
+            }
         }
-    } else {
+    } else if (Voters.size() > 1) {
         readiness.RequiresLeaderAcknowledgementBarrier = true;
-        readiness.HasLeaderAcknowledgementBarrier =
-            VolatileState->CompactionSafeConfigurationIndex >= readiness.ConfigurationIndex;
+        readiness.HasLeaderAcknowledgementBarrier = readiness.ConfigurationIndex
+            ? VolatileState->CompactionSafeConfigurationIndex >= readiness.ConfigurationIndex
+            : VolatileState->HasCompactionSafeInitialConfigurationBarrier;
+    } else {
+        readiness.HasLeaderAcknowledgementBarrier = true;
     }
     return readiness;
 }

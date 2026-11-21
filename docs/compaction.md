@@ -116,12 +116,12 @@ still need to acknowledge the committed configuration and remote active voters
 whose `InstallSnapshot` capability has not been positively advertised on a
 leader. The leader blocks compaction until each remote voter advertises support;
 it also sends the all-voter acknowledgement barrier only after that check. A
-follower with a membership-bearing committed configuration relies on that
-barrier and does not need its own outbound capability cache. A legacy
-zero-index configuration has no such barrier, so follower readiness does not
-certify the remote capability set in that case. A ready result still does not
-guarantee that storage or the application can create and validate the
-snapshot. Serialize the check with Raft work, as with `CompactShared()`.
+follower relies on that barrier and does not need its own outbound capability
+cache. The barrier also covers the fixed initial voter set with configuration
+index zero; the explicit zero-index marker prevents that baseline from
+bypassing the check. A ready result still does not guarantee that storage or
+the application can create and validate the snapshot. Serialize the check with
+Raft work, as with `CompactShared()`.
 
 ## Transfer protocol
 

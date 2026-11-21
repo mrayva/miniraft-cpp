@@ -198,6 +198,29 @@ void test_shared_compaction_reuses_storage_snapshot_image(void**) {
     assert_int_equal(snapshot->Index, cluster.Apps[0]->LastAppliedIndex);
     assert_true(Read(*cluster.Apps[0], "key") == "value");
 }
+void test_zero_index_follower_compaction_waits_for_capability_barrier(void**) {
+    TCluster cluster;
+    cluster.Elect(1);
+    cluster.Pump(1);
+
+    auto* followerState = const_cast<TVolatileState*>(cluster.Nodes[1]->GetVolatileState());
+    auto readiness = cluster.Nodes[1]->CheckCompactionMembershipReadiness();
+    assert_false(readiness.IsLeader);
+    assert_int_equal(readiness.ConfigurationIndex, 0);
+    assert_true(readiness.RequiresLeaderAcknowledgementBarrier);
+    assert_true(readiness.HasLeaderAcknowledgementBarrier);
+    assert_true(readiness.Ready());
+
+    followerState->HasCompactionSafeInitialConfigurationBarrier = false;
+    readiness = cluster.Nodes[1]->CheckCompactionMembershipReadiness();
+    assert_false(readiness.HasLeaderAcknowledgementBarrier);
+    assert_false(readiness.Ready());
+    Reject([&] { cluster.Nodes[1]->Compact(); });
+
+    followerState->HasCompactionSafeInitialConfigurationBarrier = true;
+    assert_true(cluster.Nodes[1]->CheckCompactionMembershipReadiness().Ready());
+    assert_true(cluster.Nodes[1]->Compact().Index > 0);
+}
 void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
     const std::vector<uint32_t> stableVoters{1, 5}, addedVoters{1, 2, 5};
     auto history = TConfigurationHistory::Stable(stableVoters, 0, 0, 0, 0);
@@ -1334,7 +1357,11 @@ void test_newer_snapshot_cannot_regress_committed_term(void**) {
         auto heartbeat = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 2, .Term = 2},
             TAppendEntriesRequest{.PrevLogIndex = 3, .PrevLogTerm = 2, .LeaderCommit = 3, .LeaderId = 1});
         raft->Process({}, heartbeat); processor.ProcessCommitted();
-        if (compacted) raft->Compact();
+        if (compacted) {
+            auto* volatileState = const_cast<TVolatileState*>(raft->GetVolatileState());
+            volatileState->HasCompactionSafeInitialConfigurationBarrier = true;
+            raft->Compact();
+        }
         assert_int_equal(app->LastAppliedIndex, 3); assert_true(Read(*app, "key") == "3");
         TKv source; source.Write(source.Prepare(Command("key", "future")), 4);
         TSnapshot snapshot{4, 1, {1, 2}, source.SaveSnapshot()};
@@ -1683,6 +1710,7 @@ int main() {
         cmocka_unit_test(test_kv_snapshot_precomputes_size_without_changing_encoding),
         cmocka_unit_test(test_snapshot_capture_preflights_application_size_bound),
         cmocka_unit_test(test_shared_compaction_reuses_storage_snapshot_image),
+        cmocka_unit_test(test_zero_index_follower_compaction_waits_for_capability_barrier),
         cmocka_unit_test(test_snapshot_history_encoding_is_negotiated_per_peer),
         cmocka_unit_test(test_idle_snapshot_transfer_discards_partial_image_and_restarts),
         cmocka_unit_test(test_snapshot_install_budget_is_shared_and_reclaimed_after_idle_expiry),
