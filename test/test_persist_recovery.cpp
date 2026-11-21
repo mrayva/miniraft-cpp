@@ -357,6 +357,26 @@ void test_versioned_metadata_persists_commit_and_voter_baseline(void**) {
         assert_true(reason.find("configuration entries") != std::string::npos);
         assert_true(state.GetBoundVoters().empty());
     }
+
+    TFiles unsupportedFlags;
+    unsupportedFlags.Seed();
+    unsupportedFlags.OverwriteEntry(0, sizeof(TMessage) + sizeof(uint64_t), uint64_t(1) << 40);
+    unsupportedFlags.WriteLegacyMetadata(2, 7, 2);
+    {
+        TDiskState state(unsupportedFlags.Name, 1);
+        std::ifstream metadataInput(unsupportedFlags.Path("state"), std::ios::binary);
+        const std::string metadataBefore(std::istreambuf_iterator<char>(metadataInput), {});
+        std::string reason;
+        assert_false(state.CanBindVotersFromTrustedBaseline({1, 2, 3}, 1, &reason));
+        assert_true(reason.find("unsupported entry flags") != std::string::npos);
+        assert_true(state.GetBoundVoters().empty());
+        bool bindingRejected = false;
+        try { state.BindVotersFromTrustedBaseline({1, 2, 3}, 1); }
+        catch (const std::invalid_argument&) { bindingRejected = true; }
+        assert_true(bindingRejected);
+        std::ifstream metadataAfterInput(unsupportedFlags.Path("state"), std::ios::binary);
+        assert_true(std::string(std::istreambuf_iterator<char>(metadataAfterInput), {}) == metadataBefore);
+    }
 }
 void test_disk_legacy_membership_history_can_be_bound_and_recovered(void**) {
     const std::vector<uint32_t> original{1, 2, 3};

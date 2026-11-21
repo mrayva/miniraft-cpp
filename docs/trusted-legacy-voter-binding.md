@@ -76,8 +76,8 @@ preflight a simple baseline, then call
 `TDiskState::BindVotersFromTrustedBaseline(voters, commitIndex)` before
 constructing Raft. These methods require an independently verified voter set
 and commit index, check the stored vote and term/log bounds, and refuse
-compacted state or any retained configuration entry. Binding atomically writes
-the new metadata before startup. The older
+compacted state, retained configuration entries, and unsupported log flags.
+Binding atomically writes the new metadata before startup. The older
 `ValidateTrustedLegacyVoterBaseline` name remains as a mutating compatibility
 wrapper. Recovered unbound state otherwise fails Raft startup. For retained
 membership entries or a compacted snapshot, use the full-history offline

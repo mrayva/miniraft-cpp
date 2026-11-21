@@ -1078,8 +1078,11 @@ void TDiskState::CheckTrustedLegacyVoterBaseline(const std::vector<uint32_t>& vo
         throw std::invalid_argument("Stored vote is outside the trusted voter baseline");
     for (uint64_t index = 1; index <= LastLogIndex; ++index) {
         auto entry = Get(index);
+        if (!entry) throw std::invalid_argument("Missing legacy log entry");
         if (entry->Flags & TLogEntry::EConfiguration)
             throw std::invalid_argument("Legacy disk voter binding requires a log without configuration entries");
+        if (entry->Flags != TLogEntry::ENone && entry->Flags != TLogEntry::EStub)
+            throw std::invalid_argument("Legacy disk log contains unsupported entry flags");
     }
 }
 
