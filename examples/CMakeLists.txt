@@ -14,7 +14,7 @@ target(debug_client client.cpp)
 target(debug_server server.cpp)
 target(debug_percentiles percentiles2.cpp)
 target(kv kv.cpp)
-target_sources(kv PRIVATE kv_rsm.cpp)
+target_sources(kv PRIVATE kv_rsm.cpp idempotent_kv_rsm.cpp)
 
 if (SQLite3_FOUND)
 target(sql sql.cpp)

@@ -51,6 +51,9 @@ if(Python3_Interpreter_FOUND)
 add_test(NAME test_kv_checkpoints_cli COMMAND ${Python3_EXECUTABLE}
   ${CMAKE_CURRENT_SOURCE_DIR}/smoke_kv_checkpoints.py $<TARGET_FILE:kv>)
 set_tests_properties(test_kv_checkpoints_cli PROPERTIES TIMEOUT 35)
+add_test(NAME test_idempotent_kv_client_cli COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/smoke_idempotent_kv_client.py $<TARGET_FILE:kv>)
+set_tests_properties(test_idempotent_kv_client_cli PROPERTIES TIMEOUT 45)
 add_test(NAME test_install_snapshot_cli COMMAND ${Python3_EXECUTABLE}
   ${CMAKE_CURRENT_SOURCE_DIR}/smoke_install_snapshot.py $<TARGET_FILE:kv>)
 set_tests_properties(test_install_snapshot_cli PROPERTIES TIMEOUT 120)

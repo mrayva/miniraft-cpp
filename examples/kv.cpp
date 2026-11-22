@@ -9,8 +9,53 @@
 
 #include "kv_messages.h"
 
+#include "idempotent_kv_rsm.h"
+#include <miniraft/idempotent_client.h>
+
+#include <random>
+
+std::string EncodeIdempotentKvWrite(std::string_view key, std::string_view value) {
+    if (key.size() > UINT16_MAX || value.size() > UINT16_MAX)
+        throw std::length_error("KV key or value is too large");
+    const auto keySize = static_cast<uint16_t>(key.size());
+    const auto valueSize = static_cast<uint16_t>(value.size());
+    std::string payload(sizeof(TKvEntry) + key.size() + value.size(), '\0');
+    memcpy(payload.data(), &keySize, sizeof(keySize));
+    memcpy(payload.data() + sizeof(keySize), &valueSize, sizeof(valueSize));
+    if (!key.empty()) memcpy(payload.data() + sizeof(TKvEntry), key.data(), key.size());
+    if (!value.empty())
+        memcpy(payload.data() + sizeof(TKvEntry) + key.size(), value.data(), value.size());
+    return payload;
+}
+
+template<typename TSocket>
+NNet::TFuture<TMessageHolder<TIdempotentCommandResponse>> SendIdempotent(
+        TSocket& socket, TMessageHolder<TIdempotentCommandRequest> request) {
+    co_await TMessageWriter(socket).Write(std::move(request));
+    auto reply = co_await TMessageReader(socket).Read();
+    co_return reply.template Cast<TIdempotentCommandResponse>();
+}
+
+void ReportIdempotentReply(TIdempotentClientSession& client,
+        const TMessageHolder<TIdempotentCommandResponse>& response) {
+    ValidateIdempotentCommandResponse(response);
+    if (response->ErrorCode != TCommandResponse::Success) {
+        std::cout << "Idempotent write unresolved (error " << response->ErrorCode
+                  << "); its operation remains saved for retry.\n";
+        return;
+    }
+    if (!client.Complete(response)) {
+        std::cout << "Idempotent response did not match the pending write; state remains pending.\n";
+        return;
+    }
+    std::cout << "Idempotent write committed at " << response->Index << "\n";
+    const auto size = response->Len - sizeof(TIdempotentCommandResponse);
+    if (size) std::cout << std::string_view(response->Data, size) << "\n";
+}
+
 template<typename TPoller, typename TSocket>
-NNet::TFuture<void> Client(TPoller& poller, TSocket socket, uint32_t flags) {
+NNet::TFuture<void> Client(TPoller& poller, TSocket socket, uint32_t flags,
+        std::shared_ptr<TIdempotentClientSession> idempotentClient) {
     using TFileHandle = typename TPoller::TFileHandle;
     TFileHandle input{0, poller}; // stdin
     co_await socket.Connect();
@@ -25,6 +70,10 @@ NNet::TFuture<void> Client(TPoller& poller, TSocket socket, uint32_t flags) {
     const char* sep = " \t\r\n";
 
     try {
+        if (idempotentClient && idempotentClient->State().HasPending) {
+            auto response = co_await SendIdempotent(socket, idempotentClient->RetryPending());
+            ReportIdempotentReply(*idempotentClient, response);
+        }
         std::cout << "> " << std::flush;
         while ((line = co_await lineReader.Read())) {
             std::string strLine;
@@ -33,6 +82,8 @@ NNet::TFuture<void> Client(TPoller& poller, TSocket socket, uint32_t flags) {
             auto prefix = strtok((char*)strLine.data(), sep);
             if (!prefix) { std::cout << "> " << std::flush; continue; }
             TMessageHolder<TMessage> req;
+            bool isWrite = false;
+            std::string idempotentPayload;
 
             if (!strcmp(prefix, "set")) {
                 auto key = strtok(nullptr, sep);
@@ -40,6 +91,9 @@ NNet::TFuture<void> Client(TPoller& poller, TSocket socket, uint32_t flags) {
                 if (!key || !val) { std::cout << "Expected set <key> <value>\n"; continue; }
                 auto keySize = strlen(key);
                 auto valSize = strlen(val);
+                isWrite = true;
+                if (idempotentClient) idempotentPayload = EncodeIdempotentKvWrite(
+                    std::string_view(key, keySize), std::string_view(val, valSize));
                 auto mes = NewHoldedMessage<TWriteKv>(sizeof(TWriteKv) + keySize + valSize);
                 mes->Flags = TCommandRequest::EWrite;
                 mes->KeySize = keySize;
@@ -64,6 +118,9 @@ NNet::TFuture<void> Client(TPoller& poller, TSocket socket, uint32_t flags) {
                 auto key = strtok(nullptr, sep);
                 if (!key) { std::cout << "Expected a key\n"; continue; }
                 auto size = strlen(key);
+                isWrite = true;
+                if (idempotentClient) idempotentPayload = EncodeIdempotentKvWrite(
+                    std::string_view(key, size), {});
                 auto mes = NewHoldedMessage<TWriteKv>(sizeof(TWriteKv) + size);
                 mes->Flags = TCommandRequest::EWrite;
                 mes->KeySize = size;
@@ -75,17 +132,33 @@ NNet::TFuture<void> Client(TPoller& poller, TSocket socket, uint32_t flags) {
                 continue;
             }
 
-            co_await TMessageWriter(socket).Write(std::move(req));
-            auto reply = co_await TMessageReader(socket).Read();
-            auto res = reply.template Cast<TCommandResponse>();
-            auto len = res->Len - sizeof(TCommandResponse);
-            std::string_view data(res->Data, len);
-            if (res->ErrorCode) {
-                std::cout << "Request failed (error " << res->ErrorCode
-                          << "). A write may still have committed.\n";
+            if (idempotentClient && isWrite) {
+                if (idempotentClient->State().HasPending &&
+                    idempotentClient->State().PendingPayload != idempotentPayload) {
+                    auto previous = co_await SendIdempotent(socket, idempotentClient->RetryPending());
+                    ReportIdempotentReply(*idempotentClient, previous);
+                    if (idempotentClient->State().HasPending) {
+                        std::cout << "Resolve the pending write before starting another write.\n";
+                        std::cout << "> " << std::flush;
+                        continue;
+                    }
+                }
+                auto request = idempotentClient->BeginWrite(idempotentPayload);
+                auto response = co_await SendIdempotent(socket, std::move(request));
+                ReportIdempotentReply(*idempotentClient, response);
             } else {
-                std::cout << "Ok, commitIndex: " << res->Index << "\n";
-                if (!data.empty()) std::cout << data << "\n";
+                co_await TMessageWriter(socket).Write(std::move(req));
+                auto reply = co_await TMessageReader(socket).Read();
+                auto res = reply.template Cast<TCommandResponse>();
+                auto len = res->Len - sizeof(TCommandResponse);
+                std::string_view data(res->Data, len);
+                if (res->ErrorCode) {
+                    std::cout << "Request failed (error " << res->ErrorCode
+                              << "). A write may still have committed.\n";
+                } else {
+                    std::cout << "Ok, commitIndex: " << res->Index << "\n";
+                    if (!data.empty()) std::cout << data << "\n";
+                }
             }
             std::cout << "> " << std::flush;
         }
@@ -114,7 +187,7 @@ NNet::TVoidTask CheckpointLoop(TPoller& poller, std::shared_ptr<TRaft> raft,
 }
 
 void usage(const char* prog) {
-    std::cerr << prog << "--client|--server --id myid --node ip:port:id [--node ip:port:id ...] [--persist|--durable] [--snapshots entries] [--learner id ...] [--stale] [--consistent]" << "\n";
+    std::cerr << prog << "--client|--server --id myid --node ip:port:id [--node ip:port:id ...] [--persist|--durable] [--snapshots entries] [--learner id ...] [--idempotent [--client-state path]] [--stale] [--consistent]" << "\n";
     exit(0);
 }
 
@@ -128,6 +201,8 @@ int main(int argc, char** argv) {
     bool server = false;
     bool persist = false;
     bool durable = false;
+    bool idempotent = false;
+    std::string clientStatePath;
     uint64_t snapshotInterval = 0;
     uint32_t flags = 0;
     for (int i = 1; i < argc; i++) {
@@ -143,6 +218,11 @@ int main(int argc, char** argv) {
         } else if (!strcmp(argv[i], "--durable")) {
             persist = true;
             durable = true;
+        } else if (!strcmp(argv[i], "--idempotent")) {
+            idempotent = true;
+        } else if (!strcmp(argv[i], "--client-state")) {
+            if (i + 1 >= argc) { std::cerr << "--client-state requires a path\n"; return 1; }
+            clientStatePath = argv[++i];
         } else if (!strcmp(argv[i], "--snapshots")) {
             if (i + 1 >= argc) { std::cerr << "--snapshots requires a positive entry interval\n"; return 1; }
             const std::string_view value(argv[++i]);
@@ -174,6 +254,18 @@ int main(int argc, char** argv) {
     if (snapshotInterval && (!server || !durable)) {
         std::cerr << "--snapshots requires --server --durable\n"; return 1;
     }
+    if (idempotent && server && !durable) {
+        std::cerr << "--idempotent server mode requires --durable\n"; return 1;
+    }
+    if (idempotent && !server && clientStatePath.empty()) {
+        std::cerr << "--idempotent client mode requires --client-state\n"; return 1;
+    }
+    if (!idempotent && !clientStatePath.empty()) {
+        std::cerr << "--client-state requires --idempotent\n"; return 1;
+    }
+    if (server && !clientStatePath.empty()) {
+        std::cerr << "--client-state is only valid in client mode\n"; return 1;
+    }
     using TPoller = NNet::TDefaultPoller;
     std::shared_ptr<ITimeSource> timeSource = std::make_shared<TTimeSource>();
     NNet::TLoop<TPoller> loop;
@@ -200,7 +292,9 @@ int main(int argc, char** argv) {
             std::cerr << "Host not found\n"; return 1;
         }
 
-        std::shared_ptr<IRsm> rsm = std::make_shared<TKv>();
+        std::shared_ptr<IRsm> rsm = idempotent
+            ? std::static_pointer_cast<IRsm>(std::make_shared<TIdempotentKvRsm>())
+            : std::static_pointer_cast<IRsm>(std::make_shared<TKv>());
         std::shared_ptr<IState> state = std::make_shared<TState>();
         if (persist) {
             if (durable) state = std::make_shared<TDurableState>("state", myHost.Id);
@@ -229,7 +323,22 @@ int main(int argc, char** argv) {
         NNet::TAddress addr{hosts[0].Address, hosts[0].Port};
         NNet::TSocket socket(std::move(addr), loop.Poller());
 
-        auto h = Client(loop.Poller(), std::move(socket), flags);
+        std::shared_ptr<TIdempotentClientSession> idempotentClient;
+        if (idempotent) {
+            auto store = std::make_shared<TDurableIdempotentClientStateStore>(clientStatePath);
+            idempotentClient = std::make_shared<TIdempotentClientSession>(store);
+            if (!idempotentClient->State().Initialized) {
+                std::random_device random;
+                const auto random64 = [&] {
+                    return (uint64_t(random()) << 32) | uint64_t(random());
+                };
+                const auto high = random64();
+                auto low = random64();
+                if (!high && !low) low = 1;
+                idempotentClient->StartSession(1, high, low);
+            }
+        }
+        auto h = Client(loop.Poller(), std::move(socket), flags, std::move(idempotentClient));
         while (!h.done()) {
             loop.Step();
         }
