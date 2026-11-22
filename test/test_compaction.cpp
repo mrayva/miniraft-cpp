@@ -1455,6 +1455,131 @@ void test_stable_snapshot_completes_known_joint_membership_only_from_new_voter(v
     assert_int_equal(app->LastAppliedIndex, stable.Index);
     assert_true(Read(*app, "membership") == "stable");
 }
+void ExerciseStaleStableSnapshotHistoryRecovery(bool jointSuccessor) {
+    const std::vector<uint32_t> original{1, 2, 3};
+    const std::vector<uint32_t> intermediate{2, 3, 4};
+    const std::vector<uint32_t> stableVoters{3, 4, 5};
+    const std::vector<uint32_t> jointVoters{4, 5, 6};
+    const TSnapshotConfigurationTransition prior{{7, 8, 9}, original, 0, 0, 2, 2, 3, 2};
+    const TSnapshotConfigurationTransition anchor{original, intermediate, 3, 2, 6, 3, 7, 3};
+    const TSnapshotConfigurationTransition stableTail{intermediate, stableVoters, 7, 3, 8, 3, 9, 3};
+    const TSnapshotConfigurationTransition jointTail{intermediate, jointVoters, 7, 3, 8, 3, 0, 0};
+
+    TKv image;
+    image.Write(image.Prepare(Command("membership", "known stable")), 5);
+    TSnapshot known{5, 2, original, image.SaveSnapshot()};
+    known.StableConfiguration = true;
+    known.ConfigurationIndex = 3;
+    known.ConfigurationTerm = 2;
+
+    auto state = std::make_shared<TState>();
+    state->BindVoters(original);
+    state->CurrentTerm = 3;
+    state->InstallSnapshot(known);
+
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> replies;
+    TNodeDict peers;
+    for (uint32_t id : {1, 3, 4, 5, 6})
+        peers.emplace(id, std::make_shared<TEndpoint>([&](auto message) {
+            replies.push_back(message.template Cast<TInstallSnapshotResponse>());
+        }));
+    auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{4, 5, 6});
+    auto app = std::make_shared<TApplication>();
+    TRequestProcessor processor(raft, app, {});
+    assert_int_equal(app->LastAppliedIndex, known.Index);
+
+    const auto snapshotIndex = jointSuccessor ? 9 : 10;
+    const auto value = jointSuccessor ? "recovered joint" : "recovered stable";
+    image.Write(image.Prepare(Command("membership", value)), snapshotIndex);
+    TSnapshot incoming;
+    incoming.Index = snapshotIndex;
+    incoming.Term = 3;
+    incoming.Data = image.SaveSnapshot();
+    incoming.ConfigurationTransitions = {prior, anchor};
+    if (jointSuccessor) {
+        incoming.Voters = intermediate;
+        incoming.JointVoters = jointVoters;
+        incoming.ConfigurationIndex = jointTail.JointIndex;
+        incoming.ConfigurationTerm = jointTail.JointTerm;
+        incoming.PreviousVoters = intermediate;
+        incoming.PreviousConfigurationIndex = jointTail.PreviousConfigurationIndex;
+        incoming.PreviousConfigurationTerm = jointTail.PreviousConfigurationTerm;
+        incoming.PreviousJointIndex = jointTail.JointIndex;
+        incoming.PreviousJointTerm = jointTail.JointTerm;
+        incoming.ConfigurationTransitions.push_back(jointTail);
+    } else {
+        incoming.Voters = stableVoters;
+        incoming.StableConfiguration = true;
+        incoming.ConfigurationIndex = stableTail.StableIndex;
+        incoming.ConfigurationTerm = stableTail.StableTerm;
+        incoming.PreviousVoters = intermediate;
+        incoming.PreviousConfigurationIndex = stableTail.PreviousConfigurationIndex;
+        incoming.PreviousConfigurationTerm = stableTail.PreviousConfigurationTerm;
+        incoming.PreviousJointIndex = stableTail.JointIndex;
+        incoming.PreviousJointTerm = stableTail.JointTerm;
+        incoming.ConfigurationTransitions.push_back(stableTail);
+    }
+
+    auto install = [&](const TSnapshot& candidate) {
+        const auto bytes = EncodeSnapshot(candidate);
+        auto request = Chunk(candidate, bytes, 0, static_cast<uint32_t>(bytes.size()));
+        request->Src = 3;
+        request->LeaderId = 3;
+        raft->Process({}, request);
+        return replies.back();
+    };
+
+    auto conflictingHistory = incoming;
+    // Keep the sender in the image's final voter set, but remove it from one
+    // missed intermediate transition. The history is structurally valid; it
+    // must still fail the local trusted-anchor check.
+    const std::vector<uint32_t> conflictingIntermediate{2, 4, 5};
+    conflictingHistory.ConfigurationTransitions[1].NewVoters = conflictingIntermediate;
+    if (jointSuccessor) {
+        conflictingHistory.Voters = conflictingIntermediate;
+        conflictingHistory.JointVoters = {3, 5, 6};
+        conflictingHistory.PreviousVoters = conflictingIntermediate;
+        conflictingHistory.ConfigurationTransitions[2].OldVoters = conflictingIntermediate;
+        conflictingHistory.ConfigurationTransitions[2].NewVoters = conflictingHistory.JointVoters;
+    } else {
+        conflictingHistory.PreviousVoters = conflictingIntermediate;
+        conflictingHistory.ConfigurationTransitions[2].OldVoters = conflictingIntermediate;
+    }
+    auto response = install(conflictingHistory);
+    assert_false(response->Success);
+    assert_false(response->Installed);
+    assert_true(state->GetSnapshot() && *state->GetSnapshot() == known);
+    assert_int_equal(app->Loads, 1);
+
+    response = install(incoming);
+    assert_true(response->Success);
+    assert_true(response->Installed);
+    const auto installed = state->GetSnapshot();
+    assert_non_null(installed.get());
+    assert_int_equal(installed->Index, incoming.Index);
+    assert_true(installed->ConfigurationTransitions.size() == 2);
+    assert_true(installed->ConfigurationTransitions.front() == anchor);
+    assert_true(installed->IsJoint() == jointSuccessor);
+    assert_true(raft->GetConfigurationState().Committed.IsJoint() == jointSuccessor);
+    assert_true(state->GetBoundVoters() == original);
+    assert_int_equal(app->Loads, 2);
+    assert_int_equal(app->LastAppliedIndex, incoming.Index);
+    assert_true(Read(*app, "membership") == value);
+    if (jointSuccessor) {
+        assert_true(installed->Voters == intermediate);
+        assert_true(installed->JointVoters == jointVoters);
+        assert_true(raft->GetVoterIds() == std::vector<uint32_t>({2, 3, 4, 5, 6}));
+    } else {
+        assert_true(installed->Voters == stableVoters);
+        assert_true(raft->GetVoterIds() == stableVoters);
+    }
+}
+void test_stale_stable_snapshot_recovers_multi_transition_stable_membership(void**) {
+    ExerciseStaleStableSnapshotHistoryRecovery(false);
+}
+void test_stale_stable_snapshot_recovers_multi_transition_joint_membership(void**) {
+    ExerciseStaleStableSnapshotHistoryRecovery(true);
+}
 void test_unproven_stable_configuration_snapshot_is_rejected_for_fixed_membership(void**) {
     TKv source; source.Write(source.Prepare(Command("a", "stable snapshot")), 5);
     TSnapshot snapshot{5, 1, {1, 2}, source.SaveSnapshot()};
@@ -2050,6 +2175,8 @@ int main() {
         cmocka_unit_test(test_valid_split_higher_term_covered_snapshot_accepts_leader_without_reload),
         cmocka_unit_test(test_unmatched_joint_snapshot_does_not_accept_leader_contact),
         cmocka_unit_test(test_stable_snapshot_completes_known_joint_membership_only_from_new_voter),
+        cmocka_unit_test(test_stale_stable_snapshot_recovers_multi_transition_stable_membership),
+        cmocka_unit_test(test_stale_stable_snapshot_recovers_multi_transition_joint_membership),
         cmocka_unit_test(test_unproven_stable_configuration_snapshot_is_rejected_for_fixed_membership),
         cmocka_unit_test(test_idle_partial_snapshot_expires_on_learner_despite_heartbeats),
         cmocka_unit_test(test_remote_snapshot_retains_suffix_without_applying_it_before_commit),
