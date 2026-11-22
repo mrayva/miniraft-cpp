@@ -1372,6 +1372,76 @@ void test_unmatched_joint_snapshot_does_not_accept_leader_contact(void**) {
     assert_true(static_cast<TStateFields>(*state) == before);
     assert_int_equal(app->Loads, 0); assert_int_equal(app->LastAppliedIndex, 0);
 }
+void test_stable_snapshot_completes_known_joint_membership_only_from_new_voter(void**) {
+    TKv image;
+    image.Write(image.Prepare(Command("membership", "joint")), 5);
+    TSnapshot joint{5, 2, {1, 2}, image.SaveSnapshot()};
+    joint.JointVoters = {2, 3};
+    joint.ConfigurationIndex = 4;
+    joint.ConfigurationTerm = 2;
+
+    const std::vector<uint32_t> bootstrapVoters{1, 2, 3};
+    auto state = std::make_shared<TState>();
+    state->BindVoters(bootstrapVoters);
+    state->CurrentTerm = 3;
+    state->InstallSnapshot(joint);
+
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> replies;
+    auto reply = [&](TMessageHolder<TMessage> message) {
+        replies.push_back(message.Cast<TInstallSnapshotResponse>());
+    };
+    auto oldVoter = std::make_shared<TEndpoint>(reply);
+    auto newVoter = std::make_shared<TEndpoint>(reply);
+    auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, oldVoter}, {3, newVoter}});
+    auto app = std::make_shared<TApplication>();
+    TRequestProcessor processor(raft, app, {});
+    assert_true(raft->GetConfigurationState().Committed.IsJoint());
+    assert_int_equal(app->LastAppliedIndex, joint.Index);
+
+    image.Write(image.Prepare(Command("membership", "stable")), 8);
+    TSnapshot stable{8, 3, {2, 3}, image.SaveSnapshot()};
+    stable.StableConfiguration = true;
+    stable.ConfigurationIndex = 7;
+    stable.ConfigurationTerm = 3;
+    stable.PreviousVoters = joint.Voters;
+    stable.PreviousJointIndex = joint.ConfigurationIndex;
+    stable.PreviousJointTerm = joint.ConfigurationTerm;
+
+    auto install = [&](const TSnapshot& candidate, uint32_t leader) {
+        const auto bytes = EncodeSnapshot(candidate);
+        auto request = Chunk(candidate, bytes, 0, static_cast<uint32_t>(bytes.size()));
+        request->Src = leader;
+        request->LeaderId = leader;
+        raft->Process({}, request);
+        return replies.back();
+    };
+
+    auto wrongLineage = stable;
+    wrongLineage.PreviousJointIndex = 3;
+    auto response = install(wrongLineage, 3);
+    assert_false(response->Success);
+    assert_false(response->Installed);
+    assert_true(state->GetSnapshot() && *state->GetSnapshot() == joint);
+    assert_int_equal(app->Loads, 1);
+
+    // The former joint side cannot claim that the successor configuration is
+    // committed; only a sender in the new voter set may complete this proof.
+    response = install(stable, 1);
+    assert_false(response->Success);
+    assert_false(response->Installed);
+    assert_true(state->GetSnapshot() && *state->GetSnapshot() == joint);
+    assert_int_equal(app->Loads, 1);
+
+    response = install(stable, 3);
+    assert_true(response->Success);
+    assert_true(response->Installed);
+    assert_true(state->GetSnapshot() && *state->GetSnapshot() == stable);
+    assert_false(raft->GetConfigurationState().Committed.IsJoint());
+    assert_true(raft->GetVoterIds() == std::vector<uint32_t>({2, 3}));
+    assert_int_equal(app->Loads, 2);
+    assert_int_equal(app->LastAppliedIndex, stable.Index);
+    assert_true(Read(*app, "membership") == "stable");
+}
 void test_unproven_stable_configuration_snapshot_is_rejected_for_fixed_membership(void**) {
     TKv source; source.Write(source.Prepare(Command("a", "stable snapshot")), 5);
     TSnapshot snapshot{5, 1, {1, 2}, source.SaveSnapshot()};
@@ -1966,6 +2036,7 @@ int main() {
         cmocka_unit_test(test_invalid_split_higher_term_snapshot_preserves_candidate_state),
         cmocka_unit_test(test_valid_split_higher_term_covered_snapshot_accepts_leader_without_reload),
         cmocka_unit_test(test_unmatched_joint_snapshot_does_not_accept_leader_contact),
+        cmocka_unit_test(test_stable_snapshot_completes_known_joint_membership_only_from_new_voter),
         cmocka_unit_test(test_unproven_stable_configuration_snapshot_is_rejected_for_fixed_membership),
         cmocka_unit_test(test_idle_partial_snapshot_expires_on_learner_despite_heartbeats),
         cmocka_unit_test(test_remote_snapshot_retains_suffix_without_applying_it_before_commit),
