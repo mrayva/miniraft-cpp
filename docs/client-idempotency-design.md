@@ -6,8 +6,8 @@ are implemented. The KV example now exposes the idempotent request path over
 its TCP client/server interface. The in-tree header
 `miniraft/net/idempotent_client_transport.h` provides a reusable bounded retry
 helper for saved idempotent writes. The sample still owns payload encoding,
-durable-store setup, and CLI behavior; an installed network package and a
-higher-level client remain open. The opt-in
+durable-store setup, and CLI behavior; a higher-level client facade remains
+open. The opt-in
 request type carries operation identity through negotiated forwarding and a
 tagged replicated log record. `IIdempotentRsm` applies committed records and
 captures application data, session records, epoch and progress in one bounded
@@ -205,8 +205,9 @@ complete old or new state is recovered; they do not emulate hardware power loss.
   a committed response, verifies retry returns its cached result, and checks
   the combined snapshot after restart. Same-process reconnect/backoff for the
   reusable network helper is covered by dropping a reply and forwarding the
-  retry. Installing/exporting the network component, a higher-level client, and
-  deployment-specific application storage integration remain open.
+  retry. A higher-level client facade and deployment-specific application
+  storage integration remain open. The network component is exported as the
+  `miniraft::net` package target when network support is enabled.
 
 Clients using ordinary `TCommandRequest` writes retain at-least-once behavior.
 For idempotent requests, a timeout after admission still has an unknown outcome;
