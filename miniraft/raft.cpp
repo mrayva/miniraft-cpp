@@ -1140,6 +1140,15 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
     if (!LogLimits.SnapshotStagingDirectory.empty())
         throw std::invalid_argument("Snapshot file staging requires Linux");
 #endif
+    if (LogLimits.SnapshotStagingDirectory.empty()) {
+        if (LogLimits.SnapshotStagingBudget)
+            throw std::invalid_argument("Snapshot staging budget requires a staging directory");
+    } else if (!LogLimits.SnapshotStagingBudget) {
+        static const auto defaultStagingBudget = std::make_shared<TSnapshotInstallBudget>();
+        LogLimits.SnapshotStagingBudget = defaultStagingBudget;
+    } else if (LogLimits.SnapshotStagingBudget == SnapshotInstallBudget) {
+        throw std::invalid_argument("Snapshot staging and heap budgets must be separate");
+    }
     if (!LogLimits.MaxUncommittedBytes || !LogLimits.MaxUncommittedEntries ||
         LogLimits.ReservedControlBytes < sizeof(TLogEntry) || !LogLimits.ReservedControlEntries ||
         LogLimits.ReservedControlBytes > LogLimits.MaxUncommittedBytes ||
@@ -3219,7 +3228,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
                     if (receivedBytes) memcpy(replacement.get(), prefix, size_t(receivedBytes));
                     incoming.CoveredPrefix = std::move(replacement);
                     incoming.CoveredPrefixCapacity = capacity;
-                    incoming.MemoryReservation = std::move(reservation);
+                    incoming.ReceiveReservation = std::move(reservation);
                     prefix = incoming.CoveredPrefix.get();
                 } catch (const std::bad_alloc&) {
                     IncomingSnapshot.reset(); reply(false, false, 0); return;
@@ -3273,8 +3282,12 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     if (!same) {
         if (request->Offset != 0 || (IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
             IncomingSnapshot->Index > request->SnapshotIndex)) { reply(false, false, 0); return; }
+        // A complete transfer still needs room for the decoded image.
+        if (request->TotalBytes > SnapshotInstallBudget->LimitBytes()) { reply(false, false, 0); return; }
         IncomingSnapshot.reset(); // Release a superseded image before reserving its replacement.
-        auto reservation = SnapshotInstallBudget->TryReserve(request->TotalBytes);
+        const auto& receiveBudget = LogLimits.SnapshotStagingBudget ?
+            LogLimits.SnapshotStagingBudget : SnapshotInstallBudget;
+        auto reservation = receiveBudget->TryReserve(request->TotalBytes);
         if (!reservation) { reply(false, false, 0); return; }
         std::string image;
         std::shared_ptr<TIncomingSnapshotFile> file;
@@ -3345,10 +3358,14 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     if (!probe.Supported) { IncomingSnapshot.reset(); reply(false, false, 0); return; }
     acceptLeaderContact();
     if (receivedBytes < request->TotalBytes) { reply(true, false, receivedBytes); return; }
-    auto installationReservation = std::move(IncomingSnapshot->MemoryReservation);
-    (void)installationReservation; // Hold the aggregate reservation through validation and publication.
+    // Keep the heap allocation charged through validation and publication.
+    // A staged file retains its separate disk reservation until we close it.
+    std::shared_ptr<void> installationReservation;
     TSnapshot snapshot;
     try {
+        installationReservation = incoming.File ? SnapshotInstallBudget->TryReserve(incoming.Total) :
+            std::move(incoming.ReceiveReservation);
+        if (!installationReservation) { IncomingSnapshot.reset(); reply(false, false, 0); return; }
         snapshot = incoming.File ? DecodeSnapshot(receivedImage) :
             DecodeSnapshotOwned(std::move(incoming.Bytes));
         IncomingSnapshot.reset();

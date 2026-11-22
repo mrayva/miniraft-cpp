@@ -58,9 +58,9 @@ struct TSnapshot {
     bool operator==(const TSnapshot&) const = default;
 };
 
-// Shares an aggregate byte limit across concurrent InstallSnapshot assemblies.
-// One process-wide instance is used by default; callers may provide a shared
-// custom budget through Raft limits when they need a different cap.
+// Shares an aggregate byte limit across InstallSnapshot operations. Raft uses
+// separate instances for receive and decode allocations and temporary files.
+// Callers can supply shared custom budgets through Raft limits.
 class TSnapshotInstallBudget : public std::enable_shared_from_this<TSnapshotInstallBudget> {
     class TReservation {
     public:

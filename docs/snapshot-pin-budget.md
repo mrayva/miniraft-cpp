@@ -28,6 +28,8 @@ heap usage. Incomplete incoming InstallSnapshot images reserve their declared
 sizes against a 256 MiB process-wide byte budget by default. Covered-boundary
 probes use the same budget for the prefix they buffer, including both buffers
 when growing it. Callers can configure a shared `TSnapshotInstallBudget`.
+Optional Linux staging files have their own shared quota. Completed staged
+images must reserve receive heap space before decoding.
 Current application/log state, outgoing snapshots,
 snapshot capture, transport buffers and other allocations remain outside these
 limits; disk-streamed snapshot transfer remains open. Voter membership changes

@@ -1997,9 +1997,11 @@ struct TFiles {
 void test_file_staged_snapshot_install_accepts_every_small_fixed_chunk_size(void**) {
     TFiles files;
     auto budget = std::make_shared<TSnapshotInstallBudget>();
+    auto stagingBudget = std::make_shared<TSnapshotInstallBudget>();
     CheckSnapshotInstallChunkSizes({.SnapshotInstallBudget = budget,
-        .SnapshotStagingDirectory = files.Directory.string()});
+        .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingBudget = stagingBudget});
     assert_int_equal(budget->UsedBytes(), 0);
+    assert_int_equal(stagingBudget->UsedBytes(), 0);
     assert_true(std::filesystem::is_empty(files.Directory));
 }
 
@@ -2014,7 +2016,7 @@ void test_file_staging_failure_releases_snapshot_reservation(void**) {
     auto app = std::make_shared<TApplication>();
     TNodeDict peers{{1, peer}};
     auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{},
-        TRaft::TLogLimits{.SnapshotInstallBudget = budget, .SnapshotStagingDirectory = files.Name});
+        TRaft::TLogLimits{.SnapshotStagingDirectory = files.Name, .SnapshotStagingBudget = budget});
     TRequestProcessor processor(raft, app, peers);
     TKv source;
     const TSnapshot snapshot{1, 1, {1, 2}, source.SaveSnapshot()};
@@ -2047,6 +2049,67 @@ void test_file_staging_failure_releases_snapshot_reservation(void**) {
     assert_true(response->Installed);
     assert_int_equal(state->SnapshotIndex, 1);
     assert_int_equal(budget->UsedBytes(), 0);
+}
+void test_file_staging_and_decode_use_separate_shared_budgets(void**) {
+    TFiles files;
+    TKv source;
+    const TSnapshot snapshot{1, 1, {1, 2}, source.SaveSnapshot()};
+    const auto bytes = EncodeSnapshot(snapshot);
+    auto heap = std::make_shared<TSnapshotInstallBudget>(bytes.size());
+    auto disk = std::make_shared<TSnapshotInstallBudget>(bytes.size());
+    TMessageHolder<TInstallSnapshotResponse> response;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) {
+        if (auto reply = message.template Maybe<TInstallSnapshotResponse>()) response = reply.Cast();
+    });
+    TNodeDict peers{{1, peer}};
+    std::vector<std::unique_ptr<TRequestProcessor>> processors;
+    auto makeReceiver = [&](bool staged) {
+        auto state = std::make_shared<TState>();
+        state->CurrentTerm = 3;
+        TRaft::TLogLimits limits{.SnapshotInstallBudget = heap};
+        if (staged) {
+            limits.SnapshotStagingDirectory = files.Directory.string();
+            limits.SnapshotStagingBudget = disk;
+        }
+        auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{}, limits);
+        processors.push_back(std::make_unique<TRequestProcessor>(raft, std::make_shared<TApplication>(), peers));
+        return raft;
+    };
+    auto memoryReceiver = makeReceiver(false);
+    auto stagedReceiver = makeReceiver(true);
+    auto otherStagedReceiver = makeReceiver(true);
+    auto first = Chunk(snapshot, bytes, 0, 8);
+    auto last = Chunk(snapshot, bytes, 8, bytes.size() - 8);
+
+    memoryReceiver->Process({}, first);
+    assert_true(response->Success);
+    assert_int_equal(heap->UsedBytes(), bytes.size());
+    stagedReceiver->Process({}, first);
+    assert_true(response->Success);
+    assert_int_equal(disk->UsedBytes(), bytes.size());
+    otherStagedReceiver->Process({}, first);
+    assert_false(response->Success);
+    assert_int_equal(disk->UsedBytes(), bytes.size());
+
+    stagedReceiver->Process({}, last);
+    assert_false(response->Success);
+    assert_false(response->Installed);
+    assert_int_equal(response->NextOffset, 0);
+    assert_int_equal(stagedReceiver->GetState()->SnapshotIndex, 0);
+    assert_int_equal(heap->UsedBytes(), bytes.size());
+    assert_int_equal(disk->UsedBytes(), 0);
+
+    const auto retryTime = ITimeSource::Time{} + TTimeout::SnapshotTransferIdle;
+    memoryReceiver->ProcessTimeout(retryTime);
+    assert_int_equal(heap->UsedBytes(), 0);
+    stagedReceiver->Process(retryTime, first);
+    assert_true(response->Success);
+    stagedReceiver->Process(retryTime, last);
+    assert_true(response->Installed);
+    assert_int_equal(stagedReceiver->GetState()->SnapshotIndex, 1);
+    assert_int_equal(heap->UsedBytes(), 0);
+    assert_int_equal(disk->UsedBytes(), 0);
+    assert_true(std::filesystem::is_empty(files.Directory));
 }
 void test_durable_stale_snapshot_membership_recovery_survives_restart(void**) {
     for (bool jointSuccessor : {false, true}) {
@@ -2464,6 +2527,7 @@ int main() {
 #ifdef __linux__
         cmocka_unit_test(test_file_staged_snapshot_install_accepts_every_small_fixed_chunk_size),
         cmocka_unit_test(test_file_staging_failure_releases_snapshot_reservation),
+        cmocka_unit_test(test_file_staging_and_decode_use_separate_shared_budgets),
         cmocka_unit_test(test_durable_snapshot_storage_rejects_term_regression),
         cmocka_unit_test(test_durable_snapshot_cannot_replace_committed_index_with_conflicting_term),
         cmocka_unit_test(test_durable_storage_rejects_index_exhaustion),

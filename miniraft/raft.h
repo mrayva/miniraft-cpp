@@ -380,11 +380,15 @@ public:
         // Yield leadership after this long without a fresh voter quorum.
         std::chrono::milliseconds LeadershipExpiration = TTimeout::LeadershipExpiration;
         // Shared by all Raft instances in a process by default. Supply one
-        // shared budget here to override the process-wide InstallSnapshot cap.
+        // shared budget here to override the process-wide snapshot receive
+        // heap cap, including decoding of completed staging files.
         std::shared_ptr<TSnapshotInstallBudget> SnapshotInstallBudget;
         // On Linux, stage full incoming images in anonymous files in this
-        // directory. The receive budget still limits their declared sizes.
+        // directory.
         std::string SnapshotStagingDirectory;
+        // Share this separately from SnapshotInstallBudget to limit staged
+        // file bytes. Defaults to a separate 256 MiB process-wide budget.
+        std::shared_ptr<TSnapshotInstallBudget> SnapshotStagingBudget;
     };
 
     // Nodes contains every configured replication peer; learners may include
@@ -595,7 +599,7 @@ private:
         std::string Bytes;
         uint64_t ReceivedBytes = 0;
         bool Preallocated = false;
-        std::shared_ptr<void> MemoryReservation;
+        std::shared_ptr<void> ReceiveReservation;
         std::unique_ptr<char[]> CoveredPrefix;
         size_t CoveredPrefixCapacity = 0;
         std::shared_ptr<TIncomingSnapshotFile> File;

@@ -26,8 +26,8 @@ application also supplies that bound. Existing applications retain the
 `SaveSnapshot()` path. This avoids an intermediate application-owned string,
 but capture still materializes one complete image and remains capped at 64 MiB.
 
-Full InstallSnapshot assemblies reserve their declared image size against a
-shared 256 MiB process-wide budget by default. Raft instances can share a
+Full in-memory InstallSnapshot assemblies reserve their declared image size
+against a shared 256 MiB process-wide heap budget by default. Raft instances can share a
 custom `TSnapshotInstallBudget` through `TLogLimits`. Covered-boundary probes
 reserve the capacity of the prefix they buffer. Both the old and new buffers
 count while the prefix grows. A transfer that cannot reserve space receives a
@@ -35,7 +35,7 @@ rejection with offset zero and can retry after capacity is released.
 Full-image receive buffers allocate their declared length before accepting
 chunks, so chunk appends do not grow the buffer geometrically.
 Completion, rejection, term change and idle expiry release the reservation.
-This accounts for incomplete receive buffers only; retained
+The heap budget also covers decoding completed staging files. Retained
 snapshots, outgoing pins, capture buffers, application memory and transport
 buffers remain outside this budget.
 
@@ -45,9 +45,13 @@ temporary files (`O_TMPFILE`). Durable KV servers expose the option as
 `--snapshot-staging-dir PATH`. Use a disk-backed directory to avoid placing the
 receive buffer in the process heap or on a RAM-backed filesystem. Chunks are
 written at their validated offsets, and Raft reads the received bytes through
-a read-only mapping for duplicate, metadata and checksum checks. The shared
-install budget still limits the declared sizes. Staged data is discarded when
-Raft clears the assembly, after completion, or on process exit.
+a read-only mapping for duplicate, metadata and checksum checks. Staged files
+reserve their declared sizes against a separate 256 MiB process-wide quota.
+Embedders can share a custom quota through `TLogLimits::SnapshotStagingBudget`.
+Completion reserves space in the heap budget before decoding. If there is
+insufficient heap capacity, the receiver releases the staged file and asks
+the sender to retry from offset zero. Staged data is discarded when Raft
+clears the assembly, after decoding, or on process exit.
 
 The decoder still materializes the final application image for validation
 and installation. The staging file is temporary and partial transfers restart
