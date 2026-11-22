@@ -26,5 +26,9 @@ validation.
 Deterministic tests cover the original oversized proposal, forged batch count,
 oversized child entry, typed conversion and a malformed forwarded reply followed
 by a successful valid reply. Self-review checked framing, admission, clones and
-forwarded-route ordering. No independent reviewer approval is claimed. Voting
-membership changes and joint consensus remain open.
+forwarded-route ordering. No independent reviewer approval is claimed.
+
+This holder-safety milestone does not describe cluster membership. Replicated
+voter changes and joint consensus were added in later milestones; see
+[configuration entries](configuration-entries.md) and the current
+[capability matrix](capability-matrix.md).

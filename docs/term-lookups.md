@@ -23,4 +23,7 @@ claimed. Legacy and external backends can retain the fallback cost.
 
 Self-review checked retained-suffix offsets, snapshot boundaries and fallback
 behavior. There is no wire or durable-format migration. No independent reviewer
-approval is claimed. Voting membership changes and joint consensus remain open.
+approval is claimed. This term-lookup milestone does not describe cluster
+membership. Replicated voter changes and joint consensus were added in later
+milestones; see [configuration entries](configuration-entries.md) and the
+current [capability matrix](capability-matrix.md).
