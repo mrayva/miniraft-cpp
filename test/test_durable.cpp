@@ -35,7 +35,9 @@ struct TFiles {
     TFiles() {
         static unsigned next = 0;
         Directory = fs::temp_directory_path() / ("miniraft-durable-" +
-            std::to_string(getpid()) + "-" + std::to_string(next++));
+            std::to_string(getpid()) + "-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" +
+            std::to_string(next++));
         assert_true(fs::create_directory(Directory));
         Name = (Directory / "raft").string();
     }
@@ -946,6 +948,105 @@ void test_split_legacy_disk_state_migration_requires_trusted_baselines(void**) {
     assert_false(fs::exists(missingLegacy + ".index.2"));
     assert_false(fs::exists(missingLegacy + ".state.2"));
 }
+void test_compacted_legacy_disk_state_migration_preserves_snapshot_and_suffix(void**) {
+    TFiles files;
+    const auto legacy = (files.Directory / "compacted-legacy").string();
+    const auto durable = (files.Directory / "compacted-durable").string();
+    const std::vector<uint32_t> original{1, 2, 3};
+    const std::vector<uint32_t> intermediate{2, 3, 4};
+    const std::vector<uint32_t> finalVoters{3, 4, 5};
+    const TSnapshotConfigurationTransition anchor{original, intermediate, 0, 0, 6, 3, 7, 3};
+
+    TSnapshot snapshot{7, 3, intermediate, "compacted application"};
+    snapshot.StableConfiguration = true;
+    snapshot.ConfigurationIndex = 7;
+    snapshot.ConfigurationTerm = 3;
+    snapshot.PreviousVoters = original;
+    snapshot.PreviousConfigurationIndex = 0;
+    snapshot.PreviousConfigurationTerm = 0;
+    snapshot.PreviousJointIndex = 6;
+    snapshot.PreviousJointTerm = 3;
+    snapshot.ConfigurationTransitions = {anchor};
+    {
+        TDiskState source(legacy, 2);
+        source.BindVoters(original);
+        source.CurrentTerm = 5;
+        source.VotedFor = 5;
+        source.Commit();
+        for (uint64_t term : {1, 2, 2, 3, 3}) source.Append(Entry(term, "prefix"));
+        source.Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Joint, 3, 0, 0, original, intermediate}));
+        source.Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Stable, 3, 6, 3, original, intermediate}));
+        source.CommitIndex = 7;
+        source.Commit();
+        source.InstallSnapshot(snapshot);
+        source.Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Joint, 4, 7, 3, intermediate, finalVoters}));
+        source.Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Stable, 4, 8, 4, intermediate, finalVoters}));
+        source.Append(Entry(4, "retained suffix"));
+        source.CommitIndex = 9;
+        source.Commit();
+    }
+
+    const auto info = CheckLegacyDiskStateMigration(legacy, 2, original, 9);
+    assert_int_equal(info.SnapshotIndex, 7);
+    assert_int_equal(info.SnapshotTerm, 3);
+    assert_int_equal(info.LastLogIndex, 10);
+    assert_int_equal(info.CommitIndex, 9);
+    const auto migrated = MigrateLegacyDiskState(legacy, durable, 2, original, 9);
+    assert_int_equal(migrated.SnapshotIndex, snapshot.Index);
+
+    TDurableState recovered(durable, 2);
+    assert_true(recovered.GetBoundVoters() == original);
+    assert_true(recovered.GetSnapshot() && *recovered.GetSnapshot() == snapshot);
+    assert_int_equal(recovered.SnapshotIndex, snapshot.Index);
+    assert_int_equal(recovered.SnapshotTerm, snapshot.Term);
+    assert_int_equal(recovered.LastLogIndex, 10);
+    assert_int_equal(recovered.LastLogTerm, 4);
+    assert_int_equal(recovered.CommitIndex, 9);
+    assert_int_equal(recovered.VotedFor, 5);
+    assert_string_equal(Data(recovered, 10).c_str(), "retained suffix");
+    const auto membership = ScanConfigurationHistory(recovered,
+        TConfigurationHistory::FromStableSnapshot(snapshot), recovered.CommitIndex);
+    assert_true(membership.Committed.OldVoters() == finalVoters);
+    assert_false(membership.Committed.IsJoint());
+
+    const auto unanchoredLegacy = (files.Directory / "unanchored-legacy").string();
+    const auto rejectedDurable = (files.Directory / "unanchored-durable").string();
+    const std::vector<uint32_t> unknownOriginal{7, 8, 9};
+    TSnapshot unanchored{3, 2, intermediate, "unanchored snapshot"};
+    unanchored.StableConfiguration = true;
+    unanchored.ConfigurationIndex = 3;
+    unanchored.ConfigurationTerm = 2;
+    unanchored.PreviousVoters = unknownOriginal;
+    unanchored.PreviousJointIndex = 2;
+    unanchored.PreviousJointTerm = 2;
+    unanchored.ConfigurationTransitions = {
+        {unknownOriginal, intermediate, 0, 0, 2, 2, 3, 2}};
+    {
+        TDiskState source(unanchoredLegacy, 2);
+        source.BindVoters(original);
+        source.CurrentTerm = 3;
+        source.Commit();
+        source.Append(Entry(1, "prefix"));
+        source.Append(Entry(2, "prefix"));
+        source.Append(Entry(2, "prefix"));
+        source.CommitIndex = 3;
+        source.Commit();
+        source.InstallSnapshot(unanchored);
+    }
+    bool unanchoredRejected = false;
+    try { CheckLegacyDiskStateMigration(unanchoredLegacy, 2, original, 3); }
+    catch (const std::exception&) { unanchoredRejected = true; }
+    assert_true(unanchoredRejected);
+    bool unanchoredMigrationRejected = false;
+    try { MigrateLegacyDiskState(unanchoredLegacy, rejectedDurable, 2, original, 3); }
+    catch (const std::exception&) { unanchoredMigrationRejected = true; }
+    assert_true(unanchoredMigrationRejected);
+    assert_false(fs::exists(rejectedDurable + ".durable.2"));
+}
 void test_get_and_append_do_not_share_mutable_entries(void**) {
     TFiles files;
     {
@@ -1526,6 +1627,7 @@ int main() {
         cmocka_unit_test(test_missing_image_is_not_recreated),
         cmocka_unit_test(test_legacy_store_is_not_silently_migrated),
         cmocka_unit_test(test_split_legacy_disk_state_migration_requires_trusted_baselines),
+        cmocka_unit_test(test_compacted_legacy_disk_state_migration_preserves_snapshot_and_suffix),
         cmocka_unit_test(test_legacy_configuration_snapshot_migration_requires_complete_trusted_history),
         cmocka_unit_test(test_legacy_vote_cannot_be_justified_by_uncommitted_membership),
         cmocka_unit_test(test_get_and_append_do_not_share_mutable_entries),

@@ -94,12 +94,13 @@ even if the node had not acknowledged any updates. Do not delete an existing
 store's files to force startup.
 
 Legacy entries/index/state files with the same base name are rejected by the
-runtime. The Linux `miniraft-migrate-disk-state` utility converts an offline,
-un-compacted `TDiskState` log to a distinct fresh durable base when the operator
-supplies both the complete trusted original voter set and the commit index.
-See [legacy disk-state migration](legacy-disk-state-migration.md). The tool
-leaves the source files intact and refuses snapshots or configuration entries
-that need a separate history proof. Do not replace an existing node's state
+runtime. The Linux `miniraft-migrate-disk-state` utility converts an offline
+`TDiskState` store, including a compacted snapshot and retained suffix, to a
+distinct fresh durable base when the operator supplies the complete trusted
+original voter set and commit index. See
+[legacy disk-state migration](legacy-disk-state-migration.md). The tool leaves
+the source files intact and refuses snapshots whose membership history cannot
+be anchored to the supplied voter set. Do not replace an existing node's state
 with an empty store under the same identity. A corrupt main image is never
 replaced by a seemingly valid temp image.
 

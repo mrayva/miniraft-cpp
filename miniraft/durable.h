@@ -12,12 +12,14 @@ struct TLegacyDiskStateMigrationInfo {
     uint64_t LastLogIndex = 0;
     uint64_t LastLogTerm = 0;
     uint64_t CommitIndex = 0;
+    uint64_t SnapshotIndex = 0;
+    uint64_t SnapshotTerm = 0;
 };
 
-// Check or migrate an offline, un-compacted TDiskState store. The caller must
-// supply the independently verified original voter set and commit boundary.
-// Retained configuration entries are validated from that voter-set baseline;
-// compacted stores still require a separate snapshot/history migration.
+// Check or migrate an offline TDiskState store. The caller must supply the
+// independently verified original voter set and commit boundary. Retained
+// configuration entries and compacted snapshot history are validated from
+// that voter-set baseline.
 TLegacyDiskStateMigrationInfo CheckLegacyDiskStateMigration(
     const std::string& legacyBase, uint32_t nodeId,
     const std::vector<uint32_t>& trustedVoters, uint64_t commitIndex);

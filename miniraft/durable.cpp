@@ -733,18 +733,32 @@ TLegacyDiskStateMigrationInfo InspectLegacyDiskState(const IState& source, uint3
     if (!nodeId || !std::binary_search(voters.begin(), voters.end(), nodeId))
         throw std::invalid_argument("The migrated node must belong to the trusted voter set");
     if (!source.CurrentTerm || source.LastLogIndex > uint64_t(INT64_MAX) ||
-        source.SnapshotIndex || source.SnapshotTerm || source.GetSnapshot())
-        throw std::invalid_argument("Only un-compacted legacy disk state can be migrated");
+        source.SnapshotIndex > source.LastLogIndex || source.SnapshotTerm > source.CurrentTerm ||
+        source.LastLogTerm > source.CurrentTerm || commitIndex < source.SnapshotIndex ||
+        commitIndex > source.LastLogIndex)
+        throw std::invalid_argument("Invalid legacy disk state migration boundaries");
     if (source.HasTrustedCommitIndex() && source.CommitIndex != commitIndex)
         throw std::invalid_argument("Supplied commit boundary differs from versioned disk metadata");
     const auto boundVoters = source.GetBoundVoters();
     if (!boundVoters.empty() && boundVoters != voters)
         throw std::invalid_argument("Supplied voter baseline differs from versioned disk metadata");
-    if (commitIndex > source.LastLogIndex)
-        throw std::invalid_argument("Supplied commit index exceeds the legacy log");
+
+    auto baseline = TConfigurationHistory::Stable(voters, 0, 0, 0, 0);
     std::vector<uint32_t> historicalVoters = voters;
-    uint64_t previousTerm = 0;
-    for (uint64_t index = 1; index <= source.LastLogIndex; ++index) {
+    const auto snapshot = source.GetSnapshot();
+    if (snapshot) {
+        ValidateSnapshot(*snapshot);
+        if (snapshot->Index != source.SnapshotIndex || snapshot->Term != source.SnapshotTerm ||
+            snapshot->Term > source.CurrentTerm)
+            throw std::invalid_argument("Legacy snapshot boundary mismatch");
+        baseline = TrustedSnapshotHistory(*snapshot, voters);
+        AddSnapshotVoters(baseline, historicalVoters);
+    } else if (source.SnapshotIndex || source.SnapshotTerm) {
+        throw std::invalid_argument("Compacted legacy state is missing its snapshot");
+    }
+
+    uint64_t previousTerm = source.SnapshotTerm;
+    for (uint64_t index = source.SnapshotIndex + 1; index <= source.LastLogIndex; ++index) {
         const auto entry = source.Get(static_cast<int64_t>(index));
         if (!entry) throw std::invalid_argument("Missing legacy log entry");
         ValidateMessageTree(entry);
@@ -763,7 +777,6 @@ TLegacyDiskStateMigrationInfo InspectLegacyDiskState(const IState& source, uint3
     // A vote can name a voter introduced or removed by a retained membership
     // transition, but only committed membership history is trusted here. An
     // uncommitted suffix must not legitimize a persisted vote during migration.
-    const auto baseline = TConfigurationHistory::Stable(voters, 0, 0, 0, 0);
     const auto configuration = ScanConfigurationHistory(source, baseline, commitIndex);
     for (const auto& transition : configuration.Committed.ConfigurationTransitions()) {
         historicalVoters.insert(historicalVoters.end(), transition.OldVoters.begin(), transition.OldVoters.end());
@@ -778,7 +791,8 @@ TLegacyDiskStateMigrationInfo InspectLegacyDiskState(const IState& source, uint3
     if (source.VotedFor && !std::binary_search(historicalVoters.begin(), historicalVoters.end(), source.VotedFor))
         throw std::invalid_argument("Stored vote is outside the validated membership history");
 
-    return {source.CurrentTerm, source.VotedFor, source.LastLogIndex, source.LastLogTerm, commitIndex};
+    return {source.CurrentTerm, source.VotedFor, source.LastLogIndex, source.LastLogTerm,
+        commitIndex, source.SnapshotIndex, source.SnapshotTerm};
 }
 
 std::filesystem::path NormalizedBase(const std::string& base) {
@@ -794,7 +808,7 @@ TLegacyDiskStateMigrationInfo CheckLegacyDiskStateMigration(const std::string& l
         uint32_t nodeId, const std::vector<uint32_t>& trustedVoters, uint64_t commitIndex) {
     (void)NormalizedBase(legacyBase);
     RequireExistingLegacyDiskFiles(legacyBase, nodeId);
-    TDiskState source(legacyBase, nodeId);
+    TDiskState source(legacyBase, nodeId, {}, false);
     return InspectLegacyDiskState(source, nodeId, trustedVoters, commitIndex);
 }
 
@@ -805,13 +819,14 @@ TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(const std::string& legacyBa
         throw std::invalid_argument("Legacy and durable stores must use different base paths");
 
     RequireExistingLegacyDiskFiles(legacyBase, nodeId);
-    TDiskState source(legacyBase, nodeId);
+    TDiskState source(legacyBase, nodeId, {}, false);
     const auto info = InspectLegacyDiskState(source, nodeId, trustedVoters, commitIndex);
     std::vector<TMessageHolder<TLogEntry>> entries;
-    if (info.LastLogIndex > entries.max_size())
+    const auto retainedCount = info.LastLogIndex - info.SnapshotIndex;
+    if (retainedCount > entries.max_size())
         throw std::length_error("Legacy log is too large for this platform");
-    entries.reserve(size_t(info.LastLogIndex));
-    for (uint64_t index = 1; index <= info.LastLogIndex; ++index)
+    entries.reserve(size_t(retainedCount));
+    for (uint64_t index = info.SnapshotIndex + 1; index <= info.LastLogIndex; ++index)
         entries.push_back(Clone(source.Get(static_cast<int64_t>(index))));
 
     {
@@ -822,6 +837,9 @@ TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(const std::string& legacyBa
             destination.CurrentTerm != 1 || destination.VotedFor)
             throw std::invalid_argument("Migration destination is not a fresh durable store");
         destination.Impl->Voters = trustedVoters;
+        destination.Impl->Snapshot = source.GetSnapshot();
+        destination.SnapshotIndex = info.SnapshotIndex;
+        destination.SnapshotTerm = info.SnapshotTerm;
         destination.Impl->Log = std::move(entries);
         destination.CurrentTerm = info.CurrentTerm;
         destination.VotedFor = info.VotedFor;
@@ -833,9 +851,12 @@ TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(const std::string& legacyBa
     TDurableState verified(durableBase, nodeId);
     if (verified.CurrentTerm != info.CurrentTerm || verified.VotedFor != info.VotedFor ||
         verified.LastLogIndex != info.LastLogIndex || verified.LastLogTerm != info.LastLogTerm ||
-        verified.CommitIndex != info.CommitIndex || verified.GetBoundVoters() != trustedVoters)
+        verified.CommitIndex != info.CommitIndex || verified.GetBoundVoters() != trustedVoters ||
+        verified.SnapshotIndex != info.SnapshotIndex || verified.SnapshotTerm != info.SnapshotTerm ||
+        bool(verified.GetSnapshot()) != bool(source.GetSnapshot()) ||
+        (source.GetSnapshot() && *verified.GetSnapshot() != *source.GetSnapshot()))
         throw std::runtime_error("Migrated durable metadata failed reopen verification");
-    for (uint64_t index = 1; index <= info.LastLogIndex; ++index) {
+    for (uint64_t index = info.SnapshotIndex + 1; index <= info.LastLogIndex; ++index) {
         const auto oldEntry = source.Get(static_cast<int64_t>(index));
         const auto newEntry = verified.Get(static_cast<int64_t>(index));
         if (!newEntry || oldEntry->Len != newEntry->Len ||

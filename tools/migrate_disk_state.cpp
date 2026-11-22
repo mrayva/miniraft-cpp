@@ -17,8 +17,8 @@ void Usage(std::ostream& out) {
            "--node-id ID --voters ID,ID,... --commit-index INDEX [--dry-run]\n"
         << "The complete original voter set and commit index must come from "
            "independently trusted records.\n"
-        << "Only offline, un-compacted TDiskState logs with valid retained membership "
-           "history can be migrated.\n"
+        << "Offline TDiskState logs and snapshots can be migrated when retained membership "
+           "history is anchored to the supplied original voter set.\n"
         << "Usage: miniraft-migrate-disk-state --bind-durable --durable-base PREFIX "
            "--node-id ID --voters ID,ID,... [--commit-index INDEX] [--dry-run]\n"
         << "Omit --commit-index for an unconfigured legacy log or legacy snapshot; "
@@ -64,7 +64,9 @@ void PrintInfo(const TLegacyDiskStateMigrationInfo& info) {
               << "voted for: " << info.VotedFor << '\n'
               << "last log index: " << info.LastLogIndex << '\n'
               << "last log term: " << info.LastLogTerm << '\n'
-              << "commit index: " << info.CommitIndex << '\n';
+              << "commit index: " << info.CommitIndex << '\n'
+              << "snapshot index: " << info.SnapshotIndex << '\n'
+              << "snapshot term: " << info.SnapshotTerm << '\n';
 }
 
 void RequireExistingRegularFiles(const std::vector<std::string>& paths) {
@@ -152,7 +154,7 @@ int main(int argc, char** argv) {
             {
                 TDurableState state(values.at("--durable-base"), nodeId);
                 info = {state.CurrentTerm, state.VotedFor, state.LastLogIndex,
-                    state.LastLogTerm, state.CommitIndex};
+                    state.LastLogTerm, state.CommitIndex, state.SnapshotIndex, state.SnapshotTerm};
                 snapshotIndex = state.SnapshotIndex;
                 snapshotTerm = state.SnapshotTerm;
                 std::string reason;
@@ -174,7 +176,8 @@ int main(int argc, char** argv) {
                     verified.SnapshotIndex != snapshotIndex || verified.SnapshotTerm != snapshotTerm)
                     throw std::runtime_error("Durable voter binding failed reopen verification");
                 info = {verified.CurrentTerm, verified.VotedFor, verified.LastLogIndex,
-                    verified.LastLogTerm, verified.CommitIndex};
+                    verified.LastLogTerm, verified.CommitIndex,
+                    verified.SnapshotIndex, verified.SnapshotTerm};
                 std::cout << "trusted voter binding completed\n";
             } else {
                 std::cout << "dry run passed; no store was written\n";
@@ -194,7 +197,7 @@ int main(int argc, char** argv) {
                 // a normal reopen after the metadata commit.
                 TDiskState state(base, nodeId, {}, false);
                 info = {state.CurrentTerm, state.VotedFor, state.LastLogIndex,
-                    state.LastLogTerm, state.CommitIndex};
+                    state.LastLogTerm, state.CommitIndex, state.SnapshotIndex, state.SnapshotTerm};
                 snapshotIndex = state.SnapshotIndex;
                 snapshotTerm = state.SnapshotTerm;
                 snapshot = state.GetSnapshot();
@@ -214,7 +217,8 @@ int main(int argc, char** argv) {
                     (snapshot && *verifiedSnapshot != *snapshot))
                     throw std::runtime_error("Split disk-state voter binding failed reopen verification");
                 info = {verified.CurrentTerm, verified.VotedFor, verified.LastLogIndex,
-                    verified.LastLogTerm, verified.CommitIndex};
+                    verified.LastLogTerm, verified.CommitIndex,
+                    verified.SnapshotIndex, verified.SnapshotTerm};
                 std::cout << "trusted voter binding completed\n";
             } else {
                 std::cout << "dry run passed; no store was written\n";
