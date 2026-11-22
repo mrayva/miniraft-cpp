@@ -126,10 +126,14 @@ RSM objects from disk, and retries the request. The new process returns the
 cached result at its original index with the saved session high-water mark and
 no second application mutation.
 
+The durable multi-voter case also restarts all three durable stores, restores a
+combined snapshot on the new leader, elects that voter in a later term, and
+verifies the retry returns the original cached response. A third voter recovers
+the committed application state from its durable log. The repeated request does
+not cause another application mutation on either snapshot-restored replica.
+
 The following tests remain necessary before claiming the full client guarantee:
 
-- Repeat leadership transfer, snapshot recovery and retry across multiple
-  replicas with each replica using durable Raft and application state.
 - Reject gaps, stale sequences, unsupported peers, and session-cache exhaustion
   before appending a new command.
 - Close a session through replicated state, restart, and verify old IDs cannot
@@ -148,9 +152,8 @@ The following tests remain necessary before claiming the full client guarantee:
    restart, compaction and resource limits using a stateful deduplicating RSM.
   **Partially implemented:** lost-reply retry across snapshot installation and
   leadership change, duplicate uncommitted copies across leaders, and conflicting
-  sequence reuse are covered. A single-voter durable snapshot restart preserves
-  the cached result; multi-voter durable restart and the scenarios above remain
-  open.
+  sequence reuse are covered. Single-voter and three-voter durable snapshot
+  restarts preserve the cached result; the cases above remain open.
 
 Clients using ordinary `TCommandRequest` writes retain at-least-once behavior.
 For idempotent requests, a timeout after admission still has an unknown outcome;

@@ -6,7 +6,11 @@
 #include <filesystem>
 #include <fstream>
 #include <chrono>
+#include <deque>
+#include <functional>
 #include <iterator>
+#include <memory>
+#include <set>
 #include <tuple>
 #include <stdarg.h>
 #include <stddef.h>
@@ -1101,6 +1105,193 @@ void test_idempotent_retry_after_durable_snapshot_restart_returns_cached_result(
     assert_true(std::string(response->Data,
         response->Len - sizeof(TIdempotentCommandResponse)) == "durable-result");
 }
+
+struct TDurableIdempotencyPeer : INode {
+    std::vector<TMessageHolder<TMessage>> Sent;
+    void Send(TMessageHolder<TMessage> message) override { Sent.push_back(std::move(message)); }
+    void Drain() override { }
+};
+
+struct TDurableQueuedPeer : INode {
+    std::function<void(TMessageHolder<TMessage>)> Deliver;
+    explicit TDurableQueuedPeer(std::function<void(TMessageHolder<TMessage>)> deliver)
+        : Deliver(std::move(deliver)) { }
+    void Send(TMessageHolder<TMessage> message) override { Deliver(std::move(message)); }
+    void Drain() override { }
+};
+
+struct TDurableManualTimeSource : ITimeSource {
+    Time Value{};
+    Time Now() override { return Value; }
+};
+
+struct TDurableIdempotencyCluster {
+    TFiles& Files;
+    std::vector<std::shared_ptr<TDurableState>> States;
+    std::vector<std::shared_ptr<TRaft>> Rafts;
+    std::vector<std::shared_ptr<TDurableControlRsm>> Applications;
+    std::vector<std::shared_ptr<TRequestProcessor>> Processors;
+    std::deque<TMessageHolder<TMessage>> Packets;
+    std::set<uint32_t> Isolated;
+    std::shared_ptr<TDurableManualTimeSource> Clock =
+        std::make_shared<TDurableManualTimeSource>();
+
+    explicit TDurableIdempotencyCluster(TFiles& files, bool reopen)
+        : Files(files) {
+        constexpr std::vector<uint32_t>::size_type NodeCount = 3;
+        std::vector<TNodeDict> peers(NodeCount);
+        for (uint32_t id = 1; id <= NodeCount; ++id) {
+            auto state = std::make_shared<TDurableState>(Files.Name, id);
+            if (!reopen) {
+                state->CurrentTerm = 1;
+                state->BindVoters({1, 2, 3});
+            } else {
+                assert_true((state->GetBoundVoters() == std::vector<uint32_t>{1, 2, 3}));
+            }
+            States.push_back(std::move(state));
+        }
+        for (uint32_t id = 1; id <= NodeCount; ++id) {
+            for (uint32_t dst = 1; dst <= NodeCount; ++dst) {
+                if (dst != id) {
+                    peers[id - 1][dst] = std::make_shared<TDurableQueuedPeer>(
+                        [this](auto message) { Packets.push_back(std::move(message)); });
+                }
+            }
+        }
+        for (uint32_t id = 1; id <= NodeCount; ++id) {
+            auto raft = std::make_shared<TRaft>(States[id - 1], id, peers[id - 1]);
+            auto application = std::make_shared<TDurableControlRsm>();
+            application->State.Epoch = 1;
+            auto processor = std::make_shared<TRequestProcessor>(raft, application, peers[id - 1],
+                TRequestProcessor::TAdmissionLimits{}, Clock);
+            Rafts.push_back(std::move(raft));
+            Applications.push_back(std::move(application));
+            Processors.push_back(std::move(processor));
+        }
+    }
+
+    void Drain() {
+        size_t budget = 50000;
+        while (!Packets.empty()) {
+            assert_true(budget-- > 0);
+            auto message = std::move(Packets.front());
+            Packets.pop_front();
+            auto rpc = message.Cast<TMessageEx>();
+            if (Isolated.count(rpc->Src) || Isolated.count(rpc->Dst)) continue;
+            const auto index = size_t(rpc->Dst - 1);
+            Rafts.at(index)->Process(Clock->Value, message);
+            Processors.at(index)->CheckStateChange();
+            Processors.at(index)->ProcessCommitted();
+            Processors.at(index)->ProcessWaiting();
+        }
+    }
+
+    void Elect(uint32_t id) {
+        Drain();
+        Clock->Value += std::chrono::seconds(30);
+        auto& raft = Rafts.at(id - 1);
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            raft->ProcessTimeout(Clock->Value);
+            Drain();
+        }
+        assert_int_equal(raft->CurrentStateName(), EState::LEADER);
+    }
+
+    void Replicate(uint32_t id, int rounds = 12) {
+        auto& raft = Rafts.at(id - 1);
+        for (int round = 0; round < rounds; ++round) {
+            Clock->Value += std::chrono::milliseconds(500);
+            raft->ProcessTimeout(Clock->Value);
+            Drain();
+        }
+    }
+};
+
+void test_idempotent_retry_after_multi_voter_durable_snapshot_restart(void**) {
+    TFiles files;
+    const auto makeRequest = [](uint32_t cookie) {
+        constexpr std::string_view payload = "client-payload";
+        auto request = NewHoldedMessage<TIdempotentCommandRequest>(
+            sizeof(TIdempotentCommandRequest) + payload.size());
+        request->Epoch = 1;
+        request->SessionIdHigh = 11;
+        request->SessionIdLow = 12;
+        request->Sequence = 1;
+        request->Cookie = cookie;
+        memcpy(request->Data, payload.data(), payload.size());
+        return request;
+    };
+
+    {
+        TDurableIdempotencyCluster cluster(files, false);
+        cluster.Elect(1);
+        cluster.Replicate(1);
+        assert_true(cluster.Rafts[0]->CanAppendIdempotentLogEntries());
+
+        // Voter 2 misses the committed write and is brought current by the
+        // snapshot. The client has no reply route, modeling a lost response.
+        cluster.Isolated.insert(2);
+        cluster.Processors[0]->OnIdempotentCommandRequest(makeRequest(71), {});
+        cluster.Replicate(1);
+        assert_int_equal(cluster.States[0]->CommitIndex, 2);
+        assert_int_equal(cluster.States[2]->CommitIndex, 2);
+        assert_int_equal(cluster.Applications[0]->IdempotentApplicationCalls, 1);
+        assert_int_equal(cluster.Applications[2]->IdempotentApplicationCalls, 1);
+
+        const auto snapshot = cluster.Rafts[0]->CompactShared();
+        assert_int_equal(snapshot->Index, 2);
+        cluster.Isolated.erase(2);
+        cluster.Replicate(1);
+        assert_int_equal(cluster.States[1]->SnapshotIndex, 2);
+        assert_int_equal(cluster.Applications[1]->LastAppliedIndex, 2);
+        assert_true(cluster.Applications[1]->State.ApplicationData == "client-payload");
+    }
+
+    {
+        TDurableIdempotencyCluster cluster(files, true);
+        assert_int_equal(cluster.States[0]->SnapshotIndex, 2);
+        assert_int_equal(cluster.States[1]->SnapshotIndex, 2);
+        assert_int_equal(cluster.Applications[0]->LastAppliedIndex, 2);
+        assert_int_equal(cluster.Applications[1]->LastAppliedIndex, 2);
+        assert_int_equal(cluster.Applications[1]->State.Sessions.size(), 1);
+        assert_int_equal(cluster.Applications[1]->State.Sessions.front().HighestSequence, 1);
+        assert_int_equal(cluster.Applications[1]->State.Sessions.front().LogIndex, 2);
+        assert_true(cluster.Applications[1]->State.Sessions.front().PayloadDigest ==
+            ComputeIdempotentPayloadDigest("client-payload"));
+        assert_true(cluster.Applications[1]->State.Sessions.front().ResponseData == "durable-result");
+
+        // Voter 2 recovers the combined snapshot, wins a new term, and commits
+        // a retry. Voter 3 recovers the same history by replaying its durable log.
+        cluster.Elect(2);
+        cluster.Replicate(2);
+        assert_true(cluster.Rafts[1]->CanAppendIdempotentLogEntries());
+        auto retryClient = std::make_shared<TDurableIdempotencyPeer>();
+        cluster.Processors[1]->OnIdempotentCommandRequest(makeRequest(72), retryClient);
+        cluster.Replicate(2);
+
+        assert_int_equal(retryClient->Sent.size(), 1);
+        auto response = retryClient->Sent.back().Cast<TIdempotentCommandResponse>();
+        ValidateIdempotentCommandResponse(response);
+        assert_int_equal(response->Cookie, 72);
+        assert_int_equal(response->ErrorCode, TCommandResponse::Success);
+        assert_int_equal(response->Index, 2);
+        assert_true(std::string(response->Data,
+            response->Len - sizeof(TIdempotentCommandResponse)) == "durable-result");
+
+        for (size_t i = 0; i < cluster.States.size(); ++i) {
+            assert_int_equal(cluster.States[i]->CommitIndex, 4);
+            assert_int_equal(cluster.Applications[i]->LastAppliedIndex, 4);
+            assert_true(cluster.Applications[i]->State.ApplicationData == "client-payload");
+            assert_int_equal(cluster.Applications[i]->State.Sessions.size(), 1);
+            assert_int_equal(cluster.Applications[i]->State.Sessions.front().HighestSequence, 1);
+            assert_int_equal(cluster.Applications[i]->State.Sessions.front().LogIndex, 2);
+            assert_true(cluster.Applications[i]->State.Sessions.front().ResponseData == "durable-result");
+        }
+        assert_int_equal(cluster.Applications[0]->IdempotentApplicationCalls, 0);
+        assert_int_equal(cluster.Applications[1]->IdempotentApplicationCalls, 0);
+        assert_int_equal(cluster.Applications[2]->IdempotentApplicationCalls, 1);
+    }
+}
 }
 
 int main() {
@@ -1130,6 +1321,7 @@ int main() {
         cmocka_unit_test(test_idempotency_control_survives_durable_restart_and_replays_atomically),
         cmocka_unit_test(test_duplicate_idempotent_records_apply_once_after_durable_restart),
         cmocka_unit_test(test_idempotent_retry_after_durable_snapshot_restart_returns_cached_result),
+        cmocka_unit_test(test_idempotent_retry_after_multi_voter_durable_snapshot_restart),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }
