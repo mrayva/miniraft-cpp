@@ -1,17 +1,20 @@
 # Durable client write deduplication design
 
-Status: protocol foundation is present, but durable deduplication is not
-implemented. The current client request path does not provide durable operation
-identity. A timeout or lost response leaves the write outcome unknown; retrying
-a non-idempotent write may apply it twice.
+Status: the replicated protocol hooks are implemented, but MiniRaft does not
+provide a production idempotent state machine or client library. The opt-in
+request type carries operation identity through negotiated forwarding and a
+tagged replicated log record. `IIdempotentRsm` applies committed records and
+captures application data, session records, epoch and progress in one bounded
+snapshot. Replicated close-session and epoch-advance control records are also
+available. Log-record support is negotiated; leaders reject opt-in writes until
+all voters and learners that can receive the entry advertise support.
 
-The new request and response frame types are strictly validated. An optional
-`IIdempotentRsm` contract and bounded, versioned combined application/session
-snapshot codec are also present. The request processor still returns
-`Unsupported` before forwarding, appending, or applying because operation
-identity is not yet carried through forwarding or replicated log entries. No
-capability is advertised, and clients must not treat these interfaces as a
-usable idempotency feature.
+The application implementing `IIdempotentRsm` must enforce the session,
+sequence, digest, tombstone and cached-response rules atomically. The current
+test RSMs are protocol test doubles, not a ready-to-use implementation. A
+timeout or lost response still leaves the write outcome unknown; retrying is
+safe only when the application honors the operation identity contract. The
+remaining end-to-end retry and recovery tests are listed below.
 
 ## Goal and boundary
 
@@ -97,7 +100,16 @@ The optional state-machine contract must provide a pre-append upper bound for
 the cached response. Admission reserves that space before logging; an
 application response that exceeds its declared bound is a contract violation.
 
-## Required deterministic tests
+## Deterministic validation status
+
+Focused tests now cover strict request and log-record validation, snapshot
+round trips and limits, committed application replay, forwarding with
+sessionized routes, timeout behavior, capability negotiation (including new
+joint members), atomic control application, and control-record replay after a
+durable restart. These tests validate the protocol boundary and storage
+integration with test RSMs.
+
+The following tests remain necessary before claiming the full client guarantee:
 
 - Commit a write, drop its reply, retry after leader change, and assert the
   application runs once and the original response is returned.
@@ -112,20 +124,22 @@ application response that exceeds its declared bound is a contract violation.
 - Close a session through replicated state, restart, and verify old IDs cannot
   execute again.
 
-## Implementation order
+## Implementation status
 
-1. Define versioned request and response types with strict validation. Keep
-   legacy requests unchanged and reject the new type until the durable contract
-   is available. (The frame types and fail-closed response have landed.)
-2. Add the optional idempotent state-machine contract and versioned session
-   snapshot codec with strict limits. (The contract and codec have landed.)
-3. Carry identity through negotiated forwarding, wrap commands in replicated
-   log metadata, and apply duplicate checks at the state-machine boundary. (The
-   digest, strict log-record codec and committed replay hook are present;
-   request routing and peer capability negotiation remain open.)
-4. Add end-to-end loss, retry, leadership-change, restart, compaction and
-   resource-limit tests before advertising the capability.
+1. Versioned request and response types with strict validation; legacy request
+   layouts remain unchanged. **Implemented.**
+2. Optional idempotent state-machine contract and bounded, versioned combined
+   application/session snapshots. **Implemented.**
+3. Carry identity through forwarding, encode it in replicated entries, replay
+   committed records through the state-machine contract, replicate session
+   controls, and negotiate peer support. **Implemented.**
+4. Validate lost-reply retries, duplicate log copies, leadership changes,
+   restart, compaction and resource limits using a stateful deduplicating RSM.
+   **Partially implemented:** protocol and durable control paths have focused
+   tests; the end-to-end scenarios above remain open.
 
-Until those steps land, clients must treat a nonzero error or timeout after
-admission as an unknown write outcome and must not blindly retry a
-non-idempotent operation.
+Clients using ordinary `TCommandRequest` writes retain at-least-once behavior.
+For idempotent requests, a timeout after admission still has an unknown outcome;
+the client must retry the same epoch, session ID, sequence and payload. This is
+safe only when every receiving replica runs a conforming `IIdempotentRsm` and
+the application atomically persists its deduplication state in snapshots.
