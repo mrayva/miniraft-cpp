@@ -672,6 +672,35 @@ void test_leader_expiration_uses_configured_timeout(void**) {
     assert_int_equal(leader->GetLeaderId(), 0);
 }
 
+void test_leader_initial_expiration_uses_configured_timeout(void**) {
+    for (const auto timeout : {std::chrono::seconds(4), std::chrono::seconds(25)}) {
+        TCluster cluster(3, TRaft::TLogLimits{.LeadershipExpiration = timeout});
+        auto& leader = cluster.Nodes[0];
+        cluster.Now += std::chrono::seconds(30);
+        leader->ProcessTimeout(cluster.Now);
+        cluster.Drain(); // Pre-votes.
+        leader->ProcessTimeout(cluster.Now);
+        cluster.Drain(); // Election votes.
+        cluster.Isolated.insert(1);
+        leader->ProcessTimeout(cluster.Now);
+        cluster.Drain(); // Drop replication traffic from the new leader.
+
+        assert_int_equal(leader->CurrentStateName(), EState::LEADER);
+        assert_true(leader->GetVolatileState()->QuorumResponseTime.empty());
+        const auto electedTerm = leader->GetState()->CurrentTerm;
+
+        cluster.Now += timeout - std::chrono::milliseconds(1);
+        leader->ProcessTimeout(cluster.Now);
+        assert_int_equal(leader->CurrentStateName(), EState::LEADER);
+
+        cluster.Now += std::chrono::milliseconds(1);
+        leader->ProcessTimeout(cluster.Now);
+        assert_int_equal(leader->CurrentStateName(), EState::FOLLOWER);
+        assert_int_equal(leader->GetLeaderId(), 0);
+        assert_int_equal(leader->GetState()->CurrentTerm, electedTerm);
+    }
+}
+
 void test_invalid_leadership_expiration_is_rejected(void**) {
     for (auto timeout : {std::chrono::milliseconds::zero(), std::chrono::milliseconds(-1),
                          TTimeout::Election / 2}) {
@@ -1485,6 +1514,7 @@ int main() {
         cmocka_unit_test(test_deadlines_cover_slow_validation_preparation_and_read_callbacks),
         cmocka_unit_test(test_leader_expires_after_losing_fresh_voter_quorum),
         cmocka_unit_test(test_leader_expiration_uses_configured_timeout),
+        cmocka_unit_test(test_leader_initial_expiration_uses_configured_timeout),
         cmocka_unit_test(test_invalid_leadership_expiration_is_rejected),
         cmocka_unit_test(test_uncommitted_log_budget_survives_disconnect_and_releases_after_commit),
         cmocka_unit_test(test_follower_rejects_append_batch_that_exceeds_uncommitted_log_budget),

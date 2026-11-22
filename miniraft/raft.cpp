@@ -2283,7 +2283,7 @@ void TRaft::ProcessTimeout(ITimeSource::Time now) {
                 .RpcDue = rpcDue,
                 .ElectionDue = ITimeSource::Max,
                 .LeaderContactDue = ITimeSource::Max,
-                .LeadershipExpiryDue = now + TTimeout::LeadershipExpiration,
+                .LeadershipExpiryDue = LeadershipExpirationDeadline(now),
             });
 
             VolatileState = std::move(nextVolatileState);

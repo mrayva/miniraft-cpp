@@ -4,7 +4,8 @@ A leader that stops hearing from a voting quorum yields leadership after
 `TRaft::TLogLimits::LeadershipExpiration` (20 seconds by default). Configure
 it on each `TRaft` instance before processing network traffic. The timer uses
 the same monotonic timestamps supplied to `TRaft::Process` and
-`TRaft::ProcessTimeout`.
+`TRaft::ProcessTimeout`. The initial deadline starts when the node becomes
+leader. Each fresh quorum response can move the deadline forward.
 
 Only correlated responses from active voters count. AppendEntries responses
 count whether replication succeeds or reports a log conflict; correlated
@@ -29,6 +30,6 @@ provide that guarantee.
 
 Deterministic regressions keep a healthy leader active beyond the default
 expiry window, then isolate it and check that it yields at the last known quorum
-response deadline. A second regression configures a shorter timeout and verifies
-that it controls the deadline; nonpositive values and values no greater than
+response deadline. Tests also verify the configured timeout after quorum contact
+and immediately after election with no replication replies. Values at or below
 the heartbeat interval are rejected.
