@@ -1,8 +1,9 @@
 # Design: streamed application snapshots
 
 This design describes the staged work to remove the current 64 MiB
-complete-image limit. The application capture-source API is implemented; the
-durable generation and streamed installation lifecycle are not. The current
+complete-image limit. The application capture-source API and optional receive
+staging files are implemented. Durable generations and staged application
+activation remain open. The current
 snapshot format, storage behavior and transfer limits are described in
 [compaction and InstallSnapshot](compaction.md).
 
@@ -38,10 +39,26 @@ This accounts for incomplete receive buffers only; retained
 snapshots, outgoing pins, capture buffers, application memory and transport
 buffers remain outside this budget.
 
+On Linux, set `TRaft::TLogLimits::SnapshotStagingDirectory` to stage full
+incoming images in a directory on a filesystem that supports anonymous
+temporary files (`O_TMPFILE`). Durable KV servers expose the option as
+`--snapshot-staging-dir PATH`. Use a disk-backed directory to avoid placing the
+receive buffer in the process heap or on a RAM-backed filesystem. Chunks are
+written at their validated offsets, and Raft reads the received bytes through
+a read-only mapping for duplicate, metadata and checksum checks. The shared
+install budget still limits the declared sizes. Staged data is discarded when
+Raft clears the assembly, after completion, or on process exit.
+
+The decoder still materializes the final application image for validation
+and installation. The staging file is temporary and partial transfers restart
+at offset zero after process restart. The wire format, 64 MiB limit and
+ordering of durable publication, application load and acknowledgement stay
+the same.
+
 ## Why this needs a storage contract
 
-InstallSnapshot already sends bounded chunks, but the receiver assembles the
-whole encoded image in memory before decoding it. `IRsm::SaveSnapshot()` returns
+InstallSnapshot sends bounded chunks and can stage the complete encoded image
+on disk before decoding it. `IRsm::SaveSnapshot()` returns
 one `std::string` and `ValidateSnapshot()` receives a complete view. The durable
 backend stores snapshot bytes in an immutable sidecar and still materializes
 the application payload when opening it. Raising `TSnapshot::MaxBytes` would

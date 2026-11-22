@@ -1015,7 +1015,7 @@ void test_covered_snapshot_metadata_uses_shared_install_budget(void**) {
     assert_int_equal(covered->NextOffset, image3.size());
     assert_int_equal(budget->UsedBytes(), 0);
 }
-void test_snapshot_install_accepts_every_small_fixed_chunk_size(void**) {
+void CheckSnapshotInstallChunkSizes(const TRaft::TLogLimits& limits) {
     TKv source;
     source.Write(source.Prepare(Command("key", "value")), 1);
     const TSnapshot snapshot{1, 1, {1, 2}, source.SaveSnapshot()};
@@ -1037,7 +1037,7 @@ void test_snapshot_install_accepts_every_small_fixed_chunk_size(void**) {
             ++responses;
         });
         TNodeDict peers{{1, peer}};
-        auto raft = std::make_shared<TRaft>(state, 2, peers);
+        auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{}, limits);
         auto app = std::make_shared<TApplication>();
         TRequestProcessor processor(raft, app, peers);
 
@@ -1070,6 +1070,9 @@ void test_snapshot_install_accepts_every_small_fixed_chunk_size(void**) {
         assert_true(Read(*app, "key") == "value");
         assert_true(*state->GetSnapshot() == snapshot);
     }
+}
+void test_snapshot_install_accepts_every_small_fixed_chunk_size(void**) {
+    CheckSnapshotInstallChunkSizes({});
 }
 void test_joint_snapshot_is_rejected_without_matching_history_even_if_boundary_is_covered(void**) {
     TKv source; source.Write(source.Prepare(Command("a", "old")), 5);
@@ -1991,6 +1994,60 @@ struct TFiles {
     }
     ~TFiles() { std::error_code ignored; std::filesystem::remove_all(Directory, ignored); }
 };
+void test_file_staged_snapshot_install_accepts_every_small_fixed_chunk_size(void**) {
+    TFiles files;
+    auto budget = std::make_shared<TSnapshotInstallBudget>();
+    CheckSnapshotInstallChunkSizes({.SnapshotInstallBudget = budget,
+        .SnapshotStagingDirectory = files.Directory.string()});
+    assert_int_equal(budget->UsedBytes(), 0);
+    assert_true(std::filesystem::is_empty(files.Directory));
+}
+
+void test_file_staging_failure_releases_snapshot_reservation(void**) {
+    TFiles files;
+    auto budget = std::make_shared<TSnapshotInstallBudget>();
+    TMessageHolder<TInstallSnapshotResponse> response;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) {
+        if (auto reply = message.template Maybe<TInstallSnapshotResponse>()) response = reply.Cast();
+    });
+    auto state = std::make_shared<TState>();
+    auto app = std::make_shared<TApplication>();
+    TNodeDict peers{{1, peer}};
+    auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{},
+        TRaft::TLogLimits{.SnapshotInstallBudget = budget, .SnapshotStagingDirectory = files.Name});
+    TRequestProcessor processor(raft, app, peers);
+    TKv source;
+    const TSnapshot snapshot{1, 1, {1, 2}, source.SaveSnapshot()};
+    const auto bytes = EncodeSnapshot(snapshot);
+    auto first = Chunk(snapshot, bytes, 0, 8);
+    raft->Process({}, first);
+    assert_non_null(response);
+    assert_false(response->Success);
+    assert_int_equal(budget->UsedBytes(), 0);
+    assert_int_equal(state->SnapshotIndex, 0);
+
+    assert_true(std::filesystem::create_directory(files.Name));
+    raft->Process({}, first);
+    assert_true(response->Success);
+    assert_false(response->Installed);
+    assert_int_equal(budget->UsedBytes(), bytes.size());
+    raft->ProcessTimeout(ITimeSource::Time{} + TTimeout::SnapshotTransferIdle);
+    assert_int_equal(budget->UsedBytes(), 0);
+    assert_true(std::filesystem::is_empty(files.Name));
+
+    auto corrupt = bytes;
+    corrupt.back() ^= 1;
+    const auto retryTime = ITimeSource::Time{} + TTimeout::SnapshotTransferIdle;
+    raft->Process(retryTime, Chunk(snapshot, corrupt, 0, corrupt.size()));
+    assert_false(response->Success);
+    assert_int_equal(budget->UsedBytes(), 0);
+    assert_int_equal(state->SnapshotIndex, 0);
+    raft->Process(retryTime, Chunk(snapshot, bytes, 0, bytes.size()));
+    assert_true(response->Success);
+    assert_true(response->Installed);
+    assert_int_equal(state->SnapshotIndex, 1);
+    assert_int_equal(budget->UsedBytes(), 0);
+}
 void test_durable_stale_snapshot_membership_recovery_survives_restart(void**) {
     for (bool jointSuccessor : {false, true}) {
         TFiles files;
@@ -2405,6 +2462,8 @@ int main() {
         cmocka_unit_test(test_memory_storage_rejects_index_exhaustion),
         cmocka_unit_test(test_memory_snapshot_boundary_retains_matching_suffix_and_replaces_conflict),
 #ifdef __linux__
+        cmocka_unit_test(test_file_staged_snapshot_install_accepts_every_small_fixed_chunk_size),
+        cmocka_unit_test(test_file_staging_failure_releases_snapshot_reservation),
         cmocka_unit_test(test_durable_snapshot_storage_rejects_term_regression),
         cmocka_unit_test(test_durable_snapshot_cannot_replace_committed_index_with_conflicting_term),
         cmocka_unit_test(test_durable_storage_rejects_index_exhaustion),

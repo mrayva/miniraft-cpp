@@ -8,6 +8,13 @@
 #include <iterator>
 #include <atomic>
 
+#ifdef __linux__
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #include <string.h>
 #include <assert.h>
 
@@ -905,6 +912,65 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
 
 } // namespace
 
+class TRaft::TIncomingSnapshotFile {
+public:
+    TIncomingSnapshotFile(const std::string& directory, size_t size)
+        : Size(size) {
+#ifdef __linux__
+        Fd = open(directory.c_str(), O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+        if (Fd < 0) throw std::runtime_error("Cannot open anonymous snapshot staging file");
+        if (ftruncate(Fd, off_t(Size)) == 0) {
+            void* mapped = mmap(nullptr, Size, PROT_READ, MAP_SHARED, Fd, 0);
+            if (mapped != MAP_FAILED && mapped) {
+                Mapping = static_cast<const char*>(mapped);
+                return;
+            }
+            if (!mapped) munmap(mapped, Size);
+        }
+        close(Fd);
+        throw std::runtime_error("Cannot size or map snapshot staging file");
+#else
+        (void)directory;
+        throw std::logic_error("Snapshot file staging requires Linux");
+#endif
+    }
+
+    ~TIncomingSnapshotFile() {
+#ifdef __linux__
+        munmap(const_cast<char*>(Mapping), Size);
+        close(Fd);
+#endif
+    }
+    TIncomingSnapshotFile(const TIncomingSnapshotFile&) = delete;
+    TIncomingSnapshotFile& operator=(const TIncomingSnapshotFile&) = delete;
+
+    const char* Data() const { return Mapping; }
+
+    bool Write(size_t offset, std::string_view bytes) {
+#ifdef __linux__
+        while (!bytes.empty()) {
+            const auto written = pwrite(Fd, bytes.data(), bytes.size(), off_t(offset));
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) return false;
+            offset += size_t(written);
+            bytes.remove_prefix(size_t(written));
+        }
+        return true;
+#else
+        (void)offset;
+        (void)bytes;
+        return false;
+#endif
+    }
+
+private:
+    size_t Size;
+    const char* Mapping = nullptr;
+#ifdef __linux__
+    int Fd = -1;
+#endif
+};
+
 void TDummyRsm::Validate(TMessageHolder<TCommandRequest> message) const {
     if (!message || message->Len < sizeof(TCommandRequest) ||
         (!(message->Flags & TCommandRequest::EWrite) && message->Len < sizeof(TCommandRequest) + sizeof(int64_t)))
@@ -1070,6 +1136,10 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
     , StateName(EState::FOLLOWER)
 {
     if (!node || !State) throw std::invalid_argument("Raft requires a positive ID and state");
+#ifndef __linux__
+    if (!LogLimits.SnapshotStagingDirectory.empty())
+        throw std::invalid_argument("Snapshot file staging requires Linux");
+#endif
     if (!LogLimits.MaxUncommittedBytes || !LogLimits.MaxUncommittedEntries ||
         LogLimits.ReservedControlBytes < sizeof(TLogEntry) || !LogLimits.ReservedControlEntries ||
         LogLimits.ReservedControlBytes > LogLimits.MaxUncommittedBytes ||
@@ -3120,7 +3190,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
                 request->TotalBytes, request->LeaderId, now, {}};
         }
         auto& incoming = *IncomingSnapshot;
-        char* prefix = incoming.Preallocated ? incoming.Bytes.data() : incoming.CoveredPrefix.get();
+        const char* prefix = incoming.File ? incoming.File->Data() :
+            incoming.Preallocated ? incoming.Bytes.data() : incoming.CoveredPrefix.get();
         const auto count = request->Len - sizeof(TInstallSnapshotRequest);
         auto& receivedBytes = incoming.ReceivedBytes;
         const bool advanced = request->Offset == receivedBytes;
@@ -3154,7 +3225,14 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
                     IncomingSnapshot.reset(); reply(false, false, 0); return;
                 }
             }
-            memcpy(prefix + receivedBytes, request->Data, count);
+            if (incoming.File) {
+                if (!incoming.File->Write(size_t(receivedBytes), std::string_view(request->Data, count))) {
+                    IncomingSnapshot.reset(); reply(false, false, 0); return;
+                }
+            } else {
+                auto* destination = incoming.Preallocated ? incoming.Bytes.data() : incoming.CoveredPrefix.get();
+                memcpy(destination + receivedBytes, request->Data, count);
+            }
             receivedBytes += count;
         }
         if (advanced) IncomingSnapshot->LastProgress = now;
@@ -3199,33 +3277,46 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         auto reservation = SnapshotInstallBudget->TryReserve(request->TotalBytes);
         if (!reservation) { reply(false, false, 0); return; }
         std::string image;
+        std::shared_ptr<TIncomingSnapshotFile> file;
         try {
-            // Allocate the declared image once. Incremental string growth can
-            // reserve substantially more capacity than the quota accounts for.
-            image.resize(size_t(request->TotalBytes));
+            if (!LogLimits.SnapshotStagingDirectory.empty()) {
+                file = std::make_shared<TIncomingSnapshotFile>(
+                    LogLimits.SnapshotStagingDirectory, size_t(request->TotalBytes));
+            } else {
+                // Allocate the declared image once to avoid geometric growth.
+                image.resize(size_t(request->TotalBytes));
+            }
         } catch (const std::exception&) {
             reply(false, false, 0);
             return;
         }
         IncomingSnapshot = TIncomingSnapshot{request->Term, request->SnapshotIndex, request->SnapshotTerm,
-            request->TotalBytes, request->LeaderId, now, std::move(image), 0, true, std::move(reservation)};
+            request->TotalBytes, request->LeaderId, now, std::move(image), 0, true,
+            std::move(reservation), {}, 0, std::move(file)};
     }
-    auto& bytes = IncomingSnapshot->Bytes;
+    auto& incoming = *IncomingSnapshot;
+    const char* bytes = incoming.File ? incoming.File->Data() : incoming.Bytes.data();
     const auto count = request->Len - sizeof(TInstallSnapshotRequest);
     auto& receivedBytes = IncomingSnapshot->ReceivedBytes;
     const bool advanced = request->Offset == receivedBytes;
     if (request->Offset > receivedBytes) { reply(false, false, 0); return; }
     if (request->Offset < receivedBytes) {
         if (count > receivedBytes - request->Offset ||
-            std::string_view(bytes).substr(request->Offset, count) != std::string_view(request->Data, count)) {
+            std::string_view(bytes + request->Offset, count) != std::string_view(request->Data, count)) {
             IncomingSnapshot.reset(); reply(false, false, 0); return;
         }
     } else {
-        memcpy(bytes.data() + receivedBytes, request->Data, count);
+        if (incoming.File) {
+            if (!incoming.File->Write(size_t(receivedBytes), std::string_view(request->Data, count))) {
+                IncomingSnapshot.reset(); reply(false, false, 0); return;
+            }
+        } else {
+            memcpy(incoming.Bytes.data() + receivedBytes, request->Data, count);
+        }
         receivedBytes += count;
     }
     if (advanced) IncomingSnapshot->LastProgress = now;
-    const std::string_view receivedImage(bytes.data(), size_t(receivedBytes));
+    const std::string_view receivedImage(bytes, size_t(receivedBytes));
     if (!IsSupportedSnapshotMagicPrefix(receivedImage)) {
         IncomingSnapshot.reset(); reply(false, false, 0); return;
     }
@@ -3258,7 +3349,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     (void)installationReservation; // Hold the aggregate reservation through validation and publication.
     TSnapshot snapshot;
     try {
-        snapshot = DecodeSnapshotOwned(std::move(IncomingSnapshot->Bytes));
+        snapshot = incoming.File ? DecodeSnapshot(receivedImage) :
+            DecodeSnapshotOwned(std::move(incoming.Bytes));
         IncomingSnapshot.reset();
         auto inheritTrustedLineage = [&](const TConfigurationHistory& history) {
             if (snapshot.HasConfigurationMetadata() && history.IsJoint() &&

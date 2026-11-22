@@ -4,6 +4,7 @@
 #include <charconv>
 #include <csignal>
 #include <fstream>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <optional>
@@ -376,7 +377,8 @@ static void ReloadPeerConfig(const std::string& path, uint32_t localId,
 void usage(const char* prog) {
     std::cerr << prog << " --client|--server --id myid "
         "(--node ip:port:id [--node ip:port:id ...] [--learner id ...] | --peer-config path) "
-        "[--persist|--durable] [--snapshots entries] [--idempotent [--client-state path]] [--stale] [--consistent]\n";
+        "[--persist|--durable] [--snapshots entries] [--snapshot-staging-dir path] "
+        "[--idempotent [--client-state path]] [--stale] [--consistent]\n";
     exit(0);
 }
 
@@ -392,6 +394,7 @@ int main(int argc, char** argv) {
     bool durable = false;
     bool idempotent = false;
     std::string peerConfig;
+    TRaft::TLogLimits logLimits;
     std::string clientStatePath;
     uint64_t snapshotInterval = 0;
     uint32_t flags = 0;
@@ -424,6 +427,11 @@ int main(int argc, char** argv) {
         } else if (!strcmp(argv[i], "--client-state")) {
             if (i + 1 >= argc) { std::cerr << "--client-state requires a path\n"; return 1; }
             clientStatePath = argv[++i];
+        } else if (!strcmp(argv[i], "--snapshot-staging-dir")) {
+            if (!logLimits.SnapshotStagingDirectory.empty() || i + 1 >= argc || !argv[i + 1][0]) {
+                std::cerr << "--snapshot-staging-dir requires one directory\n"; return 1;
+            }
+            logLimits.SnapshotStagingDirectory = argv[++i];
         } else if (!strcmp(argv[i], "--snapshots")) {
             if (i + 1 >= argc) { std::cerr << "--snapshots requires a positive entry interval\n"; return 1; }
             const std::string_view value(argv[++i]);
@@ -462,6 +470,17 @@ int main(int argc, char** argv) {
             std::cerr << error.what() << "\n";
             return 1;
         }
+    }
+    if (!logLimits.SnapshotStagingDirectory.empty()) {
+#ifdef __linux__
+        std::error_code error;
+        if (!server || !durable || !std::filesystem::is_directory(logLimits.SnapshotStagingDirectory, error)) {
+            std::cerr << "--snapshot-staging-dir requires --server --durable and an existing directory\n";
+            return 1;
+        }
+#else
+        std::cerr << "--snapshot-staging-dir requires Linux\n"; return 1;
+#endif
     }
     if (!learners.empty() && (!server || !durable)) {
         std::cerr << "--learner requires --server --durable\n"; return 1;
@@ -517,7 +536,7 @@ int main(int argc, char** argv) {
             if (durable) state = std::make_shared<TDurableState>("state", myHost.Id);
             else state = std::make_shared<TDiskState>("state", myHost.Id);
         }
-        auto raft = std::make_shared<TRaft>(state, myHost.Id, nodes, learners);
+        auto raft = std::make_shared<TRaft>(state, myHost.Id, nodes, learners, logLimits);
         std::shared_ptr<TSnapshotStore> snapshots;
         uint64_t savedSnapshot = state->SnapshotIndex;
         if (snapshotInterval) {

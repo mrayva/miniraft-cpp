@@ -382,6 +382,9 @@ public:
         // Shared by all Raft instances in a process by default. Supply one
         // shared budget here to override the process-wide InstallSnapshot cap.
         std::shared_ptr<TSnapshotInstallBudget> SnapshotInstallBudget;
+        // On Linux, stage full incoming images in anonymous files in this
+        // directory. The receive budget still limits their declared sizes.
+        std::string SnapshotStagingDirectory;
     };
 
     // Nodes contains every configured replication peer; learners may include
@@ -584,6 +587,7 @@ private:
     std::unique_ptr<TVolatileState> VolatileState;
     uint64_t Seqno = 1; // zero is reserved for an unconfirmed read
     std::weak_ptr<IRsm> SnapshotApplication;
+    class TIncomingSnapshotFile;
     struct TIncomingSnapshot {
         uint64_t Term, Index, BoundaryTerm, Total;
         uint32_t Leader;
@@ -594,6 +598,7 @@ private:
         std::shared_ptr<void> MemoryReservation;
         std::unique_ptr<char[]> CoveredPrefix;
         size_t CoveredPrefixCapacity = 0;
+        std::shared_ptr<TIncomingSnapshotFile> File;
     };
     std::optional<TIncomingSnapshot> IncomingSnapshot;
     std::shared_ptr<const TSnapshotEncoding> EncodedSnapshot;

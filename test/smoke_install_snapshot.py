@@ -38,11 +38,15 @@ def main():
         learner_config.write_text(learner_catalog(False))
         voter_config = root / "voters.conf"
         voter_config.write_text("".join(f"voter {endpoint}\n" for endpoint in endpoints))
+        staging_dir = root / "snapshot-staging"
+        staging_dir.mkdir()
 
         def start(index, use_role=True):
             args = [binary, "--server", "--id", str(index + 1), "--durable"]
             if learner_mode:
                 args += ["--peer-config", str(learner_config if use_role else voter_config)]
+                if index == 2:
+                    args += ["--snapshot-staging-dir", str(staging_dir)]
             else:
                 for endpoint in endpoints:
                     args += ["--node", endpoint]
@@ -144,6 +148,7 @@ def main():
             # Node 3 has no periodic snapshotting: its compacted image necessarily
             # came from the InstallSnapshot RPC, not a local checkpoint timer.
             assert not (directories[2] / "state.snapshot.3").exists()
+            assert not any(staging_dir.iterdir()), "temporary snapshot files must stay anonymous"
             wait_for(lambda: call(0, b"tail", b"after install")[0] > last[0], 15)
             wait_for(lambda: call(2, b"tail")[1] == b"after install", 15)
             processes[2].terminate()
