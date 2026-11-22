@@ -32,16 +32,11 @@ std::string EncodeIdempotentKvWrite(std::string_view key, std::string_view value
     return payload;
 }
 
-void ReportIdempotentReply(TIdempotentClientSession& client,
-        const TMessageHolder<TIdempotentCommandResponse>& response) {
+void ReportIdempotentReply(const TMessageHolder<TIdempotentCommandResponse>& response) {
     ValidateIdempotentCommandResponse(response);
     if (response->ErrorCode != TCommandResponse::Success) {
         std::cout << "Idempotent write unresolved (error " << response->ErrorCode
                   << "); its operation remains saved for retry.\n";
-        return;
-    }
-    if (!client.Complete(response)) {
-        std::cout << "Idempotent response did not match the pending write; state remains pending.\n";
         return;
     }
     std::cout << "Idempotent write committed at " << response->Index << "\n";
@@ -66,6 +61,13 @@ NNet::TFuture<void> Client(TPoller& poller, std::unique_ptr<TSocket> socket,
                   << error.what() << "\n";
     }
 
+    using TIdempotentTransport = NNet::TIdempotentClient<TPoller, TSocket>;
+    std::unique_ptr<TIdempotentTransport> idempotentTransport;
+    if (idempotentClient) {
+        idempotentTransport = std::make_unique<TIdempotentTransport>(
+            poller, address, socket, socketConnected, *idempotentClient);
+    }
+
     NNet::TLine line;
     TCommandRequest header;
     header.Flags = TCommandRequest::EWrite;
@@ -74,11 +76,10 @@ NNet::TFuture<void> Client(TPoller& poller, std::unique_ptr<TSocket> socket,
     const char* sep = " \t\r\n";
 
     try {
-        if (idempotentClient && idempotentClient->State().HasPending) {
+        if (idempotentTransport && idempotentTransport->State().HasPending) {
             try {
-                auto response = co_await NNet::SendPendingIdempotentWriteWithRetry(
-                    poller, address, socket, socketConnected, *idempotentClient);
-                ReportIdempotentReply(*idempotentClient, response);
+                auto response = co_await idempotentTransport->RetryPending();
+                ReportIdempotentReply(response);
             } catch (const std::exception& error) {
                 std::cout << "Pending idempotent write remains saved after reconnect retries: "
                           << error.what() << "\n";
@@ -142,31 +143,28 @@ NNet::TFuture<void> Client(TPoller& poller, std::unique_ptr<TSocket> socket,
                 continue;
             }
 
-            if (idempotentClient && isWrite) {
-                if (idempotentClient->State().HasPending &&
-                    idempotentClient->State().PendingPayload != idempotentPayload) {
+            if (idempotentTransport && isWrite) {
+                if (idempotentTransport->State().HasPending &&
+                    idempotentTransport->State().PendingPayload != idempotentPayload) {
                     TMessageHolder<TIdempotentCommandResponse> previous;
                     try {
-                        previous = co_await NNet::SendPendingIdempotentWriteWithRetry(
-                            poller, address, socket, socketConnected, *idempotentClient);
+                        previous = co_await idempotentTransport->RetryPending();
                     } catch (const std::exception& error) {
                         std::cout << "Pending idempotent write remains saved after reconnect retries: "
                                   << error.what() << "\n";
                         std::cout << "> " << std::flush;
                         continue;
                     }
-                    ReportIdempotentReply(*idempotentClient, previous);
-                    if (idempotentClient->State().HasPending) {
+                    ReportIdempotentReply(previous);
+                    if (idempotentTransport->State().HasPending) {
                         std::cout << "Resolve the pending write before starting another write.\n";
                         std::cout << "> " << std::flush;
                         continue;
                     }
                 }
-                (void)idempotentClient->BeginWrite(idempotentPayload);
                 try {
-                    auto response = co_await NNet::SendPendingIdempotentWriteWithRetry(
-                        poller, address, socket, socketConnected, *idempotentClient);
-                    ReportIdempotentReply(*idempotentClient, response);
+                    auto response = co_await idempotentTransport->Write(idempotentPayload);
+                    ReportIdempotentReply(response);
                 } catch (const std::exception& error) {
                     std::cout << "Pending idempotent write remains saved after reconnect retries: "
                               << error.what() << "\n";

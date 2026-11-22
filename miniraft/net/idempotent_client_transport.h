@@ -76,4 +76,64 @@ TFuture<TMessageHolder<TIdempotentCommandResponse>> SendPendingIdempotentWriteWi
     throw std::runtime_error("idempotent write transport retry exhausted: " + lastError);
 }
 
+// Couples durable operation state to the retrying transport so callers cannot
+// accidentally send before persisting, or forget to acknowledge a successful
+// response. The poller, socket pointer, connection flag, and session must outlive
+// this facade. Like TIdempotentClientSession, it is intended for serialized use.
+template<typename TPoller, typename TSocket>
+class TIdempotentClient {
+public:
+    TIdempotentClient(TPoller& poller, TAddress address,
+            std::unique_ptr<TSocket>& activeSocket, bool& activeSocketConnected,
+            TIdempotentClientSession& session,
+            TIdempotentClientRetryOptions options = {})
+        : Poller(poller)
+        , Address(std::move(address))
+        , ActiveSocket(activeSocket)
+        , ActiveSocketConnected(activeSocketConnected)
+        , Session(session)
+        , Options(options) {
+    }
+
+    const TIdempotentClientSessionState& State() const {
+        return Session.State();
+    }
+
+    // BeginWrite durably records the operation before any network I/O. If a
+    // prior operation is pending, only resending that same payload is allowed.
+    // The value parameter keeps temporary payloads alive across coroutine
+    // suspension.
+    TFuture<TMessageHolder<TIdempotentCommandResponse>> Write(
+            std::string payload) {
+        (void)Session.BeginWrite(payload);
+        co_return co_await SendAndAcknowledge();
+    }
+
+    // Retries the operation recovered from the durable session after restart or
+    // after a transport failure. A successful matching reply clears it durably.
+    TFuture<TMessageHolder<TIdempotentCommandResponse>> RetryPending() {
+        if (!Session.State().HasPending)
+            throw std::logic_error("idempotent client has no pending operation to retry");
+        co_return co_await SendAndAcknowledge();
+    }
+
+private:
+    TFuture<TMessageHolder<TIdempotentCommandResponse>> SendAndAcknowledge() {
+        auto response = co_await SendPendingIdempotentWriteWithRetry(
+            Poller, Address, ActiveSocket, ActiveSocketConnected, Session, Options);
+        ValidateIdempotentCommandResponse(response);
+        if (response->ErrorCode == TCommandResponse::Success && !Session.Complete(response))
+            throw std::runtime_error(
+                "successful idempotent response did not match the pending operation");
+        co_return response;
+    }
+
+    TPoller& Poller;
+    TAddress Address;
+    std::unique_ptr<TSocket>& ActiveSocket;
+    bool& ActiveSocketConnected;
+    TIdempotentClientSession& Session;
+    TIdempotentClientRetryOptions Options;
+};
+
 } // namespace NNet
