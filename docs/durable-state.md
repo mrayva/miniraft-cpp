@@ -20,8 +20,12 @@ payload. Snapshot bytes live in an immutable sidecar named
 updates do not rewrite it. A changed snapshot is written and synced to a
 temporary sidecar, renamed and directory-synced before the manifest references
 it. The manifest remains the atomic commit point. After it is durable, storage
-removes the previous sidecar. A crash can leave an unreferenced sidecar; recovery
-ignores it, and automatic orphan cleanup is not implemented.
+removes the previous sidecar. A crash can leave an unreferenced sidecar or an
+incomplete sidecar temp file; recovery ignores unreferenced images and removes
+matching orphan sidecars and temps after validating and syncing the selected
+manifest. If the manifest is absent but a published sidecar remains, fresh
+initialization fails closed so an interrupted migration cannot be mistaken for
+an empty store.
 
 MRFTD004 remains readable with its snapshot inline; its next successful
 publication writes MRFTD005. MRFTD001 through MRFTD003 also remain readable;

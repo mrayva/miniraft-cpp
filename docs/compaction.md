@@ -95,8 +95,9 @@ covers the v5 magic plus payload. Recovery checks
 the referenced sidecar's encoded size, identity and checksum, and validates
 nondecreasing terms beginning at SnapshotTerm. MRFTD001 through MRFTD004 remain
 readable; v1/v2/v3 recover their commit floor as SnapshotIndex, and a successful
-later publication writes v5. A crash can leave an unreferenced sidecar, which
-recovery ignores. Malformed recovery does not rewrite the manifest. Live
+later publication writes v5. A crash can leave an unreferenced sidecar or temp;
+recovery ignores those files and removes matching orphans after validating the
+selected manifest. Malformed recovery does not rewrite the manifest. Live
 publication failure is fatal.
 
 Followers publish a newly learned commit index before acknowledging

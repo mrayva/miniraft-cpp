@@ -13,6 +13,7 @@
 #include <span>
 #include <cstdlib>
 #ifdef __linux__
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/mman.h>
@@ -61,6 +62,13 @@ struct TFd {
     TFd(const TFd&) = delete;
     TFd& operator=(const TFd&) = delete;
 };
+struct TDir {
+    DIR* Value = nullptr;
+    explicit TDir(DIR* directory) : Value(directory) {}
+    ~TDir() { if (Value) closedir(Value); }
+    TDir(const TDir&) = delete;
+    TDir& operator=(const TDir&) = delete;
+};
 void Require(bool ok, const char* operation) {
     if (!ok) throw std::system_error(errno, std::generic_category(), operation);
 }
@@ -88,6 +96,83 @@ void WriteAtAll(int fd, const void* data, size_t size, off_t offset) {
         Require(n > 0, "patch durable header");
         done += size_t(n);
     }
+}
+bool IsPositiveDecimal(std::string_view value, uint64_t limit) {
+    if (value.empty() || value.size() > 20 || value.front() == '0') return false;
+    uint64_t parsed = 0;
+    for (const auto ch : value) {
+        if (ch < '0' || ch > '9') return false;
+        const auto digit = uint64_t(ch - '0');
+        if (parsed > (limit - digit) / 10) return false;
+        parsed = parsed * 10 + digit;
+    }
+    return parsed != 0;
+}
+bool IsSnapshotSidecarOrTemp(std::string_view name, std::string_view prefix) {
+    if (!name.starts_with(prefix)) return false;
+    auto identity = name.substr(prefix.size());
+    if (identity.ends_with(".tmp")) identity.remove_suffix(4);
+    const auto separator = identity.find('.');
+    return separator != std::string_view::npos &&
+        identity.find('.', separator + 1) == std::string_view::npos &&
+        IsPositiveDecimal(identity.substr(0, separator), uint64_t(INT64_MAX)) &&
+        IsPositiveDecimal(identity.substr(separator + 1), UINT64_MAX);
+}
+bool HasSnapshotSidecarWithoutManifest(int directory, const std::string& stateFile) {
+    TFd scanFd(openat(directory, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    Require(scanFd.Value >= 0, "open durable directory for snapshot check");
+    auto* rawStream = fdopendir(scanFd.Value);
+    Require(rawStream != nullptr, "read durable directory for snapshot check");
+    scanFd.Value = -1;
+    TDir stream(rawStream);
+    const auto prefix = stateFile + ".snapshot.";
+    for (;;) {
+        errno = 0;
+        const auto* entry = readdir(stream.Value);
+        if (!entry) {
+            if (errno) Require(false, "read durable directory for snapshot check");
+            return false;
+        }
+        const std::string name(entry->d_name);
+        if (!IsSnapshotSidecarOrTemp(name, prefix) ||
+            std::string_view(name).ends_with(".tmp")) continue;
+        struct stat info;
+        if (fstatat(directory, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) == 0) return true;
+        if (errno != ENOENT) Require(false, "inspect snapshot without durable manifest");
+    }
+}
+void RemoveOrphanedSnapshotFiles(int directory, const std::string& stateFile,
+        const std::string& referencedSnapshotFile) {
+    TFd scanFd(openat(directory, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    Require(scanFd.Value >= 0, "open durable directory for snapshot cleanup");
+    auto* rawStream = fdopendir(scanFd.Value);
+    Require(rawStream != nullptr, "read durable directory for snapshot cleanup");
+    scanFd.Value = -1; // fdopendir owns the descriptor now.
+    TDir stream(rawStream);
+    const auto prefix = stateFile + ".snapshot.";
+    bool removed = false;
+    for (;;) {
+        errno = 0;
+        const auto* entry = readdir(stream.Value);
+        if (!entry) {
+            if (errno) Require(false, "read durable directory for snapshot cleanup");
+            break;
+        }
+        const std::string name(entry->d_name);
+        if (name == referencedSnapshotFile || !IsSnapshotSidecarOrTemp(name, prefix)) continue;
+        struct stat info;
+        if (fstatat(directory, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) < 0) {
+            if (errno == ENOENT) continue;
+            Require(false, "inspect orphaned durable snapshot");
+        }
+        if (!S_ISREG(info.st_mode)) continue;
+        if (unlinkat(directory, name.c_str(), 0) < 0) {
+            if (errno == ENOENT) continue;
+            Require(false, "remove orphaned durable snapshot");
+        }
+        removed = true;
+    }
+    if (removed) Sync(directory);
 }
 class TReadOnlyMap {
 public:
@@ -168,6 +253,8 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
     if (file.Value < 0) {
         Require(errno == ENOENT, "open durable state");
         if (!newLock) throw std::runtime_error("Published durable state is missing");
+        if (HasSnapshotSidecarWithoutManifest(Impl->Directory.Value, Impl->File))
+            throw std::runtime_error("Snapshot sidecar exists without a durable manifest");
         Publish();
         return;
     }
@@ -292,8 +379,9 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
     // image. Stabilize the selected image and its name before serving requests.
     Sync(file.Value);
     Sync(Impl->Directory.Value);
+    RemoveOrphanedSnapshotFiles(Impl->Directory.Value, Impl->File, Impl->PublishedSnapshotFile);
     Impl->Recovered = true;
-    // A leftover temp is never a recovery candidate, even if its checksum is valid.
+    // A leftover manifest temp is never a recovery candidate, even if checksummed.
 #endif
 }
 

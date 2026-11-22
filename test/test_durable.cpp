@@ -1172,6 +1172,61 @@ void test_durable_snapshot_sidecar_is_not_rewritten_with_log_updates(void**) {
         assert_true(readFile(snapshotPath) == snapshotImage);
     }
 }
+void test_durable_recovery_reclaims_unreferenced_snapshot_files(void**) {
+    TFiles files;
+    const TSnapshot selected{1, 1, {1, 2}, "selected snapshot"};
+    const TSnapshot orphan{2, 2, {1, 2}, "orphan snapshot"};
+    const auto selectedPath = files.Image().string() + ".snapshot.1.1";
+    const auto orphanPath = files.Image().string() + ".snapshot.2.2";
+    const auto temporaryPath = files.Image().string() + ".snapshot.3.3.tmp";
+    {
+        TDurableState state(files.Name, 1);
+        state.CurrentTerm = 3;
+        state.Append(Entry(1, "covered"));
+        state.CommitIndex = 1;
+        state.Commit();
+        state.InstallSnapshot(selected);
+        state.Append(Entry(2, "retained tail"));
+        state.CommitIndex = 2;
+        state.Commit();
+    }
+
+    const auto child = fork();
+    assert_true(child >= 0);
+    if (child == 0) {
+        try {
+            TDurableState state(files.Name, 1, [](auto stage) {
+                if (stage == TDurableState::EStage::SnapshotDirectorySynced) _exit(90);
+            });
+            state.InstallSnapshot(orphan);
+        } catch (...) { _exit(2); }
+        _exit(3);
+    }
+    Wait(child, 90);
+    assert_true(fs::exists(orphanPath));
+    { std::ofstream temporary(temporaryPath, std::ios::binary); temporary << "incomplete"; }
+
+    {
+        TDurableState recovered(files.Name, 1);
+        assert_true(recovered.GetSnapshot() && *recovered.GetSnapshot() == selected);
+        assert_int_equal(recovered.LastLogIndex, 2);
+        assert_string_equal(Data(recovered, 2).c_str(), "retained tail");
+    }
+    assert_true(fs::exists(selectedPath));
+    assert_false(fs::exists(orphanPath));
+    assert_false(fs::exists(temporaryPath));
+}
+void test_fresh_durable_state_refuses_snapshot_sidecar_without_manifest(void**) {
+    TFiles files;
+    const auto sidecarPath = files.Image().string() + ".snapshot.1.1";
+    { std::ofstream sidecar(sidecarPath, std::ios::binary); sidecar << "possibly migrated snapshot"; }
+    bool rejected = false;
+    try { TDurableState fresh(files.Name, 1); }
+    catch (const std::exception&) { rejected = true; }
+    assert_true(rejected);
+    assert_true(fs::exists(sidecarPath));
+    assert_false(fs::exists(files.Image()));
+}
 void test_get_and_append_do_not_share_mutable_entries(void**) {
     TFiles files;
     {
@@ -1757,6 +1812,8 @@ int main() {
         cmocka_unit_test(test_legacy_configuration_snapshot_migration_requires_complete_trusted_history),
         cmocka_unit_test(test_legacy_vote_cannot_be_justified_by_uncommitted_membership),
         cmocka_unit_test(test_durable_snapshot_sidecar_is_not_rewritten_with_log_updates),
+        cmocka_unit_test(test_durable_recovery_reclaims_unreferenced_snapshot_files),
+        cmocka_unit_test(test_fresh_durable_state_refuses_snapshot_sidecar_without_manifest),
         cmocka_unit_test(test_get_and_append_do_not_share_mutable_entries),
         cmocka_unit_test(test_raft_election_and_application_replay_after_restart),
         cmocka_unit_test(test_idempotency_control_survives_durable_restart_and_replays_atomically),
