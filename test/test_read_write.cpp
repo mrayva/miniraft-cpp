@@ -480,6 +480,198 @@ void test_server_forwards_successful_membership_operations(void**) {
 }
 
 #ifdef __linux__
+int RunSocketMembershipJointCommitTest(const std::filesystem::path& dir) {
+    struct TManualTimeSource : ITimeSource {
+        Time Current = std::chrono::steady_clock::now();
+        Time Now() override { return Current; }
+    };
+
+    if (!std::filesystem::create_directory(dir)) return 1;
+
+    NNet::TLoop<NNet::TPoll> loop;
+    loop.Poller().SetMaxDuration(std::chrono::milliseconds(1));
+    auto timeSource = std::make_shared<TManualTimeSource>();
+    const std::vector<uint32_t> oldVoters{1, 2};
+    const std::vector<uint32_t> newVoters{2, 3};
+    std::vector<NNet::TSocket> listeners;
+    std::vector<NNet::TAddress> addresses(4);
+    listeners.reserve(3);
+    for (uint32_t id = 1; id <= 3; ++id) {
+        listeners.emplace_back(NNet::TAddress{"127.0.0.1", 0}, loop.Poller());
+        auto& listener = listeners.back();
+        listener.Bind();
+        listener.Listen();
+        sockaddr_storage bound{};
+        socklen_t boundSize = sizeof(bound);
+        if (::getsockname(listener.Fd(), reinterpret_cast<sockaddr*>(&bound), &boundSize) != 0) return 2;
+        addresses[id] = NNet::TAddress(reinterpret_cast<sockaddr*>(&bound), boundSize);
+    }
+
+    std::vector<TNodeDict> peers(4);
+    std::vector<std::vector<std::shared_ptr<TNode<NNet::TSocket>>>> transports(4,
+        std::vector<std::shared_ptr<TNode<NNet::TSocket>>>(4));
+    for (uint32_t id = 1; id <= 3; ++id) {
+        for (uint32_t peer = 1; peer <= 3; ++peer) {
+            if (peer == id) continue;
+            auto node = std::make_shared<TNode<NNet::TSocket>>(
+                [&](const NNet::TAddress& address) { return NNet::TSocket(address, loop.Poller()); },
+                "membership-peer-" + std::to_string(id) + "-" + std::to_string(peer),
+                addresses[peer], timeSource);
+            transports[id][peer] = node;
+            peers[id].emplace(peer, std::move(node));
+        }
+    }
+
+    std::vector<std::shared_ptr<TDurableState>> states(4);
+    std::vector<std::shared_ptr<TRaft>> rafts(4);
+    std::vector<std::unique_ptr<TRaftServer<NNet::TSocket>>> servers(4);
+    for (uint32_t id = 1; id <= 3; ++id) {
+        states[id] = std::make_shared<TDurableState>((dir / "raft").string(), id);
+        states[id]->BindVoters(oldVoters);
+        auto initial = NewHoldedMessage<TLogEntry>();
+        initial->Term = 1;
+        states[id]->Append(std::move(initial));
+        states[id]->CommitIndex = 1;
+        states[id]->Commit();
+        rafts[id] = std::make_shared<TRaft>(states[id], id, peers[id], std::vector<uint32_t>{3});
+        auto* volatileState = const_cast<TVolatileState*>(rafts[id]->GetVolatileState());
+        volatileState->ElectionDue = timeSource->Now() + std::chrono::hours(1);
+    }
+    for (uint32_t id = 1; id <= 3; ++id) {
+        servers[id] = std::make_unique<TRaftServer<NNet::TSocket>>(
+            loop.Poller(), std::move(listeners[id - 1]), rafts[id], std::make_shared<TDummyRsm>(),
+            peers[id], timeSource);
+    }
+
+    auto drainPeers = [&] {
+        for (uint32_t id = 1; id <= 3; ++id)
+            for (uint32_t peer = 1; peer <= 3; ++peer)
+                if (transports[id][peer]) transports[id][peer]->Drain();
+    };
+    auto pumpUntil = [&](const auto& ready, size_t maxSteps) {
+        for (size_t step = 0; step < maxSteps && !ready(); ++step) {
+            drainPeers();
+            loop.Step();
+        }
+        return ready();
+    };
+
+    // Establish the outbound TCP connections before starting response readers,
+    // so the server readers begin directly on the capability handshake.
+    for (size_t step = 0; step < 1000; ++step) {
+        drainPeers();
+        loop.Step();
+        bool connected = true;
+        for (uint32_t id = 1; id <= 3; ++id)
+            for (uint32_t peer = 1; peer <= 3; ++peer)
+                if (transports[id][peer]) connected = connected && transports[id][peer]->IsConnected();
+        if (connected) break;
+        if (step == 999) return 3;
+    }
+
+    for (uint32_t id = 1; id <= 3; ++id) servers[id]->Serve();
+    const auto capabilitiesReady = [&] {
+        for (uint32_t id = 1; id <= 3; ++id)
+            for (uint32_t peer = 1; peer <= 3; ++peer)
+                if (transports[id][peer] && transports[id][peer]->IsCapabilityNegotiating()) return false;
+        return true;
+    };
+    if (!pumpUntil(capabilitiesReady, 500)) return 4;
+
+    rafts[1]->Become(EState::LEADER);
+    auto tickLeader = [&] {
+        timeSource->Current += std::chrono::seconds(1);
+        rafts[1]->ProcessTimeout(timeSource->Now());
+        drainPeers();
+    };
+    const auto learnerReady = [&] {
+        return rafts[1]->IsLearnerCommitAcknowledged(3) &&
+            servers[1]->CheckJointConfigurationReadiness(newVoters).Ready();
+    };
+    for (unsigned retry = 0; retry < 4 && !learnerReady(); ++retry) {
+        tickLeader();
+        if (pumpUntil(learnerReady, 500)) break;
+    }
+    if (!learnerReady()) {
+        const auto readiness = servers[1]->CheckJointConfigurationReadiness(newVoters);
+        const auto* volatileState = rafts[1]->GetVolatileState();
+        std::cerr << "socket membership: commit=" << volatileState->CommitIndex
+            << " last=" << states[1]->LastLogIndex << " learner-ack="
+            << rafts[1]->IsLearnerCommitAcknowledged(3) << '\n';
+        for (uint32_t peer = 2; peer <= 3; ++peer) {
+            std::cerr << "peer " << peer << " connected=" << transports[1][peer]->IsConnected()
+                << " capability-negotiating=" << transports[1][peer]->IsCapabilityNegotiating()
+                << " match=" << (volatileState->MatchIndex.contains(peer) ?
+                    volatileState->MatchIndex.at(peer) : 0)
+                << " commit-ack=" << (volatileState->CommitAckIndex.contains(peer) ?
+                    volatileState->CommitAckIndex.at(peer) : 0)
+                << " last-sent=" << (volatileState->LastSentSeqno.contains(peer) ?
+                    volatileState->LastSentSeqno.at(peer) : 0)
+                << " last-ack=" << (volatileState->ReadAckSeqno.contains(peer) ?
+                    volatileState->ReadAckSeqno.at(peer) : 0)
+                << " capabilities=" << volatileState->PeerCapabilities.contains(peer) << '\n';
+        }
+        auto printMissing = [](const char* name, const std::vector<uint32_t>& ids) {
+            std::cerr << name << ':';
+            for (auto id : ids) std::cerr << ' ' << id;
+            std::cerr << '\n';
+        };
+        printMissing("missing targets", readiness.MissingPeerTargets);
+        printMissing("added voter commit ACKs", readiness.AddedVotersWithoutCommitAck);
+        printMissing("snapshot support", readiness.AddedVotersWithoutSnapshotInstallSupport);
+        printMissing("joint support", readiness.VotersWithoutJointConsensusSupport);
+        return 5;
+    }
+
+    const auto jointIndex = servers[1]->ProposeJointConfiguration(newVoters);
+    tickLeader();
+    const auto jointCommitted = [&] { return rafts[1]->GetVolatileState()->CommitIndex >= jointIndex; };
+    if (!pumpUntil(jointCommitted, 500)) return 6;
+
+    // Send the newly committed index over the same sockets and ensure every
+    // follower applies the joint voter union from its received AppendEntries.
+    const auto jointPropagated = [&] {
+        for (uint32_t id = 1; id <= 3; ++id)
+            if (states[id]->CommitIndex < jointIndex ||
+                rafts[id]->GetVoterIds() != std::vector<uint32_t>({1, 2, 3})) return false;
+        return true;
+    };
+    for (unsigned retry = 0; retry < 4 && !jointPropagated(); ++retry) {
+        tickLeader();
+        if (pumpUntil(jointPropagated, 500)) break;
+    }
+    if (!jointPropagated()) {
+        std::cerr << "socket membership: leader commit=" << rafts[1]->GetVolatileState()->CommitIndex
+            << " joint index=" << jointIndex << '\n';
+        for (uint32_t id = 1; id <= 3; ++id)
+            std::cerr << "node " << id << " durable commit=" << states[id]->CommitIndex
+                << " last=" << states[id]->LastLogIndex << " voters="
+                << rafts[id]->GetVoterIds().size() << '\n';
+        return 7;
+    }
+    for (uint32_t id = 1; id <= 3; ++id)
+        if (states[id]->GetBoundVoters() != oldVoters) return 8;
+    return 0;
+}
+
+void test_server_commits_joint_membership_over_socket_transport(void**) {
+    const auto dir = std::filesystem::temp_directory_path() /
+        ("miniraft-socket-membership-joint-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto child = ::fork();
+    assert_true(child >= 0);
+    if (child == 0) _exit(RunSocketMembershipJointCommitTest(dir));
+
+    int status = 0;
+    assert_int_equal(::waitpid(child, &status, 0), child);
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+    assert_true(WIFEXITED(status));
+    if (WEXITSTATUS(status) != 0)
+        std::cerr << "Socket membership integration failed at stage " << WEXITSTATUS(status) << '\n';
+    assert_int_equal(WEXITSTATUS(status), 0);
+}
+
 int RunServingServerMembershipReaderTest(const std::filesystem::path& dir) {
     using TTlsSocket = NNet::TRetirableSslSocket<NNet::TSocket>;
     if (!std::filesystem::create_directory(dir)) return 1;
@@ -653,6 +845,7 @@ int main() {
         cmocka_unit_test(test_server_stages_and_removes_runtime_learner),
         cmocka_unit_test(test_server_forwards_successful_membership_operations),
 #ifdef __linux__
+        cmocka_unit_test(test_server_commits_joint_membership_over_socket_transport),
         cmocka_unit_test(test_serving_server_retires_demoted_joint_voter_reader),
 #endif
     };
