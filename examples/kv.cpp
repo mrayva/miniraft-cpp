@@ -14,6 +14,7 @@
 
 #include "idempotent_kv_rsm.h"
 #include <miniraft/idempotent_client.h>
+#include <miniraft/net/idempotent_client_transport.h>
 
 #include <random>
 
@@ -29,44 +30,6 @@ std::string EncodeIdempotentKvWrite(std::string_view key, std::string_view value
     if (!value.empty())
         memcpy(payload.data() + sizeof(TKvEntry) + key.size(), value.data(), value.size());
     return payload;
-}
-
-template<typename TSocket>
-NNet::TFuture<TMessageHolder<TIdempotentCommandResponse>> SendIdempotent(
-        TSocket& socket, TMessageHolder<TIdempotentCommandRequest> request) {
-    co_await TMessageWriter(socket).Write(std::move(request));
-    auto reply = co_await TMessageReader(socket).Read();
-    co_return reply.template Cast<TIdempotentCommandResponse>();
-}
-
-template<typename TPoller, typename TSocket>
-NNet::TFuture<TMessageHolder<TIdempotentCommandResponse>> SendIdempotentWithRetry(
-        TPoller& poller, const NNet::TAddress& address,
-        std::unique_ptr<TSocket>& activeSocket, bool& activeSocketConnected,
-        TIdempotentClientSession& client) {
-    constexpr unsigned maxAttempts = 4;
-    std::string lastError;
-    for (unsigned attempt = 0; attempt < maxAttempts; ++attempt) {
-        try {
-            if (attempt == 0 && activeSocketConnected) {
-                auto response = co_await SendIdempotent(*activeSocket, client.RetryPending());
-                co_return response;
-            }
-            auto retrySocket = std::make_unique<TSocket>(address, poller);
-            co_await retrySocket->Connect(NNet::TClock::now() + std::chrono::seconds(2));
-            auto response = co_await SendIdempotent(*retrySocket, client.RetryPending());
-            activeSocket = std::move(retrySocket);
-            activeSocketConnected = true;
-            co_return response;
-        } catch (const std::exception& error) {
-            lastError = error.what();
-            if (attempt == 0 && activeSocketConnected)
-                activeSocketConnected = false;
-        }
-        if (attempt + 1 < maxAttempts)
-            co_await poller.Sleep(std::chrono::milliseconds(50u << attempt));
-    }
-    throw std::runtime_error("idempotent write transport retry exhausted: " + lastError);
 }
 
 void ReportIdempotentReply(TIdempotentClientSession& client,
@@ -113,7 +76,7 @@ NNet::TFuture<void> Client(TPoller& poller, std::unique_ptr<TSocket> socket,
     try {
         if (idempotentClient && idempotentClient->State().HasPending) {
             try {
-                auto response = co_await SendIdempotentWithRetry(
+                auto response = co_await NNet::SendPendingIdempotentWriteWithRetry(
                     poller, address, socket, socketConnected, *idempotentClient);
                 ReportIdempotentReply(*idempotentClient, response);
             } catch (const std::exception& error) {
@@ -184,7 +147,7 @@ NNet::TFuture<void> Client(TPoller& poller, std::unique_ptr<TSocket> socket,
                     idempotentClient->State().PendingPayload != idempotentPayload) {
                     TMessageHolder<TIdempotentCommandResponse> previous;
                     try {
-                        previous = co_await SendIdempotentWithRetry(
+                        previous = co_await NNet::SendPendingIdempotentWriteWithRetry(
                             poller, address, socket, socketConnected, *idempotentClient);
                     } catch (const std::exception& error) {
                         std::cout << "Pending idempotent write remains saved after reconnect retries: "
@@ -201,7 +164,7 @@ NNet::TFuture<void> Client(TPoller& poller, std::unique_ptr<TSocket> socket,
                 }
                 (void)idempotentClient->BeginWrite(idempotentPayload);
                 try {
-                    auto response = co_await SendIdempotentWithRetry(
+                    auto response = co_await NNet::SendPendingIdempotentWriteWithRetry(
                         poller, address, socket, socketConnected, *idempotentClient);
                     ReportIdempotentReply(*idempotentClient, response);
                 } catch (const std::exception& error) {
