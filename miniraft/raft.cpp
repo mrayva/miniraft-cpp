@@ -2511,6 +2511,10 @@ uint64_t TRaft::ProposeJointConfiguration(std::vector<uint32_t> newVoters) {
         throw std::logic_error("Every added voter must support InstallSnapshot before promotion");
     if (!readiness.VotersWithoutJointConsensusSupport.empty())
         throw std::logic_error("Every current and proposed voter must advertise joint-consensus support in this term");
+    if (!readiness.MembersWithoutIdempotentLogSupport.empty())
+        throw std::logic_error("Every replication target must support idempotent log entries before membership can change");
+    if (!readiness.MembersWithoutIdempotencyControlSupport.empty())
+        throw std::logic_error("Every replication target must support idempotency control entries before membership can change");
 
     const auto& latest = Configuration->Latest;
     TConfigurationRecord record{EConfigurationPhase::Joint, State->CurrentTerm,

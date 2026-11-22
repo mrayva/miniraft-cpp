@@ -1057,7 +1057,7 @@ void test_new_voter_requires_snapshot_install_capability(void**) {
     std::filesystem::remove_all(dir, ignored);
 #endif
 }
-void test_existing_voter_must_advertise_joint_consensus_support(void**) {
+void test_joint_configuration_requires_every_member_capability(void**) {
 #ifdef __linux__
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-readiness-existing-voter-" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -1074,6 +1074,7 @@ void test_existing_voter_must_advertise_joint_consensus_support(void**) {
         auto existing = std::make_shared<TEndpoint>();
         TRaft raft(state, 1, {{2, joining}, {3, existing}}, {2});
         raft.Become(EState::LEADER);
+        raft.SetLocalIdempotentLogSupport(true);
         auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
         volatileState->MatchIndex[2] = state->LastLogIndex;
         volatileState->CommitAckIndex[2] = state->CommitIndex;
@@ -1084,6 +1085,8 @@ void test_existing_voter_must_advertise_joint_consensus_support(void**) {
             .Term = state->CurrentTerm,
             .InstallSnapshot = true,
             .JointConsensus = true,
+            .IdempotentLogEntries = true,
+            .IdempotencyControlEntries = true,
         };
 
         auto readiness = raft.CheckJointConfigurationReadiness({1, 2, 3});
@@ -1100,7 +1103,27 @@ void test_existing_voter_must_advertise_joint_consensus_support(void**) {
         };
         readiness = raft.CheckJointConfigurationReadiness({1, 2, 3});
         assert_true(readiness.VotersWithoutJointConsensusSupport.empty());
+        assert_true(readiness.MembersWithoutIdempotentLogSupport == (std::vector<uint32_t>{3}));
+        assert_true(readiness.MembersWithoutIdempotencyControlSupport == (std::vector<uint32_t>{3}));
+        assert_false(readiness.Ready());
+        const auto beforeMissingLogSupport = static_cast<TStateFields>(*state);
+        Reject([&] { raft.ProposeJointConfiguration({1, 2, 3}); });
+        assert_true(static_cast<TStateFields>(*state) == beforeMissingLogSupport);
+
+        volatileState->PeerCapabilities[3].IdempotentLogEntries = true;
+        readiness = raft.CheckJointConfigurationReadiness({1, 2, 3});
+        assert_true(readiness.MembersWithoutIdempotentLogSupport.empty());
+        assert_true(readiness.MembersWithoutIdempotencyControlSupport == (std::vector<uint32_t>{3}));
+        assert_false(readiness.Ready());
+        const auto beforeMissingControlSupport = static_cast<TStateFields>(*state);
+        Reject([&] { raft.ProposeJointConfiguration({1, 2, 3}); });
+        assert_true(static_cast<TStateFields>(*state) == beforeMissingControlSupport);
+
+        volatileState->PeerCapabilities[3].IdempotencyControlEntries = true;
+        readiness = raft.CheckJointConfigurationReadiness({1, 2, 3});
         assert_true(readiness.Ready());
+        const auto jointIndex = raft.ProposeJointConfiguration({1, 2, 3});
+        assert_int_equal(jointIndex, state->LastLogIndex);
     }
     std::error_code ignored;
     std::filesystem::remove_all(dir, ignored);
@@ -5085,7 +5108,7 @@ int main() {
         cmocka_unit_test(test_joint_configuration_readiness_reports_log_and_index_capacity),
         cmocka_unit_test(test_compaction_membership_readiness_reports_acknowledgement_blockers),
         cmocka_unit_test(test_new_voter_requires_snapshot_install_capability),
-        cmocka_unit_test(test_existing_voter_must_advertise_joint_consensus_support),
+        cmocka_unit_test(test_joint_configuration_requires_every_member_capability),
         cmocka_unit_test(test_versioned_disk_state_can_start_voter_removal),
         cmocka_unit_test(test_new_voter_leader_can_forward_prior_term_joint_entry),
         cmocka_unit_test(test_new_side_election_replays_joint_entry_to_old_peer),
