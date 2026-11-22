@@ -43,17 +43,48 @@ restart and make sure each new leader has the endpoint. Replication progress is
 leader-local and catch-up must be checked again after leadership changes.
 Removing a target drops replication progress and pending RPCs, and a subsequent
 registration starts a fresh probe. Delayed responses cannot satisfy new RPCs.
-The KV CLI still uses static transport setup. `TRaftServer` runtime integration
+The KV CLI loads transport endpoints at startup. `TRaftServer` runtime integration
 is described in [network learner staging](online-learner-network.md). Older
 binaries must not be mixed with learner configurations because they treat
 unmarked peers as voters.
+
+## Share startup endpoints across KV replicas
+
+Create a peer config file with one role and endpoint per line. For example:
+
+```text
+# Original voters
+voter 127.0.0.1:8001:1
+voter 127.0.0.1:8002:2
+learner 127.0.0.1:8003:3
+```
+
+Start each durable KV replica with its own `--id` and the same file contents.
+Use a separate storage directory for each replica.
+
+```sh
+./kv --server --durable --id 1 --peer-config /path/to/peers.conf
+```
+
+`--peer-config` replaces `--node` and `--learner`. Blank lines and comments
+starting with `#` are accepted. Use brackets around IPv6 addresses. The parser
+rejects duplicate IDs, duplicate address and port pairs, a missing local ID,
+and files without a voter. Startup provisions all listed endpoints again on
+restart, so any elected voter with this file can replicate to the learner.
+
+File roles supply the configured bootstrap baseline. Editing a role does not
+promote or remove a voter. Raft still validates the durable voter binding and
+derives live roles from committed history. Distribute the file through your
+deployment system. The KV process reads it on startup, and live endpoint
+changes use the server's embedding APIs.
 
 Deterministic tests cover live add, snapshot catch-up, voter partitions and strong
 reads, removal and re-addition with delayed append replies, removal during a
 multi-chunk snapshot with delayed acknowledgements, invalid calls, and refusal
 on unbound or legacy stores. Durable-store tests verify that staging does not
 rewrite the binding and is absent on restart. A leader-change test verifies
-that an embedding application must re-register the target on the new leader.
+that an embedding application must register the target on a new leader that
+does not already have it.
 A bounded durable-store promotion/finalization path now uses these catch-up
 acknowledgements; see [live joint membership](configuration-entries.md).
 Leader removal is supported after joint commit through

@@ -1,8 +1,13 @@
 #include <string_view>
+#include <algorithm>
 #include <chrono>
 #include <charconv>
+#include <fstream>
 #include <memory>
+#include <set>
+#include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 
 #include <miniraft/net/server.h>
 #include <miniraft/persist.h>
@@ -260,8 +265,43 @@ NNet::TVoidTask CheckpointLoop(TPoller& poller, std::shared_ptr<TRaft> raft,
     }
 }
 
+static void LoadPeerConfig(const std::string& path, std::vector<THost>& hosts,
+        std::vector<uint32_t>& learners) {
+    std::ifstream file(path);
+    if (!file) throw std::runtime_error("Cannot open peer config: " + path);
+    std::unordered_set<uint32_t> ids;
+    std::set<std::pair<std::string, int>> addresses;
+    std::string line;
+    size_t lineNumber = 0;
+    bool hasVoter = false;
+    while (std::getline(file, line)) {
+        ++lineNumber;
+        std::istringstream fields(line);
+        std::string role, endpoint, extra;
+        if (!(fields >> role) || role.starts_with('#')) continue;
+        try {
+            if (line.find('\0') != std::string::npos || (role != "voter" && role != "learner") || !(fields >> endpoint) ||
+                (fields >> extra && !extra.starts_with('#')))
+                throw std::invalid_argument("Expected voter or learner followed by address:port:id");
+            THost host(endpoint);
+            if (!ids.insert(host.Id).second) throw std::invalid_argument("Duplicate node ID");
+            if (!addresses.emplace(host.Address, host.Port).second)
+                throw std::invalid_argument("Duplicate node address and port");
+            if (role == "learner") learners.push_back(host.Id);
+            else hasVoter = true;
+            hosts.push_back(std::move(host));
+        } catch (const std::invalid_argument& error) {
+            throw std::invalid_argument(path + ":" + std::to_string(lineNumber) + ": " + error.what());
+        }
+    }
+    if (!file.eof() || file.bad()) throw std::runtime_error("Cannot read peer config: " + path);
+    if (!hasVoter) throw std::invalid_argument("Peer config requires at least one voter: " + path);
+}
+
 void usage(const char* prog) {
-    std::cerr << prog << "--client|--server --id myid --node ip:port:id [--node ip:port:id ...] [--persist|--durable] [--snapshots entries] [--learner id ...] [--idempotent [--client-state path]] [--stale] [--consistent]" << "\n";
+    std::cerr << prog << " --client|--server --id myid "
+        "(--node ip:port:id [--node ip:port:id ...] [--learner id ...] | --peer-config path) "
+        "[--persist|--durable] [--snapshots entries] [--idempotent [--client-state path]] [--stale] [--consistent]\n";
     exit(0);
 }
 
@@ -276,17 +316,29 @@ int main(int argc, char** argv) {
     bool persist = false;
     bool durable = false;
     bool idempotent = false;
+    std::string peerConfig;
     std::string clientStatePath;
     uint64_t snapshotInterval = 0;
     uint32_t flags = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--server")) {
             server = true;
-        } else if (!strcmp(argv[i], "--node") && i < argc - 1) {
-            // address:port:id
-            hosts.push_back(THost{argv[++i]});
-        } else if (!strcmp(argv[i], "--id") && i < argc - 1) {
-            id = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--node")) {
+            if (i + 1 >= argc) { std::cerr << "--node requires address:port:id\n"; return 1; }
+            try { hosts.emplace_back(argv[++i]); }
+            catch (const std::invalid_argument& error) { std::cerr << error.what() << "\n"; return 1; }
+        } else if (!strcmp(argv[i], "--peer-config")) {
+            if (!peerConfig.empty() || i + 1 >= argc || !argv[i + 1][0]) {
+                std::cerr << "--peer-config requires one path\n"; return 1;
+            }
+            peerConfig = argv[++i];
+        } else if (!strcmp(argv[i], "--id")) {
+            if (i + 1 >= argc) { std::cerr << "--id requires a positive node ID\n"; return 1; }
+            const std::string_view value(argv[++i]);
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), id);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || !id) {
+                std::cerr << "--id requires a positive node ID\n"; return 1;
+            }
         } else if (!strcmp(argv[i], "--persist")) {
             persist = true;
         } else if (!strcmp(argv[i], "--durable")) {
@@ -322,6 +374,20 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (!peerConfig.empty()) {
+        if (!server || !durable || !hosts.empty() || !learners.empty()) {
+            std::cerr << "--peer-config requires --server --durable and replaces --node and --learner\n";
+            return 1;
+        }
+        try {
+            LoadPeerConfig(peerConfig, hosts, learners);
+            if (std::none_of(hosts.begin(), hosts.end(), [id](const THost& host) { return host.Id == id; }))
+                throw std::invalid_argument("Local node ID is missing from peer config");
+        } catch (const std::exception& error) {
+            std::cerr << error.what() << "\n";
+            return 1;
+        }
+    }
     if (!learners.empty() && (!server || !durable)) {
         std::cerr << "--learner requires --server --durable\n"; return 1;
     }
@@ -340,6 +406,7 @@ int main(int argc, char** argv) {
     if (server && !clientStatePath.empty()) {
         std::cerr << "--client-state is only valid in client mode\n"; return 1;
     }
+    if (hosts.empty()) { std::cerr << "No node endpoints configured\n"; return 1; }
     using TPoller = NNet::TDefaultPoller;
     std::shared_ptr<ITimeSource> timeSource = std::make_shared<TTimeSource>();
     NNet::TLoop<TPoller> loop;

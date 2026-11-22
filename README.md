@@ -283,6 +283,9 @@ Then link against miniraft.net which also brings in miniraft internally.
 - CMake 3.20 or newer
 - [Cmocka](https://cmocka.org/) (for unit tests only)
 
+Durable KV servers can share a [peer config file](docs/online-learner-staging.md#share-startup-endpoints-across-kv-replicas)
+for voter and learner endpoints.
+
 ### Building the Project
 1. Clone the repository:
    ```

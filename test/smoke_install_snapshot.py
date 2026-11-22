@@ -28,13 +28,20 @@ def main():
             directories.append(directory)
             logs.append((directory / "output.log").open("w+"))
         processes = [None] * 3
+        endpoints = [f"127.0.0.1:{endpoint}:{node + 1}" for node, endpoint in enumerate(ports)]
+        learner_config = root / "learners.conf"
+        learner_config.write_text(f"# Two voters and a learner\n\nvoter {endpoints[0]}\n"
+                                  f"voter {endpoints[1]}\nlearner {endpoints[2]} # staging\n")
+        voter_config = root / "voters.conf"
+        voter_config.write_text("".join(f"voter {endpoint}\n" for endpoint in endpoints))
 
         def start(index, use_role=True):
             args = [binary, "--server", "--id", str(index + 1), "--durable"]
-            for node, endpoint in enumerate(ports):
-                args += ["--node", f"127.0.0.1:{endpoint}:{node + 1}"]
-            if learner_mode and use_role:
-                args += ["--learner", "3"]
+            if learner_mode:
+                args += ["--peer-config", str(learner_config if use_role else voter_config)]
+            else:
+                for endpoint in endpoints:
+                    args += ["--node", endpoint]
             if index < 2:
                 args += ["--snapshots", "1"]
             processes[index] = subprocess.Popen(args, cwd=directories[index], stdout=logs[index], stderr=logs[index], preexec_fn=no_core)
@@ -58,8 +65,25 @@ def main():
             raise AssertionError("timed out waiting for cluster progress")
 
         try:
+            if learner_mode:
+                invalid_config = root / "invalid.conf"
+                invalid_args = [binary, "--server", "--durable", "--id", "1",
+                                "--peer-config", str(invalid_config)]
+                for contents, diagnostic in (
+                    (f"voter {endpoints[0]}\nlearner {endpoints[0]}\n", "Duplicate node ID"),
+                    (f"voter {endpoints[0]}\nlearner {endpoints[0].rsplit(':', 1)[0]}:3\n",
+                     "Duplicate node address and port"),
+                    (f"voter {endpoints[1]}\n", "Local node ID is missing"),
+                    (f"learner {endpoints[0]}\n", "requires at least one voter"),
+                    (f"voter {endpoints[0]} extra\n", "Expected voter or learner"),
+                ):
+                    invalid_config.write_text(contents)
+                    result = subprocess.run(invalid_args, cwd=directories[0], capture_output=True,
+                                            text=True, timeout=5)
+                    assert result.returncode != 0 and diagnostic in result.stderr, result
+                    assert not (directories[0] / "state.durable.1").exists()
             start(0)
-            start(1)  # Two of the three voters can elect a leader and keep it in place.
+            start(1)  # Nodes 1 and 2 form a voter quorum in either configuration.
             values = {b"a": b"a" * 60000, b"b": b"b" * 60000, b"c": b"c" * 60000}
             last = [0]
             for key, value in values.items():
