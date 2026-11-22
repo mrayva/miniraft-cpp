@@ -49,7 +49,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
 add_test(NAME test_install_package COMMAND ${Python3_EXECUTABLE}
-  ${CMAKE_CURRENT_SOURCE_DIR}/test_install_package.py ${CMAKE_BINARY_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_install_package.py "${CMAKE_BINARY_DIR}"
+  "${CMAKE_COMMAND}" "${CMAKE_MINIMUM_REQUIRED_VERSION}"
   "${CMAKE_CXX_FLAGS}" "${CMAKE_EXE_LINKER_FLAGS}")
 set_tests_properties(test_install_package PROPERTIES TIMEOUT 60)
 add_test(NAME test_kv_checkpoints_cli COMMAND ${Python3_EXECUTABLE}

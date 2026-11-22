@@ -1,8 +1,9 @@
 # CMake package
 
-The core `miniraft` library installs as the imported target
-`miniraft::miniraft`, with its public headers and C++20 requirement. The package
-does not include the optional built-in network server.
+Use CMake 3.20 or newer. The core library installs as `miniraft::miniraft`
+with its public headers and C++20 requirement. A build with
+`MINIRAFT_BUILD_NETWORK=ON` also installs the `Network` component as
+`miniraft::net`.
 
 Build and install it to a prefix:
 

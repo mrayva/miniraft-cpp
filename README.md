@@ -280,7 +280,7 @@ Then link against miniraft.net which also brings in miniraft internally.
 
 ### Prerequisites
 - A C++20-compatible compiler
-- CMake (for building)
+- CMake 3.20 or newer
 - [Cmocka](https://cmocka.org/) (for unit tests only)
 
 ### Building the Project
