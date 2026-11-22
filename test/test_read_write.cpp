@@ -363,12 +363,17 @@ void test_server_stages_and_removes_runtime_learner(void**) {
 void test_server_forwards_successful_membership_operations(void**) {
 #ifdef __linux__
     struct TEndpoint : INode {
-        std::vector<TMessageHolder<TMessage>> Messages;
-        void Send(TMessageHolder<TMessage> message) override { Messages.push_back(std::move(message)); }
+        std::function<void(TMessageHolder<TMessage>)> Route;
+        bool SawTimeoutNow = false;
+        void Send(TMessageHolder<TMessage> message) override {
+            SawTimeoutNow |= message->Type == uint32_t(EMessageType::TIMEOUT_NOW_REQUEST);
+            if (Route) Route(std::move(message));
+        }
         void Drain() override { }
     };
     struct TManualTimeSource : ITimeSource {
-        Time Now() override { return {}; }
+        Time Current{};
+        Time Now() override { return Current; }
     };
 
     const auto dir = std::filesystem::temp_directory_path() / ("miniraft-server-membership-success-" +
@@ -382,76 +387,92 @@ void test_server_forwards_successful_membership_operations(void**) {
             return std::make_unique<TRaftServer<NNet::TSocket>>(
                 loop.Poller(), std::move(listener), raft, std::make_shared<TDummyRsm>(), peers, timeSource);
         };
-        auto ordinary = [] {
-            auto entry = NewHoldedMessage<TLogEntry>();
-            entry->Term = 1;
-            return entry;
+        const std::vector<uint32_t> oldVoters{1, 2};
+        const std::vector<uint32_t> newVoters{2, 3};
+        std::vector<std::shared_ptr<TDurableState>> states(4);
+        std::vector<std::shared_ptr<TRaft>> rafts(4);
+        std::vector<TNodeDict> peers(4);
+        std::vector<std::vector<std::shared_ptr<TEndpoint>>> endpoints(
+            4, std::vector<std::shared_ptr<TEndpoint>>(4));
+
+        for (uint32_t id = 1; id <= 3; ++id) {
+            states[id] = std::make_shared<TDurableState>((dir / "raft").string(), id);
+            states[id]->BindVoters(oldVoters);
+            auto initial = NewHoldedMessage<TLogEntry>();
+            initial->Term = 1;
+            states[id]->Append(std::move(initial));
+            states[id]->CommitIndex = 1;
+            states[id]->Commit();
+            for (uint32_t peer = 1; peer <= 3; ++peer) {
+                if (peer == id) continue;
+                endpoints[id][peer] = std::make_shared<TEndpoint>();
+                peers[id].emplace(peer, endpoints[id][peer]);
+            }
+        }
+        for (uint32_t id = 1; id <= 3; ++id)
+            rafts[id] = std::make_shared<TRaft>(states[id], id, peers[id], std::vector<uint32_t>{3});
+        for (uint32_t from = 1; from <= 3; ++from) {
+            for (uint32_t to = 1; to <= 3; ++to) {
+                if (from == to) continue;
+                endpoints[from][to]->Route = [&, to](auto message) {
+                    rafts[to]->Process(timeSource->Now(), std::move(message));
+                };
+            }
+        }
+        auto tick = [&](uint32_t leader) {
+            timeSource->Current += std::chrono::seconds(1);
+            rafts[leader]->ProcessTimeout(timeSource->Now());
         };
 
-        // A stable cluster can propose a removal through the server facade once
-        // its current-term peer capability has been observed.
-        auto proposalState = std::make_shared<TDurableState>((dir / "proposal").string(), 1);
-        proposalState->BindVoters({1, 2});
-        proposalState->Append(ordinary());
-        proposalState->CommitIndex = 1;
-        proposalState->Commit();
-        auto proposalPeer = std::make_shared<TEndpoint>();
-        TNodeDict proposalPeers{{2, proposalPeer}};
-        auto proposalRaft = std::make_shared<TRaft>(proposalState, 1, proposalPeers);
-        proposalRaft->Become(EState::LEADER);
-        auto* proposalVolatile = const_cast<TVolatileState*>(proposalRaft->GetVolatileState());
-        proposalVolatile->PeerCapabilities[2].Term = proposalState->CurrentTerm;
-        proposalVolatile->PeerCapabilities[2].JointConsensus = true;
-        auto proposalServer = makeServer(proposalRaft, proposalPeers);
-        assert_true(proposalServer->CheckJointConfigurationReadiness({1}).Ready());
-        const auto jointIndex = proposalServer->ProposeJointConfiguration({1});
-        assert_int_equal(jointIndex, 2);
-        const auto proposed = proposalRaft->GetConfigurationState().Latest;
-        assert_true(proposed.IsJoint());
-        assert_true(proposed.OldVoters() == std::vector<uint32_t>({1, 2}));
-        assert_true(proposed.NewVoters() == std::vector<uint32_t>({1}));
+        rafts[1]->Become(EState::LEADER);
+        auto oldLeaderServer = makeServer(rafts[1], peers[1]);
+        auto newLeaderServer = makeServer(rafts[2], peers[2]);
+        for (unsigned i = 0; i < 8 && !rafts[1]->IsLearnerCommitAcknowledged(3); ++i) tick(1);
+        assert_true(rafts[1]->IsLearnerCommitAcknowledged(3));
+        assert_true(oldLeaderServer->CheckJointConfigurationReadiness(newVoters).Ready());
 
-        // A committed joint configuration with this leader on the new side can
-        // append its stable successor through the same server API.
-        auto finalizeState = std::make_shared<TDurableState>((dir / "finalize").string(), 1);
-        finalizeState->BindVoters({1, 2});
-        finalizeState->Append(ordinary());
-        finalizeState->Append(EncodeConfigurationEntry({
-            EConfigurationPhase::Joint, 1, 0, 0, {1, 2}, {1}}));
-        finalizeState->CommitIndex = 2;
-        finalizeState->Commit();
-        TNodeDict finalizePeers{{2, std::make_shared<TEndpoint>()}};
-        auto finalizeRaft = std::make_shared<TRaft>(finalizeState, 1, finalizePeers);
-        finalizeRaft->Become(EState::LEADER);
-        auto finalizeServer = makeServer(finalizeRaft, finalizePeers);
-        const auto stableIndex = finalizeServer->FinalizeConfiguration();
-        assert_int_equal(stableIndex, 3);
-        const auto stable = DecodeConfigurationEntry(finalizeState->Get(stableIndex));
-        assert_int_equal(stable.Phase, EConfigurationPhase::Stable);
-        assert_true(stable.NewVoters == std::vector<uint32_t>({1}));
+        const auto jointIndex = oldLeaderServer->ProposeJointConfiguration(newVoters);
+        for (unsigned i = 0; i < 8 && rafts[1]->GetVolatileState()->CommitIndex < jointIndex; ++i) tick(1);
+        assert_int_equal(rafts[1]->GetVolatileState()->CommitIndex, jointIndex);
+        for (unsigned i = 0; i < 8; ++i) {
+            bool propagated = true;
+            for (uint32_t id = 2; id <= 3; ++id)
+                propagated = propagated && states[id]->CommitIndex >= jointIndex;
+            if (propagated) break;
+            tick(1);
+        }
+        for (uint32_t id = 1; id <= 3; ++id)
+            assert_true(rafts[id]->GetVoterIds() == (std::vector<uint32_t>{1, 2, 3}));
 
-        // The wrapper supplies its time source and sends TimeoutNow to a caught-up
-        // voter on the new side of a committed joint configuration.
-        auto transferState = std::make_shared<TDurableState>((dir / "transfer").string(), 1);
-        transferState->BindVoters({1, 2});
-        transferState->Append(ordinary());
-        transferState->Append(EncodeConfigurationEntry({
-            EConfigurationPhase::Joint, 1, 0, 0, {1, 2}, {2, 3}}));
-        transferState->CommitIndex = 2;
-        transferState->Commit();
-        auto target = std::make_shared<TEndpoint>();
-        TNodeDict transferPeers{{2, std::make_shared<TEndpoint>()}, {3, target}};
-        auto transferRaft = std::make_shared<TRaft>(transferState, 1, transferPeers, std::vector<uint32_t>{3});
-        transferRaft->Become(EState::LEADER);
-        auto* transferVolatile = const_cast<TVolatileState*>(transferRaft->GetVolatileState());
-        transferVolatile->MatchIndex[3] = transferState->LastLogIndex;
-        transferVolatile->CommitAckIndex[3] = transferState->CommitIndex;
-        auto transferServer = makeServer(transferRaft, transferPeers);
-        transferServer->TransferLeadership(3);
-        assert_true(transferRaft->CurrentStateName() == EState::FOLLOWER);
-        assert_false(target->Messages.empty());
-        const auto timeoutNow = target->Messages.back().Cast<TTimeoutNowRequest>();
-        assert_int_equal(timeoutNow->TargetId, 3);
+        for (unsigned i = 0; i < 8 &&
+            (rafts[1]->GetVolatileState()->MatchIndex.at(2) < states[1]->LastLogIndex ||
+             rafts[1]->GetVolatileState()->CommitAckIndex.at(2) < rafts[1]->GetVolatileState()->CommitIndex); ++i)
+            tick(1);
+        oldLeaderServer->TransferLeadership(2);
+        assert_true(rafts[1]->CurrentStateName() == EState::FOLLOWER);
+        assert_true(endpoints[1][2]->SawTimeoutNow);
+        for (unsigned i = 0; i < 4 && rafts[2]->CurrentStateName() != EState::LEADER; ++i) tick(2);
+        assert_true(rafts[2]->CurrentStateName() == EState::LEADER);
+
+        for (unsigned i = 0; i < 8 &&
+            rafts[2]->GetVolatileState()->CommitIndex < states[2]->LastLogIndex; ++i)
+            tick(2);
+        assert_true(rafts[2]->GetVolatileState()->CommitIndex > jointIndex);
+        const auto stableIndex = newLeaderServer->FinalizeConfiguration();
+        for (unsigned i = 0; i < 8 && rafts[2]->GetVolatileState()->CommitIndex < stableIndex; ++i) tick(2);
+        assert_int_equal(rafts[2]->GetVolatileState()->CommitIndex, stableIndex);
+        for (unsigned i = 0; i < 8; ++i) {
+            bool propagated = true;
+            for (uint32_t id = 1; id <= 3; ++id)
+                propagated = propagated && states[id]->CommitIndex >= stableIndex;
+            if (propagated) break;
+            tick(2);
+        }
+        for (uint32_t id = 1; id <= 3; ++id) {
+            assert_true(rafts[id]->GetVoterIds() == newVoters);
+            assert_true(rafts[id]->IsVoter(id) == (id != 1));
+            assert_true(states[id]->GetBoundVoters() == oldVoters);
+        }
     }
     std::error_code ignored;
     std::filesystem::remove_all(dir, ignored);
