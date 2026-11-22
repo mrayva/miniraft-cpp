@@ -524,6 +524,24 @@ public:
         const std::vector<uint32_t>& newVoters) const {
         return Raft->CheckJointConfigurationReadiness(newVoters);
     }
+    // Start a joint-consensus voter transition after staging added peers with
+    // AddLearnerTarget and satisfying the readiness report. FinalizeConfiguration
+    // appends the stable successor after the joint entry commits.
+    // Calls must be serialized with the poller loop and Raft work.
+    uint64_t ProposeJointConfiguration(std::vector<uint32_t> newVoters) {
+        return Raft->ProposeJointConfiguration(std::move(newVoters));
+    }
+    // Append the stable successor after the joint configuration commits and
+    // leadership has transferred to a voter on its new side.
+    uint64_t FinalizeConfiguration() {
+        return Raft->FinalizeConfiguration();
+    }
+    // Transfer leadership to a voter on the new side of a committed joint
+    // configuration. Calls must be serialized with the poller loop and Raft work.
+    void TransferLeadership(uint32_t target) {
+        if (!TimeSource) throw std::logic_error("Leadership transfer requires a time source");
+        Raft->TransferLeadership(target, TimeSource->Now());
+    }
     // Calls must be serialized with the poller loop and Raft work.
     TCompactionMembershipReadiness CheckCompactionMembershipReadiness() const {
         return Raft->CheckCompactionMembershipReadiness();

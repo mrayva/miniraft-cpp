@@ -303,6 +303,21 @@ void test_server_stages_and_removes_runtime_learner(void**) {
     assert_true(readiness.AddedVotersWithoutCommitAck == std::vector<uint32_t>({2}));
     assert_false(readiness.Ready());
 
+    const auto lastIndexBeforeRejectedChanges = raft->GetLastIndex();
+    bool changeRejected = false;
+    try { server.ProposeJointConfiguration({1, 2}); }
+    catch (const std::logic_error&) { changeRejected = true; }
+    assert_true(changeRejected);
+    changeRejected = false;
+    try { server.FinalizeConfiguration(); }
+    catch (const std::logic_error&) { changeRejected = true; }
+    assert_true(changeRejected);
+    changeRejected = false;
+    try { server.TransferLeadership(2); }
+    catch (const std::logic_error&) { changeRejected = true; }
+    assert_true(changeRejected);
+    assert_int_equal(raft->GetLastIndex(), lastIndexBeforeRejectedChanges);
+
     bool duplicateRejected = false;
     try {
         server.AddLearnerTarget(2, makeEndpoint());
