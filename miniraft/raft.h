@@ -4,6 +4,7 @@
 #include <optional>
 #include <queue>
 #include <deque>
+#include <span>
 #include <string>
 #include <string_view>
 #include <stdexcept>
@@ -33,6 +34,22 @@ struct INode {
     virtual bool SupportsSessionizedForwarding() const { return false; }
 };
 
+// Immutable, range-readable application snapshot data. A source must remain
+// stable until released and represent the requested applied index. Read returns
+// the number of bytes copied; zero before Size() is reached is an error.
+struct ISnapshotSource {
+    virtual ~ISnapshotSource() = default;
+    virtual uint64_t Size() const = 0;
+    virtual size_t Read(uint64_t offset, std::span<char> destination) const = 0;
+};
+
+// Optional application contract for range-readable snapshot capture. Keeping
+// this separate from IRsm preserves the existing application's virtual ABI.
+struct IStreamingSnapshotRsm {
+    virtual ~IStreamingSnapshotRsm() = default;
+    virtual std::shared_ptr<const ISnapshotSource> OpenSnapshotSource(uint64_t index) const = 0;
+};
+
 // CommandRequest -> Write? -> LogEntry -> Append -> Committed As Index -> Applied As Index (Same) -> Index -> CommandResponse
 // CommandRequest -> Read? -> CurrentIndex (fixate) >= CommittedIndex -> CommandResponse
 struct IRsm {
@@ -43,9 +60,10 @@ struct IRsm {
     virtual TMessageHolder<TMessage> Write(TMessageHolder<TLogEntry> message, uint64_t index) = 0;
     virtual TMessageHolder<TLogEntry> Prepare(TMessageHolder<TCommandRequest> message) = 0;
     virtual std::string SaveSnapshot() const { throw std::logic_error("Application snapshots are unsupported"); }
-    // Optional upper bound for SaveSnapshot(). Raft checks it against the
-    // metadata-adjusted image budget before asking the application to allocate
-    // the image. An empty result preserves the legacy post-capture size check.
+    // Optional upper bound for SaveSnapshot() or IStreamingSnapshotRsm source
+    // data. Raft
+    // checks it against the metadata-adjusted image budget before allocating
+    // the final buffer. An empty result preserves the legacy post-capture check.
     virtual std::optional<uint64_t> SnapshotSizeUpperBound() const { return std::nullopt; }
     virtual void ValidateSnapshot(std::string_view, uint64_t) const { throw std::logic_error("Application snapshots are unsupported"); }
     // Implementations must validate completely before atomically replacing state

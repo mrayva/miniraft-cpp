@@ -429,6 +429,73 @@ void test_capture_requires_committed_applied_progress(void**) {
     assert_int_equal(snapshot.Term, 1);
     assert_true(snapshot.Voters == std::vector<uint32_t>{1});
 }
+struct TRangeSnapshotSource : ISnapshotSource {
+    std::string Bytes;
+    mutable size_t ReadCalls = 0;
+    mutable size_t MaxReadBytes = 0;
+    mutable size_t MaxReturnBytes = 16 * 1024;
+    explicit TRangeSnapshotSource(std::string bytes) : Bytes(std::move(bytes)) { }
+    uint64_t Size() const override { return Bytes.size(); }
+    size_t Read(uint64_t offset, std::span<char> destination) const override {
+        if (offset > Bytes.size() || destination.size() > Bytes.size() - size_t(offset))
+            throw std::out_of_range("Snapshot source read outside its image");
+        const auto count = std::min(destination.size(), MaxReturnBytes);
+        if (!count) return 0;
+        memcpy(destination.data(), Bytes.data() + size_t(offset), count);
+        ++ReadCalls;
+        MaxReadBytes = std::max(MaxReadBytes, destination.size());
+        return count;
+    }
+};
+struct TRangeSnapshotApplication : TKv, IStreamingSnapshotRsm {
+    std::shared_ptr<const TRangeSnapshotSource> Source;
+    std::optional<uint64_t> Bound;
+    mutable size_t OpenCalls = 0;
+    mutable size_t SaveCalls = 0;
+    explicit TRangeSnapshotApplication(std::string bytes)
+        : Source(std::make_shared<TRangeSnapshotSource>(std::move(bytes))), Bound(Source->Size()) { }
+    std::shared_ptr<const ISnapshotSource> OpenSnapshotSource(uint64_t index) const override {
+        if (index != LastAppliedIndex) throw std::logic_error("Snapshot source index mismatch");
+        ++OpenCalls;
+        return Source;
+    }
+    std::optional<uint64_t> SnapshotSizeUpperBound() const override { return Bound; }
+    std::string SaveSnapshot() const override {
+        ++SaveCalls;
+        throw std::logic_error("Range-readable capture must not call SaveSnapshot");
+    }
+};
+void test_capture_reads_immutable_snapshot_source_in_bounded_ranges(void**) {
+    const std::string applicationImage(2 * 64 * 1024 + 17, 's');
+    TRangeSnapshotApplication application(applicationImage);
+    application.LastAppliedIndex = 1;
+
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 1;
+    auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = 1;
+    state->Append(entry);
+    TRaft raft(state, 1, TNodeDict{});
+    const_cast<TVolatileState*>(raft.GetVolatileState())->CommitIndex = 1;
+
+    const auto snapshot = CaptureSnapshot(raft, application);
+    assert_int_equal(snapshot.Index, 1);
+    assert_true(snapshot.Data == applicationImage);
+    assert_int_equal(application.SaveCalls, 0);
+    assert_int_equal(application.OpenCalls, 1);
+    assert_int_equal(application.Source->ReadCalls, 9);
+    assert_true(application.Source->MaxReadBytes <= 64 * 1024);
+
+    const auto readsBeforeBoundViolation = application.Source->ReadCalls;
+    application.Bound = application.Source->Size() - 1;
+    Reject([&] { CaptureSnapshot(raft, application); });
+    assert_int_equal(application.OpenCalls, 2);
+    assert_int_equal(application.Source->ReadCalls, readsBeforeBoundViolation);
+
+    application.Bound = application.Source->Size();
+    application.Source->MaxReturnBytes = 0;
+    Reject([&] { CaptureSnapshot(raft, application); });
+    assert_int_equal(application.OpenCalls, 3);
+}
 void test_restore_rejects_mismatched_log_configuration_and_used_application(void**) {
     auto state = std::make_shared<TState>();
     TKv source;
@@ -869,6 +936,7 @@ int main() {
         cmocka_unit_test(test_kv_snapshot_is_canonical_and_binary_safe),
         cmocka_unit_test(test_kv_invalid_snapshot_preserves_existing_state_and_progress),
         cmocka_unit_test(test_capture_requires_committed_applied_progress),
+        cmocka_unit_test(test_capture_reads_immutable_snapshot_source_in_bounded_ranges),
         cmocka_unit_test(test_restore_rejects_mismatched_log_configuration_and_used_application),
         cmocka_unit_test(test_restore_rejects_checkpoint_with_conflicting_stable_identity),
         cmocka_unit_test(test_startup_restores_stale_application_from_durable_snapshot_boundary),

@@ -650,14 +650,38 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm) {
         }
     }
     CheckLocalLog(snapshot, raft, raft.Configuration->Committed);
-    if (const auto upperBound = rsm.SnapshotSizeUpperBound()) {
-        const auto metadataEncoding = PrepareSnapshotEncoding(snapshot);
-        const auto metadataBytes = SnapshotEncodingSize(*metadataEncoding);
-        if (metadataBytes > TSnapshot::MaxBytes ||
-            *upperBound > TSnapshot::MaxBytes - metadataBytes)
-            throw std::runtime_error("Application snapshot size bound exceeds the Raft snapshot limit");
+    const auto metadataEncoding = PrepareSnapshotEncoding(snapshot);
+    const auto metadataBytes = SnapshotEncodingSize(*metadataEncoding);
+    if (metadataBytes > TSnapshot::MaxBytes)
+        throw std::runtime_error("Snapshot configuration metadata exceeds the Raft snapshot limit");
+    const auto upperBound = rsm.SnapshotSizeUpperBound();
+    if (upperBound && *upperBound > TSnapshot::MaxBytes - metadataBytes)
+        throw std::runtime_error("Application snapshot size bound exceeds the Raft snapshot limit");
+    const auto streamingRsm = dynamic_cast<const IStreamingSnapshotRsm*>(&rsm);
+    if (auto source = streamingRsm ? streamingRsm->OpenSnapshotSource(index) : nullptr) {
+        const auto dataBytes = source->Size();
+        if (dataBytes > TSnapshot::MaxBytes - metadataBytes)
+            throw std::runtime_error("Application snapshot source exceeds the Raft snapshot limit");
+        if (upperBound && dataBytes > *upperBound)
+            throw std::logic_error("Application snapshot source exceeded its declared size bound");
+        snapshot.Data.resize(size_t(dataBytes));
+        constexpr size_t ReadChunkBytes = 64 * 1024;
+        for (uint64_t offset = 0; offset < dataBytes;) {
+            const auto count = size_t(std::min<uint64_t>(ReadChunkBytes, dataBytes - offset));
+            size_t copied = 0;
+            while (copied < count) {
+                const auto remaining = count - copied;
+                const auto read = source->Read(offset + copied,
+                    std::span<char>(snapshot.Data.data() + size_t(offset) + copied, remaining));
+                if (!read || read > remaining)
+                    throw std::runtime_error("Application snapshot source returned an invalid read length");
+                copied += read;
+            }
+            offset += count;
+        }
+    } else {
+        snapshot.Data = rsm.SaveSnapshot();
     }
-    snapshot.Data = rsm.SaveSnapshot();
     Validate(snapshot);
     return snapshot;
 }

@@ -1,8 +1,10 @@
 # Design: streamed application snapshots
 
-This is a proposed design for removing the current 64 MiB complete-image
-limit. It is not implemented. The current snapshot format, storage behavior and
-transfer limits are described in [compaction and InstallSnapshot](compaction.md).
+This design describes the staged work to remove the current 64 MiB
+complete-image limit. The application capture-source API is implemented; the
+durable generation and streamed installation lifecycle are not. The current
+snapshot format, storage behavior and transfer limits are described in
+[compaction and InstallSnapshot](compaction.md).
 
 ## Current incremental step
 
@@ -13,6 +15,15 @@ its encoded size and the SQL example reports its database page-size bound. An
 application that does not implement the callback keeps the legacy post-capture
 size check. This preflight still uses complete in-memory images and does not
 change the 64 MiB limit.
+
+`IStreamingSnapshotRsm::OpenSnapshotSource(index)` now optionally returns an immutable,
+range-readable source for exactly the requested applied index. Capture copies
+it in 64 KiB ranges into the final `TSnapshot::Data` buffer and does not call
+`SaveSnapshot()`. Its exact size is checked against the metadata-adjusted image
+limit before allocation and against `SnapshotSizeUpperBound()` when the
+application also supplies that bound. Existing applications retain the
+`SaveSnapshot()` path. This avoids an intermediate application-owned string,
+but capture still materializes one complete image and remains capped at 64 MiB.
 
 Incoming InstallSnapshot assemblies reserve their declared image size against
 a shared 256 MiB process-wide budget by default. Raft instances can share a
