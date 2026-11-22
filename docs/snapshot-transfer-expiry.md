@@ -7,14 +7,16 @@ could retain that allocation indefinitely after an interrupted transfer. Normal
 heartbeats could also keep a voter from reaching its election timeout while an
 image remained abandoned.
 
-Incoming snapshot state now records the time of the last valid chunk. The
-receiver discards an incomplete image after 30 seconds without a valid chunk,
-regardless of role or heartbeat traffic. Matching retries count as activity so
-lost acknowledgements remain safe; malformed, conflicting, and out-of-order
-chunks do not extend the deadline. A continuation after expiry receives a
-failure with offset zero, which tells the sender to restart the pinned image
-from its first chunk. Completed installations and the covered-prefix metadata
-fast path release the partial state as before.
+Incoming snapshot state now records the time of the last forward-progressing
+chunk. The receiver discards an incomplete image after 30 seconds without new
+bytes, regardless of role or heartbeat traffic. Exact duplicate chunks are
+acknowledged idempotently but do not extend the deadline; malformed, conflicting,
+and out-of-order chunks do not extend it either. If an acknowledgement is lost
+long enough for the receiver to expire, the next continuation receives a
+failure with offset zero and the sender safely restarts the pinned image from
+its first chunk. This may retransmit bytes, while ensuring repeated old chunks
+cannot retain the receiver's memory indefinitely. Completed installations and
+the covered-prefix metadata fast path release the partial state as before.
 
 The sender also releases a pinned image after 30 seconds without a successful
 chunk acknowledgement. It retries from the current local snapshot on a later
