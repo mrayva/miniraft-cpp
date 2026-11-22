@@ -253,7 +253,7 @@ void test_v1_v2_v3_images_recover_conservatively_and_upgrade_on_publish(void**) 
         }
         std::ifstream upgraded(files.Image(), std::ios::binary);
         std::string published(8, '\0'); upgraded.read(published.data(), published.size());
-        assert_true(published == "MRFTD005");
+        assert_true(published == "MRFTD006");
     }
 }
 void test_v4_inline_snapshot_recovers_and_upgrades_to_sidecar(void**) {
@@ -287,7 +287,7 @@ void test_v4_inline_snapshot_recovers_and_upgrades_to_sidecar(void**) {
     {
         std::ifstream manifest(files.Image(), std::ios::binary);
         std::string magic(8, '\0'); manifest.read(magic.data(), magic.size());
-        assert_true(magic == "MRFTD005");
+        assert_true(magic == "MRFTD006");
         std::ifstream sidecar(sidecarPath, std::ios::binary);
         assert_true(bool(sidecar));
         TDurableState recovered(files.Name, 1);
@@ -296,6 +296,60 @@ void test_v4_inline_snapshot_recovers_and_upgrades_to_sidecar(void**) {
         assert_string_equal(Data(recovered, 2).c_str(), "tail");
     }
 }
+void test_v5_sidecar_is_bound_on_next_manifest_publication(void**) {
+    TFiles files;
+    const TSnapshot snapshot{1, 1, {1}, "legacy sidecar"};
+    const auto encodedSnapshot = EncodeSnapshot(snapshot);
+    const auto sidecar = files.Image().string() + ".snapshot.1.1";
+    { std::ofstream output(sidecar, std::ios::binary); output << encodedSnapshot; }
+    std::string payload;
+    Put(payload, 1, 8); // current term
+    Put(payload, 0, 4); // vote
+    Put(payload, 0, 8); // retained entries
+    Put(payload, 1, 8); // commit index
+    Put(payload, 1, 4); Put(payload, 1, 4); // bound voters
+    Put(payload, 1, 8); Put(payload, 1, 8); // snapshot boundary
+    std::string legacy("MRFTD005");
+    Put(legacy, payload.size(), 8);
+    Put(legacy, Crc32("MRFTD005" + payload), 4);
+    legacy += payload;
+    { std::ofstream output(files.Image(), std::ios::binary); output << legacy; }
+    {
+        TDurableState state(files.Name, 1, [](auto stage) {
+            assert_true(stage != TStage::SnapshotTempCreated);
+        });
+        assert_true(state.GetSnapshot() && *state.GetSnapshot() == snapshot);
+        state.Commit();
+    }
+    std::ifstream manifest(files.Image(), std::ios::binary);
+    std::string magic(8, '\0'); manifest.read(magic.data(), magic.size());
+    assert_true(magic == "MRFTD006");
+    TDurableState recovered(files.Name, 1);
+    assert_true(recovered.GetSnapshot() && *recovered.GetSnapshot() == snapshot);
+}
+
+void test_durable_manifest_rejects_valid_snapshot_with_wrong_payload(void**) {
+    TFiles files;
+    const TSnapshot snapshot{1, 1, {1}, "original"};
+    {
+        TDurableState state(files.Name, 1);
+        state.BindVoters({1});
+        state.InstallSnapshot(snapshot);
+    }
+    const auto sidecar = files.Image().string() + ".snapshot.1.1";
+    auto replacement = snapshot;
+    replacement.Data = "replaced"; // Same boundary, voters, and encoded length.
+    const auto wrongImage = EncodeSnapshot(replacement);
+    { std::ofstream output(sidecar, std::ios::binary); output << wrongImage; }
+    std::string error;
+    try { TDurableState state(files.Name, 1); }
+    catch (const std::exception& e) { error = e.what(); }
+    assert_true(error.find("digest does not match its manifest") != std::string::npos);
+    { std::ofstream output(sidecar, std::ios::binary); output << EncodeSnapshot(snapshot); }
+    TDurableState recovered(files.Name, 1);
+    assert_true(recovered.GetSnapshot() && *recovered.GetSnapshot() == snapshot);
+}
+
 void test_legacy_configuration_snapshot_migration_requires_complete_trusted_history(void**) {
     const std::vector<uint32_t> originalVoters{1, 2, 3};
     const std::vector<uint32_t> newVoters{2, 3, 4};
@@ -1799,6 +1853,8 @@ int main() {
         cmocka_unit_test(test_publication_order),
         cmocka_unit_test(test_v1_v2_v3_images_recover_conservatively_and_upgrade_on_publish),
         cmocka_unit_test(test_v4_inline_snapshot_recovers_and_upgrades_to_sidecar),
+        cmocka_unit_test(test_v5_sidecar_is_bound_on_next_manifest_publication),
+        cmocka_unit_test(test_durable_manifest_rejects_valid_snapshot_with_wrong_payload),
         cmocka_unit_test(test_live_publication_failure_is_fatal),
         cmocka_unit_test(test_mid_payload_failure_is_fatal_and_preserves_image),
         cmocka_unit_test(test_write_error_is_fatal_and_preserves_image),

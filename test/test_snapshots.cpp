@@ -2,6 +2,7 @@
 #include <miniraft/snapshot_codec.h>
 #include <miniraft/raft.h>
 #include <miniraft/durable.h>
+#include "durable_snapshot_fixture.h"
 #include "../examples/kv.h"
 #include "../examples/kv_messages.h"
 #include <algorithm>
@@ -754,10 +755,12 @@ void test_unbound_durable_configuration_snapshot_recovery_fails_closed(void**) {
     }
     std::ifstream input(path, std::ios::binary);
     std::string bytes(std::istreambuf_iterator<char>(input), {}); input.close();
-    assert_true(bytes.substr(0, 8) == "MRFTD005");
     auto snapshot = Sample(); snapshot.StableConfiguration = true;
     snapshot.ConfigurationIndex = 1; snapshot.ConfigurationTerm = 1;
     const auto image = EncodeSnapshot(snapshot);
+    RebindDurableSnapshotFixture(bytes, image);
+    { std::ofstream output(path, std::ios::binary | std::ios::trunc);
+      output.write(bytes.data(), bytes.size()); assert_true(bool(output)); }
     const auto snapshotPath = path + ".snapshot." + std::to_string(snapshot.Index) + "." +
         std::to_string(snapshot.Term);
     { std::ofstream output(snapshotPath, std::ios::binary | std::ios::trunc);

@@ -1,6 +1,6 @@
 # Linux durable state: v0.1.0-alpha.3
 
-## Commit recovery: MRFTD005
+## Commit recovery: MRFTD006
 
 The current durable store persists `CommitIndex` alongside the current term,
 vote, voter binding, snapshot and retained log. Recovery requires
@@ -11,11 +11,12 @@ entries even when the application checkpoint trails them. Installed snapshots
 advance the persisted commit floor to at least their included index, and storage
 rejects truncation of committed entries.
 
-MRFTD005 keeps the 20-byte file header: magic[8], payload length[8] and CRC[4].
+MRFTD006 keeps the 20-byte file header: magic[8], payload length[8] and CRC[4].
 Its payload is CurrentTerm[8], VotedFor[4], retained-log count[8],
 CommitIndex[8], voter count[4], sorted voter IDs[4 each], SnapshotIndex[8],
-SnapshotTerm[8], then retained log records. The CRC covers the v5 magic and
-payload. Snapshot bytes live in an immutable sidecar named
+SnapshotTerm[8], encoded snapshot length[8], SHA-256 digest[32], then retained
+log records. Stores without a snapshot write zero length and digest fields.
+The CRC covers the v6 magic and payload. Snapshot bytes live in an immutable sidecar named
 `NAME.durable.ID.snapshot.INDEX.TERM`; ordinary log, term, vote and commit
 updates do not rewrite it. A changed snapshot is written and synced to a
 temporary sidecar, renamed and directory-synced before the manifest references
@@ -25,13 +26,16 @@ incomplete sidecar temp file; recovery ignores unreferenced images and removes
 matching orphan sidecars and temps after validating and syncing the selected
 manifest. If the manifest is absent but a published sidecar remains, fresh
 initialization fails closed so an interrupted migration cannot be mistaken for
-an empty store.
+an empty store. Recovery verifies the length and digest of the exact encoded
+sidecar before decoding it. A sidecar from another store with the same snapshot
+index, term, and voters is rejected if its bytes differ.
 
-MRFTD004 remains readable with its snapshot inline; its next successful
-publication writes MRFTD005. MRFTD001 through MRFTD003 also remain readable;
-their commit floor is conservatively initialized to SnapshotIndex, since those
-formats did not record commit progress, and their next successful publication
-writes MRFTD005.
+MRFTD005 remains readable. It has no recorded digest, so the next successful
+publication binds the sidecar that passed legacy recovery checks without
+rewriting it. MRFTD004 remains readable with its snapshot inline. MRFTD001
+through MRFTD003 also remain readable and initialize their commit floor to
+SnapshotIndex because those formats did not record commit progress. All new
+publications write MRFTD006, which older binaries cannot open.
 Recovered unbound MRFTD002 snapshots with configuration metadata remain offline
 until explicitly bound. `BindVotersFromTrustedHistory` accepts them only when
 their complete retained membership chain starts from the independently trusted

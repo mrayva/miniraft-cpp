@@ -17,10 +17,10 @@ log, then persists the binding before Raft startup. The API does not establish
 that the caller's assertion is true; absent an independent trusted baseline, the
 store still cannot infer its voter set.
 
-The current MRFTD005 durable format persists a reference to the snapshot
-sidecar, commit boundary and original voter binding in the atomic manifest; it
-does not reinterpret that binding from snapshot metadata. MRFTD004 snapshots
-remain readable inline. MRFTD001 through MRFTD003 remain readable and use their
+The MRFTD006 manifest records the snapshot sidecar's length and digest, the
+commit boundary, and the original voter binding. The original binding comes
+from the manifest. MRFTD005 sidecars and MRFTD004 inline snapshots remain
+readable. MRFTD001 through MRFTD003 remain readable and use their
 snapshot boundary as the conservative commit floor. The history scanner
 checks configuration-bearing snapshot metadata against the active baseline;
 the original binding may refer to an earlier stable set.

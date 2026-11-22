@@ -1376,40 +1376,47 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             && State->LogTerm(message->PrevLogIndex) == message->PrevLogTerm)))
     {
         uint64_t conflictIndex = 0;
-        uint32_t conflictOffset = 0;
         auto index = message->PrevLogIndex;
         for (uint32_t i = 0; i < message.PayloadSize; ++i) {
             ++index;
             const auto entry = message.Payload[i].Cast<TLogEntry>();
             if (State->LogTerm(index) != entry->Term) {
                 conflictIndex = index;
-                conflictOffset = i;
                 break;
             }
         }
 
+        const auto requestLastIndex = message->PrevLogIndex + message.PayloadSize;
+        const auto commitFloor = std::max(State->CommitIndex, VolatileState->CommitIndex);
+        const auto batchCommitIndex = std::max(commitFloor, std::min(message->LeaderCommit, requestLastIndex));
         bool fits = supportsIncomingEntries;
         if (conflictIndex) {
             // Refuse a conflicting leader suffix at or below a commit boundary
             // before touching storage. Storage removal methods also guard this,
             // but a protocol rejection is the correct response to stale input.
-            const auto commitFloor = std::max(State->CommitIndex, VolatileState->CommitIndex);
             if (conflictIndex <= commitFloor) {
                 fits = false;
             } else {
-                uint64_t replacedBytes = 0;
-                size_t replacedEntries = 0;
+                auto retainedBytes = UncommittedLogBytes;
+                auto retainedEntries = UncommittedLog.size();
                 for (auto it = UncommittedLog.rbegin(); it != UncommittedLog.rend() &&
                         it->Index >= conflictIndex; ++it) {
-                    replacedBytes += it->Bytes;
-                    ++replacedEntries;
+                    retainedBytes -= it->Bytes;
+                    --retainedEntries;
                 }
+                // Count only entries that will still be uncommitted after this
+                // batch publishes its replacement suffix and commit boundary.
+                for (const auto& entry : UncommittedLog) {
+                    if (entry.Index >= conflictIndex || entry.Index > batchCommitIndex) break;
+                    retainedBytes -= entry.Bytes;
+                    --retainedEntries;
+                }
+                const auto firstUncommittedOffset =
+                    std::max(batchCommitIndex, conflictIndex - 1) - message->PrevLogIndex;
                 uint64_t incomingBytes = 0;
-                for (uint32_t i = conflictOffset; i < message.PayloadSize; ++i)
+                for (auto i = firstUncommittedOffset; i < message.PayloadSize; ++i)
                     incomingBytes += message.Payload[i].Cast<TLogEntry>()->Len;
-                const auto retainedBytes = UncommittedLogBytes - replacedBytes;
-                const auto retainedEntries = UncommittedLog.size() - replacedEntries;
-                const auto incomingEntries = size_t(message.PayloadSize - conflictOffset);
+                const auto incomingEntries = size_t(message.PayloadSize - firstUncommittedOffset);
                 fits = supportsIncomingEntries && retainedBytes <= LogLimits.MaxUncommittedBytes &&
                     incomingBytes <= LogLimits.MaxUncommittedBytes - retainedBytes &&
                     retainedEntries <= LogLimits.MaxUncommittedEntries &&
@@ -1437,8 +1444,6 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             }
 
             if (!appendBatch.empty()) {
-                const auto batchCommitIndex = std::max({commitIndex, State->CommitIndex,
-                    std::min(message->LeaderCommit, index)});
                 State->ReplaceSuffixAndAppendBatch(conflictIndex, appendBatch, batchCommitIndex);
                 RemoveUncommittedLogSuffix(conflictIndex);
                 PruneCommittedLogUsage(batchCommitIndex);

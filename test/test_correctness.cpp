@@ -738,6 +738,38 @@ void test_follower_rejects_append_batch_that_exceeds_uncommitted_log_budget(void
     assert_false(response->Success);
 }
 
+void test_follower_log_budget_counts_only_post_commit_suffix(void**) {
+    for (uint64_t advertisedCommit : {0, 1, 2, 3}) {
+        TMessageHolder<TAppendEntriesResponse> response;
+        auto peer = std::make_shared<TEndpoint>([&](auto message) {
+            response = message.template Cast<TAppendEntriesResponse>();
+        });
+        auto state = std::make_shared<TState>();
+        auto retained = NewHoldedMessage<TLogEntry>();
+        retained->Term = 1;
+        state->Append(retained);
+        TRaft raft(state, 1, TNodeDict{{2, peer}}, {},
+            TRaft::TLogLimits{.MaxUncommittedBytes = sizeof(TLogEntry), .MaxUncommittedEntries = 1});
+        auto request = NewHoldedMessage(
+            TMessageEx{.Src = 2, .Dst = 1, .Term = 1, .Seqno = 1},
+            TAppendEntriesRequest{
+                .PrevLogIndex = 1, .PrevLogTerm = 1, .LeaderCommit = advertisedCommit,
+                .LeaderId = 2, .Nentries = 2,
+            });
+        request.InitPayload(2);
+        request.Payload[0] = retained;
+        request.Payload[1] = retained;
+        raft.Process({}, request);
+
+        const bool fits = advertisedCommit >= 2;
+        assert_non_null(response);
+        assert_int_equal(response->Success, fits);
+        assert_int_equal(response->MatchIndex, fits ? 3 : 0);
+        assert_int_equal(state->LastLogIndex, fits ? 3 : 1);
+        assert_int_equal(state->CommitIndex, fits ? advertisedCommit : 0);
+    }
+}
+
 void test_follower_log_budget_is_reclaimed_when_leader_replaces_uncommitted_suffix(void**) {
     TMessageHolder<TAppendEntriesResponse> response;
     auto peer = std::make_shared<TEndpoint>([&](auto message) {
@@ -1456,6 +1488,7 @@ int main() {
         cmocka_unit_test(test_invalid_leadership_expiration_is_rejected),
         cmocka_unit_test(test_uncommitted_log_budget_survives_disconnect_and_releases_after_commit),
         cmocka_unit_test(test_follower_rejects_append_batch_that_exceeds_uncommitted_log_budget),
+        cmocka_unit_test(test_follower_log_budget_counts_only_post_commit_suffix),
         cmocka_unit_test(test_follower_log_budget_is_reclaimed_when_leader_replaces_uncommitted_suffix),
         cmocka_unit_test(test_pending_request_byte_admission_covers_leader_wait_queue),
         cmocka_unit_test(test_cached_write_reply_budget_returns_unknown_outcome),

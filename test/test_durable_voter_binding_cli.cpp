@@ -2,6 +2,7 @@
 #include <miniraft/persist.h>
 #include <miniraft/configuration.h>
 #include <miniraft/snapshot_codec.h>
+#include "durable_snapshot_fixture.h"
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -39,15 +40,18 @@ std::string ReadFile(const fs::path& path) {
 }
 
 void ReplaceDurableSnapshot(const fs::path& path, const TSnapshot& snapshot) {
-    const auto bytes = ReadFile(path);
-    Require(bytes.substr(0, 8) == "MRFTD005", "unexpected durable snapshot fixture version");
+    auto bytes = ReadFile(path);
     const auto image = EncodeSnapshot(snapshot);
+    RebindDurableSnapshotFixture(bytes, image);
     const auto snapshotPath = path.string() + ".snapshot." + std::to_string(snapshot.Index) + "." +
         std::to_string(snapshot.Term);
     std::ofstream output(snapshotPath, std::ios::binary | std::ios::trunc);
     Require(bool(output), "cannot open external durable snapshot fixture for replacement");
     output.write(image.data(), std::streamsize(image.size()));
     Require(bool(output), "cannot write external durable snapshot fixture");
+    std::ofstream manifest(path, std::ios::binary | std::ios::trunc);
+    manifest.write(bytes.data(), std::streamsize(bytes.size()));
+    Require(bool(manifest), "cannot write durable snapshot fixture manifest");
 }
 
 void SeedUnboundDurableStore(const std::string& base, uint32_t vote) {
