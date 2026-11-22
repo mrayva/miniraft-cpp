@@ -2113,6 +2113,107 @@ void test_durable_stale_snapshot_membership_recovery_survives_restart(void**) {
         assert_true(Read(*application, "membership") == value);
     }
 }
+void test_durable_membership_snapshot_install_is_atomic_across_restart(void**) {
+    using TStage = TDurableState::EStage;
+    const std::vector<TStage> stages{TStage::TempCreated, TStage::PayloadStarted, TStage::Written,
+        TStage::FileSynced, TStage::Renamed, TStage::DirectorySynced};
+    for (bool jointSuccessor : {false, true}) for (auto stage : stages) {
+        TFiles files;
+        const std::vector<uint32_t> original{1, 2, 3};
+        const std::vector<uint32_t> intermediate{2, 3, 4};
+        const std::vector<uint32_t> stableVoters{3, 4, 5};
+        const std::vector<uint32_t> jointVoters{4, 5, 6};
+        TKv image;
+        image.Write(image.Prepare(Command("membership", "before crash")), 5);
+        const TSnapshot known{5, 2, original, image.SaveSnapshot()};
+        {
+            TDurableState state(files.Name, 2);
+            state.BindVoters(original);
+            state.CurrentTerm = 3;
+            state.Commit();
+            state.InstallSnapshot(known);
+        }
+
+        const auto snapshotIndex = jointSuccessor ? 9 : 10;
+        const auto value = jointSuccessor ? "recovered joint" : "recovered stable";
+        image.Write(image.Prepare(Command("membership", value)), snapshotIndex);
+        const TSnapshotConfigurationTransition anchor{original, intermediate, 0, 0, 6, 3, 7, 3};
+        const TSnapshotConfigurationTransition tail{intermediate,
+            jointSuccessor ? jointVoters : stableVoters, 7, 3, 8, 3,
+            jointSuccessor ? 0u : 9u, jointSuccessor ? 0u : 3u};
+        TSnapshot incoming;
+        incoming.Index = snapshotIndex;
+        incoming.Term = 3;
+        incoming.Data = image.SaveSnapshot();
+        incoming.ConfigurationTransitions = {anchor, tail};
+        incoming.PreviousVoters = intermediate;
+        incoming.PreviousConfigurationIndex = 7;
+        incoming.PreviousConfigurationTerm = 3;
+        incoming.PreviousJointIndex = 8;
+        incoming.PreviousJointTerm = 3;
+        if (jointSuccessor) {
+            incoming.Voters = intermediate;
+            incoming.JointVoters = jointVoters;
+            incoming.ConfigurationIndex = 8;
+            incoming.ConfigurationTerm = 3;
+        } else {
+            incoming.Voters = stableVoters;
+            incoming.StableConfiguration = true;
+            incoming.ConfigurationIndex = 9;
+            incoming.ConfigurationTerm = 3;
+        }
+        const auto bytes = EncodeSnapshot(incoming);
+        auto request = Chunk(incoming, bytes, 0, static_cast<uint32_t>(bytes.size()));
+        request->Src = 3;
+        request->LeaderId = 3;
+
+        const auto child = fork();
+        assert_true(child >= 0);
+        if (child == 0) {
+            try {
+                auto state = std::make_shared<TDurableState>(files.Name, 2, [&](auto point) {
+                    if (point == stage) _exit(90);
+                });
+                TNodeDict peers;
+                for (uint32_t id : {1, 3, 4, 5, 6})
+                    peers.emplace(id, std::make_shared<TEndpoint>([](auto) {}));
+                auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{4, 5, 6});
+                auto application = std::make_shared<TApplication>();
+                TRequestProcessor processor(raft, application, peers);
+                raft->Process({}, request);
+            } catch (...) { _exit(91); }
+            _exit(92);
+        }
+        int status = 0;
+        assert_int_equal(waitpid(child, &status, 0), child);
+        assert_true(WIFEXITED(status));
+        assert_int_equal(WEXITSTATUS(status), 90);
+
+        const bool updated = stage == TStage::Renamed || stage == TStage::DirectorySynced;
+        auto recovered = std::make_shared<TDurableState>(files.Name, 2);
+        assert_true(recovered->GetBoundVoters() == original);
+        const auto expectedIndex = updated ? snapshotIndex : known.Index;
+        assert_int_equal(recovered->SnapshotIndex, expectedIndex);
+        assert_int_equal(recovered->CommitIndex, expectedIndex);
+        assert_true(recovered->GetSnapshot()->Data == (updated ? incoming.Data : known.Data));
+        auto application = std::make_shared<TApplication>();
+        TNodeDict peers;
+        for (uint32_t id : {1, 3, 4, 5, 6})
+            peers.emplace(id, std::make_shared<TEndpoint>([](auto) {}));
+        auto raft = std::make_shared<TRaft>(recovered, 2, peers, std::vector<uint32_t>{4, 5, 6});
+        TRequestProcessor processor(raft, application, peers);
+        assert_true(raft->GetConfigurationState().Committed.IsJoint() == (updated && jointSuccessor));
+        const auto expectedVoters = updated
+            ? jointSuccessor ? std::vector<uint32_t>{2, 3, 4, 5, 6} : stableVoters
+            : original;
+        assert_true(raft->GetVoterIds() == expectedVoters);
+        assert_int_equal(application->LastAppliedIndex, expectedIndex);
+        assert_true(Read(*application, "membership") == (updated ? value : "before crash"));
+        if (updated)
+            assert_true(recovered->GetSnapshot()->ConfigurationTransitions ==
+                std::vector<TSnapshotConfigurationTransition>({anchor, tail}));
+    }
+}
 struct TCountingDurable : TDurableState {
     using TDurableState::TDurableState;
     mutable unsigned Reads = 0;
@@ -2309,6 +2410,7 @@ int main() {
         cmocka_unit_test(test_snapshot_and_suffix_are_atomic_at_every_publication_stage),
         cmocka_unit_test(test_remote_snapshot_install_crash_before_application_load_recovers_on_restart),
         cmocka_unit_test(test_durable_stale_snapshot_membership_recovery_survives_restart),
+        cmocka_unit_test(test_durable_membership_snapshot_install_is_atomic_across_restart),
         cmocka_unit_test(test_compaction_reclaims_durable_prefix_bytes),
         cmocka_unit_test(test_durable_v4_semantic_corruption_rejects_without_rewriting),
 #endif
