@@ -68,6 +68,9 @@ std::string Hex(const std::array<uint8_t, 32>& bytes) {
 }
 
 struct TSnapshotRsm : IIdempotentRsm {
+    explicit TSnapshotRsm(TIdempotencySnapshotLimits limits = {})
+        : IIdempotentRsm(std::move(limits)) { }
+
     TIdempotencySnapshot State;
     uint64_t ResponseBound = 64;
     size_t IdempotentWrites = 0;
@@ -161,6 +164,9 @@ struct TIdempotencyManualTimeSource : ITimeSource {
 struct TDeduplicatingSnapshotRsm : TSnapshotRsm {
     size_t ApplicationMutations = 0;
 
+    explicit TDeduplicatingSnapshotRsm(TIdempotencySnapshotLimits limits = {})
+        : TSnapshotRsm(std::move(limits)) { }
+
     void ValidateIdempotent(TMessageHolder<TIdempotentCommandRequest> request) const override {
         if (request->Epoch != State.Epoch)
             throw std::invalid_argument("Unexpected idempotent test epoch");
@@ -172,6 +178,10 @@ struct TDeduplicatingSnapshotRsm : TSnapshotRsm {
         if (existing == State.Sessions.end()) {
             if (request->Sequence != 1)
                 throw std::invalid_argument("New idempotent test sessions must start at sequence 1");
+            const auto activeSessions = std::count_if(State.Sessions.begin(), State.Sessions.end(),
+                [](const auto& session) { return !session.Closed; });
+            if (activeSessions >= SnapshotLimits.MaxActiveSessions)
+                throw std::invalid_argument("Idempotent test session cache is full");
             return;
         }
         if (request->Sequence < existing->HighestSequence)
@@ -259,7 +269,7 @@ struct TIdempotencyCluster {
     std::shared_ptr<TIdempotencyManualTimeSource> Clock =
         std::make_shared<TIdempotencyManualTimeSource>();
 
-    explicit TIdempotencyCluster(uint32_t count) {
+    explicit TIdempotencyCluster(uint32_t count, TIdempotencySnapshotLimits limits = {}) {
         std::vector<TNodeDict> peers(count);
         for (uint32_t id = 1; id <= count; ++id) {
             for (uint32_t dst = 1; dst <= count; ++dst) {
@@ -269,7 +279,7 @@ struct TIdempotencyCluster {
         }
         for (uint32_t id = 1; id <= count; ++id) {
             auto raft = std::make_shared<TRaft>(std::make_shared<TState>(), id, peers[id - 1]);
-            auto application = std::make_shared<TDeduplicatingSnapshotRsm>();
+            auto application = std::make_shared<TDeduplicatingSnapshotRsm>(limits);
             application->State.Epoch = 1;
             auto processor = std::make_shared<TRequestProcessor>(raft, application, peers[id - 1],
                 TRequestProcessor::TAdmissionLimits{}, Clock);
@@ -1187,6 +1197,69 @@ void test_idempotent_stale_and_gap_sequences_reject_before_append(void**) {
     assert_int_equal(application.State.Sessions.size(), 1);
     assert_int_equal(application.ApplicationMutations, 2);
 }
+
+void test_idempotent_request_rejects_unsupported_peer_before_append(void**) {
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 1;
+    state->BindVoters({1, 2});
+    TNodeDict peers{{2, std::make_shared<TIdempotencyPeer>()}};
+    auto raft = std::make_shared<TRaft>(state, 1, peers);
+    auto rsm = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor processor(raft, rsm, peers);
+    raft->Become(EState::LEADER);
+
+    auto* volatileState = const_cast<TVolatileState*>(raft->GetVolatileState());
+    volatileState->PeerCapabilities[2] = {
+        .AppendAckSeqno = 1, .Term = state->CurrentTerm, .IdempotentLogEntries = false};
+    assert_false(raft->CanAppendIdempotentLogEntries());
+
+    auto client = std::make_shared<TIdempotencyPeer>();
+    processor.OnIdempotentCommandRequest(IdempotentRequest(73), client);
+
+    assert_int_equal(state->LastLogIndex, 0);
+    assert_int_equal(rsm->IdempotentWrites, 0);
+    assert_int_equal(client->Sent.size(), 1);
+    const auto response = client->Sent.back().Cast<TIdempotentCommandResponse>();
+    ValidateIdempotentCommandResponse(response);
+    assert_int_equal(response->Cookie, 73);
+    assert_int_equal(response->ErrorCode, TCommandResponse::Unsupported);
+    assert_int_equal(response->Index, 0);
+}
+
+void test_idempotent_new_session_rejects_full_cache_before_append(void**) {
+    auto limits = TIdempotencySnapshotLimits{};
+    limits.MaxActiveSessions = 1;
+    TIdempotencyCluster cluster(3, limits);
+    cluster.Elect(1);
+    cluster.Replicate(1);
+
+    auto firstClient = std::make_shared<TIdempotencyPeer>();
+    cluster.Processors[0]->OnIdempotentCommandRequest(IdempotentRequest(74), firstClient);
+    cluster.Replicate(1);
+    assert_int_equal(cluster.Applications[0]->State.Sessions.size(), 1);
+    assert_int_equal(cluster.Applications[0]->ApplicationMutations, 1);
+    const auto committedLogIndex = cluster.Rafts[0]->GetState()->LastLogIndex;
+
+    auto newSession = IdempotentRequest(75, "second-session");
+    newSession->SessionIdHigh = 21;
+    newSession->SessionIdLow = 22;
+    auto client = std::make_shared<TIdempotencyPeer>();
+    bool rejected = false;
+    try {
+        cluster.Processors[0]->OnIdempotentCommandRequest(newSession, client);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+
+    assert_true(rejected);
+    assert_true(client->Sent.empty());
+    for (size_t node = 0; node < 3; ++node) {
+        assert_int_equal(cluster.Rafts[node]->GetState()->LastLogIndex, committedLogIndex);
+        assert_int_equal(cluster.Applications[node]->State.Sessions.size(), 1);
+        assert_int_equal(cluster.Applications[node]->ApplicationMutations, 1);
+        assert_true(cluster.Applications[node]->State.ApplicationData == "work");
+    }
+}
 }
 
 int main() {
@@ -1211,6 +1284,8 @@ int main() {
         cmocka_unit_test(test_duplicate_idempotent_entries_from_two_leaders_apply_once),
         cmocka_unit_test(test_idempotent_sequence_reuse_with_different_payload_conflicts_without_mutation),
         cmocka_unit_test(test_idempotent_stale_and_gap_sequences_reject_before_append),
+        cmocka_unit_test(test_idempotent_request_rejects_unsupported_peer_before_append),
+        cmocka_unit_test(test_idempotent_new_session_rejects_full_cache_before_append),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }

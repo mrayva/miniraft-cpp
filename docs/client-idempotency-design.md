@@ -123,8 +123,11 @@ different payload, confirms the conflict response, and checks that application
 data and the saved session result remain unchanged. Its test RSM advances a
 session through sequence 2 and rejects stale requests, skipped sequence numbers,
 and a new session starting above sequence 1 before appending; the test verifies
-the log and cached session remain unchanged. A durable single-voter case
-then compacts the combined Raft/application snapshot, reconstructs the Raft and
+the log and cached session remain unchanged. A request sent to a leader with a
+voter that lacks idempotent-log support returns `Unsupported` without appending.
+The test RSM also refuses a new session when its active-session bound is full,
+before the request reaches the log. A durable single-voter case then compacts
+the combined Raft/application snapshot, reconstructs the Raft and
 RSM objects from disk, and retries the request. The new process returns the
 cached result at its original index with the saved session high-water mark and
 no second application mutation.
@@ -135,12 +138,14 @@ verifies the retry returns the original cached response. A third voter recovers
 the committed application state from its durable log. The repeated request does
 not cause another application mutation on either snapshot-restored replica.
 
-The following tests remain necessary before claiming the full client guarantee:
+A separate durable three-voter case commits a session close while one voter is
+isolated, installs the resulting tombstone through snapshot transfer, restarts
+all voters, and elects the snapshot-restored voter. Retrying the closed session
+is rejected before append, with the tombstone and application state unchanged.
 
-- Reject unsupported peers and session-cache exhaustion before appending a new
-  command.
-- Close a session through replicated state, restart, and verify old IDs cannot
-  execute again.
+The protocol tests use test RSMs. A production `IIdempotentRsm` implementation
+and client library are not included, so the guarantee still needs an integration
+test with an application's own durable state and snapshot implementation.
 
 ## Implementation status
 
@@ -155,8 +160,9 @@ The following tests remain necessary before claiming the full client guarantee:
    restart, compaction and resource limits using a stateful deduplicating RSM.
   **Partially implemented:** lost-reply retry across snapshot installation and
   leadership change, duplicate uncommitted copies across leaders, and conflicting
-  sequence reuse are covered. Single-voter and three-voter durable snapshot
-  restarts preserve the cached result; the cases above remain open.
+  sequence reuse, stale/gap rejection, unsupported-peer rejection, active-session
+  cache exhaustion, durable snapshot restart, and durable session close are
+  covered with test RSMs. Application-specific durable integration remains open.
 
 Clients using ordinary `TCommandRequest` writes retain at-least-once behavior.
 For idempotent requests, a timeout after admission still has an unknown outcome;

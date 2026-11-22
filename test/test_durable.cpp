@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <chrono>
+#include <algorithm>
 #include <deque>
 #include <functional>
 #include <iterator>
@@ -108,7 +109,17 @@ struct TDurableControlRsm : IIdempotentRsm {
     TMessageHolder<TLogEntry> Prepare(TMessageHolder<TCommandRequest>) override {
         return NewHoldedMessage<TLogEntry>();
     }
-    void ValidateIdempotent(TMessageHolder<TIdempotentCommandRequest>) const override { }
+    void ValidateIdempotent(TMessageHolder<TIdempotentCommandRequest> request) const override {
+        if (request->Epoch != State.Epoch)
+            throw std::invalid_argument("Unexpected durable test epoch");
+        const auto session = std::find_if(State.Sessions.begin(), State.Sessions.end(),
+            [&](const auto& record) {
+                return record.SessionIdHigh == request->SessionIdHigh &&
+                    record.SessionIdLow == request->SessionIdLow;
+            });
+        if (session != State.Sessions.end() && session->Closed)
+            throw std::invalid_argument("Durable test session is closed");
+    }
     uint64_t CachedResponseDataUpperBound(
             TMessageHolder<TIdempotentCommandRequest>) const override { return 32; }
     TMessageHolder<TLogEntry> PrepareIdempotent(
@@ -126,6 +137,8 @@ struct TDurableControlRsm : IIdempotentRsm {
                     record.SessionIdLow == identity.SessionIdLow;
             });
         if (session != State.Sessions.end()) {
+            if (session->Closed)
+                return {.Index = session->LogIndex, .ErrorCode = TCommandResponse::AlreadyCompleted};
             if (identity.Epoch != State.Epoch || identity.Sequence != session->HighestSequence ||
                 identity.PayloadDigest != session->PayloadDigest)
                 throw std::invalid_argument("Unexpected durable test duplicate");
@@ -161,6 +174,17 @@ struct TDurableControlRsm : IIdempotentRsm {
         ValidateIdempotencyControlOperation(operation);
         if (operation.Kind == EIdempotencyControlKind::AdvanceEpoch && State.Epoch != operation.Epoch)
             throw std::invalid_argument("Unexpected durable test epoch");
+        if (operation.Kind == EIdempotencyControlKind::CloseSession) {
+            if (State.Epoch != operation.Epoch)
+                throw std::invalid_argument("Unexpected durable test session epoch");
+            const auto session = std::find_if(State.Sessions.begin(), State.Sessions.end(),
+                [&](const auto& record) {
+                    return record.SessionIdHigh == operation.SessionIdHigh &&
+                        record.SessionIdLow == operation.SessionIdLow;
+                });
+            if (session == State.Sessions.end())
+                throw std::invalid_argument("Cannot close an unknown durable test session");
+        }
     }
     TMessageHolder<TLogEntry> PrepareIdempotencyControl(
             const TIdempotencyControlOperation&) override {
@@ -168,10 +192,22 @@ struct TDurableControlRsm : IIdempotentRsm {
     }
     void ApplyIdempotencyControl(const TIdempotencyControlOperation& operation,
             TMessageHolder<TLogEntry> applicationEntry, uint64_t index) override {
-        State.ApplicationData.assign(applicationEntry->Data,
-            applicationEntry->Len - sizeof(TLogEntry));
-        if (operation.Kind == EIdempotencyControlKind::AdvanceEpoch)
+        if (operation.Kind == EIdempotencyControlKind::AdvanceEpoch) {
+            State.ApplicationData.assign(applicationEntry->Data,
+                applicationEntry->Len - sizeof(TLogEntry));
             State.Epoch = operation.NewEpoch;
+        } else if (operation.Kind == EIdempotencyControlKind::CloseSession) {
+            const auto session = std::find_if(State.Sessions.begin(), State.Sessions.end(),
+                [&](const auto& record) {
+                    return record.SessionIdHigh == operation.SessionIdHigh &&
+                        record.SessionIdLow == operation.SessionIdLow;
+                });
+            if (session == State.Sessions.end())
+                throw std::logic_error("Committed close-session control lost its session");
+            session->Closed = true;
+            session->ErrorCode = TCommandResponse::Success;
+            session->ResponseData.clear();
+        }
         State.LastAppliedIndex = index;
         LastAppliedIndex = index;
     }
@@ -1292,6 +1328,104 @@ void test_idempotent_retry_after_multi_voter_durable_snapshot_restart(void**) {
         assert_int_equal(cluster.Applications[2]->IdempotentApplicationCalls, 1);
     }
 }
+
+void test_closed_idempotent_session_survives_durable_snapshot_restart(void**) {
+    TFiles files;
+    const auto makeRequest = [](uint32_t cookie) {
+        constexpr std::string_view payload = "client-payload";
+        auto request = NewHoldedMessage<TIdempotentCommandRequest>(
+            sizeof(TIdempotentCommandRequest) + payload.size());
+        request->Epoch = 1;
+        request->SessionIdHigh = 11;
+        request->SessionIdLow = 12;
+        request->Sequence = 1;
+        request->Cookie = cookie;
+        memcpy(request->Data, payload.data(), payload.size());
+        return request;
+    };
+    const TIdempotencyControlOperation closeSession{
+        .Kind = EIdempotencyControlKind::CloseSession,
+        .Epoch = 1,
+        .SessionIdHigh = 11,
+        .SessionIdLow = 12,
+    };
+
+    {
+        TDurableIdempotencyCluster cluster(files, false);
+        cluster.Elect(1);
+        cluster.Replicate(1);
+        assert_true(cluster.Rafts[0]->CanAppendIdempotentLogEntries());
+        assert_true(cluster.Rafts[0]->CanAppendIdempotencyControlEntries());
+
+        cluster.Isolated.insert(2);
+        cluster.Processors[0]->OnIdempotentCommandRequest(makeRequest(81), {});
+        cluster.Replicate(1);
+        assert_int_equal(cluster.States[0]->CommitIndex, 2);
+        assert_int_equal(cluster.States[2]->CommitIndex, 2);
+
+        const auto closeIndex = cluster.Processors[0]->ProposeIdempotencyControl(closeSession);
+        assert_int_equal(closeIndex, 3);
+        cluster.Replicate(1);
+        assert_int_equal(cluster.States[0]->CommitIndex, 3);
+        assert_int_equal(cluster.States[2]->CommitIndex, 3);
+        for (size_t node : {size_t(0), size_t(2)}) {
+            const auto& session = cluster.Applications[node]->State.Sessions.front();
+            assert_true(session.Closed);
+            assert_int_equal(session.HighestSequence, 1);
+            assert_int_equal(session.LogIndex, 2);
+            assert_true(session.ResponseData.empty());
+            assert_int_equal(session.ErrorCode, TCommandResponse::Success);
+            assert_true(cluster.Applications[node]->State.ApplicationData == "client-payload");
+        }
+
+        const auto snapshot = cluster.Rafts[0]->CompactShared();
+        assert_int_equal(snapshot->Index, 3);
+        cluster.Isolated.erase(2);
+        cluster.Replicate(1);
+        assert_int_equal(cluster.States[1]->SnapshotIndex, 3);
+        assert_true(cluster.Applications[1]->State.Sessions.front().Closed);
+        assert_true(cluster.Applications[1]->State.ApplicationData == "client-payload");
+    }
+
+    {
+        TDurableIdempotencyCluster cluster(files, true);
+        assert_int_equal(cluster.States[0]->SnapshotIndex, 3);
+        assert_int_equal(cluster.States[1]->SnapshotIndex, 3);
+        for (size_t node : {size_t(0), size_t(1)}) {
+            const auto& session = cluster.Applications[node]->State.Sessions.front();
+            assert_true(session.Closed);
+            assert_int_equal(session.HighestSequence, 1);
+            assert_true(session.ResponseData.empty());
+            assert_true(cluster.Applications[node]->State.ApplicationData == "client-payload");
+        }
+
+        cluster.Elect(2);
+        cluster.Replicate(2);
+        assert_true(cluster.Rafts[1]->CanAppendIdempotentLogEntries());
+        assert_true(cluster.Rafts[1]->CanAppendIdempotencyControlEntries());
+        const auto lastLogIndex = cluster.States[1]->LastLogIndex;
+        auto retryClient = std::make_shared<TDurableIdempotencyPeer>();
+        bool rejected = false;
+        try {
+            cluster.Processors[1]->OnIdempotentCommandRequest(makeRequest(82), retryClient);
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+
+        assert_true(rejected);
+        assert_true(retryClient->Sent.empty());
+        assert_int_equal(cluster.States[1]->LastLogIndex, lastLogIndex);
+        assert_int_equal(cluster.Applications[1]->IdempotentApplicationCalls, 0);
+        assert_int_equal(cluster.Applications[1]->State.Sessions.size(), 1);
+        assert_true(cluster.Applications[1]->State.Sessions.front().Closed);
+        assert_true(cluster.Applications[1]->State.Sessions.front().ResponseData.empty());
+        for (size_t node = 0; node < cluster.States.size(); ++node) {
+            assert_true(cluster.Applications[node]->State.Sessions.front().Closed);
+            assert_true(cluster.Applications[node]->State.Sessions.front().ResponseData.empty());
+            assert_true(cluster.Applications[node]->State.ApplicationData == "client-payload");
+        }
+    }
+}
 }
 
 int main() {
@@ -1322,6 +1456,7 @@ int main() {
         cmocka_unit_test(test_duplicate_idempotent_records_apply_once_after_durable_restart),
         cmocka_unit_test(test_idempotent_retry_after_durable_snapshot_restart_returns_cached_result),
         cmocka_unit_test(test_idempotent_retry_after_multi_voter_durable_snapshot_restart),
+        cmocka_unit_test(test_closed_idempotent_session_survives_durable_snapshot_restart),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }
