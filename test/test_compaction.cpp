@@ -1996,6 +1996,123 @@ struct TFiles {
     }
     ~TFiles() { std::error_code ignored; std::filesystem::remove_all(Directory, ignored); }
 };
+void test_durable_stale_snapshot_membership_recovery_survives_restart(void**) {
+    for (bool jointSuccessor : {false, true}) {
+        TFiles files;
+        const std::vector<uint32_t> original{1, 2, 3};
+        const std::vector<uint32_t> intermediate{2, 3, 4};
+        const std::vector<uint32_t> stableVoters{3, 4, 5};
+        const std::vector<uint32_t> jointVoters{4, 5, 6};
+
+        TKv image;
+        image.Write(image.Prepare(Command("membership", "before recovery")), 5);
+        TSnapshot known{5, 2, original, image.SaveSnapshot()};
+        {
+            TDurableState state(files.Name, 2);
+            state.BindVoters(original);
+            state.CurrentTerm = 3;
+            state.Commit();
+            state.InstallSnapshot(known);
+        }
+
+        const auto snapshotIndex = jointSuccessor ? 9 : 10;
+        const auto value = jointSuccessor ? "recovered joint" : "recovered stable";
+        image.Write(image.Prepare(Command("membership", value)), snapshotIndex);
+
+        const TSnapshotConfigurationTransition anchor{original, intermediate, 0, 0, 6, 3, 7, 3};
+        const TSnapshotConfigurationTransition tail{intermediate,
+            jointSuccessor ? jointVoters : stableVoters, 7, 3, 8, 3,
+            jointSuccessor ? 0u : 9u, jointSuccessor ? 0u : 3u};
+        TSnapshot incoming;
+        incoming.Index = snapshotIndex;
+        incoming.Term = 3;
+        incoming.Data = image.SaveSnapshot();
+        incoming.ConfigurationTransitions = {anchor, tail};
+        incoming.PreviousVoters = intermediate;
+        incoming.PreviousConfigurationIndex = 7;
+        incoming.PreviousConfigurationTerm = 3;
+        incoming.PreviousJointIndex = 8;
+        incoming.PreviousJointTerm = 3;
+        if (jointSuccessor) {
+            incoming.Voters = intermediate;
+            incoming.JointVoters = jointVoters;
+            incoming.ConfigurationIndex = 8;
+            incoming.ConfigurationTerm = 3;
+        } else {
+            incoming.Voters = stableVoters;
+            incoming.StableConfiguration = true;
+            incoming.ConfigurationIndex = 9;
+            incoming.ConfigurationTerm = 3;
+        }
+
+        std::vector<TMessageHolder<TInstallSnapshotResponse>> replies;
+        auto buildRaft = [&](std::shared_ptr<IState> state, std::shared_ptr<TApplication> application) {
+            TNodeDict peers;
+            for (uint32_t id : {1, 3, 4, 5, 6})
+                peers.emplace(id, std::make_shared<TEndpoint>([&](auto message) {
+                    replies.push_back(message.template Cast<TInstallSnapshotResponse>());
+                }));
+            auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{4, 5, 6});
+            auto processor = std::make_unique<TRequestProcessor>(raft, application, peers);
+            return std::pair{std::move(raft), std::move(processor)};
+        };
+        auto install = [&](const std::shared_ptr<TRaft>& raft, const TSnapshot& candidate) {
+            const auto bytes = EncodeSnapshot(candidate);
+            auto request = Chunk(candidate, bytes, 0, static_cast<uint32_t>(bytes.size()));
+            request->Src = 3;
+            request->LeaderId = 3;
+            raft->Process({}, request);
+            return replies.back();
+        };
+
+        {
+            auto state = std::make_shared<TDurableState>(files.Name, 2);
+            auto application = std::make_shared<TApplication>();
+            auto [raft, processor] = buildRaft(state, application);
+            assert_int_equal(application->LastAppliedIndex, known.Index);
+
+            auto conflict = incoming;
+            const std::vector<uint32_t> conflictingIntermediate{2, 4, 5};
+            conflict.ConfigurationTransitions[0].NewVoters = conflictingIntermediate;
+            conflict.ConfigurationTransitions[1].OldVoters = conflictingIntermediate;
+            conflict.PreviousVoters = conflictingIntermediate;
+            if (jointSuccessor) conflict.Voters = conflictingIntermediate;
+            auto response = install(raft, conflict);
+            assert_false(response->Success);
+            assert_false(response->Installed);
+            assert_true(*state->GetSnapshot() == known);
+            assert_int_equal(application->Loads, 1);
+
+            response = install(raft, incoming);
+            assert_true(response->Success);
+            assert_true(response->Installed);
+            assert_true(state->GetBoundVoters() == original);
+            assert_int_equal(state->CommitIndex, snapshotIndex);
+            assert_true(state->GetSnapshot()->ConfigurationTransitions ==
+                std::vector<TSnapshotConfigurationTransition>({anchor, tail}));
+            assert_true(raft->GetConfigurationState().Committed.IsJoint() == jointSuccessor);
+            assert_int_equal(application->LastAppliedIndex, snapshotIndex);
+            assert_true(Read(*application, "membership") == value);
+        }
+
+        replies.clear();
+        auto recovered = std::make_shared<TDurableState>(files.Name, 2);
+        assert_true(recovered->GetBoundVoters() == original);
+        assert_int_equal(recovered->SnapshotIndex, snapshotIndex);
+        assert_int_equal(recovered->CommitIndex, snapshotIndex);
+        assert_true(recovered->GetSnapshot()->ConfigurationTransitions ==
+            std::vector<TSnapshotConfigurationTransition>({anchor, tail}));
+        auto application = std::make_shared<TApplication>();
+        auto [raft, processor] = buildRaft(recovered, application);
+        assert_true(raft->GetConfigurationState().Committed.IsJoint() == jointSuccessor);
+        if (jointSuccessor)
+            assert_true(raft->GetVoterIds() == std::vector<uint32_t>({2, 3, 4, 5, 6}));
+        else
+            assert_true(raft->GetVoterIds() == stableVoters);
+        assert_int_equal(application->LastAppliedIndex, snapshotIndex);
+        assert_true(Read(*application, "membership") == value);
+    }
+}
 struct TCountingDurable : TDurableState {
     using TDurableState::TDurableState;
     mutable unsigned Reads = 0;
@@ -2191,6 +2308,7 @@ int main() {
         cmocka_unit_test(test_durable_compacted_boundary_survives_restart),
         cmocka_unit_test(test_snapshot_and_suffix_are_atomic_at_every_publication_stage),
         cmocka_unit_test(test_remote_snapshot_install_crash_before_application_load_recovers_on_restart),
+        cmocka_unit_test(test_durable_stale_snapshot_membership_recovery_survives_restart),
         cmocka_unit_test(test_compaction_reclaims_durable_prefix_bytes),
         cmocka_unit_test(test_durable_v4_semantic_corruption_rejects_without_rewriting),
 #endif
