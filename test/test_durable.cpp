@@ -1013,6 +1013,39 @@ void test_compacted_legacy_disk_state_migration_preserves_snapshot_and_suffix(vo
     assert_true(membership.Committed.OldVoters() == finalVoters);
     assert_false(membership.Committed.IsJoint());
 
+    const auto occupiedBase = (files.Directory / "occupied-destination").string();
+    {
+        TDurableState occupied(occupiedBase, 2);
+        occupied.BindVoters(original);
+        occupied.Append(Entry(1, "existing destination"));
+    }
+    const auto occupiedImagePath = occupiedBase + ".durable.2";
+    auto readImage = [](const std::string& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    };
+    const auto occupiedBytes = readImage(occupiedImagePath);
+    bool occupiedDestinationRejected = false;
+    try { MigrateLegacyDiskState(legacy, occupiedBase, 2, original, 9); }
+    catch (const std::exception&) { occupiedDestinationRejected = true; }
+    assert_true(occupiedDestinationRejected);
+    assert_true(readImage(occupiedImagePath) == occupiedBytes);
+
+    const auto collidingBase = (files.Directory / "colliding-destination").string();
+    const auto collidingImagePath = collidingBase + ".durable.2";
+    {
+        std::ofstream collision(collidingImagePath, std::ios::binary);
+        collision << "preserve this pre-existing image";
+        assert_true(bool(collision));
+    }
+    const auto collidingBytes = readImage(collidingImagePath);
+    bool collidingDestinationRejected = false;
+    try { MigrateLegacyDiskState(legacy, collidingBase, 2, original, 9); }
+    catch (const std::exception&) { collidingDestinationRejected = true; }
+    assert_true(collidingDestinationRejected);
+    assert_true(readImage(collidingImagePath) == collidingBytes);
+    assert_false(fs::exists(collidingImagePath + ".lock"));
+
     const auto unanchoredLegacy = (files.Directory / "unanchored-legacy").string();
     const auto rejectedDurable = (files.Directory / "unanchored-durable").string();
     const std::vector<uint32_t> unknownOriginal{7, 8, 9};
@@ -1046,6 +1079,7 @@ void test_compacted_legacy_disk_state_migration_preserves_snapshot_and_suffix(vo
     catch (const std::exception&) { unanchoredMigrationRejected = true; }
     assert_true(unanchoredMigrationRejected);
     assert_false(fs::exists(rejectedDurable + ".durable.2"));
+    assert_false(fs::exists(rejectedDurable + ".durable.2.lock"));
 }
 void test_get_and_append_do_not_share_mutable_entries(void**) {
     TFiles files;

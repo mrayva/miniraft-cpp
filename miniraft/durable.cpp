@@ -11,6 +11,7 @@
 #include <exception>
 #include <iostream>
 #include <span>
+#include <cstdlib>
 #ifdef __linux__
 #include <fcntl.h>
 #include <sys/file.h>
@@ -815,8 +816,13 @@ TLegacyDiskStateMigrationInfo CheckLegacyDiskStateMigration(const std::string& l
 TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(const std::string& legacyBase,
         const std::string& durableBase, uint32_t nodeId,
         const std::vector<uint32_t>& trustedVoters, uint64_t commitIndex) {
-    if (NormalizedBase(legacyBase) == NormalizedBase(durableBase))
+    const auto finalBase = NormalizedBase(durableBase);
+    if (NormalizedBase(legacyBase) == finalBase)
         throw std::invalid_argument("Legacy and durable stores must use different base paths");
+    const auto finalBaseName = finalBase.string();
+    for (const auto* kind : {"entries", "index", "state"})
+        if (std::filesystem::exists(finalBaseName + "." + kind + "." + std::to_string(nodeId)))
+            throw std::runtime_error("Legacy storage exists at the migration destination");
 
     RequireExistingLegacyDiskFiles(legacyBase, nodeId);
     TDiskState source(legacyBase, nodeId, {}, false);
@@ -829,8 +835,28 @@ TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(const std::string& legacyBa
     for (uint64_t index = info.SnapshotIndex + 1; index <= info.LastLogIndex; ++index)
         entries.push_back(Clone(source.Get(static_cast<int64_t>(index))));
 
+#ifndef __linux__
+    throw std::runtime_error("Legacy disk-state migration currently requires Linux");
+#else
+    auto pattern = (finalBase.parent_path() /
+        (finalBase.filename().string() + ".migration.XXXXXX")).string();
+    pattern.push_back('\0');
+    const auto* createdDirectory = mkdtemp(pattern.data());
+    Require(createdDirectory != nullptr, "create migration staging directory");
+    const std::filesystem::path stagingDirectory(createdDirectory);
+    struct TStagingDirectoryCleanup {
+        std::filesystem::path Path;
+        ~TStagingDirectoryCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(Path, ignored);
+        }
+    } stagingCleanup{stagingDirectory};
+    const auto stagingBase = (stagingDirectory / "state").string();
+    const auto stagingFile = std::filesystem::path(stagingBase).filename().string() +
+        ".durable." + std::to_string(nodeId);
+
     {
-        TDurableState destination(durableBase, nodeId);
+        TDurableState destination(stagingBase, nodeId);
         if (destination.Impl->Recovered || !destination.Impl->Log.empty() ||
             destination.Impl->Snapshot || !destination.Impl->Voters.empty() ||
             destination.LastLogIndex || destination.SnapshotIndex || destination.CommitIndex ||
@@ -846,22 +872,39 @@ TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(const std::string& legacyBa
         destination.LastLogIndex = info.LastLogIndex;
         destination.LastLogTerm = info.LastLogTerm;
         destination.CommitIndex = info.CommitIndex;
-        destination.Commit();
+        destination.Publish();
     }
-    TDurableState verified(durableBase, nodeId);
-    if (verified.CurrentTerm != info.CurrentTerm || verified.VotedFor != info.VotedFor ||
-        verified.LastLogIndex != info.LastLogIndex || verified.LastLogTerm != info.LastLogTerm ||
-        verified.CommitIndex != info.CommitIndex || verified.GetBoundVoters() != trustedVoters ||
-        verified.SnapshotIndex != info.SnapshotIndex || verified.SnapshotTerm != info.SnapshotTerm ||
-        bool(verified.GetSnapshot()) != bool(source.GetSnapshot()) ||
-        (source.GetSnapshot() && *verified.GetSnapshot() != *source.GetSnapshot()))
-        throw std::runtime_error("Migrated durable metadata failed reopen verification");
-    for (uint64_t index = info.SnapshotIndex + 1; index <= info.LastLogIndex; ++index) {
-        const auto oldEntry = source.Get(static_cast<int64_t>(index));
-        const auto newEntry = verified.Get(static_cast<int64_t>(index));
-        if (!newEntry || oldEntry->Len != newEntry->Len ||
-            memcmp(oldEntry.Mes, newEntry.Mes, oldEntry->Len) != 0)
-            throw std::runtime_error("Migrated durable log failed reopen verification");
+    {
+        TDurableState verified(stagingBase, nodeId);
+        if (verified.CurrentTerm != info.CurrentTerm || verified.VotedFor != info.VotedFor ||
+            verified.LastLogIndex != info.LastLogIndex || verified.LastLogTerm != info.LastLogTerm ||
+            verified.CommitIndex != info.CommitIndex || verified.GetBoundVoters() != trustedVoters ||
+            verified.SnapshotIndex != info.SnapshotIndex || verified.SnapshotTerm != info.SnapshotTerm ||
+            bool(verified.GetSnapshot()) != bool(source.GetSnapshot()) ||
+            (source.GetSnapshot() && *verified.GetSnapshot() != *source.GetSnapshot()))
+            throw std::runtime_error("Migrated durable metadata failed reopen verification");
+        for (uint64_t index = info.SnapshotIndex + 1; index <= info.LastLogIndex; ++index) {
+            const auto oldEntry = source.Get(static_cast<int64_t>(index));
+            const auto newEntry = verified.Get(static_cast<int64_t>(index));
+            if (!newEntry || oldEntry->Len != newEntry->Len ||
+                memcmp(oldEntry.Mes, newEntry.Mes, oldEntry->Len) != 0)
+                throw std::runtime_error("Migrated durable log failed reopen verification");
+        }
     }
+
+    const auto finalDirectory = finalBase.parent_path();
+    TFd directory(open(finalDirectory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    Require(directory.Value >= 0, "open migration destination directory");
+    const auto finalFile = finalBase.filename().string() + ".durable." + std::to_string(nodeId);
+    // The final store name is linked only after the complete image has been
+    // published and reopened from the private staging directory. linkat is
+    // atomic and refuses to replace an existing destination. The store lock
+    // is created by the first normal open, after this complete image exists.
+    TFd staging(open(stagingDirectory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    Require(staging.Value >= 0, "open migration staging directory");
+    Require(linkat(staging.Value, stagingFile.c_str(), directory.Value, finalFile.c_str(), 0) == 0,
+        "publish migrated durable image");
+    Sync(directory.Value);
     return info;
+#endif
 }
