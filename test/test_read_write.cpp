@@ -490,10 +490,15 @@ int RunSocketJointSnapshotMembershipTest(const std::filesystem::path& dir) {
         size_t Loads = 0;
         TMessageHolder<TMessage> Read(TMessageHolder<TCommandRequest>, uint64_t) override { return {}; }
         TMessageHolder<TMessage> Write(TMessageHolder<TLogEntry> entry, uint64_t) override {
-            if (std::string_view(entry->Data) == "joint-snapshot-payload")
+            const std::string_view payload(entry->Data, entry->Len - sizeof(TLogEntry));
+            constexpr std::string_view snapshotPayload = "joint-snapshot-payload";
+            const bool isSnapshotPayload = payload == snapshotPayload ||
+                (payload.size() == snapshotPayload.size() + 1 && payload.back() == '\0' &&
+                    payload.substr(0, snapshotPayload.size()) == snapshotPayload);
+            if (isSnapshotPayload)
                 Value.assign(256 * 1024, 'x');
             else
-                Value = entry->Data;
+                Value.assign(payload);
             return {};
         }
         TMessageHolder<TLogEntry> Prepare(TMessageHolder<TCommandRequest>) override {
