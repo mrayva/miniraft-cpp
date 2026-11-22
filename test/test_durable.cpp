@@ -86,6 +86,63 @@ TMessageHolder<TLogEntry> Entry(uint64_t term, const std::string& data) {
     memcpy(entry->Data, data.data(), data.size());
     return entry;
 }
+struct TDurableControlRsm : IIdempotentRsm {
+    TIdempotencySnapshot State;
+
+    TMessageHolder<TMessage> Read(TMessageHolder<TCommandRequest>, uint64_t index) override {
+        return NewHoldedMessage(TCommandResponse{.Index = index});
+    }
+    TMessageHolder<TMessage> Write(TMessageHolder<TLogEntry>, uint64_t index) override {
+        LastAppliedIndex = index;
+        State.LastAppliedIndex = index;
+        return NewHoldedMessage(TCommandResponse{.Index = index});
+    }
+    TMessageHolder<TLogEntry> Prepare(TMessageHolder<TCommandRequest>) override {
+        return NewHoldedMessage<TLogEntry>();
+    }
+    void ValidateIdempotent(TMessageHolder<TIdempotentCommandRequest>) const override { }
+    uint64_t CachedResponseDataUpperBound(
+            TMessageHolder<TIdempotentCommandRequest>) const override { return 0; }
+    TMessageHolder<TLogEntry> PrepareIdempotent(
+            TMessageHolder<TIdempotentCommandRequest>) override {
+        return NewHoldedMessage<TLogEntry>();
+    }
+    TIdempotentWriteResult WriteIdempotent(TMessageHolder<TLogEntry>, uint64_t index,
+            const TIdempotentOperationIdentity&) override {
+        LastAppliedIndex = index;
+        State.LastAppliedIndex = index;
+        return {.Index = index, .ErrorCode = TCommandResponse::Success};
+    }
+    void ValidateIdempotencyControl(const TIdempotencyControlOperation& operation) const override {
+        ValidateIdempotencyControlOperation(operation);
+        if (operation.Kind == EIdempotencyControlKind::AdvanceEpoch && State.Epoch != operation.Epoch)
+            throw std::invalid_argument("Unexpected durable test epoch");
+    }
+    TMessageHolder<TLogEntry> PrepareIdempotencyControl(
+            const TIdempotencyControlOperation&) override {
+        return NewHoldedMessage<TLogEntry>();
+    }
+    void ApplyIdempotencyControl(const TIdempotencyControlOperation& operation,
+            TMessageHolder<TLogEntry> applicationEntry, uint64_t index) override {
+        State.ApplicationData.assign(applicationEntry->Data,
+            applicationEntry->Len - sizeof(TLogEntry));
+        if (operation.Kind == EIdempotencyControlKind::AdvanceEpoch)
+            State.Epoch = operation.NewEpoch;
+        State.LastAppliedIndex = index;
+        LastAppliedIndex = index;
+    }
+    TIdempotencySnapshot CaptureIdempotencySnapshot() const override { return State; }
+    void ValidateIdempotencySnapshot(const TIdempotencySnapshot& snapshot,
+            uint64_t index) const override {
+        ::ValidateIdempotencySnapshot(snapshot, SnapshotLimits);
+        if (snapshot.LastAppliedIndex != index)
+            throw std::invalid_argument("Durable test snapshot boundary mismatch");
+    }
+    void RestoreIdempotencySnapshot(TIdempotencySnapshot snapshot, uint64_t index) override {
+        State = std::move(snapshot);
+        LastAppliedIndex = index;
+    }
+};
 std::string Data(TDurableState& state, int64_t index);
 
 void test_v1_v2_v3_images_recover_conservatively_and_upgrade_on_publish(void**) {
@@ -845,6 +902,36 @@ void test_raft_election_and_application_replay_after_restart(void**) {
         assert_int_equal(rsm->LastAppliedIndex, state->LastLogIndex);
     }
 }
+void test_idempotency_control_survives_durable_restart_and_replays_atomically(void**) {
+    TFiles files;
+    const TIdempotencyControlOperation operation{
+        .Kind = EIdempotencyControlKind::AdvanceEpoch,
+        .Epoch = 2,
+        .NewEpoch = 3,
+    };
+    auto control = EncodeIdempotencyControlLogEntry(operation, Entry(1, "durable-control"));
+    {
+        TDurableState state(files.Name, 1);
+        state.CurrentTerm = 1;
+        state.BindVoters({1});
+        state.AppendBatchAndCommit({control}, 1);
+    }
+
+    auto state = std::make_shared<TDurableState>(files.Name, 1);
+    assert_int_equal(state->LastLogIndex, 1);
+    assert_int_equal(state->CommitIndex, 1);
+    assert_int_equal(state->Get(1)->Flags, TLogEntry::EIdempotencyControl);
+    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+    auto rsm = std::make_shared<TDurableControlRsm>();
+    rsm->State.Epoch = 2;
+    TRequestProcessor processor(raft, rsm, {});
+    processor.ProcessCommitted();
+
+    assert_int_equal(rsm->LastAppliedIndex, 1);
+    assert_int_equal(rsm->State.LastAppliedIndex, 1);
+    assert_int_equal(rsm->State.Epoch, 3);
+    assert_true(rsm->State.ApplicationData == "durable-control");
+}
 }
 
 int main() {
@@ -871,6 +958,7 @@ int main() {
         cmocka_unit_test(test_legacy_vote_cannot_be_justified_by_uncommitted_membership),
         cmocka_unit_test(test_get_and_append_do_not_share_mutable_entries),
         cmocka_unit_test(test_raft_election_and_application_replay_after_restart),
+        cmocka_unit_test(test_idempotency_control_survives_durable_restart_and_replays_atomically),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }
