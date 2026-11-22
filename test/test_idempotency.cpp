@@ -164,6 +164,21 @@ struct TDeduplicatingSnapshotRsm : TSnapshotRsm {
     void ValidateIdempotent(TMessageHolder<TIdempotentCommandRequest> request) const override {
         if (request->Epoch != State.Epoch)
             throw std::invalid_argument("Unexpected idempotent test epoch");
+        const auto existing = std::find_if(State.Sessions.begin(), State.Sessions.end(),
+            [&](const auto& session) {
+                return session.SessionIdHigh == request->SessionIdHigh &&
+                    session.SessionIdLow == request->SessionIdLow;
+            });
+        if (existing == State.Sessions.end()) {
+            if (request->Sequence != 1)
+                throw std::invalid_argument("New idempotent test sessions must start at sequence 1");
+            return;
+        }
+        if (request->Sequence < existing->HighestSequence)
+            throw std::invalid_argument("Stale idempotent test sequence");
+        if (request->Sequence > existing->HighestSequence &&
+            request->Sequence - existing->HighestSequence > 1)
+            throw std::invalid_argument("Gap in idempotent test sequence");
     }
     TIdempotentWriteResult WriteIdempotent(TMessageHolder<TLogEntry> command, uint64_t index,
             const TIdempotentOperationIdentity& identity) override {
@@ -185,6 +200,13 @@ struct TDeduplicatingSnapshotRsm : TSnapshotRsm {
                 identity.PayloadDigest == existing->PayloadDigest)
                 return {.Index = existing->LogIndex, .ErrorCode = existing->ErrorCode,
                     .Data = existing->ResponseData};
+            if (identity.Sequence == existing->HighestSequence)
+                return {.Index = index, .ErrorCode = TCommandResponse::IdempotencyConflict};
+            if (identity.Sequence < existing->HighestSequence)
+                return {.Index = existing->LogIndex, .ErrorCode = TCommandResponse::AlreadyCompleted};
+            if (identity.Sequence - existing->HighestSequence > 1)
+                return {.Index = index, .ErrorCode = TCommandResponse::IdempotencyConflict};
+        } else if (identity.Sequence != 1) {
             return {.Index = index, .ErrorCode = TCommandResponse::IdempotencyConflict};
         }
 
@@ -192,15 +214,23 @@ struct TDeduplicatingSnapshotRsm : TSnapshotRsm {
         if (!State.ApplicationData.empty()) State.ApplicationData.push_back('|');
         State.ApplicationData += payload;
         const std::string response = "result:" + payload;
-        State.Sessions.push_back({
-            .SessionIdHigh = identity.SessionIdHigh,
-            .SessionIdLow = identity.SessionIdLow,
-            .HighestSequence = identity.Sequence,
-            .PayloadDigest = identity.PayloadDigest,
-            .LogIndex = index,
-            .ErrorCode = TCommandResponse::Success,
-            .ResponseData = response,
-        });
+        if (existing != State.Sessions.end()) {
+            existing->HighestSequence = identity.Sequence;
+            existing->PayloadDigest = identity.PayloadDigest;
+            existing->LogIndex = index;
+            existing->ErrorCode = TCommandResponse::Success;
+            existing->ResponseData = response;
+        } else {
+            State.Sessions.push_back({
+                .SessionIdHigh = identity.SessionIdHigh,
+                .SessionIdLow = identity.SessionIdLow,
+                .HighestSequence = identity.Sequence,
+                .PayloadDigest = identity.PayloadDigest,
+                .LogIndex = index,
+                .ErrorCode = TCommandResponse::Success,
+                .ResponseData = response,
+            });
+        }
         return {.Index = index, .ErrorCode = TCommandResponse::Success, .Data = response};
     }
     TIdempotencySnapshot CaptureIdempotencySnapshot() const override {
@@ -1093,6 +1123,70 @@ void test_idempotent_sequence_reuse_with_different_payload_conflicts_without_mut
         assert_int_equal(application->LastAppliedIndex, 3);
     }
 }
+
+void test_idempotent_stale_and_gap_sequences_reject_before_append(void**) {
+    TIdempotencyCluster cluster(3);
+    cluster.Elect(1);
+    cluster.Replicate(1);
+
+    const auto submit = [](uint32_t cookie, uint64_t sequence,
+                            std::string_view payload = "work") {
+        auto request = IdempotentRequest(cookie, payload);
+        request->Sequence = sequence;
+        return request;
+    };
+    auto firstClient = std::make_shared<TIdempotencyPeer>();
+    cluster.Processors[0]->OnIdempotentCommandRequest(submit(61, 1), firstClient);
+    cluster.Replicate(1);
+    auto secondClient = std::make_shared<TIdempotencyPeer>();
+    cluster.Processors[0]->OnIdempotentCommandRequest(submit(62, 2, "next"), secondClient);
+    cluster.Replicate(1);
+
+    const auto& application = *cluster.Applications[0];
+    assert_int_equal(application.State.Sessions.size(), 1);
+    assert_int_equal(application.State.Sessions.front().HighestSequence, 2);
+    assert_int_equal(application.ApplicationMutations, 2);
+    assert_true(application.State.ApplicationData == "work|next");
+    const auto committedLogIndex = cluster.Rafts[0]->GetState()->LastLogIndex;
+    const auto savedSession = application.State.Sessions.front();
+
+    const auto rejectWithoutAppend = [&](uint32_t cookie, uint64_t sequence) {
+        auto client = std::make_shared<TIdempotencyPeer>();
+        bool rejected = false;
+        try {
+            cluster.Processors[0]->OnIdempotentCommandRequest(submit(cookie, sequence), client);
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        assert_true(rejected);
+        assert_true(client->Sent.empty());
+        assert_int_equal(cluster.Rafts[0]->GetState()->LastLogIndex, committedLogIndex);
+        assert_int_equal(application.ApplicationMutations, 2);
+        assert_true(application.State.ApplicationData == "work|next");
+        assert_int_equal(application.State.Sessions.front().HighestSequence, 2);
+        assert_int_equal(application.State.Sessions.front().LogIndex, savedSession.LogIndex);
+        assert_true(application.State.Sessions.front().PayloadDigest == savedSession.PayloadDigest);
+        assert_true(application.State.Sessions.front().ResponseData == savedSession.ResponseData);
+    };
+    rejectWithoutAppend(63, 1); // Below the session high-water mark.
+    rejectWithoutAppend(64, 4); // Skips sequence 3.
+
+    auto newSessionGap = submit(65, 2, "new-session-gap");
+    newSessionGap->SessionIdHigh = 21;
+    newSessionGap->SessionIdLow = 22;
+    auto client = std::make_shared<TIdempotencyPeer>();
+    bool rejected = false;
+    try {
+        cluster.Processors[0]->OnIdempotentCommandRequest(newSessionGap, client);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    assert_true(rejected);
+    assert_true(client->Sent.empty());
+    assert_int_equal(cluster.Rafts[0]->GetState()->LastLogIndex, committedLogIndex);
+    assert_int_equal(application.State.Sessions.size(), 1);
+    assert_int_equal(application.ApplicationMutations, 2);
+}
 }
 
 int main() {
@@ -1116,6 +1210,7 @@ int main() {
         cmocka_unit_test(test_idempotent_retry_after_snapshot_recovery_and_leader_change_returns_cached_result),
         cmocka_unit_test(test_duplicate_idempotent_entries_from_two_leaders_apply_once),
         cmocka_unit_test(test_idempotent_sequence_reuse_with_different_payload_conflicts_without_mutation),
+        cmocka_unit_test(test_idempotent_stale_and_gap_sequences_reject_before_append),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }

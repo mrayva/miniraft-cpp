@@ -120,7 +120,10 @@ retries the same identity before replicating the old suffix. Both copies then
 commit, while each RSM applies the operation once and retains the original
 result index. A separate replicated case reuses the committed sequence with a
 different payload, confirms the conflict response, and checks that application
-data and the saved session result remain unchanged. A durable single-voter case
+data and the saved session result remain unchanged. Its test RSM advances a
+session through sequence 2 and rejects stale requests, skipped sequence numbers,
+and a new session starting above sequence 1 before appending; the test verifies
+the log and cached session remain unchanged. A durable single-voter case
 then compacts the combined Raft/application snapshot, reconstructs the Raft and
 RSM objects from disk, and retries the request. The new process returns the
 cached result at its original index with the saved session high-water mark and
@@ -134,8 +137,8 @@ not cause another application mutation on either snapshot-restored replica.
 
 The following tests remain necessary before claiming the full client guarantee:
 
-- Reject gaps, stale sequences, unsupported peers, and session-cache exhaustion
-  before appending a new command.
+- Reject unsupported peers and session-cache exhaustion before appending a new
+  command.
 - Close a session through replicated state, restart, and verify old IDs cannot
   execute again.
 
