@@ -1,7 +1,8 @@
 # Durable client write deduplication design
 
-Status: the replicated protocol hooks are implemented, but MiniRaft does not
-provide a production idempotent state machine or client library. The opt-in
+Status: the replicated protocol hooks and a reference KV idempotent state
+machine are implemented, but MiniRaft does not provide a client library or an
+application-specific durable storage engine. The opt-in
 request type carries operation identity through negotiated forwarding and a
 tagged replicated log record. `IIdempotentRsm` applies committed records and
 captures application data, session records, epoch and progress in one bounded
@@ -143,9 +144,15 @@ isolated, installs the resulting tombstone through snapshot transfer, restarts
 all voters, and elects the snapshot-restored voter. Retrying the closed session
 is rejected before append, with the tombstone and application state unchanged.
 
-The protocol tests use test RSMs. A production `IIdempotentRsm` implementation
-and client library are not included, so the guarantee still needs an integration
-test with an application's own durable state and snapshot implementation.
+The reference `TIdempotentKvRsm` in `examples/idempotent_kv_rsm.cpp` applies
+real KV writes together with session records and exercises combined snapshot
+capture, restore, retry, close-session tombstones and epoch advance. Its focused
+test verifies that a restored retry returns the original response without
+reapplying the KV mutation, and that invalid application snapshot data leaves
+the prior state intact. This closes the test-double-only application-contract
+gap for the sample KV application. A client library and an integration test
+with a deployment application's own durable state and snapshot implementation
+remain open.
 
 ## Implementation status
 
@@ -162,7 +169,9 @@ test with an application's own durable state and snapshot implementation.
   leadership change, duplicate uncommitted copies across leaders, and conflicting
   sequence reuse, stale/gap rejection, unsupported-peer rejection, active-session
   cache exhaustion, durable snapshot restart, and durable session close are
-  covered with test RSMs. Application-specific durable integration remains open.
+  covered with test RSMs. The sample KV application's real write/snapshot path
+  is covered by `test_idempotent_kv`; deployment-specific durable integration
+  remains open.
 
 Clients using ordinary `TCommandRequest` writes retain at-least-once behavior.
 For idempotent requests, a timeout after admission still has an unknown outcome;
