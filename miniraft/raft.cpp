@@ -2736,7 +2736,8 @@ TCompactionMembershipReadiness TRaft::CheckCompactionMembershipReadiness() const
         for (auto voter : Voters) {
             if (voter == Id) continue;
             const auto capability = VolatileState->PeerCapabilities.find(voter);
-            if (capability == VolatileState->PeerCapabilities.end() || !capability->second.InstallSnapshot)
+            if (capability == VolatileState->PeerCapabilities.end() ||
+                capability->second.Term != State->CurrentTerm || !capability->second.InstallSnapshot)
                 readiness.ActiveVotersWithoutSnapshotInstallSupport.push_back(voter);
         }
     }

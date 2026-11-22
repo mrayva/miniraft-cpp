@@ -961,13 +961,20 @@ void test_compaction_membership_readiness_reports_acknowledgement_blockers(void*
         readiness = raft.CheckCompactionMembershipReadiness();
         assert_true(readiness.ActiveVotersWithoutSnapshotInstallSupport == (std::vector<uint32_t>{2}));
         volatileState->PeerCapabilities[2].InstallSnapshot = true;
+        volatileState->CommitAckIndex[2] = 3;
+        volatileState->PeerCapabilities[2].Term = state->CurrentTerm - 1;
+        readiness = raft.CheckCompactionMembershipReadiness();
+        assert_true(readiness.ActiveVotersWithoutSnapshotInstallSupport == (std::vector<uint32_t>{2}));
+        assert_true(readiness.ActiveVotersWithoutConfigurationAck.empty());
+        assert_false(readiness.Ready());
+        compactionError.clear();
+        try { (void)raft.Compact(); }
+        catch (const std::logic_error& error) { compactionError = error.what(); }
+        assert_string_equal(compactionError.c_str(),
+            "Compaction requires every active voter to advertise InstallSnapshot support");
+        volatileState->PeerCapabilities[2].Term = state->CurrentTerm;
         readiness = raft.CheckCompactionMembershipReadiness();
         assert_true(readiness.ActiveVotersWithoutSnapshotInstallSupport.empty());
-        assert_false(readiness.Ready()); // The committed configuration ACK is still behind.
-
-        volatileState->CommitAckIndex[2] = 3;
-        readiness = raft.CheckCompactionMembershipReadiness();
-        assert_true(readiness.ActiveVotersWithoutConfigurationAck.empty());
         assert_true(readiness.Ready());
 
         raft.Become(EState::FOLLOWER);
