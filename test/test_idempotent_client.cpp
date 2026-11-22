@@ -100,9 +100,42 @@ void test_client_persists_pending_identity_and_retries_after_restart(void**) {
     assert_int_equal(recovered.State().NextSequence, 1);
 }
 
+void test_client_replaces_only_a_matching_terminal_session(void**) {
+    auto store = std::make_shared<TMemoryClientStore>();
+    TIdempotentClientSession client(store);
+    client.StartSession(1, 2, 3);
+    auto pending = client.BeginWrite("pending");
+    auto closed = Response(pending, TCommandResponse::SessionClosed);
+    assert_false(client.ReplaceTerminalSession(closed, 1, 2, 4)); // No committed index.
+    closed->Index = 10;
+    ++closed->Sequence;
+    assert_false(client.ReplaceTerminalSession(closed, 1, 2, 4));
+    --closed->Sequence;
+    auto timedOut = Response(pending, TCommandResponse::TimedOut);
+    assert_false(client.ReplaceTerminalSession(timedOut, 1, 2, 4));
+    Reject([&] { client.ReplaceTerminalSession(closed, 1, 2, 3); });
+
+    store->FailNextSave = true;
+    Reject([&] { client.ReplaceTerminalSession(closed, 1, 2, 4); });
+    assert_true(client.State().HasPending);
+    assert_true(store->Saved == client.State());
+    assert_true(client.ReplaceTerminalSession(closed, 1, 2, 4));
+
+    TIdempotentClientSession recovered(store);
+    assert_false(recovered.State().HasPending);
+    auto next = recovered.BeginWrite("new payload");
+    assert_int_equal(next->Sequence, 1);
+    assert_int_equal(next->SessionIdLow, 4);
+    auto stale = Response(next, TCommandResponse::StaleEpoch);
+    stale->Index = 12;
+    assert_true(recovered.ReplaceTerminalSession(stale, 2, 2, 5));
+    assert_int_equal(store->Saved->Epoch, 2);
+}
+
 int main() {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_client_persists_pending_identity_and_retries_after_restart),
+        cmocka_unit_test(test_client_replaces_only_a_matching_terminal_session),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }

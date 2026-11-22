@@ -13,6 +13,7 @@
 #include <miniraft/messages.h>
 #include <miniraft/raft.h>
 #include <miniraft/net/server.h>
+#include <miniraft/net/idempotent_client_transport.h>
 #include <miniraft/timesource.h>
 #include <coroio/all.hpp>
 #ifdef __linux__
@@ -63,6 +64,75 @@ void test_host_endpoint_parser_validates_all_fields(void**) {
         assert_true(rejected);
     }
 }
+
+#ifdef __linux__
+void test_idempotent_client_times_out_and_retries_same_operation(void**) {
+    using namespace std::chrono_literals;
+    struct TStore : IIdempotentClientStateStore {
+        std::optional<TIdempotentClientSessionState> Saved;
+        std::optional<TIdempotentClientSessionState> Load() override { return Saved; }
+        void Save(const TIdempotentClientSessionState& state) override { Saved = state; }
+    };
+    NNet::TLoop<NNet::TDefaultPoller> loop;
+    loop.Poller().SetMaxDuration(1ms);
+    auto store = std::make_shared<TStore>();
+    TIdempotentClientSession session(store);
+    session.StartSession(1, 2, 3);
+    NNet::TSocket listener(NNet::TAddress{"127.0.0.1", 0}, loop.Poller());
+    listener.Bind();
+    listener.Listen();
+    sockaddr_in bound{};
+    socklen_t length = sizeof(bound);
+    assert_int_equal(::getsockname(listener.Fd(), reinterpret_cast<sockaddr*>(&bound), &length), 0);
+    NNet::TAddress address{"127.0.0.1", ntohs(bound.sin_port)};
+    TMessageHolder<TIdempotentCommandRequest> first, retried;
+    auto server = [](NNet::TSocket& listener, auto& first, auto& retried) -> NNet::TFuture<void> {
+        auto stalled = co_await listener.Accept();
+        auto request = co_await TMessageReader(stalled).Read();
+        first = request.template Cast<TIdempotentCommandRequest>();
+        // Keep the first connection open without a reply while accepting a retry.
+        auto active = co_await listener.Accept();
+        request = co_await TMessageReader(active).Read();
+        retried = request.template Cast<TIdempotentCommandRequest>();
+        auto reply = NewHoldedMessage<TIdempotentCommandResponse>();
+        reply->Epoch = retried->Epoch;
+        reply->SessionIdHigh = retried->SessionIdHigh;
+        reply->SessionIdLow = retried->SessionIdLow;
+        reply->Sequence = retried->Sequence;
+        reply->Cookie = retried->Cookie;
+        reply->Index = 42;
+        co_await TMessageWriter(active).Write(reply);
+    }(listener, first, retried);
+    const auto drive = [&](const auto& task) {
+        const auto until = NNet::TClock::now() + 3s;
+        while (!task.done() && NNet::TClock::now() < until) loop.Step();
+        assert_true(task.done());
+    };
+    std::unique_ptr<NNet::TSocket> active;
+    bool connected = false;
+    NNet::TIdempotentClient shortClient(loop.Poller(), address, active, connected, session,
+        NNet::TIdempotentClientRetryOptions{.MaxAttempts = 1, .ExchangeTimeout = 50ms});
+    auto stalled = shortClient.Write("pending payload");
+    drive(stalled);
+    bool timedOut = false;
+    try { (void)stalled.await_resume(); }
+    catch (const std::exception& e) { timedOut = std::string_view(e.what()).find("exchange timed out") != std::string_view::npos; }
+    assert_true(timedOut);
+    assert_false(connected);
+    assert_true(store->Saved && store->Saved->HasPending);
+
+    NNet::TIdempotentClient retryClient(loop.Poller(), address, active, connected, session);
+    auto retry = retryClient.RetryPending();
+    drive(retry);
+    assert_int_equal(retry.await_resume()->Index, 42);
+    drive(server);
+    server.await_resume();
+    assert_true(first && retried);
+    assert_int_equal(first->Len, retried->Len);
+    assert_memory_equal(first.Mes, retried.Mes, first->Len);
+    assert_false(store->Saved->HasPending);
+}
+#endif
 
 void test_node_send_queue_bounds_data_and_coalesces_raft_retries(void**) {
     NNet::TLoop<NNet::TPoll> loop;
@@ -1038,6 +1108,7 @@ int main() {
         cmocka_unit_test(test_server_stages_and_removes_runtime_learner),
         cmocka_unit_test(test_server_forwards_successful_membership_operations),
 #ifdef __linux__
+        cmocka_unit_test(test_idempotent_client_times_out_and_retries_same_operation),
         cmocka_unit_test(test_server_transitions_membership_and_installs_joint_snapshot_over_socket_transport),
         cmocka_unit_test(test_serving_server_retires_demoted_joint_voter_reader),
 #endif

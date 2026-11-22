@@ -1,5 +1,6 @@
 #include <string_view>
 #include <chrono>
+#include <charconv>
 #include <memory>
 #include <stdexcept>
 
@@ -17,6 +18,15 @@
 #include <miniraft/net/idempotent_client_transport.h>
 
 #include <random>
+
+static std::pair<uint64_t, uint64_t> NewClientSessionId() {
+    std::random_device random;
+    const auto random64 = [&] { return (uint64_t(random()) << 32) | uint64_t(random()); };
+    const auto high = random64();
+    auto low = random64();
+    if (!high && !low) low = 1;
+    return {high, low};
+}
 
 std::string EncodeIdempotentKvWrite(std::string_view key, std::string_view value) {
     if (key.size() > UINT16_MAX || value.size() > UINT16_MAX)
@@ -67,6 +77,17 @@ NNet::TFuture<void> Client(TPoller& poller, std::unique_ptr<TSocket> socket,
         idempotentTransport = std::make_unique<TIdempotentTransport>(
             poller, address, socket, socketConnected, *idempotentClient);
     }
+    TMessageHolder<TIdempotentCommandResponse> terminalReply;
+    const auto report = [&](const TMessageHolder<TIdempotentCommandResponse>& response) {
+        ReportIdempotentReply(response);
+        if (response->Index && (response->ErrorCode == TCommandResponse::StaleEpoch ||
+                response->ErrorCode == TCommandResponse::SessionClosed)) {
+            terminalReply = response;
+            std::cout << "After resolving the old outcome, use replace-terminal-session <epoch>.\n";
+        } else if (response->ErrorCode == TCommandResponse::Success) {
+            terminalReply = {};
+        }
+    };
 
     NNet::TLine line;
     TCommandRequest header;
@@ -79,7 +100,7 @@ NNet::TFuture<void> Client(TPoller& poller, std::unique_ptr<TSocket> socket,
         if (idempotentTransport && idempotentTransport->State().HasPending) {
             try {
                 auto response = co_await idempotentTransport->RetryPending();
-                ReportIdempotentReply(response);
+                report(response);
             } catch (const std::exception& error) {
                 std::cout << "Pending idempotent write remains saved after reconnect retries: "
                           << error.what() << "\n";
@@ -96,7 +117,32 @@ NNet::TFuture<void> Client(TPoller& poller, std::unique_ptr<TSocket> socket,
             bool isWrite = false;
             std::string idempotentPayload;
 
-            if (!strcmp(prefix, "set")) {
+            if (!strcmp(prefix, "replace-terminal-session") && idempotentClient) {
+                const auto* argument = strtok(nullptr, sep);
+                uint64_t epoch = 0;
+                if (argument) {
+                    const auto* end = argument + strlen(argument);
+                    const auto result = std::from_chars(argument, end, epoch);
+                    if (result.ec != std::errc{} || result.ptr != end) epoch = 0;
+                }
+                if (!epoch || strtok(nullptr, sep)) {
+                    std::cout << "Expected replace-terminal-session <positive epoch>\n";
+                } else if (!terminalReply) {
+                    std::cout << "A matching stale epoch or closed session reply is required.\n";
+                } else {
+                    try {
+                        const auto [high, low] = NewClientSessionId();
+                        if (idempotentClient->ReplaceTerminalSession(terminalReply, epoch, high, low)) {
+                            terminalReply = {};
+                            std::cout << "Started a new session. The previous operation can have applied earlier.\n";
+                        }
+                    } catch (const std::exception& error) {
+                        std::cout << "Could not replace the session: " << error.what() << "\n";
+                    }
+                }
+                std::cout << "> " << std::flush;
+                continue;
+            } else if (!strcmp(prefix, "set")) {
                 auto key = strtok(nullptr, sep);
                 auto val = strtok(nullptr, sep);
                 if (!key || !val) { std::cout << "Expected set <key> <value>\n"; continue; }
@@ -155,7 +201,7 @@ NNet::TFuture<void> Client(TPoller& poller, std::unique_ptr<TSocket> socket,
                         std::cout << "> " << std::flush;
                         continue;
                     }
-                    ReportIdempotentReply(previous);
+                    report(previous);
                     if (idempotentTransport->State().HasPending) {
                         std::cout << "Resolve the pending write before starting another write.\n";
                         std::cout << "> " << std::flush;
@@ -164,7 +210,7 @@ NNet::TFuture<void> Client(TPoller& poller, std::unique_ptr<TSocket> socket,
                 }
                 try {
                     auto response = co_await idempotentTransport->Write(idempotentPayload);
-                    ReportIdempotentReply(response);
+                    report(response);
                 } catch (const std::exception& error) {
                     std::cout << "Pending idempotent write remains saved after reconnect retries: "
                               << error.what() << "\n";
@@ -356,13 +402,7 @@ int main(int argc, char** argv) {
             auto store = std::make_shared<TDurableIdempotentClientStateStore>(clientStatePath);
             idempotentClient = std::make_shared<TIdempotentClientSession>(store);
             if (!idempotentClient->State().Initialized) {
-                std::random_device random;
-                const auto random64 = [&] {
-                    return (uint64_t(random()) << 32) | uint64_t(random());
-                };
-                const auto high = random64();
-                auto low = random64();
-                if (!high && !low) low = 1;
+                const auto [high, low] = NewClientSessionId();
                 idempotentClient->StartSession(1, high, low);
             }
         }

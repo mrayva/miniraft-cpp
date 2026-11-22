@@ -54,8 +54,9 @@ private:
 
 // One in-flight write per session. BeginWrite durably records an operation
 // before returning its request. Repeating the same payload returns the same
-// operation identity; a different payload is rejected until success is
-// acknowledged. The caller supplies a unique session ID and a durable store.
+// operation identity; a different payload requires acknowledgement or explicit
+// replacement of a terminal session. The caller supplies a unique session ID
+// and a durable store.
 // This object is intended for serialized, single-threaded use.
 class TIdempotentClientSession {
 public:
@@ -71,9 +72,17 @@ public:
     // unrelated/late responses leave the pending operation intact.
     bool Complete(const TMessageHolder<TIdempotentCommandResponse>& response);
 
+    // Replaces the pending session atomically after a matching committed
+    // StaleEpoch or SessionClosed reply. The caller must resolve or accept
+    // uncertainty about any earlier application of the pending operation.
+    bool ReplaceTerminalSession(const TMessageHolder<TIdempotentCommandResponse>& response,
+        uint64_t epoch, uint64_t sessionIdHigh, uint64_t sessionIdLow);
+
     const TIdempotentClientSessionState& State() const { return Session; }
 
 private:
+    bool MatchesPending(const TIdempotentCommandResponse& response) const;
+    void SaveNewSession(uint64_t epoch, uint64_t sessionIdHigh, uint64_t sessionIdLow);
     TMessageHolder<TIdempotentCommandRequest> BuildRequest(
         const TIdempotentClientSessionState& state, uint32_t cookie) const;
     void RequireInitialized() const;

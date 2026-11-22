@@ -41,6 +41,11 @@ void TIdempotentClientSession::StartSession(
         uint64_t epoch, uint64_t sessionIdHigh, uint64_t sessionIdLow) {
     if (Session.HasPending)
         throw std::logic_error("Cannot replace a client session with an unresolved write");
+    SaveNewSession(epoch, sessionIdHigh, sessionIdLow);
+}
+
+void TIdempotentClientSession::SaveNewSession(
+        uint64_t epoch, uint64_t sessionIdHigh, uint64_t sessionIdLow) {
     if (Session.Initialized && Session.Epoch == epoch &&
         Session.SessionIdHigh == sessionIdHigh && Session.SessionIdLow == sessionIdLow)
         throw std::invalid_argument("Cannot restart a client session with the same identity and epoch");
@@ -88,11 +93,7 @@ TMessageHolder<TIdempotentCommandRequest> TIdempotentClientSession::RetryPending
 bool TIdempotentClientSession::Complete(
         const TMessageHolder<TIdempotentCommandResponse>& response) {
     ValidateIdempotentCommandResponse(response);
-    if (!Session.HasPending || response->Epoch != Session.Epoch ||
-        response->SessionIdHigh != Session.SessionIdHigh ||
-        response->SessionIdLow != Session.SessionIdLow ||
-        response->Sequence != Session.NextSequence ||
-        response->ErrorCode != TCommandResponse::Success)
+    if (!MatchesPending(*response.Mes) || response->ErrorCode != TCommandResponse::Success)
         return false;
 
     auto candidate = Session;
@@ -102,6 +103,24 @@ bool TIdempotentClientSession::Complete(
     ValidateClientSessionState(candidate);
     Store->Save(candidate);
     Session = std::move(candidate);
+    return true;
+}
+
+bool TIdempotentClientSession::MatchesPending(const TIdempotentCommandResponse& response) const {
+    return Session.HasPending && response.Epoch == Session.Epoch &&
+        response.SessionIdHigh == Session.SessionIdHigh && response.SessionIdLow == Session.SessionIdLow &&
+        response.Sequence == Session.NextSequence;
+}
+
+bool TIdempotentClientSession::ReplaceTerminalSession(
+        const TMessageHolder<TIdempotentCommandResponse>& response,
+        uint64_t epoch, uint64_t sessionIdHigh, uint64_t sessionIdLow) {
+    ValidateIdempotentCommandResponse(response);
+    if (!MatchesPending(*response.Mes) || !response->Index ||
+        (response->ErrorCode != TCommandResponse::StaleEpoch &&
+         response->ErrorCode != TCommandResponse::SessionClosed))
+        return false;
+    SaveNewSession(epoch, sessionIdHigh, sessionIdLow);
     return true;
 }
 

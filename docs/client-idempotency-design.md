@@ -169,8 +169,22 @@ client process is launched again, including after the server applied the write
 but its reply was lost. `NNet::SendPendingIdempotentWriteWithRetry` in
 `miniraft/net/idempotent_client_transport.h` retries within the running process,
 using the same saved operation identity and bounded reconnect/backoff options.
-Exhausted retries leave the operation pending for a later command or process
-restart. Integration with a deployment application's own durable state and
+Each write and reply exchange shares one configurable deadline (35 seconds by
+default), separate from the connect timeout. The timer shuts down the connection
+and waits for pending I/O to unwind before retrying. Socket adapters must
+provide a native descriptor or a nonthrowing `Shutdown()` that wakes pending
+I/O through the poller. Exhausted retries leave the operation pending for a
+later command or process restart.
+
+A matching committed `StaleEpoch` or `SessionClosed` response allows an explicit
+`ReplaceTerminalSession` call. It atomically replaces the saved session with
+a new identity and starts at sequence one. The KV client exposes
+`replace-terminal-session <epoch>` after receiving such a reply. The supplied
+epoch must come from the application or operator. An earlier attempt may have
+applied, so reconcile that outcome before replacing the session or submitting
+the same business operation again.
+
+Integration with a deployment application's own durable state and
 snapshot implementation remains open. The
 `TDurableIdempotentClientStateStore` adapter stores one versioned, checksummed
 session image per file and publishes updates through a synced temporary file,
@@ -205,8 +219,9 @@ complete old or new state is recovered; they do not emulate hardware power loss.
   a committed response, verifies retry returns its cached result, and checks
   the combined snapshot after restart. Same-process reconnect/backoff for the
   reusable network helper is covered by dropping a reply and forwarding the
-  retry. A higher-level client facade and deployment-specific application
-  storage integration remain open. The network component is exported as the
+  retry. The client facade persists successful acknowledgements, and
+  deployment-specific application storage integration remains open.
+  The network component is exported as the
   `miniraft::net` package target when network support is enabled.
 
 Clients using ordinary `TCommandRequest` writes retain at-least-once behavior.

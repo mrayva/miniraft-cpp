@@ -19,14 +19,60 @@ struct TIdempotentClientRetryOptions {
     std::chrono::milliseconds InitialBackoff{50};
     std::chrono::milliseconds MaxBackoff{200};
     std::chrono::milliseconds ConnectTimeout{2000};
+    std::chrono::milliseconds ExchangeTimeout{35000};
 };
 
 template<typename TSocket>
 TFuture<TMessageHolder<TIdempotentCommandResponse>> SendIdempotentRequest(
         TSocket& socket, TMessageHolder<TIdempotentCommandRequest> request) {
-    co_await TMessageWriter(socket).Write(std::move(request));
+    co_await TMessageWriter(socket).Write(request);
     auto reply = co_await TMessageReader(socket).Read();
-    co_return reply.template Cast<TIdempotentCommandResponse>();
+    auto response = reply.template Cast<TIdempotentCommandResponse>();
+    ValidateIdempotentCommandResponse(response);
+    if (response->Epoch != request->Epoch || response->SessionIdHigh != request->SessionIdHigh ||
+        response->SessionIdLow != request->SessionIdLow || response->Sequence != request->Sequence ||
+        response->Cookie != request->Cookie)
+        throw TMessageError("Idempotent reply did not match the request");
+    co_return response;
+}
+
+namespace TDetail {
+template<typename TPoller, typename TSocket>
+TFuture<void> ShutdownAtExchangeDeadline(TPoller& poller, TSocket& socket, TTime due, bool& expired) {
+    co_await poller.Sleep(due);
+    expired = true;
+    // Shutdown wakes the outstanding read/write while leaving its coroutine
+    // and descriptor alive until the poller finishes the operation.
+    if constexpr (requires { { socket.Shutdown() } noexcept; }) {
+        socket.Shutdown();
+    } else {
+        const auto fd = socket.Fd();
+#ifdef _WIN32
+        ::shutdown(static_cast<SOCKET>(fd), SD_BOTH);
+#else
+        ::shutdown(fd, SHUT_RDWR);
+#endif
+    }
+}
+
+template<typename TPoller, typename TSocket>
+TFuture<TMessageHolder<TIdempotentCommandResponse>> ExchangeIdempotentRequest(
+        TPoller& poller, TSocket& socket, TMessageHolder<TIdempotentCommandRequest> request,
+        std::chrono::milliseconds timeout) {
+    const auto start = TClock::now();
+    const auto duration = std::chrono::duration_cast<TTime::duration>(timeout);
+    const auto due = start > TTime::max() - duration ? TTime::max() : start + duration;
+    bool expired = false;
+    // Destroying the sleeping task removes its timer on normal completion.
+    auto timer = ShutdownAtExchangeDeadline(poller, socket, due, expired);
+    try {
+        auto response = co_await SendIdempotentRequest(socket, std::move(request));
+        if (!expired && TClock::now() < due) co_return response;
+    } catch (...) {
+        if (!expired) throw;
+    }
+    throw std::runtime_error("Idempotent write exchange timed out");
+}
 }
 
 // Retries the durable session's one pending operation after transport errors.
@@ -46,27 +92,32 @@ TFuture<TMessageHolder<TIdempotentCommandResponse>> SendPendingIdempotentWriteWi
         throw std::invalid_argument("Invalid idempotent client retry backoff");
     if (options.ConnectTimeout <= std::chrono::milliseconds::zero())
         throw std::invalid_argument("Idempotent client connect timeout must be positive");
+    if (options.ExchangeTimeout <= std::chrono::milliseconds::zero() ||
+        options.ExchangeTimeout > std::chrono::duration_cast<std::chrono::milliseconds>(TTime::duration::max()))
+        throw std::invalid_argument("Invalid idempotent client exchange timeout");
 
     std::string lastError;
     auto backoff = options.InitialBackoff;
     for (size_t attempt = 0; attempt < options.MaxAttempts; ++attempt) {
         try {
             if (attempt == 0 && activeSocketConnected) {
-                auto response = co_await SendIdempotentRequest(
-                    *activeSocket, client.RetryPending());
+                auto response = co_await TDetail::ExchangeIdempotentRequest(
+                    poller, *activeSocket, client.RetryPending(), options.ExchangeTimeout);
                 co_return response;
             }
             auto retrySocket = std::make_unique<TSocket>(address, poller);
             co_await retrySocket->Connect(TClock::now() + options.ConnectTimeout);
-            auto response = co_await SendIdempotentRequest(
-                *retrySocket, client.RetryPending());
+            auto response = co_await TDetail::ExchangeIdempotentRequest(
+                poller, *retrySocket, client.RetryPending(), options.ExchangeTimeout);
             activeSocket = std::move(retrySocket);
             activeSocketConnected = true;
             co_return response;
         } catch (const std::exception& error) {
             lastError = error.what();
-            if (attempt == 0 && activeSocketConnected)
+            if (attempt == 0 && activeSocketConnected) {
                 activeSocketConnected = false;
+                activeSocket.reset();
+            }
         }
         if (attempt + 1 < options.MaxAttempts && backoff > std::chrono::milliseconds::zero())
             co_await poller.Sleep(backoff);
