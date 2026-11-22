@@ -108,19 +108,23 @@ sessionized routes, timeout behavior, capability negotiation (including new
 joint members), atomic control application, and control-record replay after a
 durable restart. Duplicate committed idempotent records also replay after a
 durable restart, applying the command once and returning the original cached
-result. These tests validate the protocol boundary and storage integration
-with test RSMs.
+result. A deterministic three-voter scenario now commits a write while one
+voter is isolated, drops the reply, compacts and installs a snapshot on that
+voter, elects it in a later term, and retries the same identity. The retry
+returns the saved response without another application mutation. These tests
+validate the protocol boundary and storage integration with test RSMs; the
+three-voter scenario uses in-memory Raft storage and does not simulate a process
+restart.
 
 The following tests remain necessary before claiming the full client guarantee:
 
-- Commit a write, drop its reply, retry after leader change, and assert the
-  application runs once and the original response is returned.
 - Retry the same identity and digest while the first copy is uncommitted on a
   former leader; deliver both log copies and assert only one application call.
 - Reuse the latest sequence with a different payload and verify conflict with
   no state mutation.
-- Retry after restart and after snapshot compaction; verify the saved response
-  and high-water mark survive both.
+- Restart a new leader from durable Raft and application snapshots, retry the
+  operation, and verify the saved response and high-water mark survive process
+  restart.
 - Reject gaps, stale sequences, unsupported peers, and session-cache exhaustion
   before appending a new command.
 - Close a session through replicated state, restart, and verify old IDs cannot
@@ -137,8 +141,9 @@ The following tests remain necessary before claiming the full client guarantee:
    controls, and negotiate peer support. **Implemented.**
 4. Validate lost-reply retries, duplicate log copies, leadership changes,
    restart, compaction and resource limits using a stateful deduplicating RSM.
-   **Partially implemented:** protocol and durable control paths have focused
-   tests; the end-to-end scenarios above remain open.
+  **Partially implemented:** lost-reply retry across snapshot installation and
+  leadership change is covered; durable process restart and the scenarios
+  above remain open.
 
 Clients using ordinary `TCommandRequest` writes retain at-least-once behavior.
 For idempotent requests, a timeout after admission still has an unknown outcome;

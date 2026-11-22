@@ -1,9 +1,16 @@
 #include <miniraft/raft.h>
 #include <miniraft/snapshot_codec.h>
+#include <algorithm>
+#include <chrono>
+#include <deque>
 #include <functional>
+#include <memory>
+#include <set>
 #include <stdarg.h>
 #include <stddef.h>
 #include <setjmp.h>
+#include <string>
+#include <vector>
 extern "C" {
 #include <cmocka.h>
 }
@@ -150,6 +157,145 @@ struct TIdempotencyManualTimeSource : ITimeSource {
     Time Value{};
     Time Now() override { return Value; }
 };
+
+struct TDeduplicatingSnapshotRsm : TSnapshotRsm {
+    size_t ApplicationMutations = 0;
+
+    void ValidateIdempotent(TMessageHolder<TIdempotentCommandRequest> request) const override {
+        if (request->Epoch != State.Epoch)
+            throw std::invalid_argument("Unexpected idempotent test epoch");
+    }
+    TIdempotentWriteResult WriteIdempotent(TMessageHolder<TLogEntry> command, uint64_t index,
+            const TIdempotentOperationIdentity& identity) override {
+        const auto payloadSize = command->Len - sizeof(TLogEntry);
+        const std::string payload(command->Data, payloadSize);
+        const auto existing = std::find_if(State.Sessions.begin(), State.Sessions.end(),
+            [&](const auto& session) {
+                return session.SessionIdHigh == identity.SessionIdHigh &&
+                    session.SessionIdLow == identity.SessionIdLow;
+            });
+
+        LastAppliedCommand = payload;
+        LastIdentity = identity;
+        LastAppliedIndex = index;
+        State.LastAppliedIndex = index;
+        if (existing != State.Sessions.end()) {
+            if (identity.Epoch == State.Epoch &&
+                identity.Sequence == existing->HighestSequence &&
+                identity.PayloadDigest == existing->PayloadDigest)
+                return {.Index = existing->LogIndex, .ErrorCode = existing->ErrorCode,
+                    .Data = existing->ResponseData};
+            return {.Index = index, .ErrorCode = TCommandResponse::IdempotencyConflict};
+        }
+
+        ++ApplicationMutations;
+        if (!State.ApplicationData.empty()) State.ApplicationData.push_back('|');
+        State.ApplicationData += payload;
+        const std::string response = "result:" + payload;
+        State.Sessions.push_back({
+            .SessionIdHigh = identity.SessionIdHigh,
+            .SessionIdLow = identity.SessionIdLow,
+            .HighestSequence = identity.Sequence,
+            .PayloadDigest = identity.PayloadDigest,
+            .LogIndex = index,
+            .ErrorCode = TCommandResponse::Success,
+            .ResponseData = response,
+        });
+        return {.Index = index, .ErrorCode = TCommandResponse::Success, .Data = response};
+    }
+    TIdempotencySnapshot CaptureIdempotencySnapshot() const override {
+        auto snapshot = State;
+        snapshot.LastAppliedIndex = LastAppliedIndex;
+        return snapshot;
+    }
+};
+
+struct TIdempotencyQueuedPeer : INode {
+    std::function<void(TMessageHolder<TMessage>)> Deliver;
+    explicit TIdempotencyQueuedPeer(std::function<void(TMessageHolder<TMessage>)> deliver)
+        : Deliver(std::move(deliver)) { }
+    void Send(TMessageHolder<TMessage> message) override { Deliver(std::move(message)); }
+    void Drain() override { }
+};
+
+struct TIdempotencyCluster {
+    std::vector<std::shared_ptr<TRaft>> Rafts;
+    std::vector<std::shared_ptr<TDeduplicatingSnapshotRsm>> Applications;
+    std::vector<std::shared_ptr<TRequestProcessor>> Processors;
+    std::deque<TMessageHolder<TMessage>> Packets;
+    std::set<uint32_t> Isolated;
+    std::shared_ptr<TIdempotencyManualTimeSource> Clock =
+        std::make_shared<TIdempotencyManualTimeSource>();
+
+    explicit TIdempotencyCluster(uint32_t count) {
+        std::vector<TNodeDict> peers(count);
+        for (uint32_t id = 1; id <= count; ++id) {
+            for (uint32_t dst = 1; dst <= count; ++dst) {
+                if (dst != id) peers[id - 1][dst] = std::make_shared<TIdempotencyQueuedPeer>(
+                    [this](auto message) { Packets.push_back(std::move(message)); });
+            }
+        }
+        for (uint32_t id = 1; id <= count; ++id) {
+            auto raft = std::make_shared<TRaft>(std::make_shared<TState>(), id, peers[id - 1]);
+            auto application = std::make_shared<TDeduplicatingSnapshotRsm>();
+            application->State.Epoch = 1;
+            auto processor = std::make_shared<TRequestProcessor>(raft, application, peers[id - 1],
+                TRequestProcessor::TAdmissionLimits{}, Clock);
+            Rafts.push_back(std::move(raft));
+            Applications.push_back(std::move(application));
+            Processors.push_back(std::move(processor));
+        }
+    }
+
+    void Drain() {
+        size_t budget = 50000;
+        while (!Packets.empty()) {
+            assert_true(budget-- > 0);
+            auto message = std::move(Packets.front());
+            Packets.pop_front();
+            auto rpc = message.Cast<TMessageEx>();
+            if (Isolated.count(rpc->Src) || Isolated.count(rpc->Dst)) continue;
+            const auto index = size_t(rpc->Dst - 1);
+            Rafts.at(index)->Process(Clock->Value, message);
+            Processors.at(index)->CheckStateChange();
+            Processors.at(index)->ProcessCommitted();
+            Processors.at(index)->ProcessWaiting();
+        }
+    }
+
+    void Elect(uint32_t id) {
+        Drain();
+        Clock->Value += std::chrono::seconds(30);
+        auto& raft = Rafts.at(id - 1);
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            raft->ProcessTimeout(Clock->Value);
+            Drain();
+        }
+        assert_int_equal(raft->CurrentStateName(), EState::LEADER);
+    }
+
+    void Replicate(uint32_t id, int rounds = 12) {
+        auto& raft = Rafts.at(id - 1);
+        for (int round = 0; round < rounds; ++round) {
+            Clock->Value += std::chrono::milliseconds(500);
+            raft->ProcessTimeout(Clock->Value);
+            Drain();
+        }
+    }
+};
+
+TMessageHolder<TIdempotentCommandRequest> IdempotentRequest(uint32_t cookie) {
+    constexpr std::string_view payload = "work";
+    auto request = NewHoldedMessage<TIdempotentCommandRequest>(
+        sizeof(TIdempotentCommandRequest) + payload.size());
+    request->Epoch = 1;
+    request->SessionIdHigh = 11;
+    request->SessionIdLow = 12;
+    request->Sequence = 1;
+    request->Cookie = cookie;
+    memcpy(request->Data, payload.data(), payload.size());
+    return request;
+}
 
 void test_idempotency_snapshot_roundtrip_preserves_dedup_state(void**) {
     const auto source = MakeSnapshot();
@@ -772,6 +918,61 @@ void test_idempotent_rsm_snapshot_hook_validates_before_atomic_restore(void**) {
     assert_true(restored.State == before);
     assert_int_equal(restored.LastAppliedIndex, 7);
 }
+
+void test_idempotent_retry_after_snapshot_recovery_and_leader_change_returns_cached_result(void**) {
+    TIdempotencyCluster cluster(3);
+    cluster.Elect(1);
+    cluster.Replicate(1);
+    assert_true(cluster.Rafts[0]->CanAppendIdempotentLogEntries());
+
+    // Voter 2 misses the write. Voters 1 and 3 commit and apply it, but the
+    // client loses the successful response and must retry the same identity.
+    cluster.Isolated.insert(2);
+    auto firstClient = std::make_shared<TIdempotencyPeer>();
+    cluster.Processors[0]->OnIdempotentCommandRequest(IdempotentRequest(31), firstClient);
+    cluster.Replicate(1);
+    assert_int_equal(firstClient->Sent.size(), 1);
+    auto firstResponse = firstClient->Sent.back().Cast<TIdempotentCommandResponse>();
+    ValidateIdempotentCommandResponse(firstResponse);
+    assert_int_equal(firstResponse->ErrorCode, TCommandResponse::Success);
+    assert_true(std::string(firstResponse->Data,
+        firstResponse->Len - sizeof(TIdempotentCommandResponse)) == "result:work");
+    const auto originalIndex = firstResponse->Index;
+    firstClient->Sent.clear(); // Simulate losing the reply after the write committed.
+    assert_int_equal(cluster.Applications[0]->ApplicationMutations, 1);
+    assert_int_equal(cluster.Applications[2]->ApplicationMutations, 1);
+
+    const auto snapshot = cluster.Rafts[0]->Compact();
+    assert_int_equal(snapshot.Index, originalIndex);
+    cluster.Isolated.erase(2);
+    cluster.Replicate(1);
+    assert_int_equal(cluster.Rafts[1]->GetState()->SnapshotIndex, snapshot.Index);
+    assert_int_equal(cluster.Applications[1]->LastAppliedIndex, snapshot.Index);
+    assert_true(cluster.Applications[1]->State.ApplicationData == "work");
+    assert_int_equal(cluster.Applications[1]->State.Sessions.size(), 1);
+
+    // The snapshot restored the dedup record on voter 2. It wins a new term,
+    // then receives the client's retry while the original leader remains live.
+    cluster.Elect(2);
+    cluster.Replicate(2);
+    assert_true(cluster.Rafts[1]->CanAppendIdempotentLogEntries());
+    auto retryClient = std::make_shared<TIdempotencyPeer>();
+    cluster.Processors[1]->OnIdempotentCommandRequest(IdempotentRequest(32), retryClient);
+    cluster.Replicate(2);
+
+    assert_int_equal(retryClient->Sent.size(), 1);
+    auto retryResponse = retryClient->Sent.back().Cast<TIdempotentCommandResponse>();
+    ValidateIdempotentCommandResponse(retryResponse);
+    assert_int_equal(retryResponse->ErrorCode, TCommandResponse::Success);
+    assert_int_equal(retryResponse->Cookie, 32);
+    assert_int_equal(retryResponse->Index, originalIndex);
+    assert_true(std::string(retryResponse->Data,
+        retryResponse->Len - sizeof(TIdempotentCommandResponse)) == "result:work");
+    assert_true(cluster.Applications[1]->State.ApplicationData == "work");
+    assert_int_equal(cluster.Applications[1]->ApplicationMutations, 0);
+    assert_int_equal(cluster.Applications[2]->ApplicationMutations, 1);
+    assert_true(cluster.Applications[2]->State.ApplicationData == "work");
+}
 }
 
 int main() {
@@ -792,6 +993,7 @@ int main() {
         cmocka_unit_test(test_rsm_without_idempotency_rejects_tagged_append_entries),
         cmocka_unit_test(test_idempotency_control_capability_is_advertised_and_recorded),
         cmocka_unit_test(test_idempotent_rsm_snapshot_hook_validates_before_atomic_restore),
+        cmocka_unit_test(test_idempotent_retry_after_snapshot_recovery_and_leader_change_returns_cached_result),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }
