@@ -360,6 +360,104 @@ void test_server_stages_and_removes_runtime_learner(void**) {
     assert_true(raft->GetLearnerIds().empty());
 }
 
+void test_server_forwards_successful_membership_operations(void**) {
+#ifdef __linux__
+    struct TEndpoint : INode {
+        std::vector<TMessageHolder<TMessage>> Messages;
+        void Send(TMessageHolder<TMessage> message) override { Messages.push_back(std::move(message)); }
+        void Drain() override { }
+    };
+    struct TManualTimeSource : ITimeSource {
+        Time Now() override { return {}; }
+    };
+
+    const auto dir = std::filesystem::temp_directory_path() / ("miniraft-server-membership-success-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    {
+        NNet::TLoop<NNet::TPoll> loop;
+        auto timeSource = std::make_shared<TManualTimeSource>();
+        auto makeServer = [&](const std::shared_ptr<TRaft>& raft, const TNodeDict& peers) {
+            NNet::TSocket listener(NNet::TAddress{"127.0.0.1", 0}, loop.Poller());
+            return std::make_unique<TRaftServer<NNet::TSocket>>(
+                loop.Poller(), std::move(listener), raft, std::make_shared<TDummyRsm>(), peers, timeSource);
+        };
+        auto ordinary = [] {
+            auto entry = NewHoldedMessage<TLogEntry>();
+            entry->Term = 1;
+            return entry;
+        };
+
+        // A stable cluster can propose a removal through the server facade once
+        // its current-term peer capability has been observed.
+        auto proposalState = std::make_shared<TDurableState>((dir / "proposal").string(), 1);
+        proposalState->BindVoters({1, 2});
+        proposalState->Append(ordinary());
+        proposalState->CommitIndex = 1;
+        proposalState->Commit();
+        auto proposalPeer = std::make_shared<TEndpoint>();
+        TNodeDict proposalPeers{{2, proposalPeer}};
+        auto proposalRaft = std::make_shared<TRaft>(proposalState, 1, proposalPeers);
+        proposalRaft->Become(EState::LEADER);
+        auto* proposalVolatile = const_cast<TVolatileState*>(proposalRaft->GetVolatileState());
+        proposalVolatile->PeerCapabilities[2].Term = proposalState->CurrentTerm;
+        proposalVolatile->PeerCapabilities[2].JointConsensus = true;
+        auto proposalServer = makeServer(proposalRaft, proposalPeers);
+        assert_true(proposalServer->CheckJointConfigurationReadiness({1}).Ready());
+        const auto jointIndex = proposalServer->ProposeJointConfiguration({1});
+        assert_int_equal(jointIndex, 2);
+        const auto proposed = proposalRaft->GetConfigurationState().Latest;
+        assert_true(proposed.IsJoint());
+        assert_true(proposed.OldVoters() == std::vector<uint32_t>({1, 2}));
+        assert_true(proposed.NewVoters() == std::vector<uint32_t>({1}));
+
+        // A committed joint configuration with this leader on the new side can
+        // append its stable successor through the same server API.
+        auto finalizeState = std::make_shared<TDurableState>((dir / "finalize").string(), 1);
+        finalizeState->BindVoters({1, 2});
+        finalizeState->Append(ordinary());
+        finalizeState->Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Joint, 1, 0, 0, {1, 2}, {1}}));
+        finalizeState->CommitIndex = 2;
+        finalizeState->Commit();
+        TNodeDict finalizePeers{{2, std::make_shared<TEndpoint>()}};
+        auto finalizeRaft = std::make_shared<TRaft>(finalizeState, 1, finalizePeers);
+        finalizeRaft->Become(EState::LEADER);
+        auto finalizeServer = makeServer(finalizeRaft, finalizePeers);
+        const auto stableIndex = finalizeServer->FinalizeConfiguration();
+        assert_int_equal(stableIndex, 3);
+        const auto stable = DecodeConfigurationEntry(finalizeState->Get(stableIndex));
+        assert_int_equal(stable.Phase, EConfigurationPhase::Stable);
+        assert_true(stable.NewVoters == std::vector<uint32_t>({1}));
+
+        // The wrapper supplies its time source and sends TimeoutNow to a caught-up
+        // voter on the new side of a committed joint configuration.
+        auto transferState = std::make_shared<TDurableState>((dir / "transfer").string(), 1);
+        transferState->BindVoters({1, 2});
+        transferState->Append(ordinary());
+        transferState->Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Joint, 1, 0, 0, {1, 2}, {2, 3}}));
+        transferState->CommitIndex = 2;
+        transferState->Commit();
+        auto target = std::make_shared<TEndpoint>();
+        TNodeDict transferPeers{{2, std::make_shared<TEndpoint>()}, {3, target}};
+        auto transferRaft = std::make_shared<TRaft>(transferState, 1, transferPeers, std::vector<uint32_t>{3});
+        transferRaft->Become(EState::LEADER);
+        auto* transferVolatile = const_cast<TVolatileState*>(transferRaft->GetVolatileState());
+        transferVolatile->MatchIndex[3] = transferState->LastLogIndex;
+        transferVolatile->CommitAckIndex[3] = transferState->CommitIndex;
+        auto transferServer = makeServer(transferRaft, transferPeers);
+        transferServer->TransferLeadership(3);
+        assert_true(transferRaft->CurrentStateName() == EState::FOLLOWER);
+        assert_false(target->Messages.empty());
+        const auto timeoutNow = target->Messages.back().Cast<TTimeoutNowRequest>();
+        assert_int_equal(timeoutNow->TargetId, 3);
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
+
 #ifdef __linux__
 int RunServingServerMembershipReaderTest(const std::filesystem::path& dir) {
     using TTlsSocket = NNet::TRetirableSslSocket<NNet::TSocket>;
@@ -532,6 +630,7 @@ int main() {
         cmocka_unit_test(test_read_write),
         cmocka_unit_test(test_read_write_payload),
         cmocka_unit_test(test_server_stages_and_removes_runtime_learner),
+        cmocka_unit_test(test_server_forwards_successful_membership_operations),
 #ifdef __linux__
         cmocka_unit_test(test_serving_server_retires_demoted_joint_voter_reader),
 #endif
