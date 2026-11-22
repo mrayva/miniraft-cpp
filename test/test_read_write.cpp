@@ -480,10 +480,40 @@ void test_server_forwards_successful_membership_operations(void**) {
 }
 
 #ifdef __linux__
-int RunSocketMembershipTransitionTest(const std::filesystem::path& dir) {
+int RunSocketJointSnapshotMembershipTest(const std::filesystem::path& dir) {
     struct TManualTimeSource : ITimeSource {
         Time Current = std::chrono::steady_clock::now();
         Time Now() override { return Current; }
+    };
+    struct TSnapshotRsm : IRsm {
+        std::string Value;
+        size_t Loads = 0;
+        TMessageHolder<TMessage> Read(TMessageHolder<TCommandRequest>, uint64_t) override { return {}; }
+        TMessageHolder<TMessage> Write(TMessageHolder<TLogEntry> entry, uint64_t) override {
+            if (std::string_view(entry->Data) == "joint-snapshot-payload")
+                Value.assign(256 * 1024, 'x');
+            else
+                Value = entry->Data;
+            return {};
+        }
+        TMessageHolder<TLogEntry> Prepare(TMessageHolder<TCommandRequest>) override {
+            return NewHoldedMessage<TLogEntry>();
+        }
+        std::string SaveSnapshot() const override { return Value; }
+        void ValidateSnapshot(std::string_view bytes, uint64_t) const override {
+            if (bytes.size() != 256 * 1024 || bytes.find_first_not_of('x') != std::string_view::npos)
+                throw std::runtime_error("Unexpected joint snapshot application image");
+        }
+        void LoadSnapshot(std::string_view bytes, uint64_t index) override {
+            ValidateSnapshot(bytes, index);
+            Value.assign(bytes);
+            LastAppliedIndex = index;
+            ++Loads;
+        }
+    };
+    struct TDummyPeer : INode {
+        void Send(TMessageHolder<TMessage>) override { }
+        void Drain() override { }
     };
 
     if (!std::filesystem::create_directory(dir)) return 1;
@@ -494,9 +524,9 @@ int RunSocketMembershipTransitionTest(const std::filesystem::path& dir) {
     const std::vector<uint32_t> oldVoters{1, 2};
     const std::vector<uint32_t> newVoters{2, 3};
     std::vector<NNet::TSocket> listeners;
-    std::vector<NNet::TAddress> addresses(4);
-    listeners.reserve(3);
-    for (uint32_t id = 1; id <= 3; ++id) {
+    std::vector<NNet::TAddress> addresses(5);
+    listeners.reserve(4);
+    for (uint32_t id = 1; id <= 4; ++id) {
         listeners.emplace_back(NNet::TAddress{"127.0.0.1", 0}, loop.Poller());
         auto& listener = listeners.back();
         listener.Bind();
@@ -507,9 +537,9 @@ int RunSocketMembershipTransitionTest(const std::filesystem::path& dir) {
         addresses[id] = NNet::TAddress(reinterpret_cast<sockaddr*>(&bound), boundSize);
     }
 
-    std::vector<TNodeDict> peers(4);
-    std::vector<std::vector<std::shared_ptr<TNode<NNet::TSocket>>>> transports(4,
-        std::vector<std::shared_ptr<TNode<NNet::TSocket>>>(4));
+    std::vector<TNodeDict> peers(5);
+    std::vector<std::vector<std::shared_ptr<TNode<NNet::TSocket>>>> transports(5,
+        std::vector<std::shared_ptr<TNode<NNet::TSocket>>>(5));
     for (uint32_t id = 1; id <= 3; ++id) {
         for (uint32_t peer = 1; peer <= 3; ++peer) {
             if (peer == id) continue;
@@ -522,9 +552,10 @@ int RunSocketMembershipTransitionTest(const std::filesystem::path& dir) {
         }
     }
 
-    std::vector<std::shared_ptr<TDurableState>> states(4);
-    std::vector<std::shared_ptr<TRaft>> rafts(4);
-    std::vector<std::unique_ptr<TRaftServer<NNet::TSocket>>> servers(4);
+    std::vector<std::shared_ptr<TDurableState>> states(5);
+    std::vector<std::shared_ptr<TRaft>> rafts(5);
+    std::vector<std::shared_ptr<TSnapshotRsm>> applications(5);
+    std::vector<std::unique_ptr<TRaftServer<NNet::TSocket>>> servers(5);
     for (uint32_t id = 1; id <= 3; ++id) {
         states[id] = std::make_shared<TDurableState>((dir / "raft").string(), id);
         states[id]->BindVoters(oldVoters);
@@ -534,18 +565,19 @@ int RunSocketMembershipTransitionTest(const std::filesystem::path& dir) {
         states[id]->CommitIndex = 1;
         states[id]->Commit();
         rafts[id] = std::make_shared<TRaft>(states[id], id, peers[id], std::vector<uint32_t>{3});
+        applications[id] = std::make_shared<TSnapshotRsm>();
         auto* volatileState = const_cast<TVolatileState*>(rafts[id]->GetVolatileState());
         volatileState->ElectionDue = timeSource->Now() + std::chrono::hours(1);
     }
     for (uint32_t id = 1; id <= 3; ++id) {
         servers[id] = std::make_unique<TRaftServer<NNet::TSocket>>(
-            loop.Poller(), std::move(listeners[id - 1]), rafts[id], std::make_shared<TDummyRsm>(),
+            loop.Poller(), std::move(listeners[id - 1]), rafts[id], applications[id],
             peers[id], timeSource);
     }
 
     auto drainPeers = [&] {
-        for (uint32_t id = 1; id <= 3; ++id)
-            for (uint32_t peer = 1; peer <= 3; ++peer)
+        for (uint32_t id = 1; id <= 4; ++id)
+            for (uint32_t peer = 1; peer <= 4; ++peer)
                 if (transports[id][peer]) transports[id][peer]->Drain();
     };
     auto pumpUntil = [&](const auto& ready, size_t maxSteps) {
@@ -681,12 +713,106 @@ int RunSocketMembershipTransitionTest(const std::filesystem::path& dir) {
     }
     if (!currentTermEntryCommitted()) return 11;
 
-    const auto stableIndex = servers[2]->FinalizeConfiguration();
     auto tickNewLeader = [&] {
         timeSource->Current += std::chrono::seconds(1);
         rafts[2]->ProcessTimeout(timeSource->Now());
         drainPeers();
     };
+    const auto payloadIndex = rafts[2]->Append(MakeEntry("joint-snapshot-payload"));
+    const auto payloadApplied = [&] {
+        if (rafts[2]->GetVolatileState()->CommitIndex < payloadIndex) return false;
+        for (uint32_t id = 1; id <= 3; ++id)
+            if (states[id]->CommitIndex < payloadIndex ||
+                applications[id]->LastAppliedIndex < payloadIndex) return false;
+        return true;
+    };
+    for (unsigned retry = 0; retry < 6 && !payloadApplied(); ++retry) {
+        tickNewLeader();
+        if (pumpUntil(payloadApplied, 1000)) break;
+    }
+    if (!payloadApplied()) return 14;
+
+    const auto compactionReady = [&] {
+        const auto readiness = servers[2]->CheckCompactionMembershipReadiness();
+        return readiness.ActiveVotersWithoutSnapshotInstallSupport.empty() &&
+            readiness.ActiveVotersWithoutConfigurationAck.empty() &&
+            (!readiness.RequiresLeaderAcknowledgementBarrier || readiness.HasLeaderAcknowledgementBarrier);
+    };
+    for (unsigned retry = 0; retry < 6 && !compactionReady(); ++retry) {
+        tickNewLeader();
+        if (pumpUntil(compactionReady, 1000)) break;
+    }
+    if (!compactionReady()) return 15;
+
+    const auto jointSnapshot = rafts[2]->CompactShared();
+    if (!jointSnapshot->IsJoint() || jointSnapshot->Index != payloadIndex ||
+        jointSnapshot->Data.size() <= TInstallSnapshotRequest::MaxChunkBytes) return 16;
+
+    const std::vector<uint32_t> jointBootstrapVoters{1, 2, 3};
+    TNodeDict learnerPeers;
+    learnerPeers.emplace(1, std::make_shared<TDummyPeer>());
+    auto learnerToLeader = std::make_shared<TNode<NNet::TSocket>>(
+        [&](const NNet::TAddress& address) { return NNet::TSocket(address, loop.Poller()); },
+        "joint-snapshot-learner-4-to-2", addresses[2], timeSource);
+    learnerPeers.emplace(2, learnerToLeader);
+    learnerPeers.emplace(3, std::make_shared<TDummyPeer>());
+    states[4] = std::make_shared<TDurableState>((dir / "raft").string(), 4);
+    states[4]->BindVoters(jointBootstrapVoters);
+    applications[4] = std::make_shared<TSnapshotRsm>();
+    rafts[4] = std::make_shared<TRaft>(states[4], 4, learnerPeers, std::vector<uint32_t>{4});
+    servers[4] = std::make_unique<TRaftServer<NNet::TSocket>>(
+        loop.Poller(), std::move(listeners[3]), rafts[4], applications[4], learnerPeers, timeSource);
+    transports[4][2] = learnerToLeader;
+    auto leaderToLearner = std::make_shared<TNode<NNet::TSocket>>(
+        [&](const NNet::TAddress& address) { return NNet::TSocket(address, loop.Poller()); },
+        "joint-snapshot-leader-2-to-4", addresses[4], timeSource);
+    transports[2][4] = leaderToLearner;
+    servers[2]->AddLearnerTarget(4, leaderToLearner);
+    servers[4]->Serve();
+
+    const auto learnerTransportsReady = [&] {
+        return learnerToLeader->IsConnected() && !learnerToLeader->IsCapabilityNegotiating() &&
+            leaderToLearner->IsConnected() && !leaderToLearner->IsCapabilityNegotiating();
+    };
+    if (!pumpUntil(learnerTransportsReady, 2000)) return 17;
+
+    const auto learnerInstalledJointSnapshot = [&] {
+        const auto snapshot = states[4]->GetSnapshot();
+        return applications[4]->Loads == 1 && snapshot && snapshot->Index == jointSnapshot->Index &&
+            snapshot->IsJoint() && applications[4]->Value == applications[2]->Value &&
+            applications[4]->LastAppliedIndex == jointSnapshot->Index &&
+            rafts[4]->GetVoterIds() == std::vector<uint32_t>({1, 2, 3}) &&
+            rafts[4]->GetConfigurationState().Committed.IsJoint();
+    };
+    for (unsigned retry = 0; retry < 8 && !learnerInstalledJointSnapshot(); ++retry) {
+        tickNewLeader();
+        if (pumpUntil(learnerInstalledJointSnapshot, 1000)) break;
+    }
+    if (!learnerInstalledJointSnapshot()) {
+        std::cerr << "joint snapshot socket install: learner->leader connected="
+            << learnerToLeader->IsConnected() << " leader->learner connected="
+            << leaderToLearner->IsConnected() << " loads=" << applications[4]->Loads
+            << " snapshot=" << states[4]->SnapshotIndex << " expected=" << jointSnapshot->Index
+            << " commit=" << states[4]->CommitIndex << " last=" << states[4]->LastLogIndex
+            << " app-index=" << applications[4]->LastAppliedIndex << " voters=";
+        for (auto voter : rafts[4]->GetVoterIds()) std::cerr << voter << ' ';
+        const auto* leaderVolatile = rafts[2]->GetVolatileState();
+        std::cerr << " leader-state=" << int(rafts[2]->CurrentStateName())
+            << " leader-commit=" << leaderVolatile->CommitIndex << " leader-last=" << states[2]->LastLogIndex
+            << " learner-next=" << (leaderVolatile->NextIndex.contains(4) ? leaderVolatile->NextIndex.at(4) : 0)
+            << " learner-match=" << (leaderVolatile->MatchIndex.contains(4) ? leaderVolatile->MatchIndex.at(4) : 0)
+            << " learner-capabilities=" << leaderVolatile->PeerCapabilities.contains(4)
+            << " learner-snapshot-rpc=" << leaderVolatile->SnapshotRpcs.contains(4);
+        if (leaderVolatile->SnapshotRpcs.contains(4)) {
+            const auto& rpc = leaderVolatile->SnapshotRpcs.at(4);
+            std::cerr << " snapshot-offset=" << rpc.Offset << " snapshot-sent-end=" << rpc.SentEnd
+                << " snapshot-seq=" << rpc.Seqno;
+        }
+        std::cerr << '\n';
+        return 18;
+    }
+
+    const auto stableIndex = servers[2]->FinalizeConfiguration();
     const auto stablePropagated = [&] {
         for (uint32_t id = 1; id <= 3; ++id)
             if (states[id]->CommitIndex < stableIndex || rafts[id]->GetVoterIds() != newVoters ||
@@ -700,16 +826,29 @@ int RunSocketMembershipTransitionTest(const std::filesystem::path& dir) {
     if (!stablePropagated()) return 12;
     for (uint32_t id = 1; id <= 3; ++id)
         if (states[id]->GetBoundVoters() != oldVoters) return 13;
+    const auto learnerAppliedStableConfiguration = [&] {
+        return states[4]->CommitIndex >= stableIndex && applications[4]->LastAppliedIndex >= stableIndex &&
+            rafts[4]->GetVoterIds() == newVoters &&
+            !rafts[4]->GetConfigurationState().Committed.IsJoint();
+    };
+    for (unsigned retry = 0; retry < 6 && !learnerAppliedStableConfiguration(); ++retry) {
+        tickNewLeader();
+        if (pumpUntil(learnerAppliedStableConfiguration, 1000)) break;
+    }
+    if (!learnerAppliedStableConfiguration() || applications[4]->Loads != 1 ||
+        applications[4]->Value != applications[2]->Value ||
+        states[4]->GetBoundVoters() != jointBootstrapVoters)
+        return 19;
     return 0;
 }
 
-void test_server_transitions_membership_over_socket_transport(void**) {
+void test_server_transitions_membership_and_installs_joint_snapshot_over_socket_transport(void**) {
     const auto dir = std::filesystem::temp_directory_path() /
-        ("miniraft-socket-membership-transition-" +
+        ("miniraft-socket-joint-snapshot-membership-" +
             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     const auto child = ::fork();
     assert_true(child >= 0);
-    if (child == 0) _exit(RunSocketMembershipTransitionTest(dir));
+    if (child == 0) _exit(RunSocketJointSnapshotMembershipTest(dir));
 
     int status = 0;
     assert_int_equal(::waitpid(child, &status, 0), child);
