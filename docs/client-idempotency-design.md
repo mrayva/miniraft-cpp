@@ -149,10 +149,12 @@ real KV writes together with session records and exercises combined snapshot
 capture, restore, retry, close-session tombstones and epoch advance. Its focused
 test verifies that a restored retry returns the original response without
 reapplying the KV mutation, and that invalid application snapshot data leaves
-the prior state intact. This closes the test-double-only application-contract
-gap for the sample KV application. A client library and an integration test
-with a deployment application's own durable state and snapshot implementation
-remain open.
+the prior state intact. A Linux durable integration test stores the combined
+KV/dedup snapshot, restarts the durable store, persists a duplicate committed
+log record, restarts again, and verifies replay returns the cached result at its
+original index. This closes the test-double-only application-contract gap for
+the sample KV application. A client library and integration with a deployment
+application's own durable state and snapshot implementation remain open.
 
 ## Implementation status
 
@@ -168,10 +170,10 @@ remain open.
   **Partially implemented:** lost-reply retry across snapshot installation and
   leadership change, duplicate uncommitted copies across leaders, and conflicting
   sequence reuse, stale/gap rejection, unsupported-peer rejection, active-session
-  cache exhaustion, durable snapshot restart, and durable session close are
-  covered with test RSMs. The sample KV application's real write/snapshot path
-  is covered by `test_idempotent_kv`; deployment-specific durable integration
-  remains open.
+  cache exhaustion and durable session close are covered with test RSMs. The
+  sample KV application's real write/snapshot path is covered by
+  `test_idempotent_kv`, and its disk-backed snapshot plus committed replay path
+  is covered by `test_durable`; deployment-specific integration remains open.
 
 Clients using ordinary `TCommandRequest` writes retain at-least-once behavior.
 For idempotent requests, a timeout after admission still has an unknown outcome;

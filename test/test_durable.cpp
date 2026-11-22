@@ -3,6 +3,8 @@
 #include <miniraft/persist.h>
 #include <miniraft/raft.h>
 #include <miniraft/snapshot_codec.h>
+#include "../examples/idempotent_kv_rsm.h"
+#include "../examples/kv_messages.h"
 #include <filesystem>
 #include <fstream>
 #include <chrono>
@@ -1426,6 +1428,82 @@ void test_closed_idempotent_session_survives_durable_snapshot_restart(void**) {
         }
     }
 }
+
+void test_reference_kv_idempotency_replays_from_durable_snapshot_and_log(void**) {
+    TFiles files;
+    auto request = NewHoldedMessage<TIdempotentCommandRequest>(
+        sizeof(TIdempotentCommandRequest) + sizeof(TKvEntry) + 3 + 3);
+    request->Epoch = 1;
+    request->SessionIdLow = 91;
+    request->Sequence = 1;
+    const uint16_t keySize = 3, valueSize = 3;
+    memcpy(request->Data, &keySize, sizeof(keySize));
+    memcpy(request->Data + sizeof(keySize), &valueSize, sizeof(valueSize));
+    memcpy(request->Data + sizeof(TKvEntry), "keyone", 6);
+
+    const TIdempotentOperationIdentity identity{
+        .Epoch = 1,
+        .SessionIdLow = 91,
+        .Sequence = 1,
+        .PayloadDigest = ComputeIdempotentPayloadDigest(std::string_view(
+            request->Data, request->Len - sizeof(TIdempotentCommandRequest))),
+    };
+    TSnapshot raftSnapshot;
+    {
+        TIdempotentKvRsm application;
+        auto prepared = application.PrepareIdempotent(request);
+        prepared->Term = 1;
+        const auto result = application.ApplyIdempotentLogRecord(
+            EncodeIdempotentLogEntry(identity, std::move(prepared)), 1);
+        assert_int_equal(result.ErrorCode, TCommandResponse::Success);
+        assert_int_equal(result.Index, 1);
+        raftSnapshot = TSnapshot{1, 1, {1}, application.SaveSnapshot()};
+
+        TDurableState state(files.Name, 1);
+        state.BindVoters({1});
+        state.InstallSnapshot(raftSnapshot);
+    }
+
+    // Reopen the durable snapshot, restore the real application RSM, then
+    // persist a retry as a committed retained log entry.
+    {
+        TDurableState state(files.Name, 1);
+        const auto savedSnapshot = state.GetSnapshot();
+        assert_true(savedSnapshot && *savedSnapshot == raftSnapshot);
+        TIdempotentKvRsm application;
+        application.LoadSnapshot(savedSnapshot->Data, savedSnapshot->Index);
+        auto retry = application.PrepareIdempotent(request);
+        retry->Term = state.CurrentTerm;
+        std::vector<TMessageHolder<TLogEntry>> suffix;
+        suffix.push_back(EncodeIdempotentLogEntry(identity, std::move(retry)));
+        state.AppendBatchAndCommit(suffix, 2);
+    }
+
+    // A second process restart recovers both the snapshot and committed retry.
+    // Replaying the log entry returns the cached original result at index 1.
+    {
+        TDurableState state(files.Name, 1);
+        assert_int_equal(state.SnapshotIndex, 1);
+        assert_int_equal(state.LastLogIndex, 2);
+        assert_int_equal(state.CommitIndex, 2);
+        const auto savedSnapshot = state.GetSnapshot();
+        assert_true(bool(savedSnapshot));
+        TIdempotentKvRsm application;
+        application.LoadSnapshot(savedSnapshot->Data, savedSnapshot->Index);
+        const auto result = application.ApplyIdempotentLogRecord(state.Get(2), 2);
+        assert_int_equal(result.ErrorCode, TCommandResponse::Success);
+        assert_int_equal(result.Index, 1);
+        assert_true(result.Data == "one");
+        assert_int_equal(application.LastAppliedIndex, 2);
+
+        auto read = NewHoldedMessage<TReadKv>(sizeof(TReadKv) + 3);
+        read->KeySize = 3;
+        memcpy(read->Data, "key", 3);
+        const auto response = application.Read(read, 2).Cast<TCommandResponse>();
+        assert_true(std::string(response->Data,
+            response->Len - sizeof(TCommandResponse)) == "one");
+    }
+}
 }
 
 int main() {
@@ -1457,6 +1535,7 @@ int main() {
         cmocka_unit_test(test_idempotent_retry_after_durable_snapshot_restart_returns_cached_result),
         cmocka_unit_test(test_idempotent_retry_after_multi_voter_durable_snapshot_restart),
         cmocka_unit_test(test_closed_idempotent_session_survives_durable_snapshot_restart),
+        cmocka_unit_test(test_reference_kv_idempotency_replays_from_durable_snapshot_and_log),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }
