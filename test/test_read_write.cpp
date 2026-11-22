@@ -1033,7 +1033,7 @@ int main() {
         cmocka_unit_test(test_server_stages_and_removes_runtime_learner),
         cmocka_unit_test(test_server_forwards_successful_membership_operations),
 #ifdef __linux__
-        cmocka_unit_test(test_server_transitions_membership_over_socket_transport),
+        cmocka_unit_test(test_server_transitions_membership_and_installs_joint_snapshot_over_socket_transport),
         cmocka_unit_test(test_serving_server_retires_demoted_joint_voter_reader),
 #endif
     };
