@@ -294,7 +294,7 @@ void test_follower_append_entries_7a(void**) {
     assert_true(messages.back().Maybe<TAppendEntriesResponse>());
     auto last = messages.back().Cast<TAppendEntriesResponse>();
     assert_true(last->Success);
-    assert_true(last->MatchIndex = 10);
+    assert_int_equal(last->MatchIndex, 10);
     assert_true(raft->GetState()->LastLogIndex == 10);
 }
 
@@ -327,7 +327,7 @@ void test_follower_append_entries_7b(void**) {
     assert_true(messages.back().Maybe<TAppendEntriesResponse>());
     auto last = messages.back().Cast<TAppendEntriesResponse>();
     assert_true(last->Success);
-    assert_true(last->MatchIndex = 10);
+    assert_int_equal(last->MatchIndex, 10);
     assert_true(raft->GetState()->LastLogIndex == 10);
 }
 
@@ -360,7 +360,7 @@ void test_follower_append_entries_7c(void**) {
     assert_true(messages.back().Maybe<TAppendEntriesResponse>());
     auto last = messages.back().Cast<TAppendEntriesResponse>();
     assert_true(last->Success);
-    assert_true(last->MatchIndex = 10);
+    assert_int_equal(last->MatchIndex, 10);
     assert_true(raft->GetState()->LastLogIndex == 11);
 }
 
@@ -393,7 +393,7 @@ void test_follower_append_entries_7f(void**) {
     assert_true(messages.back().Maybe<TAppendEntriesResponse>());
     auto last = messages.back().Cast<TAppendEntriesResponse>();
     assert_true(last->Success);
-    assert_true(last->MatchIndex = 10);
+    assert_int_equal(last->MatchIndex, 10);
     assert_true(raft->GetState()->LastLogIndex == 10);
     assert_terms(std::static_pointer_cast<TState>(raft->GetState())->Log, {1,1,1,4,4,5,5,6,6,6});
 }
