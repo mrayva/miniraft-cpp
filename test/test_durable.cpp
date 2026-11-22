@@ -106,10 +106,13 @@ struct TDurableControlRsm : IIdempotentRsm {
     }
     void ValidateIdempotent(TMessageHolder<TIdempotentCommandRequest>) const override { }
     uint64_t CachedResponseDataUpperBound(
-            TMessageHolder<TIdempotentCommandRequest>) const override { return 0; }
+            TMessageHolder<TIdempotentCommandRequest>) const override { return 32; }
     TMessageHolder<TLogEntry> PrepareIdempotent(
-            TMessageHolder<TIdempotentCommandRequest>) override {
-        return NewHoldedMessage<TLogEntry>();
+            TMessageHolder<TIdempotentCommandRequest> request) override {
+        const auto payloadSize = request->Len - sizeof(TIdempotentCommandRequest);
+        auto entry = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + payloadSize);
+        if (payloadSize) memcpy(entry->Data, request->Data, payloadSize);
+        return entry;
     }
     TIdempotentWriteResult WriteIdempotent(TMessageHolder<TLogEntry> command, uint64_t index,
             const TIdempotentOperationIdentity& identity) override {
@@ -1007,6 +1010,97 @@ void test_duplicate_idempotent_records_apply_once_after_durable_restart(void**) 
     assert_int_equal(rsm->LastIdempotentResultError, TCommandResponse::Success);
     assert_true(rsm->LastIdempotentResultData == "durable-result");
 }
+
+void test_idempotent_retry_after_durable_snapshot_restart_returns_cached_result(void**) {
+    TFiles files;
+    const auto makeRequest = [](uint32_t cookie) {
+        constexpr std::string_view payload = "client-payload";
+        auto request = NewHoldedMessage<TIdempotentCommandRequest>(
+            sizeof(TIdempotentCommandRequest) + payload.size());
+        request->Epoch = 1;
+        request->SessionIdHigh = 11;
+        request->SessionIdLow = 12;
+        request->Sequence = 1;
+        request->Cookie = cookie;
+        memcpy(request->Data, payload.data(), payload.size());
+        return request;
+    };
+
+    {
+        auto state = std::make_shared<TDurableState>(files.Name, 1);
+        state->CurrentTerm = 1;
+        state->BindVoters({1});
+        auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+        auto rsm = std::make_shared<TDurableControlRsm>();
+        rsm->State.Epoch = 1;
+        TRequestProcessor processor(raft, rsm, {});
+        raft->Become(EState::LEADER);
+
+        auto client = std::make_shared<TEndpoint>();
+        processor.OnIdempotentCommandRequest(makeRequest(61), client);
+        assert_int_equal(state->LastLogIndex, 1);
+        raft->ProcessTimeout(ITimeSource::Time{});
+        processor.ProcessCommitted();
+        assert_int_equal(state->CommitIndex, 1);
+        assert_int_equal(rsm->IdempotentApplicationCalls, 1);
+        assert_true(rsm->State.ApplicationData == "client-payload");
+        assert_int_equal(client->Sent.size(), 1);
+        auto response = client->Sent.back().Cast<TIdempotentCommandResponse>();
+        ValidateIdempotentCommandResponse(response);
+        assert_int_equal(response->ErrorCode, TCommandResponse::Success);
+        assert_int_equal(response->Index, 1);
+        assert_true(std::string(response->Data,
+            response->Len - sizeof(TIdempotentCommandResponse)) == "durable-result");
+
+        const auto snapshot = raft->CompactShared();
+        assert_int_equal(snapshot->Index, 1);
+        assert_int_equal(state->SnapshotIndex, 1);
+        assert_true(state->GetSnapshot()->Data == snapshot->Data);
+    }
+
+    auto state = std::make_shared<TDurableState>(files.Name, 1);
+    assert_int_equal(state->SnapshotIndex, 1);
+    assert_int_equal(state->CommitIndex, 1);
+    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+    auto rsm = std::make_shared<TDurableControlRsm>();
+    TRequestProcessor processor(raft, rsm, {}); // Restores app data and dedup state from Raft's durable snapshot.
+    assert_int_equal(rsm->LastAppliedIndex, 1);
+    assert_true(rsm->State.ApplicationData == "client-payload");
+    assert_int_equal(rsm->State.Sessions.size(), 1);
+    assert_int_equal(rsm->State.Sessions.front().HighestSequence, 1);
+    assert_int_equal(rsm->State.Sessions.front().LogIndex, 1);
+    assert_true(rsm->State.Sessions.front().PayloadDigest ==
+        ComputeIdempotentPayloadDigest("client-payload"));
+    assert_true(rsm->State.Sessions.front().ResponseData == "durable-result");
+
+    // Elect a fresh leader process from the recovered durable image. Its retry
+    // is logged and committed, but replay returns the cached original response
+    // without a second application mutation.
+    const auto restartTime = ITimeSource::Time{} + std::chrono::seconds(30);
+    raft->ProcessTimeout(restartTime);
+    assert_int_equal(raft->CurrentStateName(), EState::LEADER);
+    auto retryClient = std::make_shared<TEndpoint>();
+    processor.OnIdempotentCommandRequest(makeRequest(62), retryClient);
+    assert_int_equal(state->LastLogIndex, 3); // New-term leader stub plus the retry.
+    raft->ProcessTimeout(restartTime + std::chrono::milliseconds(500));
+    processor.ProcessCommitted();
+
+    assert_int_equal(state->CommitIndex, 3);
+    assert_int_equal(rsm->LastAppliedIndex, 3);
+    assert_int_equal(rsm->IdempotentApplicationCalls, 0);
+    assert_true(rsm->State.ApplicationData == "client-payload");
+    assert_int_equal(rsm->State.Sessions.size(), 1);
+    assert_int_equal(rsm->State.Sessions.front().HighestSequence, 1);
+    assert_int_equal(rsm->State.Sessions.front().LogIndex, 1);
+    assert_int_equal(retryClient->Sent.size(), 1);
+    auto response = retryClient->Sent.back().Cast<TIdempotentCommandResponse>();
+    ValidateIdempotentCommandResponse(response);
+    assert_int_equal(response->Cookie, 62);
+    assert_int_equal(response->ErrorCode, TCommandResponse::Success);
+    assert_int_equal(response->Index, 1);
+    assert_true(std::string(response->Data,
+        response->Len - sizeof(TIdempotentCommandResponse)) == "durable-result");
+}
 }
 
 int main() {
@@ -1035,6 +1129,7 @@ int main() {
         cmocka_unit_test(test_raft_election_and_application_replay_after_restart),
         cmocka_unit_test(test_idempotency_control_survives_durable_restart_and_replays_atomically),
         cmocka_unit_test(test_duplicate_idempotent_records_apply_once_after_durable_restart),
+        cmocka_unit_test(test_idempotent_retry_after_durable_snapshot_restart_returns_cached_result),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }

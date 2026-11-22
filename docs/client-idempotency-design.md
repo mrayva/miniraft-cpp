@@ -120,13 +120,16 @@ retries the same identity before replicating the old suffix. Both copies then
 commit, while each RSM applies the operation once and retains the original
 result index. A separate replicated case reuses the committed sequence with a
 different payload, confirms the conflict response, and checks that application
-data and the saved session result remain unchanged.
+data and the saved session result remain unchanged. A durable single-voter case
+then compacts the combined Raft/application snapshot, reconstructs the Raft and
+RSM objects from disk, and retries the request. The new process returns the
+cached result at its original index with the saved session high-water mark and
+no second application mutation.
 
 The following tests remain necessary before claiming the full client guarantee:
 
-- Restart a new leader from durable Raft and application snapshots, retry the
-  operation, and verify the saved response and high-water mark survive process
-  restart.
+- Repeat leadership transfer, snapshot recovery and retry across multiple
+  replicas with each replica using durable Raft and application state.
 - Reject gaps, stale sequences, unsupported peers, and session-cache exhaustion
   before appending a new command.
 - Close a session through replicated state, restart, and verify old IDs cannot
@@ -145,8 +148,9 @@ The following tests remain necessary before claiming the full client guarantee:
    restart, compaction and resource limits using a stateful deduplicating RSM.
   **Partially implemented:** lost-reply retry across snapshot installation and
   leadership change, duplicate uncommitted copies across leaders, and conflicting
-  sequence reuse are covered; durable process restart and the scenarios above
-  remain open.
+  sequence reuse are covered. A single-voter durable snapshot restart preserves
+  the cached result; multi-voter durable restart and the scenarios above remain
+  open.
 
 Clients using ordinary `TCommandRequest` writes retain at-least-once behavior.
 For idempotent requests, a timeout after admission still has an unknown outcome;
