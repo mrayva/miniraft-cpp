@@ -118,12 +118,12 @@ restart. Another deterministic three-voter scenario leaves an operation
 uncommitted on a former leader, elects the follower that holds that copy, and
 retries the same identity before replicating the old suffix. Both copies then
 commit, while each RSM applies the operation once and retains the original
-result index.
+result index. A separate replicated case reuses the committed sequence with a
+different payload, confirms the conflict response, and checks that application
+data and the saved session result remain unchanged.
 
 The following tests remain necessary before claiming the full client guarantee:
 
-- Reuse the latest sequence with a different payload and verify conflict with
-  no state mutation.
 - Restart a new leader from durable Raft and application snapshots, retry the
   operation, and verify the saved response and high-water mark survive process
   restart.
@@ -144,8 +144,9 @@ The following tests remain necessary before claiming the full client guarantee:
 4. Validate lost-reply retries, duplicate log copies, leadership changes,
    restart, compaction and resource limits using a stateful deduplicating RSM.
   **Partially implemented:** lost-reply retry across snapshot installation and
-  leadership change and duplicate uncommitted copies across leaders are covered;
-  durable process restart and the scenarios above remain open.
+  leadership change, duplicate uncommitted copies across leaders, and conflicting
+  sequence reuse are covered; durable process restart and the scenarios above
+  remain open.
 
 Clients using ordinary `TCommandRequest` writes retain at-least-once behavior.
 For idempotent requests, a timeout after admission still has an unknown outcome;

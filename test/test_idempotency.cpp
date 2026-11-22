@@ -289,8 +289,8 @@ struct TIdempotencyCluster {
     }
 };
 
-TMessageHolder<TIdempotentCommandRequest> IdempotentRequest(uint32_t cookie) {
-    constexpr std::string_view payload = "work";
+TMessageHolder<TIdempotentCommandRequest> IdempotentRequest(
+        uint32_t cookie, std::string_view payload = "work") {
     auto request = NewHoldedMessage<TIdempotentCommandRequest>(
         sizeof(TIdempotentCommandRequest) + payload.size());
     request->Epoch = 1;
@@ -1047,6 +1047,52 @@ void test_duplicate_idempotent_entries_from_two_leaders_apply_once(void**) {
         assert_int_equal(cluster.Applications[node]->State.Sessions.front().LogIndex, 2);
     }
 }
+
+void test_idempotent_sequence_reuse_with_different_payload_conflicts_without_mutation(void**) {
+    TIdempotencyCluster cluster(3);
+    cluster.Elect(1);
+    cluster.Replicate(1);
+
+    auto originalClient = std::make_shared<TIdempotencyPeer>();
+    cluster.Processors[0]->OnIdempotentCommandRequest(IdempotentRequest(51), originalClient);
+    cluster.Replicate(1);
+    assert_int_equal(originalClient->Sent.size(), 1);
+    const auto original = originalClient->Sent.back().Cast<TIdempotentCommandResponse>();
+    ValidateIdempotentCommandResponse(original);
+    assert_int_equal(original->ErrorCode, TCommandResponse::Success);
+    assert_int_equal(original->Index, 2);
+    assert_int_equal(cluster.Applications[0]->ApplicationMutations, 1);
+    assert_true(cluster.Applications[0]->State.ApplicationData == "work");
+
+    // Keep the session and sequence fixed but change the payload digest. The
+    // conflicting operation commits as a Raft entry but cannot change app or
+    // dedup state, and the client receives an explicit conflict.
+    assert_true(ComputeIdempotentPayloadDigest("work") !=
+        ComputeIdempotentPayloadDigest("changed"));
+    auto conflictingClient = std::make_shared<TIdempotencyPeer>();
+    cluster.Processors[0]->OnIdempotentCommandRequest(
+        IdempotentRequest(52, "changed"), conflictingClient);
+    cluster.Replicate(1);
+
+    assert_int_equal(conflictingClient->Sent.size(), 1);
+    const auto conflict = conflictingClient->Sent.back().Cast<TIdempotentCommandResponse>();
+    ValidateIdempotentCommandResponse(conflict);
+    assert_int_equal(conflict->Cookie, 52);
+    assert_int_equal(conflict->ErrorCode, TCommandResponse::IdempotencyConflict);
+    assert_int_equal(conflict->Index, 3);
+    for (size_t node = 0; node < 3; ++node) {
+        const auto& application = cluster.Applications[node];
+        assert_int_equal(cluster.Rafts[node]->GetVolatileState()->CommitIndex, 3);
+        assert_int_equal(application->ApplicationMutations, 1);
+        assert_true(application->State.ApplicationData == "work");
+        assert_int_equal(application->State.Sessions.size(), 1);
+        assert_int_equal(application->State.Sessions.front().HighestSequence, 1);
+        assert_int_equal(application->State.Sessions.front().LogIndex, 2);
+        assert_true(application->State.Sessions.front().PayloadDigest ==
+            ComputeIdempotentPayloadDigest("work"));
+        assert_int_equal(application->LastAppliedIndex, 3);
+    }
+}
 }
 
 int main() {
@@ -1069,6 +1115,7 @@ int main() {
         cmocka_unit_test(test_idempotent_rsm_snapshot_hook_validates_before_atomic_restore),
         cmocka_unit_test(test_idempotent_retry_after_snapshot_recovery_and_leader_change_returns_cached_result),
         cmocka_unit_test(test_duplicate_idempotent_entries_from_two_leaders_apply_once),
+        cmocka_unit_test(test_idempotent_sequence_reuse_with_different_payload_conflicts_without_mutation),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }
