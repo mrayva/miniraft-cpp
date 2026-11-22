@@ -72,11 +72,24 @@ rejects duplicate IDs, duplicate address and port pairs, a missing local ID,
 and files without a voter. Startup provisions all listed endpoints again on
 restart, so any elected voter with this file can replicate to the learner.
 
-File roles supply the configured bootstrap baseline. Editing a role does not
-promote or remove a voter. Raft still validates the durable voter binding and
-derives live roles from committed history. Distribute the file through your
-deployment system. The KV process reads it on startup, and live endpoint
-changes use the server's embedding APIs.
+File roles supply the configured bootstrap baseline. Use the replicated joint
+configuration API for voter changes. Raft validates the durable voter binding
+and derives live roles from committed history.
+
+On Linux, you can add learner endpoints or replace a remote address for the
+same node ID while KV is serving. Publish a complete file using an atomic
+rename, then send `SIGHUP` to each replica you want to update. Look for
+`Reloaded peer config` in each process log before checking learner catch-up or
+proposing a voter change. Reload rejects bootstrap role edits, endpoint
+removals, address reassignment across node IDs, and local listener changes.
+Restart a node to change its own listener. Existing cluster membership and
+voter proofs still govern which changes can be committed.
+
+Each process validates the file and creates replacement endpoints before
+applying changes. The server applies endpoints individually. If an endpoint
+operation fails during application, earlier successful changes can remain in
+effect. Fix the cause and send another `SIGHUP` to reconcile the rest.
+Distribution and signaling are handled by your deployment system.
 
 Deterministic tests cover live add, snapshot catch-up, voter partitions and strong
 reads, removal and re-addition with delayed append replies, removal during a

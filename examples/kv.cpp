@@ -2,11 +2,15 @@
 #include <algorithm>
 #include <chrono>
 #include <charconv>
+#include <csignal>
 #include <fstream>
+#include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <miniraft/net/server.h>
@@ -298,6 +302,77 @@ static void LoadPeerConfig(const std::string& path, std::vector<THost>& hosts,
     if (!hasVoter) throw std::invalid_argument("Peer config requires at least one voter: " + path);
 }
 
+#ifdef __linux__
+static volatile std::sig_atomic_t PeerConfigReloadRequested = 0;
+
+static void RequestPeerConfigReload(int) {
+    PeerConfigReloadRequested = 1;
+}
+
+template<typename TSocket, typename TMakeEndpoint>
+static void ReloadPeerConfig(const std::string& path, uint32_t localId,
+        std::vector<THost>& hosts, std::vector<uint32_t>& learners,
+        TRaftServer<TSocket>& server, TMakeEndpoint makeEndpoint) {
+    std::vector<THost> requested;
+    std::vector<uint32_t> requestedLearners;
+    LoadPeerConfig(path, requested, requestedLearners);
+    const std::unordered_set<uint32_t> learnerIds(learners.begin(), learners.end());
+    const std::unordered_set<uint32_t> newLearnerIds(requestedLearners.begin(), requestedLearners.end());
+    std::unordered_map<uint32_t, size_t> currentById;
+    std::map<std::pair<std::string, int>, uint32_t> currentByAddress;
+    for (size_t i = 0; i < hosts.size(); ++i) {
+        currentById.emplace(hosts[i].Id, i);
+        currentByAddress.emplace(std::pair{hosts[i].Address, hosts[i].Port}, hosts[i].Id);
+    }
+
+    struct TChange {
+        size_t Requested;
+        std::optional<size_t> Current;
+        std::shared_ptr<TNode<TSocket>> Endpoint;
+    };
+    std::vector<TChange> changes;
+    size_t existing = 0;
+    for (size_t i = 0; i < requested.size(); ++i) {
+        const auto& host = requested[i];
+        std::optional<size_t> current;
+        if (const auto it = currentById.find(host.Id); it != currentById.end()) {
+            ++existing;
+            current = it->second;
+            const auto& previous = hosts[*current];
+            if (learnerIds.contains(host.Id) != newLearnerIds.contains(host.Id))
+                throw std::invalid_argument("Peer config reload cannot change bootstrap roles");
+            if (previous.Address == host.Address && previous.Port == host.Port) continue;
+            if (host.Id == localId)
+                throw std::invalid_argument("Peer config reload cannot change the local listener");
+        } else if (!newLearnerIds.contains(host.Id)) {
+            throw std::invalid_argument("Peer config reload can only add learners");
+        }
+        const auto owner = currentByAddress.find({host.Address, host.Port});
+        if (owner != currentByAddress.end() && owner->second != host.Id)
+            throw std::invalid_argument("Peer config reload cannot reassign an existing address to another node ID");
+        changes.push_back({i, current, {}});
+    }
+    if (existing != hosts.size()) throw std::invalid_argument("Peer config reload cannot remove endpoints");
+
+    // Resolve and allocate every new endpoint before changing any live routes.
+    for (auto& change : changes) change.Endpoint = makeEndpoint(requested[change.Requested]);
+    hosts.reserve(requested.size());
+    learners.reserve(requestedLearners.size());
+    for (auto& change : changes) {
+        auto& host = requested[change.Requested];
+        if (change.Current) {
+            server.ReplacePeerTarget(host.Id, std::move(change.Endpoint));
+            hosts[*change.Current] = std::move(host);
+        } else {
+            server.RegisterPeerTarget(host.Id, std::move(change.Endpoint));
+            learners.push_back(host.Id);
+            hosts.push_back(std::move(host));
+        }
+    }
+    std::cerr << "Reloaded peer config (" << changes.size() << " endpoint changes)\n";
+}
+#endif
+
 void usage(const char* prog) {
     std::cerr << prog << " --client|--server --id myid "
         "(--node ip:port:id [--node ip:port:id ...] [--learner id ...] | --peer-config path) "
@@ -412,6 +487,11 @@ int main(int argc, char** argv) {
     NNet::TLoop<TPoller> loop;
 
     if (server) {
+        const auto makeEndpoint = [&](const THost& host) {
+            return std::make_shared<TNode<TPoller::TSocket>>(
+                [&](const NNet::TAddress& addr) { return TPoller::TSocket(addr, loop.Poller()); },
+                std::to_string(host.Id), NNet::TAddress{host.Address, host.Port}, timeSource);
+        };
         std::unordered_set<uint32_t> hostIds;
         for (auto& host : hosts) {
             if (!hostIds.insert(host.Id).second) { std::cerr << "Duplicate node ID\n"; return 1; }
@@ -421,11 +501,7 @@ int main(int argc, char** argv) {
             if (host.Id == id) {
                 myHost = host;
             } else {
-                nodes[host.Id] = std::make_shared<TNode<TPoller::TSocket>>(
-                    [&](const NNet::TAddress& addr) { return TPoller::TSocket(addr, loop.Poller()); },
-                    std::to_string(host.Id),
-                    NNet::TAddress{host.Address, host.Port},
-                    timeSource);
+                nodes[host.Id] = makeEndpoint(host);
             }
         }
 
@@ -454,11 +530,36 @@ int main(int argc, char** argv) {
             }
         }
         TPoller::TSocket socket(NNet::TAddress{myHost.Address, myHost.Port}, loop.Poller());
+#ifdef __linux__
+        if (!peerConfig.empty()) {
+            struct sigaction action{};
+            action.sa_handler = RequestPeerConfigReload;
+            sigemptyset(&action.sa_mask);
+            if (sigaction(SIGHUP, &action, nullptr) != 0) {
+                std::cerr << "Cannot install peer config reload handler\n";
+                return 1;
+            }
+        }
+#endif
         socket.Bind();
         socket.Listen();
         TRaftServer server(loop.Poller(), std::move(socket), raft, rsm, nodes, timeSource);
         server.Serve();
         if (snapshots) CheckpointLoop(loop.Poller(), raft, rsm, snapshots, snapshotInterval, savedSnapshot);
+#ifdef __linux__
+        if (!peerConfig.empty()) {
+            for (;;) {
+                loop.Step();
+                if (!PeerConfigReloadRequested) continue;
+                PeerConfigReloadRequested = 0;
+                try {
+                    ReloadPeerConfig(peerConfig, myHost.Id, hosts, learners, server, makeEndpoint);
+                } catch (const std::exception& error) {
+                    std::cerr << "Peer config reload failed: " << error.what() << "\n";
+                }
+            }
+        }
+#endif
         loop.Loop();
     } else {
         NNet::TAddress addr{hosts[0].Address, hosts[0].Port};

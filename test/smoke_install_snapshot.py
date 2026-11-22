@@ -1,5 +1,6 @@
 """Real three-process durable catch-up smoke, separate from deterministic schedules."""
 import pathlib
+import signal
 import socket
 import struct
 import subprocess
@@ -30,8 +31,11 @@ def main():
         processes = [None] * 3
         endpoints = [f"127.0.0.1:{endpoint}:{node + 1}" for node, endpoint in enumerate(ports)]
         learner_config = root / "learners.conf"
-        learner_config.write_text(f"# Two voters and a learner\n\nvoter {endpoints[0]}\n"
-                                  f"voter {endpoints[1]}\nlearner {endpoints[2]} # staging\n")
+        def learner_catalog(include_learner):
+            voters = f"# Two voters\n\nvoter {endpoints[0]}\nvoter {endpoints[1]}\n"
+            return voters + (f"learner {endpoints[2]} # staging\n" if include_learner else "")
+
+        learner_config.write_text(learner_catalog(False))
         voter_config = root / "voters.conf"
         voter_config.write_text("".join(f"voter {endpoint}\n" for endpoint in endpoints))
 
@@ -64,6 +68,17 @@ def main():
                 time.sleep(0.05)
             raise AssertionError("timed out waiting for cluster progress")
 
+        def reload(contents, diagnostic):
+            log_paths = [directory / "output.log" for directory in directories[:2]]
+            counts = [path.read_text().count(diagnostic) for path in log_paths]
+            staged = learner_config.with_suffix(".new")
+            staged.write_text(contents)
+            staged.replace(learner_config)
+            for process in processes[:2]:
+                process.send_signal(signal.SIGHUP)
+            wait_for(lambda: all(path.read_text().count(diagnostic) > count
+                                 for path, count in zip(log_paths, counts)), 5)
+
         try:
             if learner_mode:
                 invalid_config = root / "invalid.conf"
@@ -92,6 +107,11 @@ def main():
                     return last[0] > 0
                 wait_for(write, 30)
                 if key == b"a":
+                    if learner_mode:
+                        invalid = (f"learner {endpoints[2]}\nlearner {endpoints[0]}\n"
+                                   f"voter {endpoints[1]}\n")
+                        reload(invalid, "Peer config reload cannot change bootstrap roles")
+                        reload(learner_catalog(True), "Reloaded peer config (1 endpoint changes)")
                     start(2)  # The established leader learns voter 3's snapshot support.
                     wait_for(lambda: call(2, key)[1] == value, 15)
                     processes[2].terminate()
@@ -135,8 +155,17 @@ def main():
                 start(2, use_role=False)
                 assert processes[2].wait(timeout=5) != 0, "restart must not promote a learner"
                 assert durable.read_bytes() == before
+                new_port = port()
+                while new_port in ports:
+                    new_port = port()
+                ports[2] = new_port
+                endpoints[2] = f"127.0.0.1:{new_port}:3"
+                reload(learner_catalog(True), "Reloaded peer config (1 endpoint changes)")
             start(2)
             wait_for(lambda: caught_up() and call(2, b"tail")[1] == b"after install", 25)
+            if learner_mode:
+                wait_for(lambda: call(0, b"moved", b"new endpoint")[0] > last[0], 15)
+                wait_for(lambda: call(2, b"moved")[1] == b"new endpoint", 15)
             for log in logs:
                 log.flush(); log.seek(0)
                 output = log.read()

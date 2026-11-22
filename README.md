@@ -284,7 +284,8 @@ Then link against miniraft.net which also brings in miniraft internally.
 - [Cmocka](https://cmocka.org/) (for unit tests only)
 
 Durable KV servers can share a [peer config file](docs/online-learner-staging.md#share-startup-endpoints-across-kv-replicas)
-for voter and learner endpoints.
+for voter and learner endpoints. On Linux, `SIGHUP` reloads supported endpoint
+changes while the server is running.
 
 ### Building the Project
 1. Clone the repository:
