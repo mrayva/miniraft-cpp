@@ -292,6 +292,8 @@ static_assert(sizeof(TForwardedCommandResponse) == sizeof(TMessage) + 24);
 // instance matching a reused 64-bit correlation ID on a live peer connection.
 struct TSessionForwardedCommandRequest: public TMessage {
     static constexpr EMessageType MessageType = EMessageType::SESSION_FORWARDED_COMMAND_REQUEST;
+    // The opaque payload is a complete TIdempotentCommandRequest when set.
+    static constexpr uint32_t EIdempotent = 1u << 31;
     uint64_t SessionId = 0;
     uint64_t ForwardCookie = 0;
     uint32_t Flags = TCommandRequest::ENone;

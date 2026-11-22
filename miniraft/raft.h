@@ -602,8 +602,8 @@ public:
 
     void CheckStateChange();
     void OnCommandRequest(TMessageHolder<TCommandRequest> message, const std::shared_ptr<INode>& replyTo);
-    // Direct idempotent writes are accepted by the current leader when the RSM
-    // and all replication targets support the durable deduplication contract.
+    // Idempotent writes are forwarded from followers only over a negotiated
+    // sessionized route; the leader also gates on RSM and replica support.
     void OnIdempotentCommandRequest(TMessageHolder<TIdempotentCommandRequest> message,
                                     const std::shared_ptr<INode>& replyTo);
     void OnForwardedCommandRequest(TMessageHolder<TForwardedCommandRequest> message,
@@ -640,10 +640,16 @@ private:
                                 const std::shared_ptr<INode>& replyTo, uint64_t admissionId);
     void Forward(TMessageHolder<TCommandRequest> message, const std::shared_ptr<INode>& replyTo,
                  uint64_t admissionId);
+    void ForwardIdempotent(TMessageHolder<TIdempotentCommandRequest> message,
+                           const TIdempotentOperationIdentity& identity,
+                           const std::shared_ptr<INode>& replyTo, uint64_t admissionId,
+                           uint64_t& reservedReplyBytes);
     void OnReadRequest(TMessageHolder<TCommandRequest> message, const std::shared_ptr<INode>& replyTo,
                        uint64_t admissionId);
     void OnWriteRequest(TMessageHolder<TCommandRequest> message, const std::shared_ptr<INode>& replyTo,
                         uint64_t admissionId);
+    void OnIdempotentCommandRequestInternal(TMessageHolder<TIdempotentCommandRequest> message,
+                                            const std::shared_ptr<INode>& replyTo, bool forwarded);
     void PruneRequests(const std::shared_ptr<INode>& disconnected = {});
     void ExpireRequests(ITimeSource::Time now, const std::shared_ptr<INode>& disconnected = {});
     void CancelForwarded(const std::shared_ptr<INode>& disconnected = {}, bool peerFailure = false);
@@ -698,6 +704,9 @@ private:
         uint64_t Term;
         uint64_t AdmissionId;
         bool Sessionized;
+        bool Idempotent = false;
+        TIdempotentOperationIdentity IdempotentIdentity;
+        uint64_t ReservedReplyBytes = 0;
     };
     // Never reuse a wire correlation ID within this processor, including after
     // failure. IDs above uint32 use the extended forwarded-command envelope.

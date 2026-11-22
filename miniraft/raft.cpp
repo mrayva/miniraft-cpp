@@ -67,6 +67,28 @@ public:
 
 private:
     TMessageHolder<TMessage> Wrap(TMessageHolder<TMessage> message) const {
+        if (message && message->Type == uint32_t(EMessageType::IDEMPOTENT_COMMAND_RESPONSE)) {
+            if (!SessionId)
+                throw TMessageError("Idempotent forwarded replies require a sessionized route");
+            ValidateIdempotentCommandResponse(message.Cast<TIdempotentCommandResponse>());
+            auto response = message.Cast<TIdempotentCommandResponse>();
+            const auto dataBytes = response->Len - sizeof(TIdempotentCommandResponse);
+            constexpr size_t ResponseOverhead =
+                sizeof(TSessionForwardedCommandResponse) - sizeof(TIdempotentCommandResponse);
+            const bool responseTooLarge = response->Len >
+                TMessageLimits{}.MaxFrameBytes - ResponseOverhead;
+            auto forwarded = NewHoldedMessage<TSessionForwardedCommandResponse>(
+                responseTooLarge ? sizeof(TSessionForwardedCommandResponse) :
+                    sizeof(TSessionForwardedCommandResponse) + dataBytes);
+            forwarded->SessionId = SessionId;
+            forwarded->ForwardCookie = ForwardCookie;
+            forwarded->Index = response->Index;
+            forwarded->ClientCookie = response->Cookie;
+            forwarded->ErrorCode = responseTooLarge ? TCommandResponse::Failed : response->ErrorCode;
+            if (!responseTooLarge && dataBytes) memcpy(forwarded->Data, response->Data, dataBytes);
+            ValidateMessageTree(forwarded);
+            return forwarded;
+        }
         if (!message || message->Type != uint32_t(EMessageType::COMMAND_RESPONSE))
             throw TMessageError("Forwarded command produced a non-response message");
         ValidateMessageTree(message);
@@ -3693,6 +3715,82 @@ void TRequestProcessor::Forward(TMessageHolder<TCommandRequest> command,
     assert(false && "Wrong state");
 }
 
+void TRequestProcessor::ForwardIdempotent(TMessageHolder<TIdempotentCommandRequest> message,
+        const TIdempotentOperationIdentity& identity, const std::shared_ptr<INode>& replyTo,
+        uint64_t admissionId, uint64_t& reservedReplyBytes) {
+    auto reject = [&](uint32_t errorCode) {
+        if (reservedReplyBytes) {
+            if (reservedReplyBytes > PendingReplyBytes) std::terminate();
+            PendingReplyBytes -= reservedReplyBytes;
+            reservedReplyBytes = 0;
+        }
+        ReleaseAdmission(admissionId);
+        if (replyTo)
+            replyTo->Send(MakeIdempotentResponse(identity, message->Cookie, 0, errorCode));
+    };
+    if (!replyTo) {
+        ReleaseAdmission(admissionId);
+        return;
+    }
+
+    const auto leaderId = Raft->GetLeaderId();
+    if (Raft->CurrentStateName() != EState::FOLLOWER || !leaderId ||
+        leaderId == Raft->GetId() || !Nodes.contains(leaderId)) {
+        reject(TCommandResponse::Failed);
+        return;
+    }
+    if (!NextForwardId) {
+        reject(TCommandResponse::Failed);
+        return;
+    }
+    auto peer = Nodes.at(leaderId);
+    if (!peer->SupportsSessionizedForwarding()) {
+        reject(TCommandResponse::Unsupported);
+        return;
+    }
+    if (message->Len > TMessageLimits{}.MaxFrameBytes - sizeof(TSessionForwardedCommandRequest)) {
+        reject(TCommandResponse::Overloaded);
+        return;
+    }
+
+    const auto forwardId = NextForwardId;
+    NextForwardId = forwardId == UINT64_MAX ? 0 : forwardId + 1;
+    Forwarded.emplace(forwardId, TForwarded{
+        .Client = replyTo,
+        .Peer = peer,
+        .OriginalCookie = message->Cookie,
+        .LeaderId = leaderId,
+        .Term = Raft->GetState()->CurrentTerm,
+        .AdmissionId = admissionId,
+        .Sessionized = true,
+        .Idempotent = true,
+        .IdempotentIdentity = identity,
+        .ReservedReplyBytes = reservedReplyBytes,
+    });
+
+    bool accepted = false;
+    try {
+        auto forwarded = NewHoldedMessage<TSessionForwardedCommandRequest>(
+            sizeof(TSessionForwardedCommandRequest) + message->Len);
+        forwarded->SessionId = ForwardingSession;
+        forwarded->ForwardCookie = forwardId;
+        forwarded->Flags = TCommandRequest::EWrite | TCommandRequest::EForwarded |
+            TSessionForwardedCommandRequest::EIdempotent;
+        forwarded->ClientCookie = message->Cookie;
+        memcpy(forwarded->Data, message.Mes, message->Len);
+        accepted = peer->TrySend(std::move(forwarded));
+    } catch (...) {
+        Forwarded.erase(forwardId);
+        throw;
+    }
+    if (!accepted) {
+        Forwarded.erase(forwardId);
+        reject(TCommandResponse::Overloaded);
+        return;
+    }
+    reservedReplyBytes = 0; // The forwarding record now owns the reservation.
+}
+
 void TRequestProcessor::OnReadRequest(TMessageHolder<TCommandRequest> command,
         const std::shared_ptr<INode>& replyTo, uint64_t admissionId)
 {
@@ -3830,8 +3928,15 @@ void TRequestProcessor::ExpireRequests(ITimeSource::Time now,
         if (!expired.contains(it->second.AdmissionId)) { ++it; continue; }
         auto pending = std::move(it->second);
         it = Forwarded.erase(it);
-        if (pending.Client && pending.Client != disconnected)
+        if (pending.Idempotent) {
+            if (pending.ReservedReplyBytes > PendingReplyBytes) std::terminate();
+            PendingReplyBytes -= pending.ReservedReplyBytes;
+            if (pending.Client && pending.Client != disconnected)
+                rejectedIdempotent.push_back({pending.Client, pending.IdempotentIdentity,
+                    pending.OriginalCookie});
+        } else if (pending.Client && pending.Client != disconnected) {
             rejected.emplace_back(pending.Client, pending.OriginalCookie);
+        }
     }
 
     for (auto id : expired) ReleaseAdmission(id);
@@ -3854,8 +3959,15 @@ void TRequestProcessor::CancelForwarded(const std::shared_ptr<INode>& disconnect
         auto pending = std::move(it->second);
         it = Forwarded.erase(it);
         ReleaseAdmission(pending.AdmissionId);
-        if (!disconnected || peerFailure) pending.Client->Send(NewHoldedMessage(
-            TCommandResponse{.Cookie = pending.OriginalCookie, .ErrorCode = TCommandResponse::Failed}));
+        if (pending.Idempotent) {
+            if (pending.ReservedReplyBytes > PendingReplyBytes) std::terminate();
+            PendingReplyBytes -= pending.ReservedReplyBytes;
+            if (!disconnected || peerFailure) pending.Client->Send(MakeIdempotentResponse(
+                pending.IdempotentIdentity, pending.OriginalCookie, 0, TCommandResponse::Failed));
+        } else if (!disconnected || peerFailure) {
+            pending.Client->Send(NewHoldedMessage(TCommandResponse{
+                .Cookie = pending.OriginalCookie, .ErrorCode = TCommandResponse::Failed}));
+        }
     }
 }
 
@@ -3930,6 +4042,12 @@ void TRequestProcessor::OnCommandRequest(TMessageHolder<TCommandRequest> command
 void TRequestProcessor::OnIdempotentCommandRequest(
         TMessageHolder<TIdempotentCommandRequest> command,
         const std::shared_ptr<INode>& replyTo) {
+    OnIdempotentCommandRequestInternal(std::move(command), replyTo, false);
+}
+
+void TRequestProcessor::OnIdempotentCommandRequestInternal(
+        TMessageHolder<TIdempotentCommandRequest> command,
+        const std::shared_ptr<INode>& replyTo, bool forwarded) {
     ValidateIdempotentCommandRequest(command);
     TIdempotentOperationIdentity identity{
         .Epoch = command->Epoch,
@@ -3959,16 +4077,6 @@ void TRequestProcessor::OnIdempotentCommandRequest(
         idempotentRsm->ValidateIdempotent(command);
         identity.PayloadDigest = ComputeIdempotentPayloadDigest(std::string_view(
             command->Data, command->Len - sizeof(TIdempotentCommandRequest)));
-        if (Raft->CurrentStateName() != EState::LEADER) {
-            ReleaseAdmission(admissionId);
-            respond(TCommandResponse::Failed);
-            return;
-        }
-        if (!Raft->CanAppendIdempotentLogEntries()) {
-            ReleaseAdmission(admissionId);
-            respond(TCommandResponse::Unsupported);
-            return;
-        }
         if (AdmissionExpired(admissionId, TimeSource->Now())) {
             ReleaseAdmission(admissionId);
             respond(TCommandResponse::TimedOut);
@@ -3993,6 +4101,29 @@ void TRequestProcessor::OnIdempotentCommandRequest(
                 return;
             }
             PendingReplyBytes += reservedReplyBytes;
+        }
+
+        if (Raft->CurrentStateName() != EState::LEADER) {
+            if (forwarded) {
+                if (reservedReplyBytes) {
+                    PendingReplyBytes -= reservedReplyBytes;
+                    reservedReplyBytes = 0;
+                }
+                ReleaseAdmission(admissionId);
+                respond(TCommandResponse::Failed);
+                return;
+            }
+            ForwardIdempotent(std::move(command), identity, replyTo, admissionId, reservedReplyBytes);
+            return;
+        }
+        if (!Raft->CanAppendIdempotentLogEntries()) {
+            if (reservedReplyBytes) {
+                PendingReplyBytes -= reservedReplyBytes;
+                reservedReplyBytes = 0;
+            }
+            ReleaseAdmission(admissionId);
+            respond(TCommandResponse::Unsupported);
+            return;
         }
 
         auto applicationEntry = idempotentRsm->PrepareIdempotent(command);
@@ -4069,18 +4200,33 @@ void TRequestProcessor::OnSessionForwardedCommandRequest(
         message->Type != uint32_t(EMessageType::SESSION_FORWARDED_COMMAND_REQUEST))
         throw TMessageError("Invalid sessionized forwarded command request");
     ValidateMessageTree(message);
+    const bool idempotent = message->Flags & TSessionForwardedCommandRequest::EIdempotent;
+    constexpr uint32_t commandFlags = TCommandRequest::EWrite | TCommandRequest::EStale |
+        TCommandRequest::EConsistent | TCommandRequest::EForwarded;
     if (!peer || !message->SessionId || !message->ForwardCookie ||
         !(message->Flags & TCommandRequest::EForwarded) ||
-        (message->Flags & ~(TCommandRequest::EWrite | TCommandRequest::EStale |
-            TCommandRequest::EConsistent | TCommandRequest::EForwarded)))
+        (message->Flags & ~(commandFlags | TSessionForwardedCommandRequest::EIdempotent)) ||
+        (idempotent && (message->Flags & commandFlags) !=
+            (TCommandRequest::EWrite | TCommandRequest::EForwarded)))
         throw TMessageError("Invalid sessionized forwarded command metadata");
     const auto payloadBytes = message->Len - sizeof(TSessionForwardedCommandRequest);
+    auto reply = std::make_shared<TForwardedCommandReplyNode>(
+        peer, message->ForwardCookie, message->SessionId);
+    if (idempotent) {
+        if (payloadBytes < sizeof(TIdempotentCommandRequest))
+            throw TMessageError("Truncated forwarded idempotent request");
+        auto command = NewHoldedMessage<TIdempotentCommandRequest>(payloadBytes);
+        memcpy(command.Mes, message->Data, payloadBytes);
+        ValidateIdempotentCommandRequest(command);
+        if (command->Cookie != message->ClientCookie)
+            throw TMessageError("Forwarded idempotent cookie mismatch");
+        OnIdempotentCommandRequestInternal(std::move(command), reply, true);
+        return;
+    }
     auto command = NewHoldedMessage<TCommandRequest>(sizeof(TCommandRequest) + payloadBytes);
     command->Flags = message->Flags;
     command->Cookie = message->ClientCookie;
     if (payloadBytes) memcpy(command->Data, message->Data, payloadBytes);
-    auto reply = std::make_shared<TForwardedCommandReplyNode>(
-        peer, message->ForwardCookie, message->SessionId);
     OnCommandRequest(std::move(command), reply);
 }
 
@@ -4139,6 +4285,27 @@ void TRequestProcessor::OnSessionForwardedCommandResponse(
     if (it == Forwarded.end() || !it->second.Sessionized || it->second.Peer != peer) return;
     auto pending = std::move(it->second);
     Forwarded.erase(it);
+    if (pending.Idempotent) {
+        const auto maxDataBytes = std::min<uint64_t>(TMessageLimits{}.MaxFrameBytes,
+            UINT32_MAX) - sizeof(TIdempotentCommandResponse);
+        const bool validResult = message->ClientCookie == pending.OriginalCookie &&
+            message->ErrorCode <= TCommandResponse::AlreadyCompleted &&
+            (message->ErrorCode != TCommandResponse::Success || message->Index != 0) &&
+            pending.ReservedReplyBytes >= sizeof(TIdempotentCommandResponse) &&
+            dataBytes <= pending.ReservedReplyBytes - sizeof(TIdempotentCommandResponse) &&
+            dataBytes <= maxDataBytes;
+        auto response = validResult
+            ? MakeIdempotentResponse(pending.IdempotentIdentity, pending.OriginalCookie,
+                message->Index, message->ErrorCode,
+                std::string_view(message->Data, validResult ? dataBytes : 0))
+            : MakeIdempotentResponse(pending.IdempotentIdentity, pending.OriginalCookie,
+                0, TCommandResponse::Failed);
+        if (pending.ReservedReplyBytes > PendingReplyBytes) std::terminate();
+        PendingReplyBytes -= pending.ReservedReplyBytes;
+        ReleaseAdmission(pending.AdmissionId);
+        pending.Client->Send(std::move(response));
+        return;
+    }
     ReleaseAdmission(pending.AdmissionId);
     auto response = NewHoldedMessage<TCommandResponse>(sizeof(TCommandResponse) + dataBytes);
     response->Index = message->Index;

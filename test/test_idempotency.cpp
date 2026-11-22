@@ -118,8 +118,10 @@ struct TSnapshotRsm : IIdempotentRsm {
 
 struct TIdempotencyPeer : INode {
     std::vector<TMessageHolder<TMessage>> Sent;
+    bool SessionizedForwarding = false;
     void Send(TMessageHolder<TMessage> message) override { Sent.push_back(std::move(message)); }
     void Drain() override { }
+    bool SupportsSessionizedForwarding() const override { return SessionizedForwarding; }
 };
 
 struct TIdempotencyManualTimeSource : ITimeSource {
@@ -306,6 +308,98 @@ void test_idempotent_request_is_proposed_and_replied_after_application(void**) {
     assert_true(rsm->LastIdentity.PayloadDigest == ComputeIdempotentPayloadDigest("work"));
 }
 
+void test_idempotent_request_forwards_through_sessionized_route(void**) {
+    auto followerState = std::make_shared<TState>();
+    followerState->CurrentTerm = 1;
+    followerState->BindVoters({1, 2});
+    auto peer = std::make_shared<TIdempotencyPeer>();
+    peer->SessionizedForwarding = true;
+    auto followerRaft = std::make_shared<TRaft>(followerState, 2, TNodeDict{{1, peer}});
+    auto followerRsm = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor follower(followerRaft, followerRsm, TNodeDict{{1, peer}});
+    const_cast<TVolatileState*>(followerRaft->GetVolatileState())->LeaderId = 1;
+    auto client = std::make_shared<TIdempotencyPeer>();
+
+    auto request = NewHoldedMessage<TIdempotentCommandRequest>(
+        sizeof(TIdempotentCommandRequest) + 4);
+    request->Epoch = 3;
+    request->SessionIdHigh = 4;
+    request->SessionIdLow = 5;
+    request->Sequence = 6;
+    request->Cookie = 7;
+    memcpy(request->Data, "work", 4);
+    follower.OnIdempotentCommandRequest(request, client);
+
+    assert_int_equal(peer->Sent.size(), 1);
+    auto forwarded = peer->Sent.back().Cast<TSessionForwardedCommandRequest>();
+    assert_true(forwarded->Flags & TSessionForwardedCommandRequest::EIdempotent);
+    assert_int_equal(forwarded->ClientCookie, request->Cookie);
+
+    auto leaderState = std::make_shared<TState>();
+    leaderState->CurrentTerm = 1;
+    leaderState->BindVoters({1});
+    auto leaderRaft = std::make_shared<TRaft>(leaderState, 1, TNodeDict{});
+    auto leaderRsm = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor leader(leaderRaft, leaderRsm, {});
+    leaderRaft->Become(EState::LEADER);
+    leader.OnSessionForwardedCommandRequest(forwarded, peer);
+    assert_int_equal(leaderState->LastLogIndex, 1);
+
+    const_cast<TVolatileState*>(leaderRaft->GetVolatileState())->CommitIndex = 1;
+    leader.ProcessCommitted();
+    assert_int_equal(peer->Sent.size(), 2);
+    auto forwardedResponse = peer->Sent.back().Cast<TSessionForwardedCommandResponse>();
+    follower.OnSessionForwardedCommandResponse(forwardedResponse, peer);
+
+    assert_int_equal(client->Sent.size(), 1);
+    auto response = client->Sent.back().Cast<TIdempotentCommandResponse>();
+    ValidateIdempotentCommandResponse(response);
+    assert_int_equal(response->Index, 1);
+    assert_int_equal(response->Epoch, request->Epoch);
+    assert_int_equal(response->SessionIdHigh, request->SessionIdHigh);
+    assert_int_equal(response->SessionIdLow, request->SessionIdLow);
+    assert_int_equal(response->Sequence, request->Sequence);
+    assert_int_equal(response->Cookie, request->Cookie);
+    assert_int_equal(response->ErrorCode, TCommandResponse::Success);
+}
+
+void test_forwarded_idempotent_request_is_not_forwarded_again_by_follower(void**) {
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 1;
+    state->BindVoters({1, 2});
+    auto peer = std::make_shared<TIdempotencyPeer>();
+    peer->SessionizedForwarding = true;
+    auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}});
+    auto rsm = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor processor(raft, rsm, TNodeDict{{1, peer}});
+    const_cast<TVolatileState*>(raft->GetVolatileState())->LeaderId = 1;
+
+    auto request = NewHoldedMessage<TIdempotentCommandRequest>(
+        sizeof(TIdempotentCommandRequest) + 1);
+    request->Epoch = 1;
+    request->SessionIdLow = 1;
+    request->Sequence = 1;
+    request->Cookie = 4;
+    request->Data[0] = 'x';
+    auto forwarded = NewHoldedMessage<TSessionForwardedCommandRequest>(
+        sizeof(TSessionForwardedCommandRequest) + request->Len);
+    forwarded->SessionId = 9;
+    forwarded->ForwardCookie = 10;
+    forwarded->Flags = TCommandRequest::EWrite | TCommandRequest::EForwarded |
+        TSessionForwardedCommandRequest::EIdempotent;
+    forwarded->ClientCookie = request->Cookie;
+    memcpy(forwarded->Data, request.Mes, request->Len);
+
+    processor.OnSessionForwardedCommandRequest(forwarded, peer);
+
+    assert_int_equal(state->LastLogIndex, 0);
+    assert_int_equal(peer->Sent.size(), 1);
+    const auto response = peer->Sent.back().Cast<TSessionForwardedCommandResponse>();
+    assert_int_equal(response->SessionId, forwarded->SessionId);
+    assert_int_equal(response->ForwardCookie, forwarded->ForwardCookie);
+    assert_int_equal(response->ErrorCode, TCommandResponse::Failed);
+}
+
 void test_idempotent_request_without_idempotent_rsm_is_rejected(void**) {
     auto state = std::make_shared<TState>();
     state->CurrentTerm = 1;
@@ -482,6 +576,8 @@ int main() {
         cmocka_unit_test(test_idempotent_log_record_roundtrip_and_rejects_corruption),
         cmocka_unit_test(test_committed_idempotent_log_replay_uses_identity_and_application_entry),
         cmocka_unit_test(test_idempotent_request_is_proposed_and_replied_after_application),
+        cmocka_unit_test(test_idempotent_request_forwards_through_sessionized_route),
+        cmocka_unit_test(test_forwarded_idempotent_request_is_not_forwarded_again_by_follower),
         cmocka_unit_test(test_idempotent_request_without_idempotent_rsm_is_rejected),
         cmocka_unit_test(test_idempotent_request_timeout_releases_reply_but_keeps_log_entry),
         cmocka_unit_test(test_idempotent_log_requires_every_member_capability_including_joint_additions),
