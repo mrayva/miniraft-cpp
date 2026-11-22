@@ -224,6 +224,8 @@ struct TIdempotencyCluster {
     std::vector<std::shared_ptr<TRequestProcessor>> Processors;
     std::deque<TMessageHolder<TMessage>> Packets;
     std::set<uint32_t> Isolated;
+    std::set<std::pair<uint32_t, uint32_t>> DroppedLinks;
+    std::set<uint32_t> DroppedAppendEntriesFrom;
     std::shared_ptr<TIdempotencyManualTimeSource> Clock =
         std::make_shared<TIdempotencyManualTimeSource>();
 
@@ -254,7 +256,10 @@ struct TIdempotencyCluster {
             auto message = std::move(Packets.front());
             Packets.pop_front();
             auto rpc = message.Cast<TMessageEx>();
-            if (Isolated.count(rpc->Src) || Isolated.count(rpc->Dst)) continue;
+            if (Isolated.count(rpc->Src) || Isolated.count(rpc->Dst) ||
+                DroppedLinks.contains({rpc->Src, rpc->Dst}) ||
+                (message->Type == uint32_t(EMessageType::APPEND_ENTRIES_REQUEST) &&
+                 DroppedAppendEntriesFrom.count(rpc->Src))) continue;
             const auto index = size_t(rpc->Dst - 1);
             Rafts.at(index)->Process(Clock->Value, message);
             Processors.at(index)->CheckStateChange();
@@ -973,6 +978,75 @@ void test_idempotent_retry_after_snapshot_recovery_and_leader_change_returns_cac
     assert_int_equal(cluster.Applications[2]->ApplicationMutations, 1);
     assert_true(cluster.Applications[2]->State.ApplicationData == "work");
 }
+
+void test_duplicate_idempotent_entries_from_two_leaders_apply_once(void**) {
+    TIdempotencyCluster cluster(3);
+    cluster.Elect(1);
+    cluster.Replicate(1);
+    const auto formerLeaderTerm = cluster.Rafts[0]->GetState()->CurrentTerm;
+
+    // Node 2 stores leader 1's operation, but its acknowledgement is lost and
+    // node 3 is unavailable, so the original copy remains uncommitted.
+    cluster.Isolated.insert(3);
+    cluster.DroppedLinks.insert({2, 1});
+    auto abandonedClient = std::make_shared<TIdempotencyPeer>();
+    cluster.Processors[0]->OnIdempotentCommandRequest(IdempotentRequest(41), abandonedClient);
+    cluster.Replicate(1);
+    assert_true(abandonedClient->Sent.empty());
+    assert_int_equal(cluster.Rafts[0]->GetState()->LastLogIndex, 2);
+    assert_int_equal(cluster.Rafts[0]->GetState()->CommitIndex, 1);
+    assert_int_equal(cluster.Rafts[1]->GetState()->LastLogIndex, 2);
+    assert_int_equal(cluster.Rafts[1]->GetState()->CommitIndex, 1);
+    assert_int_equal(cluster.Applications[0]->ApplicationMutations, 0);
+    assert_int_equal(cluster.Applications[1]->ApplicationMutations, 0);
+    cluster.Processors[0]->CleanUp(abandonedClient);
+
+    // Node 2 wins a later term with node 3. The old leader steps down on the
+    // new term's replication probe. Before that suffix reaches either follower,
+    // retry the same operation so the new leader appends a second log copy.
+    cluster.Isolated.erase(3);
+    cluster.DroppedLinks.clear();
+    cluster.DroppedAppendEntriesFrom.insert(2);
+    cluster.Elect(2);
+    cluster.DroppedAppendEntriesFrom.erase(2);
+    assert_true(cluster.Rafts[1]->GetState()->CurrentTerm > formerLeaderTerm);
+    assert_int_equal(cluster.Rafts[1]->GetState()->LastLogIndex, 3);
+    assert_int_equal(cluster.Applications[1]->LastAppliedIndex, 1);
+    // Election sends the first heartbeat immediately and then backs off for
+    // half an election timeout. Force one deterministic probe round now; both
+    // followers reject the new leader's term-3 stub boundary and advertise
+    // current-term capabilities without receiving the uncommitted suffix.
+    auto* leaderVolatile = const_cast<TVolatileState*>(cluster.Rafts[1]->GetVolatileState());
+    for (uint32_t peer : {1, 3}) {
+        leaderVolatile->HeartbeatDue[peer] = cluster.Clock->Value;
+        leaderVolatile->RpcDue[peer] = cluster.Clock->Value;
+    }
+    cluster.Replicate(2, 1);
+    assert_true(cluster.Rafts[1]->CanAppendIdempotentLogEntries());
+
+    auto retryClient = std::make_shared<TIdempotencyPeer>();
+    cluster.Processors[1]->OnIdempotentCommandRequest(IdempotentRequest(42), retryClient);
+    assert_int_equal(cluster.Rafts[1]->GetState()->LastLogIndex, 4);
+    assert_int_equal(cluster.Rafts[1]->GetState()->CommitIndex, 1);
+    cluster.Replicate(2);
+
+    assert_int_equal(retryClient->Sent.size(), 1);
+    auto response = retryClient->Sent.back().Cast<TIdempotentCommandResponse>();
+    ValidateIdempotentCommandResponse(response);
+    assert_int_equal(response->Cookie, 42);
+    assert_int_equal(response->ErrorCode, TCommandResponse::Success);
+    assert_int_equal(response->Index, 2);
+    assert_true(std::string(response->Data,
+        response->Len - sizeof(TIdempotentCommandResponse)) == "result:work");
+
+    for (size_t node = 0; node < 3; ++node) {
+        assert_int_equal(cluster.Rafts[node]->GetVolatileState()->CommitIndex, 4);
+        assert_int_equal(cluster.Applications[node]->ApplicationMutations, 1);
+        assert_true(cluster.Applications[node]->State.ApplicationData == "work");
+        assert_int_equal(cluster.Applications[node]->State.Sessions.size(), 1);
+        assert_int_equal(cluster.Applications[node]->State.Sessions.front().LogIndex, 2);
+    }
+}
 }
 
 int main() {
@@ -994,6 +1068,7 @@ int main() {
         cmocka_unit_test(test_idempotency_control_capability_is_advertised_and_recorded),
         cmocka_unit_test(test_idempotent_rsm_snapshot_hook_validates_before_atomic_restore),
         cmocka_unit_test(test_idempotent_retry_after_snapshot_recovery_and_leader_change_returns_cached_result),
+        cmocka_unit_test(test_duplicate_idempotent_entries_from_two_leaders_apply_once),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }

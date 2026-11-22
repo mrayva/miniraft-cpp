@@ -114,12 +114,14 @@ voter, elects it in a later term, and retries the same identity. The retry
 returns the saved response without another application mutation. These tests
 validate the protocol boundary and storage integration with test RSMs; the
 three-voter scenario uses in-memory Raft storage and does not simulate a process
-restart.
+restart. Another deterministic three-voter scenario leaves an operation
+uncommitted on a former leader, elects the follower that holds that copy, and
+retries the same identity before replicating the old suffix. Both copies then
+commit, while each RSM applies the operation once and retains the original
+result index.
 
 The following tests remain necessary before claiming the full client guarantee:
 
-- Retry the same identity and digest while the first copy is uncommitted on a
-  former leader; deliver both log copies and assert only one application call.
 - Reuse the latest sequence with a different payload and verify conflict with
   no state mutation.
 - Restart a new leader from durable Raft and application snapshots, retry the
@@ -142,8 +144,8 @@ The following tests remain necessary before claiming the full client guarantee:
 4. Validate lost-reply retries, duplicate log copies, leadership changes,
    restart, compaction and resource limits using a stateful deduplicating RSM.
   **Partially implemented:** lost-reply retry across snapshot installation and
-  leadership change is covered; durable process restart and the scenarios
-  above remain open.
+  leadership change and duplicate uncommitted copies across leaders are covered;
+  durable process restart and the scenarios above remain open.
 
 Clients using ordinary `TCommandRequest` writes retain at-least-once behavior.
 For idempotent requests, a timeout after admission still has an unknown outcome;
