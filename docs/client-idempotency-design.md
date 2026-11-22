@@ -1,8 +1,8 @@
 # Durable client write deduplication design
 
-Status: the replicated protocol hooks and a reference KV idempotent state
-machine are implemented, but MiniRaft does not provide a client library or an
-application-specific durable storage engine. The opt-in
+Status: the replicated protocol hooks, a reference KV idempotent state machine,
+and a client session/retry helper are implemented. MiniRaft does not provide a
+network client or a durable client-state-store adapter. The opt-in
 request type carries operation identity through negotiated forwarding and a
 tagged replicated log record. `IIdempotentRsm` applies committed records and
 captures application data, session records, epoch and progress in one bounded
@@ -153,7 +153,12 @@ the prior state intact. A Linux durable integration test stores the combined
 KV/dedup snapshot, restarts the durable store, persists a duplicate committed
 log record, restarts again, and verifies replay returns the cached result at its
 original index. This closes the test-double-only application-contract gap for
-the sample KV application. A client library and integration with a deployment
+the sample KV application. `TIdempotentClientSession` in
+`miniraft/idempotent_client.h` persists each pending operation through a caller-
+provided durable state-store interface before returning a request. It resends
+the same identity and payload after restart and advances the sequence only
+after a matching success response is durably acknowledged. The network client,
+a production state-store adapter, and integration with a deployment
 application's own durable state and snapshot implementation remain open.
 
 ## Implementation status
@@ -173,7 +178,10 @@ application's own durable state and snapshot implementation remain open.
   cache exhaustion and durable session close are covered with test RSMs. The
   sample KV application's real write/snapshot path is covered by
   `test_idempotent_kv`, and its disk-backed snapshot plus committed replay path
-  is covered by `test_durable`; deployment-specific integration remains open.
+  is covered by `test_durable`. The client session/retry helper and its
+  persist-before-send and restart behavior are covered by
+  `test_idempotent_client`; the network client and deployment-specific storage
+  adapters remain open.
 
 Clients using ordinary `TCommandRequest` writes retain at-least-once behavior.
 For idempotent requests, a timeout after admission still has an unknown outcome;
