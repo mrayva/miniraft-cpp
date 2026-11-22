@@ -106,8 +106,10 @@ Focused tests now cover strict request and log-record validation, snapshot
 round trips and limits, committed application replay, forwarding with
 sessionized routes, timeout behavior, capability negotiation (including new
 joint members), atomic control application, and control-record replay after a
-durable restart. These tests validate the protocol boundary and storage
-integration with test RSMs.
+durable restart. Duplicate committed idempotent records also replay after a
+durable restart, applying the command once and returning the original cached
+result. These tests validate the protocol boundary and storage integration
+with test RSMs.
 
 The following tests remain necessary before claiming the full client guarantee:
 

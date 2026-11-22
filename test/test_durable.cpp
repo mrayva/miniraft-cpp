@@ -88,6 +88,10 @@ TMessageHolder<TLogEntry> Entry(uint64_t term, const std::string& data) {
 }
 struct TDurableControlRsm : IIdempotentRsm {
     TIdempotencySnapshot State;
+    size_t IdempotentApplicationCalls = 0;
+    uint64_t LastIdempotentResultIndex = 0;
+    uint32_t LastIdempotentResultError = TCommandResponse::Success;
+    std::string LastIdempotentResultData;
 
     TMessageHolder<TMessage> Read(TMessageHolder<TCommandRequest>, uint64_t index) override {
         return NewHoldedMessage(TCommandResponse{.Index = index});
@@ -107,11 +111,44 @@ struct TDurableControlRsm : IIdempotentRsm {
             TMessageHolder<TIdempotentCommandRequest>) override {
         return NewHoldedMessage<TLogEntry>();
     }
-    TIdempotentWriteResult WriteIdempotent(TMessageHolder<TLogEntry>, uint64_t index,
-            const TIdempotentOperationIdentity&) override {
+    TIdempotentWriteResult WriteIdempotent(TMessageHolder<TLogEntry> command, uint64_t index,
+            const TIdempotentOperationIdentity& identity) override {
+        const auto session = std::find_if(State.Sessions.begin(), State.Sessions.end(),
+            [&](const auto& record) {
+                return record.SessionIdHigh == identity.SessionIdHigh &&
+                    record.SessionIdLow == identity.SessionIdLow;
+            });
+        if (session != State.Sessions.end()) {
+            if (identity.Epoch != State.Epoch || identity.Sequence != session->HighestSequence ||
+                identity.PayloadDigest != session->PayloadDigest)
+                throw std::invalid_argument("Unexpected durable test duplicate");
+            State.LastAppliedIndex = index;
+            LastAppliedIndex = index;
+            LastIdempotentResultIndex = session->LogIndex;
+            LastIdempotentResultError = session->ErrorCode;
+            LastIdempotentResultData = session->ResponseData;
+            return {.Index = LastIdempotentResultIndex, .ErrorCode = LastIdempotentResultError,
+                .Data = LastIdempotentResultData};
+        }
+
+        ++IdempotentApplicationCalls;
+        State.ApplicationData.assign(command->Data, command->Len - sizeof(TLogEntry));
+        State.Sessions.push_back({
+            .SessionIdHigh = identity.SessionIdHigh,
+            .SessionIdLow = identity.SessionIdLow,
+            .HighestSequence = identity.Sequence,
+            .PayloadDigest = identity.PayloadDigest,
+            .LogIndex = index,
+            .ErrorCode = TCommandResponse::Success,
+            .ResponseData = "durable-result",
+        });
         LastAppliedIndex = index;
         State.LastAppliedIndex = index;
-        return {.Index = index, .ErrorCode = TCommandResponse::Success};
+        LastIdempotentResultIndex = index;
+        LastIdempotentResultError = TCommandResponse::Success;
+        LastIdempotentResultData = "durable-result";
+        return {.Index = index, .ErrorCode = TCommandResponse::Success,
+            .Data = "durable-result"};
     }
     void ValidateIdempotencyControl(const TIdempotencyControlOperation& operation) const override {
         ValidateIdempotencyControlOperation(operation);
@@ -932,6 +969,44 @@ void test_idempotency_control_survives_durable_restart_and_replays_atomically(vo
     assert_int_equal(rsm->State.Epoch, 3);
     assert_true(rsm->State.ApplicationData == "durable-control");
 }
+void test_duplicate_idempotent_records_apply_once_after_durable_restart(void**) {
+    TFiles files;
+    TIdempotentOperationIdentity identity;
+    identity.Epoch = 1;
+    identity.SessionIdHigh = 11;
+    identity.SessionIdLow = 12;
+    identity.Sequence = 1;
+    identity.PayloadDigest = ComputeIdempotentPayloadDigest("client-payload");
+    auto record = EncodeIdempotentLogEntry(identity, Entry(1, "durable-command"));
+    {
+        TDurableState state(files.Name, 1);
+        state.CurrentTerm = 1;
+        state.BindVoters({1});
+        state.AppendBatchAndCommit({record, record}, 2);
+    }
+
+    auto state = std::make_shared<TDurableState>(files.Name, 1);
+    assert_int_equal(state->LastLogIndex, 2);
+    assert_int_equal(state->CommitIndex, 2);
+    assert_int_equal(state->Get(1)->Flags, TLogEntry::EIdempotent);
+    assert_int_equal(state->Get(2)->Flags, TLogEntry::EIdempotent);
+    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+    auto rsm = std::make_shared<TDurableControlRsm>();
+    rsm->State.Epoch = identity.Epoch;
+    TRequestProcessor processor(raft, rsm, {});
+    processor.ProcessCommitted();
+
+    assert_int_equal(rsm->LastAppliedIndex, 2);
+    assert_int_equal(rsm->State.LastAppliedIndex, 2);
+    assert_int_equal(rsm->IdempotentApplicationCalls, 1);
+    assert_true(rsm->State.ApplicationData == "durable-command");
+    assert_int_equal(rsm->State.Sessions.size(), 1);
+    assert_int_equal(rsm->State.Sessions.front().LogIndex, 1);
+    assert_true(rsm->State.Sessions.front().ResponseData == "durable-result");
+    assert_int_equal(rsm->LastIdempotentResultIndex, 1);
+    assert_int_equal(rsm->LastIdempotentResultError, TCommandResponse::Success);
+    assert_true(rsm->LastIdempotentResultData == "durable-result");
+}
 }
 
 int main() {
@@ -959,6 +1034,7 @@ int main() {
         cmocka_unit_test(test_get_and_append_do_not_share_mutable_entries),
         cmocka_unit_test(test_raft_election_and_application_replay_after_restart),
         cmocka_unit_test(test_idempotency_control_survives_durable_restart_and_replays_atomically),
+        cmocka_unit_test(test_duplicate_idempotent_records_apply_once_after_durable_restart),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }
