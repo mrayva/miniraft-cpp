@@ -1379,6 +1379,14 @@ void test_stable_snapshot_completes_known_joint_membership_only_from_new_voter(v
     joint.JointVoters = {2, 3};
     joint.ConfigurationIndex = 4;
     joint.ConfigurationTerm = 2;
+    const TSnapshotConfigurationTransition priorStable{{7, 8}, {1, 2}, 0, 0, 2, 2, 3, 2};
+    const TSnapshotConfigurationTransition currentJoint{{1, 2}, {2, 3}, 3, 2, 4, 2, 0, 0};
+    joint.PreviousVoters = joint.Voters;
+    joint.PreviousConfigurationIndex = 3;
+    joint.PreviousConfigurationTerm = 2;
+    joint.PreviousJointIndex = joint.ConfigurationIndex;
+    joint.PreviousJointTerm = joint.ConfigurationTerm;
+    joint.ConfigurationTransitions = {priorStable, currentJoint};
 
     const std::vector<uint32_t> bootstrapVoters{1, 2, 3};
     auto state = std::make_shared<TState>();
@@ -1404,8 +1412,13 @@ void test_stable_snapshot_completes_known_joint_membership_only_from_new_voter(v
     stable.ConfigurationIndex = 7;
     stable.ConfigurationTerm = 3;
     stable.PreviousVoters = joint.Voters;
+    stable.PreviousConfigurationIndex = joint.PreviousConfigurationIndex;
+    stable.PreviousConfigurationTerm = joint.PreviousConfigurationTerm;
     stable.PreviousJointIndex = joint.ConfigurationIndex;
     stable.PreviousJointTerm = joint.ConfigurationTerm;
+    stable.ConfigurationTransitions = {priorStable, currentJoint};
+    stable.ConfigurationTransitions.back().StableIndex = stable.ConfigurationIndex;
+    stable.ConfigurationTransitions.back().StableTerm = stable.ConfigurationTerm;
 
     auto install = [&](const TSnapshot& candidate, uint32_t leader) {
         const auto bytes = EncodeSnapshot(candidate);
@@ -1416,9 +1429,9 @@ void test_stable_snapshot_completes_known_joint_membership_only_from_new_voter(v
         return replies.back();
     };
 
-    auto wrongLineage = stable;
-    wrongLineage.PreviousJointIndex = 3;
-    auto response = install(wrongLineage, 3);
+    auto wrongHistory = stable;
+    wrongHistory.ConfigurationTransitions.front().OldVoters = {9, 10};
+    auto response = install(wrongHistory, 3);
     assert_false(response->Success);
     assert_false(response->Installed);
     assert_true(state->GetSnapshot() && *state->GetSnapshot() == joint);
