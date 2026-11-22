@@ -480,7 +480,7 @@ void test_server_forwards_successful_membership_operations(void**) {
 }
 
 #ifdef __linux__
-int RunSocketMembershipJointCommitTest(const std::filesystem::path& dir) {
+int RunSocketMembershipTransitionTest(const std::filesystem::path& dir) {
     struct TManualTimeSource : ITimeSource {
         Time Current = std::chrono::steady_clock::now();
         Time Now() override { return Current; }
@@ -651,16 +651,65 @@ int RunSocketMembershipJointCommitTest(const std::filesystem::path& dir) {
     }
     for (uint32_t id = 1; id <= 3; ++id)
         if (states[id]->GetBoundVoters() != oldVoters) return 8;
+
+    const auto transferReady = [&] {
+        const auto* leaderState = rafts[1]->GetVolatileState();
+        return leaderState->MatchIndex.contains(2) &&
+            leaderState->MatchIndex.at(2) >= states[1]->LastLogIndex &&
+            leaderState->CommitAckIndex.contains(2) &&
+            leaderState->CommitAckIndex.at(2) >= leaderState->CommitIndex;
+    };
+    for (unsigned retry = 0; retry < 4 && !transferReady(); ++retry) {
+        tickLeader();
+        if (pumpUntil(transferReady, 500)) break;
+    }
+    if (!transferReady()) return 9;
+
+    servers[1]->TransferLeadership(2);
+    drainPeers();
+    if (!pumpUntil([&] { return rafts[2]->CurrentStateName() == EState::LEADER; }, 2000)) return 10;
+
+    const auto currentTermEntryCommitted = [&] {
+        return rafts[2]->GetVolatileState()->CommitIndex > jointIndex &&
+            states[2]->LogTerm(rafts[2]->GetVolatileState()->CommitIndex) == states[2]->CurrentTerm;
+    };
+    for (unsigned retry = 0; retry < 4 && !currentTermEntryCommitted(); ++retry) {
+        timeSource->Current += std::chrono::seconds(1);
+        rafts[2]->ProcessTimeout(timeSource->Now());
+        drainPeers();
+        if (pumpUntil(currentTermEntryCommitted, 500)) break;
+    }
+    if (!currentTermEntryCommitted()) return 11;
+
+    const auto stableIndex = servers[2]->FinalizeConfiguration();
+    auto tickNewLeader = [&] {
+        timeSource->Current += std::chrono::seconds(1);
+        rafts[2]->ProcessTimeout(timeSource->Now());
+        drainPeers();
+    };
+    const auto stablePropagated = [&] {
+        for (uint32_t id = 1; id <= 3; ++id)
+            if (states[id]->CommitIndex < stableIndex || rafts[id]->GetVoterIds() != newVoters ||
+                rafts[id]->IsVoter(id) != (id != 1)) return false;
+        return true;
+    };
+    for (unsigned retry = 0; retry < 6 && !stablePropagated(); ++retry) {
+        tickNewLeader();
+        if (pumpUntil(stablePropagated, 500)) break;
+    }
+    if (!stablePropagated()) return 12;
+    for (uint32_t id = 1; id <= 3; ++id)
+        if (states[id]->GetBoundVoters() != oldVoters) return 13;
     return 0;
 }
 
-void test_server_commits_joint_membership_over_socket_transport(void**) {
+void test_server_transitions_membership_over_socket_transport(void**) {
     const auto dir = std::filesystem::temp_directory_path() /
-        ("miniraft-socket-membership-joint-" +
+        ("miniraft-socket-membership-transition-" +
             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     const auto child = ::fork();
     assert_true(child >= 0);
-    if (child == 0) _exit(RunSocketMembershipJointCommitTest(dir));
+    if (child == 0) _exit(RunSocketMembershipTransitionTest(dir));
 
     int status = 0;
     assert_int_equal(::waitpid(child, &status, 0), child);
@@ -845,7 +894,7 @@ int main() {
         cmocka_unit_test(test_server_stages_and_removes_runtime_learner),
         cmocka_unit_test(test_server_forwards_successful_membership_operations),
 #ifdef __linux__
-        cmocka_unit_test(test_server_commits_joint_membership_over_socket_transport),
+        cmocka_unit_test(test_server_transitions_membership_over_socket_transport),
         cmocka_unit_test(test_serving_server_retires_demoted_joint_voter_reader),
 #endif
     };
