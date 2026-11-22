@@ -34,6 +34,7 @@ endif()
 ut(test_persist_recovery test_persist_recovery.cpp miniraft)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 ut(test_durable "test_durable.cpp;../examples/kv_rsm.cpp;../examples/idempotent_kv_rsm.cpp" miniraft)
+ut(test_durable_idempotent_client test_durable_idempotent_client.cpp miniraft)
 add_executable(test_durable_voter_binding_cli test_durable_voter_binding_cli.cpp)
 target_link_libraries(test_durable_voter_binding_cli PRIVATE miniraft)
 add_test(NAME test_durable_voter_binding_cli COMMAND $<TARGET_FILE:test_durable_voter_binding_cli>

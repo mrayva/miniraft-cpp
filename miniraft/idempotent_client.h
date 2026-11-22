@@ -2,6 +2,7 @@
 
 #include "messages.h"
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -27,6 +28,28 @@ struct IIdempotentClientStateStore {
     virtual ~IIdempotentClientStateStore() = default;
     virtual std::optional<TIdempotentClientSessionState> Load() = 0;
     virtual void Save(const TIdempotentClientSessionState& state) = 0;
+};
+
+// Linux single-file client session store. Each Save publishes one checksummed
+// state image with file and directory fsync before returning. A store holds an
+// exclusive advisory lock for its lifetime; use one store instance per session
+// file. The file contains client identity and any pending request payload.
+class TDurableIdempotentClientStateStore final : public IIdempotentClientStateStore {
+public:
+    enum class EStage { TempCreated, Written, FileSynced, Renamed, DirectorySynced };
+    using THook = std::function<void(EStage)>;
+
+    explicit TDurableIdempotentClientStateStore(const std::string& path, THook hook = {});
+    ~TDurableIdempotentClientStateStore() override;
+    TDurableIdempotentClientStateStore(const TDurableIdempotentClientStateStore&) = delete;
+    TDurableIdempotentClientStateStore& operator=(const TDurableIdempotentClientStateStore&) = delete;
+
+    std::optional<TIdempotentClientSessionState> Load() override;
+    void Save(const TIdempotentClientSessionState& state) override;
+
+private:
+    struct TImpl;
+    std::unique_ptr<TImpl> Impl;
 };
 
 // One in-flight write per session. BeginWrite durably records an operation

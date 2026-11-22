@@ -2,6 +2,7 @@ add_library(miniraft
     messages.cpp
     idempotency.cpp
     idempotent_client.cpp
+    durable_idempotent_client.cpp
     raft.cpp
     persist.cpp
     durable.cpp
