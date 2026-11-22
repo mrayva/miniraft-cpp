@@ -138,6 +138,47 @@ void test_sql_read_policy_is_restored_after_rejection(void**) {
     assert_int_equal(sql.LastAppliedIndex, 2);
     assert_true(ReadText(sql, "SELECT count(*) FROM t").find("2") != std::string::npos);
 }
+void test_sql_replica_local_defaults_roll_back_replicated_write(void**) {
+    TSql first(":memory:", 1), second(":memory:", 2);
+    constexpr auto schema =
+        "CREATE TABLE audit (v TEXT);"
+        "CREATE TABLE t (v TEXT DEFAULT CURRENT_TIMESTAMP);"
+        "CREATE TABLE d (v TEXT DEFAULT (datetime('now')));"
+        "CREATE TABLE r (v BLOB DEFAULT (randomblob(16)));"
+        "CREATE TABLE c (v TEXT DEFAULT (last_insert_rowid()));"
+        "CREATE TABLE s (v TEXT DEFAULT (upper('fixed')));";
+    assert_true(Apply(first, schema, 1).empty());
+    assert_true(Apply(second, schema, 1).empty());
+    uint64_t index = 1;
+    for (const char* table : {"t", "d", "r", "c"}) {
+        ++index;
+        const auto write = std::string("INSERT INTO audit VALUES ('prefix'); INSERT INTO ") +
+            table + " DEFAULT VALUES;";
+        const auto firstError = Apply(first, write, index);
+        const auto secondError = Apply(second, write, index);
+        assert_true(firstError.find("Replica-local SQL functions") != std::string::npos);
+        assert_true(firstError == secondError);
+        assert_int_equal(first.LastAppliedIndex, index);
+        assert_int_equal(second.LastAppliedIndex, index);
+        for (auto* replica : {&first, &second}) {
+            assert_true(ReadText(*replica, "SELECT count(*) FROM audit") == "count(*)\n0\n");
+            assert_true(ReadText(*replica, std::string("SELECT count(*) FROM ") + table) == "count(*)\n0\n");
+        }
+    }
+    ++index;
+    for (auto* replica : {&first, &second}) {
+        assert_true(Apply(*replica,
+            "INSERT INTO t VALUES ('2025-10-01 00:00:00'); INSERT INTO s DEFAULT VALUES;", index).empty());
+        assert_true(ReadText(*replica, "SELECT v FROM t") == "v\n2025-10-01 00:00:00\n");
+        assert_true(ReadText(*replica, "SELECT v FROM s") == "v\nFIXED\n");
+    }
+
+    TSql restored(":memory:", 3);
+    restored.LoadSnapshot(first.SaveSnapshot(), index);
+    const auto error = Apply(restored, "INSERT INTO t DEFAULT VALUES;", index + 1);
+    assert_true(error.find("Replica-local SQL functions") != std::string::npos);
+    assert_true(ReadText(restored, "SELECT v FROM t") == "v\n2025-10-01 00:00:00\n");
+}
 struct TDatabase {
     std::filesystem::path Directory;
     std::string Path;
@@ -593,6 +634,7 @@ int main() {
         cmocka_unit_test(test_sql_read_supports_comments_ctes_and_safe_functions),
         cmocka_unit_test(test_sql_read_rejects_nul_empty_and_second_select),
         cmocka_unit_test(test_sql_read_policy_is_restored_after_rejection),
+        cmocka_unit_test(test_sql_replica_local_defaults_roll_back_replicated_write),
         cmocka_unit_test(test_sql_write_cannot_escape_managed_transaction),
         cmocka_unit_test(test_sql_write_cannot_modify_progress_metadata),
         cmocka_unit_test(test_sql_failed_write_progress_survives_restart),

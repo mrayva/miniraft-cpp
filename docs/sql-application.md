@@ -23,6 +23,14 @@ is removed before the application's own metadata and transaction statements run.
 The policy stays active throughout payload execution and automatic recompilation.
 See SQLite's [authorizer contract](https://www.sqlite.org/c3ref/set_authorizer.html).
 
+SQLite can evaluate column defaults without an authorizer callback for the
+function. The SQL state machine overrides clock, randomness, connection state,
+and build introspection functions on its private connection. Evaluating one
+through a default rejects the write and rolls back the whole script, including
+when the schema came from a snapshot. Pass timestamps and other replica-local
+values as explicit literals in the replicated command. Date and time functions
+are disabled even when called with constant arguments.
+
 Successful data changes and their progress marker commit in the same transaction.
 SQLITE_ERROR, AUTH, CONSTRAINT and MISMATCH are treated as application rejections:
 all payload effects are rolled back, then a checked transaction records that the
@@ -59,6 +67,10 @@ not new power-loss or filesystem fault-injection coverage for SQLite.
 This remains an experimental example using trusted SQLite builds/modules and a
 private serialized connection. Existing unsafe schemas or legacy log scripts need
 review before migration. Arbitrary extensions/virtual tables are not sandboxed.
-Deterministic SQL across replicas, SQLite durability configuration, schema/metadata
-migration and external modification, result/CPU quotas, authentication, retry
-deduplication and independent review remain open production gates.
+General SQL determinism still requires deterministic row selection and ordering
+and compatible SQLite builds. Upgrade SQL replicas together and check existing
+schemas and unapplied SQL entries before deployment because function evaluation
+can now reject a write that previously succeeded. SQLite durability
+configuration, schema/metadata migration and external modification, result/CPU
+quotas, authentication, retry deduplication and independent review remain open
+production gates.

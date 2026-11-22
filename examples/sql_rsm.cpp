@@ -37,6 +37,26 @@ int WriteAuthorization(void*, int action, const char* first, const char* second,
         return ReadAuthorization(nullptr, action, first, second, database, context);
     }
 }
+
+void RejectReplicaLocalFunction(sqlite3_context* context, int, sqlite3_value**) {
+    sqlite3_result_error(context, "Replica-local SQL functions are not allowed in replicated writes", -1);
+}
+
+void DisableReplicaLocalFunctions(sqlite3* db) {
+    // SQLite can evaluate a column DEFAULT without reporting its function to
+    // the authorizer. Override these built-ins on the private RSM connection
+    // so they also fail when reached through a schema expression.
+    for (const char* name : {"current_date", "current_time", "current_timestamp",
+            "date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff",
+            "random", "randomblob", "changes", "total_changes", "last_insert_rowid",
+            "sqlite_version", "sqlite_source_id", "sqlite_compileoption_get",
+            "sqlite_compileoption_used", "sqlite_offset"}) {
+        if (sqlite3_create_function_v2(db, name, -1, SQLITE_UTF8, nullptr,
+                RejectReplicaLocalFunction, nullptr, nullptr, nullptr) != SQLITE_OK)
+            throw std::runtime_error("Cannot disable replica-local SQL function " + std::string(name));
+    }
+}
+
 using TAuthorizer = int (*)(void*, int, const char*, const char*, const char*, const char*);
 struct TSqlPolicy {
     sqlite3* Db;
@@ -282,6 +302,7 @@ TSql::TSql(const std::string& path, int serverId, TSqlReadLimits readLimits)
     // Constructors that fail must also close the connection and release its locks.
     std::unique_ptr<sqlite3, decltype(&sqlite3_close)> cleanup(Db, sqlite3_close);
     if (opened != SQLITE_OK) throw std::runtime_error("Cannot open SQL database");
+    DisableReplicaLocalFunctions(Db);
     RequireExecute("CREATE TABLE IF NOT EXISTS raft_metadata_ (key TEXT PRIMARY KEY, value TEXT)");
     sqlite3_stmt* raw = nullptr;
     const int prepared = sqlite3_prepare_v2(Db,
