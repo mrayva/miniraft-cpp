@@ -253,7 +253,47 @@ void test_v1_v2_v3_images_recover_conservatively_and_upgrade_on_publish(void**) 
         }
         std::ifstream upgraded(files.Image(), std::ios::binary);
         std::string published(8, '\0'); upgraded.read(published.data(), published.size());
-        assert_true(published == "MRFTD004");
+        assert_true(published == "MRFTD005");
+    }
+}
+void test_v4_inline_snapshot_recovers_and_upgrades_to_sidecar(void**) {
+    TFiles files;
+    const TSnapshot snapshot{1, 2, {1, 2}, "v4 inline snapshot"};
+    const auto encodedSnapshot = EncodeSnapshot(snapshot);
+    std::string payload;
+    Put(payload, 3, 8); // current term
+    Put(payload, 1, 4); // vote
+    Put(payload, 1, 8); // retained entry count
+    Put(payload, 1, 8); // commit index
+    Put(payload, 2, 4); Put(payload, 1, 4); Put(payload, 2, 4); // bound voters
+    Put(payload, encodedSnapshot.size(), 8); payload.append(encodedSnapshot);
+    Put(payload, 3, 8); Put(payload, 0, 8); Put(payload, 4, 4); payload.append("tail");
+    std::string checksumInput("MRFTD004"); checksumInput.append(payload);
+    std::string image("MRFTD004");
+    Put(image, payload.size(), 8); Put(image, Crc32(checksumInput), 4); image.append(payload);
+    { std::ofstream output(files.Image(), std::ios::binary); output.write(image.data(), image.size()); }
+
+    const auto sidecarPath = files.Image().string() + ".snapshot.1.2";
+    {
+        TDurableState state(files.Name, 1);
+        assert_int_equal(state.CurrentTerm, 3);
+        assert_int_equal(state.CommitIndex, 1);
+        assert_int_equal(state.LastLogIndex, 2);
+        assert_true(state.GetBoundVoters() == (std::vector<uint32_t>{1, 2}));
+        assert_true(state.GetSnapshot() && *state.GetSnapshot() == snapshot);
+        assert_string_equal(Data(state, 2).c_str(), "tail");
+        state.Commit();
+    }
+    {
+        std::ifstream manifest(files.Image(), std::ios::binary);
+        std::string magic(8, '\0'); manifest.read(magic.data(), magic.size());
+        assert_true(magic == "MRFTD005");
+        std::ifstream sidecar(sidecarPath, std::ios::binary);
+        assert_true(bool(sidecar));
+        TDurableState recovered(files.Name, 1);
+        assert_true(recovered.GetSnapshot() && *recovered.GetSnapshot() == snapshot);
+        assert_int_equal(recovered.LastLogIndex, 2);
+        assert_string_equal(Data(recovered, 2).c_str(), "tail");
     }
 }
 void test_legacy_configuration_snapshot_migration_requires_complete_trusted_history(void**) {
@@ -1081,6 +1121,57 @@ void test_compacted_legacy_disk_state_migration_preserves_snapshot_and_suffix(vo
     assert_false(fs::exists(rejectedDurable + ".durable.2"));
     assert_false(fs::exists(rejectedDurable + ".durable.2.lock"));
 }
+void test_durable_snapshot_sidecar_is_not_rewritten_with_log_updates(void**) {
+    TFiles files;
+    std::vector<TDurableState::EStage> stages;
+    const auto snapshotData = std::string(256 * 1024, 's');
+    const TSnapshot snapshot{1, 1, {1, 2}, snapshotData};
+    const auto snapshotPath = files.Image().string() + ".snapshot.1.1";
+    auto readFile = [](const std::string& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input), {});
+    };
+    std::string snapshotImage;
+    {
+        TDurableState state(files.Name, 1, [&](auto stage) { stages.push_back(stage); });
+        state.CurrentTerm = 2;
+        state.Append(Entry(1, "covered"));
+        state.CommitIndex = 1;
+        state.Commit();
+        state.InstallSnapshot(snapshot);
+        snapshotImage = readFile(snapshotPath);
+        assert_true(!snapshotImage.empty());
+        assert_true(readFile(files.Image()).find(snapshotData) == std::string::npos);
+
+        stages.clear();
+        state.Append(Entry(2, "retained tail"));
+        assert_true(std::none_of(stages.begin(), stages.end(), [](auto stage) {
+            return stage == TDurableState::EStage::SnapshotTempCreated ||
+                stage == TDurableState::EStage::SnapshotWritten ||
+                stage == TDurableState::EStage::SnapshotFileSynced ||
+                stage == TDurableState::EStage::SnapshotRenamed ||
+                stage == TDurableState::EStage::SnapshotDirectorySynced;
+        }));
+        assert_true(readFile(snapshotPath) == snapshotImage);
+    }
+    {
+        std::vector<TDurableState::EStage> recoveredStages;
+        TDurableState recovered(files.Name, 1,
+            [&](auto stage) { recoveredStages.push_back(stage); });
+        assert_true(recovered.GetSnapshot() && *recovered.GetSnapshot() == snapshot);
+        assert_int_equal(recovered.LastLogIndex, 2);
+        assert_string_equal(Data(recovered, 2).c_str(), "retained tail");
+        recovered.Append(Entry(2, "post-restart tail"));
+        assert_true(std::none_of(recoveredStages.begin(), recoveredStages.end(), [](auto stage) {
+            return stage == TDurableState::EStage::SnapshotTempCreated ||
+                stage == TDurableState::EStage::SnapshotWritten ||
+                stage == TDurableState::EStage::SnapshotFileSynced ||
+                stage == TDurableState::EStage::SnapshotRenamed ||
+                stage == TDurableState::EStage::SnapshotDirectorySynced;
+        }));
+        assert_true(readFile(snapshotPath) == snapshotImage);
+    }
+}
 void test_get_and_append_do_not_share_mutable_entries(void**) {
     TFiles files;
     {
@@ -1652,6 +1743,7 @@ int main() {
         cmocka_unit_test(test_follower_replaces_durable_suffix_in_one_publish),
         cmocka_unit_test(test_publication_order),
         cmocka_unit_test(test_v1_v2_v3_images_recover_conservatively_and_upgrade_on_publish),
+        cmocka_unit_test(test_v4_inline_snapshot_recovers_and_upgrades_to_sidecar),
         cmocka_unit_test(test_live_publication_failure_is_fatal),
         cmocka_unit_test(test_mid_payload_failure_is_fatal_and_preserves_image),
         cmocka_unit_test(test_write_error_is_fatal_and_preserves_image),
@@ -1664,6 +1756,7 @@ int main() {
         cmocka_unit_test(test_compacted_legacy_disk_state_migration_preserves_snapshot_and_suffix),
         cmocka_unit_test(test_legacy_configuration_snapshot_migration_requires_complete_trusted_history),
         cmocka_unit_test(test_legacy_vote_cannot_be_justified_by_uncommitted_membership),
+        cmocka_unit_test(test_durable_snapshot_sidecar_is_not_rewritten_with_log_updates),
         cmocka_unit_test(test_get_and_append_do_not_share_mutable_entries),
         cmocka_unit_test(test_raft_election_and_application_replay_after_restart),
         cmocka_unit_test(test_idempotency_control_survives_durable_restart_and_replays_atomically),

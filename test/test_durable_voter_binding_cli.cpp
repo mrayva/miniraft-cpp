@@ -38,30 +38,16 @@ std::string ReadFile(const fs::path& path) {
     return bytes;
 }
 
-void StoreLittleEndian(std::string& bytes, size_t offset, uint64_t value, unsigned width) {
-    for (unsigned i = 0; i < width; ++i) bytes[offset + i] = char(value >> (8 * i));
-}
-
 void ReplaceDurableSnapshot(const fs::path& path, const TSnapshot& snapshot) {
-    auto bytes = ReadFile(path);
-    Require(bytes.substr(0, 8) == "MRFTD004", "unexpected durable snapshot fixture version");
-    constexpr size_t imageLengthOffset = 52;
-    constexpr size_t imageOffset = 60;
-    Require(bytes.size() >= imageOffset, "truncated durable snapshot fixture");
-    uint64_t oldLength = 0;
-    for (unsigned i = 0; i < 8; ++i)
-        oldLength |= uint64_t(uint8_t(bytes[imageLengthOffset + i])) << (8 * i);
-    Require(oldLength == bytes.size() - imageOffset, "invalid durable snapshot fixture length");
+    const auto bytes = ReadFile(path);
+    Require(bytes.substr(0, 8) == "MRFTD005", "unexpected durable snapshot fixture version");
     const auto image = EncodeSnapshot(snapshot);
-    bytes.replace(imageOffset, size_t(oldLength), image);
-    StoreLittleEndian(bytes, imageLengthOffset, image.size(), 8);
-    StoreLittleEndian(bytes, 8, bytes.size() - 20, 8);
-    const auto crc = NSnapshotCodec::Checksum(bytes.substr(0, 8) + bytes.substr(20));
-    StoreLittleEndian(bytes, 16, crc, 4);
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    Require(bool(output), "cannot open durable snapshot fixture for replacement");
-    output.write(bytes.data(), std::streamsize(bytes.size()));
-    Require(bool(output), "cannot write durable snapshot fixture");
+    const auto snapshotPath = path.string() + ".snapshot." + std::to_string(snapshot.Index) + "." +
+        std::to_string(snapshot.Term);
+    std::ofstream output(snapshotPath, std::ios::binary | std::ios::trunc);
+    Require(bool(output), "cannot open external durable snapshot fixture for replacement");
+    output.write(image.data(), std::streamsize(image.size()));
+    Require(bool(output), "cannot write external durable snapshot fixture");
 }
 
 void SeedUnboundDurableStore(const std::string& base, uint32_t vote) {

@@ -28,10 +28,15 @@ TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(
     const std::vector<uint32_t>& trustedVoters, uint64_t commitIndex);
 
 // Linux: atomic hard-state + snapshot + suffix replacement, with file/directory
-// fsync. O(snapshot + retained log size) per update: a durability baseline.
+// fsync. Snapshot sidecars are immutable between snapshots, so ordinary
+// updates write only the retained log and manifest.
 class TDurableState : public IState {
 public:
-    enum class EStage { TempCreated, PayloadStarted, Written, FileSynced, Renamed, DirectorySynced };
+    enum class EStage {
+        TempCreated, PayloadStarted, Written, FileSynced, Renamed, DirectorySynced,
+        SnapshotTempCreated, SnapshotWritten, SnapshotFileSynced, SnapshotRenamed,
+        SnapshotDirectorySynced
+    };
     // Diagnostics/fault injection. Throwing from this hook during a live
     // operation is fatal, just like an I/O failure.
     using THook = std::function<void(EStage)>;

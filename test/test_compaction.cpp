@@ -2247,7 +2247,8 @@ void test_durable_compacted_boundary_survives_restart(void**) {
 void test_snapshot_and_suffix_are_atomic_at_every_publication_stage(void**) {
     using TStage = TDurableState::EStage;
     for (bool priorSnapshot : {false, true}) for (bool retain : {false, true}) for (auto stage : {TStage::TempCreated, TStage::Written, TStage::FileSynced,
-         TStage::Renamed, TStage::DirectorySynced}) {
+         TStage::Renamed, TStage::DirectorySynced, TStage::SnapshotTempCreated, TStage::SnapshotWritten,
+         TStage::SnapshotFileSynced, TStage::SnapshotRenamed, TStage::SnapshotDirectorySynced}) {
         TFiles files;
         { TDurableState state(files.Name, 1); state.CurrentTerm = 3; state.VotedFor = 2;
           for (uint64_t term : {1, 2, 3}) { auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = term; state.Append(entry); }
@@ -2261,7 +2262,7 @@ void test_snapshot_and_suffix_are_atomic_at_every_publication_stage(void**) {
         int status = 0; assert_int_equal(waitpid(child, &status, 0), child);
         assert_true(WIFEXITED(status)); assert_int_equal(WEXITSTATUS(status), 90);
         TDurableState state(files.Name, 1);
-        const bool updated = stage >= TStage::Renamed;
+        const bool updated = stage <= TStage::DirectorySynced && stage >= TStage::Renamed;
         assert_int_equal(state.CurrentTerm, 3); assert_int_equal(state.VotedFor, 2);
         assert_int_equal(state.SnapshotIndex, updated ? retain ? 2 : 4 : priorSnapshot ? 1 : 0);
         assert_int_equal(state.LastLogIndex, updated && !retain ? 4 : 3);
@@ -2334,21 +2335,28 @@ void test_compaction_reclaims_durable_prefix_bytes(void**) {
     assert_true(after < before / 10); assert_int_equal(state.LastLogIndex, 30);
     assert_true(bool(state.Get(30))); assert_false(state.Get(29));
 }
-void test_durable_v4_semantic_corruption_rejects_without_rewriting(void**) {
+void test_durable_v5_semantic_corruption_rejects_without_rewriting(void**) {
     for (int invalid = 0; invalid < 3; ++invalid) {
         TFiles files;
         { TDurableState state(files.Name, 1); ExerciseBoundary(state); }
         const auto path = files.Name + ".durable.1";
         std::ifstream input(path, std::ios::binary);
         std::string bytes(std::istreambuf_iterator<char>(input), {}); input.close();
-        assert_true(bytes.substr(0, 8) == "MRFTD004");
+        assert_true(bytes.substr(0, 8) == "MRFTD005");
+        const auto snapshotPath = path + ".snapshot.3.2";
         if (invalid < 2) {
-            const auto offset = invalid == 0 ? 52 : 32; // snapshot length or retained entry count
+            const auto offset = invalid == 0 ? 52 : 32; // snapshot index reference or retained entry count
             for (size_t i = offset; i < size_t(offset + 8); ++i) bytes[i] = char(0xff);
-        } else bytes.back() ^= 1; // inner snapshot checksum with a valid outer checksum
-        const auto crc = NSnapshotCodec::Checksum(bytes.substr(0, 8) + bytes.substr(20));
-        for (int i = 0; i < 4; ++i) bytes[16 + i] = char(crc >> (8 * i));
-        { std::ofstream out(path, std::ios::binary); out.write(bytes.data(), bytes.size()); }
+            const auto crc = NSnapshotCodec::Checksum(bytes.substr(0, 8) + bytes.substr(20));
+            for (int i = 0; i < 4; ++i) bytes[16 + i] = char(crc >> (8 * i));
+            { std::ofstream out(path, std::ios::binary); out.write(bytes.data(), bytes.size()); }
+        } else {
+            std::ifstream sidecar(snapshotPath, std::ios::binary);
+            std::string snapshot(std::istreambuf_iterator<char>(sidecar), {});
+            snapshot.back() ^= 1; // inner snapshot checksum; manifest remains valid
+            std::ofstream out(snapshotPath, std::ios::binary);
+            out.write(snapshot.data(), snapshot.size());
+        }
         Reject([&] { TDurableState state(files.Name, 1); });
         std::ifstream after(path, std::ios::binary);
         assert_true(std::string(std::istreambuf_iterator<char>(after), {}) == bytes);
@@ -2412,7 +2420,7 @@ int main() {
         cmocka_unit_test(test_durable_stale_snapshot_membership_recovery_survives_restart),
         cmocka_unit_test(test_durable_membership_snapshot_install_is_atomic_across_restart),
         cmocka_unit_test(test_compaction_reclaims_durable_prefix_bytes),
-        cmocka_unit_test(test_durable_v4_semantic_corruption_rejects_without_rewriting),
+        cmocka_unit_test(test_durable_v5_semantic_corruption_rejects_without_rewriting),
 #endif
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);

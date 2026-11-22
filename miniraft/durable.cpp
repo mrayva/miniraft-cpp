@@ -27,6 +27,10 @@ constexpr std::array<uint8_t, 8> Magic{'M','R','F','T','D','0','0','1'};
 constexpr std::array<uint8_t, 8> SnapshotMagic{'M','R','F','T','D','0','0','2'};
 constexpr std::array<uint8_t, 8> ConfigurationMagic{'M','R','F','T','D','0','0','3'};
 constexpr std::array<uint8_t, 8> CommitMagic{'M','R','F','T','D','0','0','4'};
+constexpr std::array<uint8_t, 8> ExternalSnapshotMagic{'M','R','F','T','D','0','0','5'};
+std::string SnapshotImageName(const std::string& stateFile, uint64_t index, uint64_t term) {
+    return stateFile + ".snapshot." + std::to_string(index) + "." + std::to_string(term);
+}
 uint64_t Take(std::span<const uint8_t> bytes, size_t& position, unsigned width) {
     if (position > bytes.size() || width > bytes.size() - position)
         throw std::runtime_error("Truncated durable state");
@@ -119,6 +123,7 @@ struct TDurableState::TImpl {
     std::shared_ptr<const TSnapshot> Snapshot;
     std::shared_ptr<const TSnapshot> EncodedSnapshotSource;
     std::shared_ptr<const TSnapshotEncoding> SnapshotEncoding;
+    std::string PublishedSnapshotFile;
     // Original trusted voter set; configuration snapshots can carry a later
     // active set without rewriting this binding.
     std::vector<uint32_t> Voters;
@@ -168,10 +173,12 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
     }
     TReadOnlyMap mapped(file.Value);
     const auto bytes = mapped.Bytes();
-    const bool commitAware = std::equal(CommitMagic.begin(), CommitMagic.end(), bytes.begin());
+    const bool externalSnapshot = std::equal(ExternalSnapshotMagic.begin(), ExternalSnapshotMagic.end(), bytes.begin());
+    const bool commitAware = externalSnapshot || std::equal(CommitMagic.begin(), CommitMagic.end(), bytes.begin());
     const bool configured = std::equal(ConfigurationMagic.begin(), ConfigurationMagic.end(), bytes.begin());
     const bool compacted = std::equal(SnapshotMagic.begin(), SnapshotMagic.end(), bytes.begin());
-    const auto* version = commitAware ? &CommitMagic : configured ? &ConfigurationMagic : compacted ? &SnapshotMagic : nullptr;
+    const auto* version = externalSnapshot ? &ExternalSnapshotMagic :
+        commitAware ? &CommitMagic : configured ? &ConfigurationMagic : compacted ? &SnapshotMagic : nullptr;
     if (!version && !std::equal(Magic.begin(), Magic.end(), bytes.begin()))
         throw std::runtime_error("Unknown durable state format");
     size_t position = Magic.size();
@@ -183,15 +190,43 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
     VotedFor = Take(bytes, position, 4);
     const auto count = Take(bytes, position, 8);
     if (commitAware) CommitIndex = Take(bytes, position, 8);
-    if (configured) {
+    if (configured || externalSnapshot) {
         const auto voters = Take(bytes, position, 4);
-        if (!voters || voters > TSnapshot::MaxVoters || voters > (bytes.size() - position) / 4)
+        if ((configured && !voters) || voters > TSnapshot::MaxVoters || voters > (bytes.size() - position) / 4)
             throw std::runtime_error("Invalid durable voter count");
         for (uint32_t i = 0; i < voters; ++i) Impl->Voters.push_back(Take(bytes, position, 4));
-        try { ValidateFixedVoters(Impl->Voters); }
-        catch (const std::invalid_argument&) { throw std::runtime_error("Invalid durable voter configuration"); }
+        if (voters) {
+            try { ValidateFixedVoters(Impl->Voters); }
+            catch (const std::invalid_argument&) { throw std::runtime_error("Invalid durable voter configuration"); }
+        }
     }
-    if (commitAware) {
+    if (externalSnapshot) {
+        SnapshotIndex = Take(bytes, position, 8);
+        SnapshotTerm = Take(bytes, position, 8);
+        if ((SnapshotIndex == 0) != (SnapshotTerm == 0) || SnapshotIndex > uint64_t(INT64_MAX))
+            throw std::runtime_error("Invalid external durable snapshot reference");
+        if (SnapshotIndex) {
+            const auto snapshotFileName = SnapshotImageName(Impl->File, SnapshotIndex, SnapshotTerm);
+            TFd snapshotFile(openat(Impl->Directory.Value, snapshotFileName.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+            Require(snapshotFile.Value >= 0, "open external durable snapshot");
+            TReadOnlyMap snapshotMap(snapshotFile.Value);
+            const auto snapshotBytes = snapshotMap.Bytes();
+            if (snapshotBytes.size() > TSnapshot::MaxBytes)
+                throw std::runtime_error("External durable snapshot exceeds size limit");
+            auto snapshot = DecodeSnapshot(std::string_view(
+                reinterpret_cast<const char*>(snapshotBytes.data()), snapshotBytes.size()));
+            if (snapshot.Index != SnapshotIndex || snapshot.Term != SnapshotTerm || snapshot.Term > CurrentTerm ||
+                (!Impl->Voters.empty() && !SnapshotCompatibleWithVoterBinding(snapshot, Impl->Voters)))
+                throw std::runtime_error("External durable snapshot does not match its manifest");
+            LastLogTerm = SnapshotTerm;
+            Impl->Snapshot = std::make_shared<const TSnapshot>(std::move(snapshot));
+            Impl->PublishedSnapshotFile = snapshotFileName;
+            // The sidecar was decoded and verified above. Retain its immutable
+            // source identity without re-encoding the full image on later log
+            // updates.
+            Impl->EncodedSnapshotSource = Impl->Snapshot;
+        }
+    } else if (commitAware) {
         const auto voters = Take(bytes, position, 4);
         if (voters > TSnapshot::MaxVoters || voters > (bytes.size() - position) / 4)
             throw std::runtime_error("Invalid durable voter count");
@@ -295,20 +330,48 @@ void TDurableState::Publish()
             throw std::runtime_error("Invalid durable log term");
         previousTerm = entry->Term;
     }
+    const auto previousSnapshotFile = Impl->PublishedSnapshotFile;
+    const auto snapshotFile = Impl->Snapshot
+        ? SnapshotImageName(Impl->File, SnapshotIndex, SnapshotTerm) : std::string{};
+    if (snapshotEncoding && snapshotFile != previousSnapshotFile) {
+        const auto snapshotTemp = snapshotFile + ".tmp";
+        TFd snapshot(openat(Impl->Directory.Value, snapshotTemp.c_str(),
+            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600));
+        Require(snapshot.Value >= 0, "create durable snapshot image");
+        struct stat snapshotInfo;
+        Require(fstat(snapshot.Value, &snapshotInfo) == 0, "stat durable snapshot image");
+        if (!S_ISREG(snapshotInfo.st_mode)) throw std::runtime_error("Invalid durable snapshot image type");
+        Impl->Stage(EStage::SnapshotTempCreated);
+        std::array<char, 64 * 1024> chunk{};
+        for (uint64_t offset = 0; offset < imageBytes;) {
+            const auto count = size_t(std::min<uint64_t>(chunk.size(), imageBytes - offset));
+            CopySnapshotEncodingRange(*Impl->Snapshot, *snapshotEncoding, offset, chunk.data(), count);
+            WriteAll(snapshot.Value, chunk.data(), count);
+            offset += count;
+        }
+        Impl->Stage(EStage::SnapshotWritten);
+        Sync(snapshot.Value);
+        Impl->Stage(EStage::SnapshotFileSynced);
+        Require(renameat(Impl->Directory.Value, snapshotTemp.c_str(),
+            Impl->Directory.Value, snapshotFile.c_str()) == 0, "publish durable snapshot image");
+        Impl->Stage(EStage::SnapshotRenamed);
+        Sync(Impl->Directory.Value);
+        Impl->Stage(EStage::SnapshotDirectorySynced);
+    }
     TFd temp(openat(Impl->Directory.Value, Impl->Temp.c_str(),
                     O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600));
     Require(temp.Value >= 0, "create durable temporary image");
     Impl->Stage(EStage::TempCreated);
     constexpr size_t PayloadOffset = CommitMagic.size() + 8 + 4;
     std::array<uint8_t, PayloadOffset> header{};
-    std::copy(CommitMagic.begin(), CommitMagic.end(), header.begin());
+    std::copy(ExternalSnapshotMagic.begin(), ExternalSnapshotMagic.end(), header.begin());
     WriteAll(temp.Value, header.data(), header.size());
 
     NSnapshotCodec::TChecksum checksum;
     auto updateChecksum = [&](const uint8_t* data, size_t size) {
         checksum.Update(data, size);
     };
-    updateChecksum(CommitMagic.data(), CommitMagic.size());
+    updateChecksum(ExternalSnapshotMagic.data(), ExternalSnapshotMagic.size());
     uint64_t payloadLength = 0;
     bool payloadStarted = false;
     auto writePayload = [&](const void* data, size_t size) {
@@ -334,16 +397,8 @@ void TDurableState::Publish()
     writeInteger(CommitIndex, 8);
     writeInteger(Impl->Voters.size(), 4);
     for (auto id : Impl->Voters) writeInteger(id, 4);
-    writeInteger(imageBytes, 8);
-    if (snapshotEncoding) {
-        std::array<char, 64 * 1024> chunk{};
-        for (uint64_t offset = 0; offset < imageBytes;) {
-            const auto count = size_t(std::min<uint64_t>(chunk.size(), imageBytes - offset));
-            CopySnapshotEncodingRange(*Impl->Snapshot, *snapshotEncoding, offset, chunk.data(), count);
-            writePayload(chunk.data(), count);
-            offset += count;
-        }
-    }
+    writeInteger(SnapshotIndex, 8);
+    writeInteger(SnapshotTerm, 8);
     for (const auto& entry : Impl->Log) {
         const auto dataBytes = entry->Len - sizeof(TLogEntry);
         writeInteger(entry->Term, 8);
@@ -356,7 +411,7 @@ void TDurableState::Publish()
     for (unsigned i = 0; i < 8; ++i) encodedHeader[i] = uint8_t(payloadLength >> (8 * i));
     const auto checksumValue = checksum.Finish();
     for (unsigned i = 0; i < 4; ++i) encodedHeader[8 + i] = uint8_t(checksumValue >> (8 * i));
-    WriteAtAll(temp.Value, encodedHeader.data(), encodedHeader.size(), off_t(CommitMagic.size()));
+    WriteAtAll(temp.Value, encodedHeader.data(), encodedHeader.size(), off_t(ExternalSnapshotMagic.size()));
     Impl->Stage(EStage::Written);
     Sync(temp.Value);
     Impl->Stage(EStage::FileSynced);
@@ -365,6 +420,10 @@ void TDurableState::Publish()
     Impl->Stage(EStage::Renamed);
     Sync(Impl->Directory.Value);
     Impl->Stage(EStage::DirectorySynced);
+    Impl->PublishedSnapshotFile = snapshotFile;
+    if (!previousSnapshotFile.empty() && previousSnapshotFile != snapshotFile &&
+        unlinkat(Impl->Directory.Value, previousSnapshotFile.c_str(), 0) == 0)
+        Sync(Impl->Directory.Value);
 #endif
 }
 
@@ -851,7 +910,7 @@ TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(const std::string& legacyBa
             std::filesystem::remove_all(Path, ignored);
         }
     } stagingCleanup{stagingDirectory};
-    const auto stagingBase = (stagingDirectory / "state").string();
+    const auto stagingBase = (stagingDirectory / finalBase.filename()).string();
     const auto stagingFile = std::filesystem::path(stagingBase).filename().string() +
         ".durable." + std::to_string(nodeId);
 
@@ -896,12 +955,36 @@ TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(const std::string& legacyBa
     TFd directory(open(finalDirectory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     Require(directory.Value >= 0, "open migration destination directory");
     const auto finalFile = finalBase.filename().string() + ".durable." + std::to_string(nodeId);
+    struct stat existing;
+    if (fstatat(directory.Value, finalFile.c_str(), &existing, AT_SYMLINK_NOFOLLOW) == 0)
+        throw std::runtime_error("Durable storage exists at the migration destination");
+    if (errno != ENOENT) Require(false, "inspect migration destination image");
+    const auto lockName = finalFile + ".lock";
+    if (fstatat(directory.Value, lockName.c_str(), &existing, AT_SYMLINK_NOFOLLOW) == 0)
+        throw std::runtime_error("Durable storage lock exists at the migration destination");
+    if (errno != ENOENT) Require(false, "inspect migration destination lock");
     // The final store name is linked only after the complete image has been
-    // published and reopened from the private staging directory. linkat is
-    // atomic and refuses to replace an existing destination. The store lock
-    // is created by the first normal open, after this complete image exists.
+    // published and reopened from the private staging directory. Its immutable
+    // snapshot sidecar is linked first; the manifest link is the commit point.
     TFd staging(open(stagingDirectory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     Require(staging.Value >= 0, "open migration staging directory");
+    if (const auto snapshot = source.GetSnapshot()) {
+        const auto snapshotFile = SnapshotImageName(finalFile, snapshot->Index, snapshot->Term);
+        if (linkat(staging.Value, snapshotFile.c_str(), directory.Value, snapshotFile.c_str(), 0) < 0) {
+            Require(errno == EEXIST, "publish migrated durable snapshot");
+            TFd stagedSnapshot(openat(staging.Value, snapshotFile.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+            Require(stagedSnapshot.Value >= 0, "open staged migration snapshot");
+            TFd existingSnapshot(openat(directory.Value, snapshotFile.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+            Require(existingSnapshot.Value >= 0, "open existing migration snapshot");
+            TReadOnlyMap stagedMap(stagedSnapshot.Value), existingMap(existingSnapshot.Value);
+            const auto stagedBytes = stagedMap.Bytes();
+            const auto existingBytes = existingMap.Bytes();
+            if (stagedBytes.size() != existingBytes.size() ||
+                !std::equal(stagedBytes.begin(), stagedBytes.end(), existingBytes.begin()))
+                throw std::runtime_error("Conflicting durable snapshot exists at migration destination");
+        }
+        Sync(directory.Value);
+    }
     Require(linkat(staging.Value, stagingFile.c_str(), directory.Value, finalFile.c_str(), 0) == 0,
         "publish migrated durable image");
     Sync(directory.Value);

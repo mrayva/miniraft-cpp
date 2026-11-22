@@ -99,18 +99,20 @@ all-voter operation retains its previous startup contract until that proof exist
 A standalone alpha.15 checkpoint alone is not an embedded configuration witness.
 Never delete voter state or edit votes/terms to work around this validation.
 
-Current durable images use `MRFTD004` and retain the 20-byte header. The payload
+Current durable images use `MRFTD005` and retain the 20-byte header. The payload
 stores CurrentTerm[8], VotedFor[4], retained-log count[8], CommitIndex[8], voter
-count[4], sorted voter IDs[4 each], snapshot length[8], optional MRFTS001
-through MRFTS011 image, then retained log records.
-The CRC covers version magic plus payload. Recovery bounds and validates the voter list, commit
+count[4], sorted voter IDs[4 each], SnapshotIndex[8], SnapshotTerm[8], then
+retained log records. Optional MRFTS001 through MRFTS011 images are stored in
+an immutable sidecar referenced by the manifest. The CRC covers version magic
+plus payload. Recovery bounds and validates the voter list and commit
 boundary. Legacy snapshots must name the original bound voters; configuration-
 bearing snapshots can describe a later active set while retaining that original
 binding for offline history scans. Raft startup still requires the runtime voter
-set and binding to match. MRFTD001 through MRFTD003 remain readable; formats
-without commit metadata conservatively use SnapshotIndex as their commit floor.
-The next successful publication writes v4
-using the existing atomic write/fsync/rename/directory-fsync protocol. A crash
+set and binding to match. MRFTD001 through MRFTD003 remain readable and use
+SnapshotIndex as their conservative commit floor because they lack commit
+metadata. MRFTD004 remains readable with its inline snapshot. The next successful
+publication from an earlier format writes MRFTD005 using the atomic
+write/fsync/rename/directory-fsync protocol. A crash
 before first binding leaves either a fresh unbound store with no votes/log, or a
 complete bound store. Publication failure is fatal before the node can serve
 traffic.

@@ -687,21 +687,18 @@ void test_unbound_durable_configuration_snapshot_recovery_fails_closed(void**) {
     }
     std::ifstream input(path, std::ios::binary);
     std::string bytes(std::istreambuf_iterator<char>(input), {}); input.close();
-    assert_true(bytes.substr(0, 8) == "MRFTD004");
+    assert_true(bytes.substr(0, 8) == "MRFTD005");
     auto snapshot = Sample(); snapshot.StableConfiguration = true;
     snapshot.ConfigurationIndex = 1; snapshot.ConfigurationTerm = 1;
     const auto image = EncodeSnapshot(snapshot);
-    constexpr size_t imageLengthOffset = 52;
-    constexpr size_t imageOffset = 60;
-    uint64_t oldLength = 0;
-    for (int i = 0; i < 8; ++i) oldLength |= uint64_t(uint8_t(bytes[imageLengthOffset + i])) << (8 * i);
-    assert_true(oldLength == bytes.size() - imageOffset);
-    bytes.replace(imageOffset, size_t(oldLength), image);
-    for (int i = 0; i < 8; ++i) bytes[imageLengthOffset + i] = char(uint64_t(image.size()) >> (8 * i));
-    for (int i = 0; i < 8; ++i) bytes[8 + i] = char(uint64_t(bytes.size() - 20) >> (8 * i));
-    const auto crc = NSnapshotCodec::Checksum(bytes.substr(0, 8) + bytes.substr(20));
-    for (int i = 0; i < 4; ++i) bytes[16 + i] = char(crc >> (8 * i));
-    { std::ofstream output(path, std::ios::binary | std::ios::trunc); output.write(bytes.data(), bytes.size()); }
+    const auto snapshotPath = path + ".snapshot." + std::to_string(snapshot.Index) + "." +
+        std::to_string(snapshot.Term);
+    { std::ofstream output(snapshotPath, std::ios::binary | std::ios::trunc);
+      output.write(image.data(), image.size()); assert_true(bool(output)); }
+    const auto snapshotBytes = [&] {
+        std::ifstream sidecar(snapshotPath, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(sidecar), {});
+    }();
     {
         auto state = std::make_shared<TDurableState>(files.Name, 1);
         assert_true(state->HasUnboundRecoveredState());
@@ -713,6 +710,8 @@ void test_unbound_durable_configuration_snapshot_recovery_fails_closed(void**) {
     }
     std::ifstream after(path, std::ios::binary);
     assert_true(std::string(std::istreambuf_iterator<char>(after), {}) == bytes);
+    std::ifstream sidecarAfter(snapshotPath, std::ios::binary);
+    assert_true(std::string(std::istreambuf_iterator<char>(sidecarAfter), {}) == snapshotBytes);
 }
 void test_joint_snapshot_export_and_durable_roundtrip_but_runtime_rejects(void**) {
     TFiles files;

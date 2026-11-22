@@ -1,9 +1,9 @@
 # Linux durable state: v0.1.0-alpha.3
 
-## Commit recovery: MRFTD004
+## Commit recovery: MRFTD005
 
-The current durable image stores `CommitIndex` alongside the current term, vote,
-voter binding, snapshot and retained log. Recovery requires
+The current durable store persists `CommitIndex` alongside the current term,
+vote, voter binding, snapshot and retained log. Recovery requires
 `SnapshotIndex <= CommitIndex <= LastLogIndex`. Raft publishes a commit advance
 before it acknowledges the corresponding AppendEntries request or exposes the
 new boundary to application processing. Restart therefore replays committed
@@ -11,13 +11,23 @@ entries even when the application checkpoint trails them. Installed snapshots
 advance the persisted commit floor to at least their included index, and storage
 rejects truncation of committed entries.
 
-MRFTD004 keeps the 20-byte file header: magic[8], payload length[8] and CRC[4].
+MRFTD005 keeps the 20-byte file header: magic[8], payload length[8] and CRC[4].
 Its payload is CurrentTerm[8], VotedFor[4], retained-log count[8],
-CommitIndex[8], voter count[4], sorted voter IDs[4 each], snapshot length[8],
-optional encoded snapshot, then retained log records. The CRC covers the v4 magic
-and payload. MRFTD001, MRFTD002 and MRFTD003 remain readable; their commit floor
-is conservatively initialized to SnapshotIndex, since those formats did not
-record commit progress. Their next successful publication writes MRFTD004.
+CommitIndex[8], voter count[4], sorted voter IDs[4 each], SnapshotIndex[8],
+SnapshotTerm[8], then retained log records. The CRC covers the v5 magic and
+payload. Snapshot bytes live in an immutable sidecar named
+`NAME.durable.ID.snapshot.INDEX.TERM`; ordinary log, term, vote and commit
+updates do not rewrite it. A changed snapshot is written and synced to a
+temporary sidecar, renamed and directory-synced before the manifest references
+it. The manifest remains the atomic commit point. After it is durable, storage
+removes the previous sidecar. A crash can leave an unreferenced sidecar; recovery
+ignores it, and automatic orphan cleanup is not implemented.
+
+MRFTD004 remains readable with its snapshot inline; its next successful
+publication writes MRFTD005. MRFTD001 through MRFTD003 also remain readable;
+their commit floor is conservatively initialized to SnapshotIndex, since those
+formats did not record commit progress, and their next successful publication
+writes MRFTD005.
 Recovered unbound MRFTD002 snapshots with configuration metadata remain offline
 until explicitly bound. `BindVotersFromTrustedHistory` accepts them only when
 their complete retained membership chain starts from the independently trusted
@@ -47,15 +57,20 @@ both through the trusted-baseline API before Raft startup.
 
 ## Publication protocol
 
-Each `Append`, `RemoveLast`, and `Commit` call publishes one complete image
-containing the current term, vote, and selected log prefix. A follower
-`AppendEntries` request that changes state is published once before the follower
+Each `Append`, `RemoveLast`, and `Commit` call publishes one complete manifest
+containing the current term, vote, snapshot reference and selected log prefix.
+A follower `AppendEntries` request that changes state is published once before the follower
 acknowledges it. This combines a new entry batch, any conflicting uncommitted
 suffix replacement, and a commit advance carried in that request. A commit
 advance learned by a later matching request is a separate publication. Other
 backends retain their existing truncation behavior:
 
-1. Serialize the complete state into a temporary file in the same directory.
+When the snapshot reference changes, storage first publishes its sidecar using
+the write/fsync/rename/directory-fsync sequence above. It then publishes the
+manifest:
+
+1. Serialize hard state, snapshot reference and retained log into a temporary
+   file in the same directory.
 2. fsync the temporary file and check the result.
 3. Rename the temporary file over the published image atomically.
 4. fsync the containing directory and check the result.
@@ -76,12 +91,15 @@ Startup errors are exceptions and do not fall back to older/temp images.
 
 ## Format and ownership
 
-The image has version magic, payload length and CRC32. Recovery checks the
+The manifest has version magic, payload length and CRC32. Recovery checks the
 checksum before decoding entries and validates bounds, commit metadata, snapshot
-identity and term ordering. CRC32 detects accidental corruption but does not
-protect against malicious modification or all collisions.
+identity, sidecar contents and term ordering. CRC32 detects accidental
+corruption but does not protect against malicious modification or all
+collisions.
 
-The files are NAME.durable.ID, NAME.durable.ID.tmp and NAME.durable.ID.lock.
+The files are NAME.durable.ID, its temporary image, NAME.durable.ID.lock, and
+the referenced snapshot sidecar. A sidecar is identified by included index and
+term and is never modified by ordinary manifest updates.
 A nonblocking advisory flock holds the lock for the object's lifetime. Use one
 object/thread to mutate a store, and do not delete/replace its lock while running.
 Returned/appended entries are copied so external mutation cannot change the
@@ -137,10 +155,11 @@ recovery's refusal to adopt temporary images. No independent approval is claimed
 
 ## Limits and assumptions
 
-This implementation rewrites the entire log on every publication, uses memory
-proportional to the log, and blocks the calling thread during sync. `AppendBatch`
-reduces publications for a follower request, including a commit advance carried
-in that request. Individual client proposals and commit-only advances still
+This implementation rewrites the retained log and manifest on every
+publication, uses memory proportional to the log, and blocks the calling thread
+during sync. Snapshot bytes are written only when a new snapshot is published.
+`AppendBatch` reduces publications for a follower request, including a commit
+advance carried in that request. Individual client proposals and commit-only advances still
 publish separately. There is no WAL or group commit across requests; this remains
 a conservative protocol baseline, not NuRaft-level throughput.
 
