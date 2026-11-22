@@ -4,7 +4,8 @@ Status: the replicated protocol hooks, a reference KV idempotent state machine,
 a client session/retry helper, and a Linux durable client-state-store adapter
 are implemented. The KV example now exposes the idempotent request path over
 its TCP client/server interface. MiniRaft does not provide a reusable network
-client library or an automatic reconnect/backoff manager. The opt-in
+client library. The sample CLI uses bounded reconnect/backoff for idempotent
+writes. The opt-in
 request type carries operation identity through negotiated forwarding and a
 tagged replicated log record. `IIdempotentRsm` applies committed records and
 captures application data, session records, epoch and progress in one bounded
@@ -163,8 +164,10 @@ after a matching success response is durably acknowledged. `examples/kv.cpp`
 can run an idempotent KV server with `--idempotent --durable` and a client with
 `--idempotent --client-state <path>`. It retries an unresolved write when the
 client process is launched again, including after the server applied the write
-but its reply was lost. The sample does not reconnect automatically within a
-running process. Integration with a deployment application's own durable state
+but its reply was lost. The sample also retries a lost reply within the running
+process, using the same saved operation identity and a bounded reconnect/backoff
+sequence. Exhausted retries leave the operation pending for a later command or
+process restart. Integration with a deployment application's own durable state
 and snapshot implementation remains open. The
 `TDurableIdempotentClientStateStore` adapter stores one versioned, checksummed
 session image per file and publishes updates through a synced temporary file,
@@ -197,9 +200,10 @@ complete old or new state is recovered; they do not emulate hardware power loss.
   `test_idempotent_client`; durable client-session publication and restart are
   covered by `test_durable_idempotent_client`. The CLI network smoke test drops
   a committed response, verifies retry returns its cached result, and checks
-  the combined snapshot after restart. A reusable client library, in-process
-  reconnect/backoff and deployment-specific application storage integration
-  remain open.
+  the combined snapshot after restart. Same-process reconnect/backoff for the
+  sample CLI is covered by dropping a reply and forwarding the retry. A reusable
+  client library and deployment-specific application storage integration remain
+  open.
 
 Clients using ordinary `TCommandRequest` writes retain at-least-once behavior.
 For idempotent requests, a timeout after admission still has an unknown outcome;

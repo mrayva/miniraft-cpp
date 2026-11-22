@@ -84,6 +84,30 @@ def drop_one_reply(proxy, target, captured, errors, ready):
         errors.append(error)
 
 
+def drop_reply_then_forward_retry(proxy, target, requests, responses, errors, ready):
+    try:
+        with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", proxy))
+            listener.listen(2)
+            listener.settimeout(8)
+            ready.set()
+            for attempt in range(2):
+                client, _ = listener.accept()
+                with client, socket.create_connection(("127.0.0.1", target), timeout=5) as upstream:
+                    client.settimeout(5)
+                    upstream.settimeout(5)
+                    request = receive_frame(client)
+                    requests.append(request)
+                    upstream.sendall(request)
+                    response = receive_frame(upstream)
+                    responses.append(response)
+                    if attempt == 1:
+                        client.sendall(response)
+    except Exception as error:  # surfaced on the main test thread
+        errors.append(error)
+
+
 def main():
     binary = str(pathlib.Path(sys.argv[1]).resolve())
     with tempfile.TemporaryDirectory(prefix="miniraft-idempotent-client-") as directory:
@@ -125,6 +149,34 @@ def main():
                 wait_listening(process)
                 time.sleep(0.7)  # Let the single voter complete its election.
 
+                reconnect_state = root / "reconnect.state"
+                retry_proxy_port = port()
+                retry_requests = []
+                retry_responses = []
+                retry_proxy_errors = []
+                retry_proxy_ready = threading.Event()
+                retry_proxy_thread = threading.Thread(
+                    target=drop_reply_then_forward_retry,
+                    args=(retry_proxy_port, endpoint, retry_requests, retry_responses,
+                          retry_proxy_errors, retry_proxy_ready), daemon=True)
+                retry_proxy_thread.start()
+                assert retry_proxy_ready.wait(timeout=3), "retry proxy did not listen"
+                reconnected = client(
+                    reconnect_state, retry_proxy_port, "set acct_2 balance_30\n")
+                assert reconnected.returncode == 0, reconnected.stdout + reconnected.stderr
+                retry_proxy_thread.join(timeout=8)
+                assert not retry_proxy_thread.is_alive(), "same-process retry did not finish"
+                assert not retry_proxy_errors, retry_proxy_errors
+                assert len(retry_requests) == 2 and len(retry_responses) == 2
+                assert retry_requests[0] == retry_requests[1], "retry changed the operation identity"
+                first_retry_reply, second_retry_reply = retry_responses
+                assert struct.unpack_from("<Q", first_retry_reply, 16)[0] == \
+                    struct.unpack_from("<Q", second_retry_reply, 16)[0]
+                assert struct.unpack_from("<I", first_retry_reply, 60)[0] == 0
+                assert struct.unpack_from("<I", second_retry_reply, 60)[0] == 0
+                assert "Idempotent write committed at " in reconnected.stdout, reconnected.stdout
+                assert (reconnect_state.stat().st_mode & 0o777) == 0o600
+
                 client_state = root / "client.state"
                 proxy_port = port()
                 captured = []
@@ -147,7 +199,7 @@ def main():
                 original_index = struct.unpack_from("<Q", response, 16)[0]
                 original_error = struct.unpack_from("<I", response, 60)[0]
                 assert original_error == 0, response
-                assert "Connection closed" in first.stdout, first.stdout + first.stderr
+                assert "remains saved after reconnect retries" in first.stdout, first.stdout + first.stderr
 
                 retry = client(client_state, endpoint, "")
                 assert retry.returncode == 0, retry.stdout + retry.stderr
@@ -186,7 +238,7 @@ def main():
                 log.seek(0)
                 output = log.read()
                 assert "ERROR: AddressSanitizer" not in output and "runtime error:" not in output, output
-                print("Idempotent KV network client: lost reply retry, cached result and snapshot restore passed")
+                print("Idempotent KV network client: same-process reconnect, restart retry, cached result and snapshot restore passed")
             except Exception:
                 log.flush()
                 log.seek(0)
