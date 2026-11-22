@@ -1,6 +1,7 @@
 #include "durable.h"
 #include "persist.h"
 #include "configuration.h"
+#include "idempotency.h"
 #include "snapshot_codec.h"
 #include <array>
 #include <climits>
@@ -663,6 +664,10 @@ void TDurableState::ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t
         ValidateMessageTree(entry);
         if (entry->Flags == TLogEntry::EConfiguration) {
             (void)DecodeConfigurationEntry(entry);
+        } else if (entry->Flags == TLogEntry::EIdempotent) {
+            (void)DecodeIdempotentLogEntry(entry);
+        } else if (entry->Flags == TLogEntry::EIdempotencyControl) {
+            (void)DecodeIdempotencyControlLogEntry(entry);
         } else if (entry->Flags != TLogEntry::ENone && entry->Flags != TLogEntry::EStub) {
             throw std::invalid_argument("Legacy log contains unsupported entry flags");
         }

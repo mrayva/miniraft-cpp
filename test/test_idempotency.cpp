@@ -64,8 +64,12 @@ struct TSnapshotRsm : IIdempotentRsm {
     TIdempotencySnapshot State;
     uint64_t ResponseBound = 64;
     size_t IdempotentWrites = 0;
+    size_t ControlWrites = 0;
+    mutable size_t ControlValidations = 0;
     TIdempotentOperationIdentity LastIdentity;
+    TIdempotencyControlOperation LastControl;
     std::string LastAppliedCommand;
+    std::string LastControlCommand;
 
     TMessageHolder<TMessage> Read(TMessageHolder<TCommandRequest>, uint64_t index) override {
         return NewHoldedMessage(TCommandResponse{.Index = index});
@@ -97,12 +101,30 @@ struct TSnapshotRsm : IIdempotentRsm {
         LastAppliedIndex = index;
         return {.Index = index, .ErrorCode = TCommandResponse::Success, .Data = "applied"};
     }
-    void ValidateIdempotencyControl(const TIdempotencyControlOperation&) const override { }
+    void ValidateIdempotencyControl(const TIdempotencyControlOperation& operation) const override {
+        ++ControlValidations;
+        ValidateIdempotencyControlOperation(operation);
+        if (operation.Kind == EIdempotencyControlKind::AdvanceEpoch && State.Epoch != operation.Epoch)
+            throw std::invalid_argument("Unexpected test idempotency epoch");
+    }
     TMessageHolder<TLogEntry> PrepareIdempotencyControl(
             const TIdempotencyControlOperation&) override {
-        return NewHoldedMessage<TLogEntry>();
+        auto entry = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 8);
+        memcpy(entry->Data, "prepared", 8);
+        return entry;
     }
-    void ApplyIdempotencyControl(const TIdempotencyControlOperation&, uint64_t) override { }
+    void ApplyIdempotencyControl(const TIdempotencyControlOperation& operation,
+            TMessageHolder<TLogEntry> applicationEntry, uint64_t index) override {
+        ++ControlWrites;
+        LastControl = operation;
+        LastControlCommand.assign(applicationEntry->Data,
+            applicationEntry->Len - sizeof(TLogEntry));
+        State.ApplicationData = LastControlCommand;
+        if (operation.Kind == EIdempotencyControlKind::AdvanceEpoch)
+            State.Epoch = operation.NewEpoch;
+        State.LastAppliedIndex = index;
+        LastAppliedIndex = index;
+    }
     TIdempotencySnapshot CaptureIdempotencySnapshot() const override { return State; }
     void ValidateIdempotencySnapshot(const TIdempotencySnapshot& snapshot,
             uint64_t index) const override {
@@ -231,6 +253,96 @@ void test_idempotent_log_record_roundtrip_and_rejects_corruption(void**) {
     Reject([&] { (void)EncodeIdempotentLogEntry(invalid, application); });
     application->Flags = TLogEntry::EConfiguration;
     Reject([&] { (void)EncodeIdempotentLogEntry(identity, application); });
+    application->Flags = TLogEntry::EIdempotencyControl;
+    Reject([&] { (void)EncodeIdempotentLogEntry(identity, application); });
+}
+
+void test_idempotency_control_log_record_roundtrip_and_rejects_corruption(void**) {
+    TIdempotencyControlOperation operation{
+        .Kind = EIdempotencyControlKind::CloseSession,
+        .Epoch = 8,
+        .SessionIdHigh = 9,
+        .SessionIdLow = 10,
+    };
+    auto application = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 5);
+    application->Term = 4;
+    memcpy(application->Data, "close", 5);
+    auto encoded = EncodeIdempotencyControlLogEntry(operation, application);
+    assert_int_equal(encoded->Term, 4);
+    assert_int_equal(encoded->Flags, TLogEntry::EIdempotencyControl);
+
+    const auto decoded = DecodeIdempotencyControlLogEntry(encoded);
+    assert_true(decoded.Operation == operation);
+    assert_int_equal(decoded.ApplicationEntry->Term, 4);
+    assert_int_equal(decoded.ApplicationEntry->Flags, TLogEntry::ENone);
+    assert_int_equal(decoded.ApplicationEntry->Len, sizeof(TLogEntry) + 5);
+    assert_memory_equal(decoded.ApplicationEntry->Data, "close", 5);
+
+    auto corrupt = NewHoldedMessage<TLogEntry>(encoded->Len);
+    memcpy(corrupt.Mes, encoded.Mes, encoded->Len);
+    corrupt->Data[12] ^= 1;
+    Reject([&] { (void)DecodeIdempotencyControlLogEntry(corrupt); });
+
+    auto invalid = operation;
+    invalid.SessionIdHigh = invalid.SessionIdLow = 0;
+    Reject([&] { (void)EncodeIdempotencyControlLogEntry(invalid, application); });
+    application->Flags = TLogEntry::EConfiguration;
+    Reject([&] { (void)EncodeIdempotencyControlLogEntry(operation, application); });
+}
+
+void test_configuration_history_accepts_valid_idempotency_control_entries(void**) {
+    TConfigurationHistory history = TConfigurationHistory::Stable({1}, 0, 0, 0, 0);
+    TIdempotencyControlOperation operation{
+        .Kind = EIdempotencyControlKind::AdvanceEpoch,
+        .Epoch = 2,
+        .NewEpoch = 3,
+    };
+    auto application = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry));
+    application->Term = 1;
+    auto control = EncodeIdempotencyControlLogEntry(operation, application);
+    const auto next = history.Observe(1, control);
+    assert_int_equal(next.ThroughIndex(), 1);
+    assert_int_equal(next.ThroughTerm(), 1);
+    assert_true(next.OldVoters() == (std::vector<uint32_t>{1}));
+}
+
+void test_idempotency_control_is_proposed_and_atomically_applied_after_commit(void**) {
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 1;
+    state->BindVoters({1});
+    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+    auto rsm = std::make_shared<TSnapshotRsm>();
+    rsm->State.Epoch = 2;
+    TRequestProcessor processor(raft, rsm, {});
+    raft->Become(EState::LEADER);
+
+    const TIdempotencyControlOperation operation{
+        .Kind = EIdempotencyControlKind::AdvanceEpoch,
+        .Epoch = 2,
+        .NewEpoch = 3,
+    };
+    const auto index = processor.ProposeIdempotencyControl(operation);
+    assert_int_equal(index, 1);
+    assert_int_equal(state->Get(1)->Flags, TLogEntry::EIdempotencyControl);
+    assert_int_equal(rsm->ControlWrites, 0);
+    assert_int_equal(rsm->LastAppliedIndex, 0);
+    assert_int_equal(rsm->State.Epoch, 2);
+
+    const_cast<TVolatileState*>(raft->GetVolatileState())->CommitIndex = index;
+    processor.ProcessCommitted();
+    assert_int_equal(rsm->ControlWrites, 1);
+    assert_true(rsm->LastControl == operation);
+    assert_true(rsm->LastControlCommand == "prepared");
+    assert_int_equal(rsm->ControlValidations, 2);
+    assert_true(rsm->State.ApplicationData == "prepared");
+    assert_int_equal(rsm->State.Epoch, 3);
+    assert_int_equal(rsm->State.LastAppliedIndex, index);
+    assert_int_equal(rsm->LastAppliedIndex, index);
+
+    TSnapshotRsm restored;
+    restored.LoadSnapshot(rsm->SaveSnapshot(), index);
+    assert_true(restored.State == rsm->State);
+    assert_int_equal(restored.LastAppliedIndex, index);
 }
 
 void test_committed_idempotent_log_replay_uses_identity_and_application_entry(void**) {
@@ -475,19 +587,29 @@ void test_idempotent_log_requires_every_member_capability_including_joint_additi
 
     auto* volatileState = const_cast<TVolatileState*>(raft->GetVolatileState());
     volatileState->PeerCapabilities[2] = {
-        .AppendAckSeqno = 1, .Term = state->CurrentTerm, .IdempotentLogEntries = true};
+        .AppendAckSeqno = 1, .Term = state->CurrentTerm, .IdempotentLogEntries = true,
+        .IdempotencyControlEntries = true};
     volatileState->PeerCapabilities[3] = {
-        .AppendAckSeqno = 1, .Term = state->CurrentTerm, .IdempotentLogEntries = true};
+        .AppendAckSeqno = 1, .Term = state->CurrentTerm, .IdempotentLogEntries = true,
+        .IdempotencyControlEntries = true};
     assert_false(raft->CanAppendIdempotentLogEntries());
 
     auto readiness = raft->CheckJointConfigurationReadiness({1, 2, 4});
     assert_true(readiness.MembersWithoutIdempotentLogSupport == (std::vector<uint32_t>{4}));
+    assert_true(readiness.MembersWithoutIdempotencyControlSupport == (std::vector<uint32_t>{4}));
 
     volatileState->PeerCapabilities[4] = {
         .AppendAckSeqno = 1, .Term = state->CurrentTerm, .IdempotentLogEntries = true};
     assert_true(raft->CanAppendIdempotentLogEntries());
+    assert_false(raft->CanAppendIdempotencyControlEntries());
     readiness = raft->CheckJointConfigurationReadiness({1, 2, 4});
     assert_true(readiness.MembersWithoutIdempotentLogSupport.empty());
+    assert_true(readiness.MembersWithoutIdempotencyControlSupport == (std::vector<uint32_t>{4}));
+
+    volatileState->PeerCapabilities[4].IdempotencyControlEntries = true;
+    assert_true(raft->CanAppendIdempotencyControlEntries());
+    readiness = raft->CheckJointConfigurationReadiness({1, 2, 4});
+    assert_true(readiness.MembersWithoutIdempotencyControlSupport.empty());
 
     auto application = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 1);
     application->Term = state->CurrentTerm;
@@ -501,6 +623,18 @@ void test_idempotent_log_requires_every_member_capability_including_joint_additi
     auto replicated = EncodeIdempotentLogEntry(identity, application);
     assert_int_equal(raft->Append(replicated), 1);
     assert_int_equal(state->Get(1)->Flags, TLogEntry::EIdempotent);
+
+    TIdempotencyControlOperation control{
+        .Kind = EIdempotencyControlKind::AdvanceEpoch,
+        .Epoch = 1,
+        .NewEpoch = 2,
+    };
+    auto controlApplication = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 1);
+    controlApplication->Term = state->CurrentTerm;
+    controlApplication->Data[0] = 'c';
+    auto controlEntry = EncodeIdempotencyControlLogEntry(control, controlApplication);
+    assert_int_equal(raft->Append(controlEntry), 2);
+    assert_int_equal(state->Get(2)->Flags, TLogEntry::EIdempotencyControl);
 }
 
 void test_rsm_without_idempotency_rejects_tagged_append_entries(void**) {
@@ -533,6 +667,37 @@ void test_rsm_without_idempotency_rejects_tagged_append_entries(void**) {
     const auto response = leader->Sent.back().Cast<TAppendEntriesResponse>();
     assert_false(response->Success);
     assert_false(response->Padding & TAppendEntriesResponse::SupportsIdempotentLogEntries);
+    assert_false(response->Padding & TAppendEntriesResponse::SupportsIdempotencyControlEntries);
+
+    TIdempotencyControlOperation control{
+        .Kind = EIdempotencyControlKind::AdvanceEpoch,
+        .Epoch = 1,
+        .NewEpoch = 2,
+    };
+    auto controlApplication = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 1);
+    controlApplication->Term = 1;
+    controlApplication->Data[0] = 'c';
+    auto controlEntry = EncodeIdempotencyControlLogEntry(control, controlApplication);
+    auto controlRequest = NewHoldedMessage(
+        TMessageEx{.Src = 2, .Dst = 1, .Term = 1, .Seqno = 2},
+        TAppendEntriesRequest{
+            .PrevLogIndex = 0, .PrevLogTerm = 0, .LeaderCommit = 1, .LeaderId = 2, .Nentries = 1});
+    controlRequest.InitPayload(1);
+    controlRequest.Payload[0] = controlEntry;
+
+    raft->Process(ITimeSource::Time{}, std::move(controlRequest));
+    assert_int_equal(state->LastLogIndex, 0);
+    assert_int_equal(leader->Sent.size(), 2);
+    const auto controlResponse = leader->Sent.back().Cast<TAppendEntriesResponse>();
+    assert_false(controlResponse->Success);
+    assert_false(controlResponse->Padding & TAppendEntriesResponse::SupportsIdempotentLogEntries);
+    assert_false(controlResponse->Padding & TAppendEntriesResponse::SupportsIdempotencyControlEntries);
+
+    auto retainedState = std::make_shared<TState>(1, 0,
+        std::vector<TMessageHolder<TLogEntry>>{controlEntry});
+    auto retainedRaft = std::make_shared<TRaft>(retainedState, 1, TNodeDict{});
+    auto unsupportedRsm = std::make_shared<TDummyRsm>();
+    Reject([&] { TRequestProcessor processor(retainedRaft, unsupportedRsm, {}); });
 }
 
 void test_idempotent_rsm_snapshot_hook_validates_before_atomic_restore(void**) {
@@ -574,6 +739,9 @@ int main() {
         cmocka_unit_test(test_idempotency_snapshot_roundtrip_preserves_dedup_state),
         cmocka_unit_test(test_idempotent_payload_digest_matches_sha256_vectors),
         cmocka_unit_test(test_idempotent_log_record_roundtrip_and_rejects_corruption),
+        cmocka_unit_test(test_idempotency_control_log_record_roundtrip_and_rejects_corruption),
+        cmocka_unit_test(test_configuration_history_accepts_valid_idempotency_control_entries),
+        cmocka_unit_test(test_idempotency_control_is_proposed_and_atomically_applied_after_commit),
         cmocka_unit_test(test_committed_idempotent_log_replay_uses_identity_and_application_entry),
         cmocka_unit_test(test_idempotent_request_is_proposed_and_replied_after_application),
         cmocka_unit_test(test_idempotent_request_forwards_through_sessionized_route),

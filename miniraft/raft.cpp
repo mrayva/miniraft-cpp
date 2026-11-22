@@ -1346,7 +1346,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
                     TAppendEntriesResponse::SupportsSnapshotHistory32 |
                     TAppendEntriesResponse::SupportsSnapshotLineage |
                     TAppendEntriesResponse::SupportsJointConsensus |
-                    (LocalIdempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotentLogEntries : 0u),
+                    (LocalIdempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotentLogEntries : 0u) |
+                    (LocalIdempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotencyControlEntries : 0u),
             });
         (void)Nodes[reply->Dst]->TrySend(std::move(reply));
         return;
@@ -1362,8 +1363,11 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
     bool supportsIncomingEntries = true;
     for (uint32_t i = 0; i < message.PayloadSize; ++i) {
         auto entry = message.Payload[i].Cast<TLogEntry>();
-        if (entry->Flags & TLogEntry::EIdempotent) {
+        if (entry->Flags == TLogEntry::EIdempotent) {
             (void)DecodeIdempotentLogEntry(entry);
+            if (!LocalIdempotentLogSupport) supportsIncomingEntries = false;
+        } else if (entry->Flags == TLogEntry::EIdempotencyControl) {
+            (void)DecodeIdempotencyControlLogEntry(entry);
             if (!LocalIdempotentLogSupport) supportsIncomingEntries = false;
         }
     }
@@ -1464,7 +1468,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
                 TAppendEntriesResponse::SupportsSnapshotHistory32 |
                 TAppendEntriesResponse::SupportsSnapshotLineage |
                 TAppendEntriesResponse::SupportsJointConsensus |
-                (LocalIdempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotentLogEntries : 0u),
+                (LocalIdempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotentLogEntries : 0u) |
+                (LocalIdempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotencyControlEntries : 0u),
         });
 
     AdvanceCommitIndex(commitIndex);
@@ -1517,6 +1522,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             message->Padding & TAppendEntriesResponse::SupportsJointConsensus;
         capabilities.IdempotentLogEntries =
             message->Padding & TAppendEntriesResponse::SupportsIdempotentLogEntries;
+        capabilities.IdempotencyControlEntries =
+            message->Padding & TAppendEntriesResponse::SupportsIdempotencyControlEntries;
     }
     const auto acknowledgedLeaderCommit = request->LeaderCommit;
     // A newer response supersedes older RPCs. Reordered/duplicate failures
@@ -1923,6 +1930,11 @@ bool TRaft::ValidateAppendConfiguration(TMessageHolder<TAppendEntriesRequest> me
         auto entry = message.Payload[i].Cast<TLogEntry>();
         if (entry->Flags == TLogEntry::EIdempotent) {
             try { (void)DecodeIdempotentLogEntry(entry); }
+            catch (const std::exception&) { return false; }
+            continue;
+        }
+        if (entry->Flags == TLogEntry::EIdempotencyControl) {
+            try { (void)DecodeIdempotencyControlLogEntry(entry); }
             catch (const std::exception&) { return false; }
             continue;
         }
@@ -2343,6 +2355,10 @@ uint64_t TRaft::Append(TMessageHolder<TLogEntry> entry) {
         if (!CanAppendIdempotentLogEntries())
             throw std::logic_error("Idempotent log entries require support from every replication target");
         (void)DecodeIdempotentLogEntry(entry);
+    } else if (entry->Flags == TLogEntry::EIdempotencyControl) {
+        if (!CanAppendIdempotencyControlEntries())
+            throw std::logic_error("Idempotency control entries require support from every replication target");
+        (void)DecodeIdempotencyControlLogEntry(entry);
     } else if (entry->Flags != TLogEntry::ENone) {
         throw TMessageError("Proposed log entry has unsupported flags");
     }
@@ -2365,6 +2381,24 @@ bool TRaft::CanAppendIdempotentLogEntries() const {
         const auto capability = VolatileState->PeerCapabilities.find(id);
         if (capability == VolatileState->PeerCapabilities.end() ||
             capability->second.Term != State->CurrentTerm || !capability->second.IdempotentLogEntries)
+            return false;
+    }
+    return true;
+}
+
+bool TRaft::CanAppendIdempotencyControlEntries() const {
+    if (!LocalIdempotentLogSupport) return false;
+    std::vector<uint32_t> members = Voters;
+    members.insert(members.end(), Learners.begin(), Learners.end());
+    std::sort(members.begin(), members.end());
+    members.erase(std::unique(members.begin(), members.end()), members.end());
+    for (auto id : members) {
+        if (id == Id) continue;
+        const auto capability = VolatileState->PeerCapabilities.find(id);
+        if (capability == VolatileState->PeerCapabilities.end() ||
+            capability->second.Term != State->CurrentTerm ||
+            !capability->second.IdempotentLogEntries ||
+            !capability->second.IdempotencyControlEntries)
             return false;
     }
     return true;
@@ -2444,6 +2478,11 @@ TJointConfigurationReadiness TRaft::CheckJointConfigurationReadiness(
             if (capability == VolatileState->PeerCapabilities.end() ||
                 capability->second.Term != State->CurrentTerm || !capability->second.IdempotentLogEntries)
                 readiness.MembersWithoutIdempotentLogSupport.push_back(id);
+            if (capability == VolatileState->PeerCapabilities.end() ||
+                capability->second.Term != State->CurrentTerm ||
+                !capability->second.IdempotentLogEntries ||
+                !capability->second.IdempotencyControlEntries)
+                readiness.MembersWithoutIdempotencyControlSupport.push_back(id);
         }
     }
     return readiness;
@@ -3508,8 +3547,8 @@ TRequestProcessor::TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_pt
     if (!supportsIdempotentLog) {
         const auto state = Raft->GetState();
         for (uint64_t index = state->SnapshotIndex + 1; index <= state->LastLogIndex; ++index)
-            if (state->RetainedLogFlags(index) & TLogEntry::EIdempotent)
-                throw std::invalid_argument("Retained idempotent log entries require an idempotent RSM");
+            if (state->RetainedLogFlags(index) & (TLogEntry::EIdempotent | TLogEntry::EIdempotencyControl))
+                throw std::invalid_argument("Retained idempotency log entries require an idempotent RSM");
     }
     Raft->SetLocalIdempotentLogSupport(supportsIdempotentLog);
     Raft->RestoreAppliedIndex(Rsm->LastAppliedIndex);
@@ -4045,6 +4084,27 @@ void TRequestProcessor::OnIdempotentCommandRequest(
     OnIdempotentCommandRequestInternal(std::move(command), replyTo, false);
 }
 
+uint64_t TRequestProcessor::ProposeIdempotencyControl(TIdempotencyControlOperation operation) {
+    if (Raft->CurrentStateName() != EState::LEADER)
+        throw std::logic_error("Only a leader can propose idempotency control entries");
+    auto* idempotentRsm = dynamic_cast<IIdempotentRsm*>(Rsm.get());
+    if (!idempotentRsm)
+        throw std::logic_error("Idempotency control entries require an idempotent RSM");
+    if (!Raft->CanAppendIdempotencyControlEntries())
+        throw std::logic_error("Idempotency control entries require support from every replication target");
+
+    ValidateIdempotencyControlOperation(operation);
+    idempotentRsm->ValidateIdempotencyControl(operation);
+    auto applicationEntry = idempotentRsm->PrepareIdempotencyControl(operation);
+    if (!applicationEntry.HasValidExtent() ||
+        applicationEntry->Type != uint32_t(EMessageType::LOG_ENTRY) ||
+        applicationEntry->Len < sizeof(TLogEntry))
+        throw TMessageError("Idempotent RSM prepared an invalid control application entry");
+    applicationEntry->Term = Raft->GetState()->CurrentTerm;
+    auto controlEntry = EncodeIdempotencyControlLogEntry(operation, std::move(applicationEntry));
+    return Raft->Append(std::move(controlEntry));
+}
+
 void TRequestProcessor::OnIdempotentCommandRequestInternal(
         TMessageHolder<TIdempotentCommandRequest> command,
         const std::shared_ptr<INode>& replyTo, bool forwarded) {
@@ -4363,6 +4423,20 @@ void TRequestProcessor::ProcessCommitted() {
         }
         if (entry->Flags == TLogEntry::EStub) {
             Rsm->LastAppliedIndex = i;
+            continue;
+        }
+        if (entry->Flags == TLogEntry::EIdempotencyControl) {
+            try {
+                auto* idempotentRsm = dynamic_cast<IIdempotentRsm*>(Rsm.get());
+                if (!idempotentRsm)
+                    throw std::logic_error("Idempotency control record requires an idempotent RSM");
+                auto decoded = DecodeIdempotencyControlLogEntry(entry);
+                idempotentRsm->ValidateIdempotencyControl(decoded.Operation);
+                idempotentRsm->ApplyIdempotencyControl(
+                    decoded.Operation, std::move(decoded.ApplicationEntry), i);
+                if (Rsm->LastAppliedIndex != i)
+                    throw std::logic_error("Idempotency control apply did not advance application progress");
+            } catch (...) { std::terminate(); }
             continue;
         }
         if (entry->Flags & TLogEntry::EIdempotent) {

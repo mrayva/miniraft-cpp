@@ -9,12 +9,15 @@ namespace {
 using namespace NSnapshotCodec;
 constexpr std::string_view Magic = "MRIDEM01";
 constexpr std::string_view LogMagic = "MRILOG01";
+constexpr std::string_view ControlLogMagic = "MRIDCT01";
 constexpr uint32_t EncodedVersion = TIdempotencySnapshot::CurrentVersion;
 constexpr uint32_t LogVersion = 1;
+constexpr uint32_t ControlLogVersion = 1;
 constexpr uint64_t FixedHeaderBytes = 40;
 constexpr uint64_t FixedRecordBytes = 80;
 constexpr uint64_t ChecksumBytes = 4;
 constexpr uint64_t FixedLogRecordBytes = 92;
+constexpr uint64_t FixedControlLogRecordBytes = 64;
 
 constexpr std::array<uint32_t, 64> Sha256RoundConstants{
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -125,7 +128,7 @@ TMessageHolder<TLogEntry> EncodeIdempotentLogEntry(
         const TIdempotentOperationIdentity& identity,
         TMessageHolder<TLogEntry> applicationEntry) {
     constexpr uint64_t reservedFlags = TLogEntry::EStub | TLogEntry::EIdempotent |
-        TLogEntry::EConfiguration;
+        TLogEntry::EIdempotencyControl | TLogEntry::EConfiguration;
     if (!identity.Epoch || (!identity.SessionIdHigh && !identity.SessionIdLow) || !identity.Sequence ||
         !applicationEntry.HasValidExtent() || applicationEntry->Type != uint32_t(EMessageType::LOG_ENTRY) ||
         applicationEntry->Len < sizeof(TLogEntry) || !applicationEntry->Term ||
@@ -186,7 +189,7 @@ TDecodedIdempotentLogEntry DecodeIdempotentLogEntry(TMessageHolder<TLogEntry> en
     const auto applicationFlags = reader.Take(8);
     const auto applicationBytes = reader.Take(8);
     constexpr uint64_t reservedFlags = TLogEntry::EStub | TLogEntry::EIdempotent |
-        TLogEntry::EConfiguration;
+        TLogEntry::EIdempotencyControl | TLogEntry::EConfiguration;
     if (!identity.Epoch || (!identity.SessionIdHigh && !identity.SessionIdLow) || !identity.Sequence ||
         (applicationFlags & reservedFlags) || applicationBytes != reader.Input.size())
         Invalid("Invalid idempotent operation log metadata");
@@ -199,6 +202,102 @@ TDecodedIdempotentLogEntry DecodeIdempotentLogEntry(TMessageHolder<TLogEntry> en
         memcpy(decoded.ApplicationEntry->Data, reader.Read(static_cast<size_t>(applicationBytes)).data(),
             static_cast<size_t>(applicationBytes));
     if (!reader.Input.empty()) Invalid("Trailing idempotent operation log data");
+    return decoded;
+}
+
+void ValidateIdempotencyControlOperation(const TIdempotencyControlOperation& operation) {
+    switch (operation.Kind) {
+    case EIdempotencyControlKind::CloseSession:
+        if (!operation.Epoch || (!operation.SessionIdHigh && !operation.SessionIdLow) ||
+            operation.NewEpoch)
+            throw std::invalid_argument("Invalid idempotency close-session operation");
+        return;
+    case EIdempotencyControlKind::AdvanceEpoch:
+        if (!operation.Epoch || operation.NewEpoch <= operation.Epoch ||
+            operation.SessionIdHigh || operation.SessionIdLow)
+            throw std::invalid_argument("Invalid idempotency epoch-advance operation");
+        return;
+    }
+    throw std::invalid_argument("Unknown idempotency control operation");
+}
+
+TMessageHolder<TLogEntry> EncodeIdempotencyControlLogEntry(
+        const TIdempotencyControlOperation& operation,
+        TMessageHolder<TLogEntry> applicationEntry) {
+    ValidateIdempotencyControlOperation(operation);
+    if (!applicationEntry.HasValidExtent() ||
+        applicationEntry->Type != uint32_t(EMessageType::LOG_ENTRY) ||
+        applicationEntry->Len < sizeof(TLogEntry) || !applicationEntry->Term ||
+        applicationEntry->Flags != TLogEntry::ENone)
+        throw std::invalid_argument("Invalid idempotency control application entry");
+
+    const uint64_t payloadBytes = applicationEntry->Len - sizeof(TLogEntry);
+    const uint64_t fixedBytes = FixedControlLogRecordBytes + ChecksumBytes;
+    if (payloadBytes > TMessageLimits{}.MaxFrameBytes - sizeof(TLogEntry) - fixedBytes)
+        throw TMessageError("Idempotency control log record exceeds the frame limit");
+    const auto encodedBytes = sizeof(TLogEntry) + fixedBytes + payloadBytes;
+
+    std::string bytes;
+    bytes.reserve(static_cast<size_t>(fixedBytes + payloadBytes));
+    Append(bytes, ControlLogMagic);
+    Put(bytes, ControlLogVersion, 4);
+    Put(bytes, static_cast<uint32_t>(operation.Kind), 4);
+    Put(bytes, operation.Epoch, 8);
+    Put(bytes, operation.NewEpoch, 8);
+    Put(bytes, operation.SessionIdHigh, 8);
+    Put(bytes, operation.SessionIdLow, 8);
+    Put(bytes, applicationEntry->Flags, 8);
+    Put(bytes, payloadBytes, 8);
+    Append(bytes, std::string_view(applicationEntry->Data, static_cast<size_t>(payloadBytes)));
+    Put(bytes, Checksum(bytes), 4);
+
+    auto entry = NewHoldedMessage<TLogEntry>(static_cast<size_t>(encodedBytes));
+    entry->Term = applicationEntry->Term;
+    entry->Flags = TLogEntry::EIdempotencyControl;
+    memcpy(entry->Data, bytes.data(), bytes.size());
+    return entry;
+}
+
+TDecodedIdempotencyControlLogEntry DecodeIdempotencyControlLogEntry(
+        TMessageHolder<TLogEntry> entry) {
+    if (!entry.HasValidExtent() || entry->Type != uint32_t(EMessageType::LOG_ENTRY) ||
+        entry->Len < sizeof(TLogEntry) + FixedControlLogRecordBytes + ChecksumBytes ||
+        entry->Len > TMessageLimits{}.MaxFrameBytes || !entry->Term ||
+        entry->Flags != TLogEntry::EIdempotencyControl)
+        Invalid("Invalid idempotency control log entry");
+    const std::string_view bytes(entry->Data, entry->Len - sizeof(TLogEntry));
+    TReader checksumReader{bytes.substr(bytes.size() - ChecksumBytes)};
+    const auto expectedChecksum = checksumReader.Take(4);
+    const auto body = bytes.substr(0, bytes.size() - ChecksumBytes);
+    if (Checksum(body) != expectedChecksum)
+        Invalid("Idempotency control log checksum mismatch");
+
+    TReader reader{body};
+    if (reader.Read(ControlLogMagic.size()) != ControlLogMagic ||
+        reader.Take(4) != ControlLogVersion)
+        Invalid("Unknown idempotency control log format");
+    TDecodedIdempotencyControlLogEntry decoded;
+    decoded.Operation.Kind = static_cast<EIdempotencyControlKind>(reader.Take(4));
+    decoded.Operation.Epoch = reader.Take(8);
+    decoded.Operation.NewEpoch = reader.Take(8);
+    decoded.Operation.SessionIdHigh = reader.Take(8);
+    decoded.Operation.SessionIdLow = reader.Take(8);
+    const auto applicationFlags = reader.Take(8);
+    const auto applicationBytes = reader.Take(8);
+    try { ValidateIdempotencyControlOperation(decoded.Operation); }
+    catch (const std::exception&) { Invalid("Invalid idempotency control metadata"); }
+    if (applicationFlags != TLogEntry::ENone || applicationBytes != reader.Input.size())
+        Invalid("Invalid idempotency control application metadata");
+
+    decoded.ApplicationEntry = NewHoldedMessage<TLogEntry>(
+        sizeof(TLogEntry) + static_cast<size_t>(applicationBytes));
+    decoded.ApplicationEntry->Term = entry->Term;
+    decoded.ApplicationEntry->Flags = applicationFlags;
+    if (applicationBytes)
+        memcpy(decoded.ApplicationEntry->Data,
+            reader.Read(static_cast<size_t>(applicationBytes)).data(),
+            static_cast<size_t>(applicationBytes));
+    if (!reader.Input.empty()) Invalid("Trailing idempotency control log data");
     return decoded;
 }
 

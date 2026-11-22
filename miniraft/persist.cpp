@@ -1,5 +1,6 @@
 #include "persist.h"
 #include "configuration.h"
+#include "idempotency.h"
 #include "snapshot_codec.h"
 #include <filesystem>
 #include <stdexcept>
@@ -1081,7 +1082,11 @@ void TDiskState::CheckTrustedLegacyVoterBaseline(const std::vector<uint32_t>& vo
         if (!entry) throw std::invalid_argument("Missing legacy log entry");
         if (entry->Flags & TLogEntry::EConfiguration)
             throw std::invalid_argument("Legacy disk voter binding requires a log without configuration entries");
-        if (entry->Flags != TLogEntry::ENone && entry->Flags != TLogEntry::EStub)
+        if (entry->Flags == TLogEntry::EIdempotent)
+            (void)DecodeIdempotentLogEntry(entry);
+        else if (entry->Flags == TLogEntry::EIdempotencyControl)
+            (void)DecodeIdempotencyControlLogEntry(entry);
+        else if (entry->Flags != TLogEntry::ENone && entry->Flags != TLogEntry::EStub)
             throw std::invalid_argument("Legacy disk log contains unsupported entry flags");
     }
 }
@@ -1149,7 +1154,11 @@ void TDiskState::ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t>& 
         const auto entry = Get(static_cast<int64_t>(index));
         if (!entry) throw std::invalid_argument("Missing retained legacy log entry");
         ValidateMessageTree(entry);
-        if (entry->Flags != TLogEntry::EConfiguration && entry->Flags != TLogEntry::ENone &&
+        if (entry->Flags == TLogEntry::EIdempotent) {
+            (void)DecodeIdempotentLogEntry(entry);
+        } else if (entry->Flags == TLogEntry::EIdempotencyControl) {
+            (void)DecodeIdempotencyControlLogEntry(entry);
+        } else if (entry->Flags != TLogEntry::EConfiguration && entry->Flags != TLogEntry::ENone &&
             entry->Flags != TLogEntry::EStub) {
             throw std::invalid_argument("Legacy log contains unsupported entry flags");
         }

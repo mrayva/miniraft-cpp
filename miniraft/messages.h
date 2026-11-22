@@ -62,6 +62,8 @@ struct TLogEntry: public TMessage {
         EStub = 1,
         // Reserved for versioned idempotent-operation log records.
         EIdempotent = uint64_t(1) << 1,
+        // Reserved for versioned idempotency session control records.
+        EIdempotencyControl = uint64_t(1) << 2,
         // Marks entries consumed by the guarded live membership protocol.
         EConfiguration = uint64_t(1) << 63,
     };
@@ -138,6 +140,9 @@ struct TAppendEntriesResponse: public TMessageEx {
     static constexpr uint32_t SupportsSnapshotLineage = 1u << 5;
     static constexpr uint32_t SupportsJointConsensus = 1u << 6;
     static constexpr uint32_t SupportsIdempotentLogEntries = 1u << 7;
+    // Separate from the older idempotent-command bit so mixed-version peers
+    // never apply session-control entries as ordinary application commands.
+    static constexpr uint32_t SupportsIdempotencyControlEntries = 1u << 8;
     // Success: matched index. Failure: zero or a compacted-boundary probe hint;
     // a hint never advances MatchIndex or confirms a read.
     uint64_t MatchIndex;

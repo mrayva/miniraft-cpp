@@ -38,6 +38,8 @@ struct TIdempotencyControlOperation {
     bool operator==(const TIdempotencyControlOperation&) const = default;
 };
 
+void ValidateIdempotencyControlOperation(const TIdempotencyControlOperation& operation);
+
 struct TIdempotencySessionRecord {
     uint64_t SessionIdHigh = 0, SessionIdLow = 0;
     uint64_t HighestSequence = 0;
@@ -75,10 +77,19 @@ struct TDecodedIdempotentLogEntry {
     TMessageHolder<TLogEntry> ApplicationEntry;
 };
 
+struct TDecodedIdempotencyControlLogEntry {
+    TIdempotencyControlOperation Operation;
+    TMessageHolder<TLogEntry> ApplicationEntry;
+};
+
 TMessageHolder<TLogEntry> EncodeIdempotentLogEntry(
     const TIdempotentOperationIdentity& identity,
     TMessageHolder<TLogEntry> applicationEntry);
 TDecodedIdempotentLogEntry DecodeIdempotentLogEntry(TMessageHolder<TLogEntry> entry);
+TMessageHolder<TLogEntry> EncodeIdempotencyControlLogEntry(
+    const TIdempotencyControlOperation& operation,
+    TMessageHolder<TLogEntry> applicationEntry);
+TDecodedIdempotencyControlLogEntry DecodeIdempotencyControlLogEntry(TMessageHolder<TLogEntry> entry);
 
 void ValidateIdempotencySnapshotLimits(const TIdempotencySnapshotLimits& limits);
 void ValidateIdempotencySnapshot(const TIdempotencySnapshot& snapshot,

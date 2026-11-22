@@ -105,12 +105,18 @@ struct IIdempotentRsm : IRsm {
             throw std::logic_error("Idempotent RSM violated its atomic apply/result contract");
         return result;
     }
+    // Validation is read-only and checks the operation against the state
+    // preceding its log index. Preparation returns a deterministic command
+    // without publishing application or session state before commit.
     virtual void ValidateIdempotencyControl(
         const TIdempotencyControlOperation&) const = 0;
     virtual TMessageHolder<TLogEntry> PrepareIdempotencyControl(
         const TIdempotencyControlOperation&) = 0;
+    // Committed replay validates the operation again, then atomically applies
+    // both the prepared entry and session-control transition and advances
+    // inherited LastAppliedIndex to index.
     virtual void ApplyIdempotencyControl(
-        const TIdempotencyControlOperation&, uint64_t index) = 0;
+        const TIdempotencyControlOperation&, TMessageHolder<TLogEntry>, uint64_t index) = 0;
 
     // Capture returns application data and dedup state together. Validation must
     // not mutate state; restore must publish the whole image and LastAppliedIndex
@@ -190,12 +196,16 @@ struct TJointConfigurationReadiness {
     // When this RSM enables idempotent writes, every replication target must
     // understand tagged idempotent log records before membership can change.
     std::vector<uint32_t> MembersWithoutIdempotentLogSupport;
+    // Session controls have a separate capability bit for safe mixed-version
+    // operation, even when the peer supports idempotent command records.
+    std::vector<uint32_t> MembersWithoutIdempotencyControlSupport;
 
     bool Ready() const {
         return IsLeader && HasDurableMembershipStorage && HasStableConfiguration &&
             HasCommittedCurrentTermEntry && ChangesVoterSet && HasLogCapacity && MissingPeerTargets.empty() &&
             AddedVotersWithoutCommitAck.empty() && AddedVotersWithoutSnapshotInstallSupport.empty() &&
-            VotersWithoutJointConsensusSupport.empty() && MembersWithoutIdempotentLogSupport.empty();
+            VotersWithoutJointConsensusSupport.empty() && MembersWithoutIdempotentLogSupport.empty() &&
+            MembersWithoutIdempotencyControlSupport.empty();
     }
 };
 
@@ -265,6 +275,7 @@ struct TVolatileState {
         bool InstallSnapshot = false;
         bool JointConsensus = false;
         bool IdempotentLogEntries = false;
+        bool IdempotencyControlEntries = false;
     };
     std::unordered_map<uint32_t, TPeerCapabilities> PeerCapabilities;
     struct TLeadershipTransfer {
@@ -379,6 +390,7 @@ public:
         LocalIdempotentLogSupport = supported;
     }
     bool CanAppendIdempotentLogEntries() const;
+    bool CanAppendIdempotencyControlEntries() const;
     // Start a joint-consensus transition. Every newly added voter must already
     // be staged as a learner and have acknowledged this leader's committed
     // boundary. A transition may exclude the leader; transfer leadership to a
@@ -606,6 +618,9 @@ public:
     // sessionized route; the leader also gates on RSM and replica support.
     void OnIdempotentCommandRequest(TMessageHolder<TIdempotentCommandRequest> message,
                                     const std::shared_ptr<INode>& replyTo);
+    // Replicate a session close or epoch advance. The returned index identifies
+    // the control record; application state changes only when it is applied.
+    uint64_t ProposeIdempotencyControl(TIdempotencyControlOperation operation);
     void OnForwardedCommandRequest(TMessageHolder<TForwardedCommandRequest> message,
                                    const std::shared_ptr<INode>& peer);
     void OnSessionForwardedCommandRequest(TMessageHolder<TSessionForwardedCommandRequest> message,

@@ -203,12 +203,14 @@ TConfigurationHistory TConfigurationHistory::Observe(uint64_t index, TMessageHol
         throw std::invalid_argument("Invalid ordinary log entry");
     if (entry->Flags == TLogEntry::EIdempotent)
         (void)DecodeIdempotentLogEntry(entry);
+    else if (entry->Flags == TLogEntry::EIdempotencyControl)
+        (void)DecodeIdempotencyControlLogEntry(entry);
     return ObserveMetadata(index, entry->Term, entry->Flags);
 }
 
 TConfigurationHistory TConfigurationHistory::ObserveMetadata(uint64_t index, uint64_t term, uint64_t flags) const {
     if ((flags != TLogEntry::ENone && flags != TLogEntry::EStub &&
-         flags != TLogEntry::EIdempotent) || !term ||
+         flags != TLogEntry::EIdempotent && flags != TLogEntry::EIdempotencyControl) || !term ||
         Through >= uint64_t(INT64_MAX) || index != Through + 1 || term < ThroughLogTerm)
         throw std::invalid_argument("Ordinary entry does not extend the trusted history");
     TConfigurationHistory next = *this;
