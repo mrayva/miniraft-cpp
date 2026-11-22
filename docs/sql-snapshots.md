@@ -27,9 +27,12 @@ migration or mixed-version support.
 
 The application image is captured with SQLite's backup API into an in-memory
 database and then serialized. This includes committed pages still present in a
-WAL file. Save requires a committed `LastAppliedIndex` marker and no open
-transaction. The SQL payload is capped below 64 MiB to leave room for the Raft
-snapshot header and maximum voter metadata. Before allocating the padded image,
+WAL file. Save requires a nonzero committed Raft applied index and no open
+transaction. Raft no-ops and configuration entries advance this index without
+changing SQL data. If the SQLite progress marker trails the Raft index or is
+absent, capture writes the exact boundary into the backup copy. The live
+database is unaffected. The SQL payload is capped below 64 MiB to leave room for
+the Raft snapshot header and maximum voter metadata. Before allocating the padded image,
 SQL checks the format signature, rollback mode, page size, page alignment and
 the in-header page count when SQLite's header counters make it authoritative.
 It then copies the image into a buffer with 20 zeroed trailing guard bytes for
@@ -41,6 +44,11 @@ standalone rollback-mode format before deserialization. The receiver also
 requires the target database page size to match before Raft publishes the
 snapshot durably. Invalid or incompatible images do not replace the live
 database.
+
+The live database's page count gives an exact size bound when the marker
+already matches. If capture needs to update the backup, SQLite can allocate
+another page. Capture checks the SQLite size limit before backup and again
+before serialization, then Raft checks the complete snapshot and its metadata.
 
 Restore uses SQLite's backup API to copy the validated in-memory image into the
 existing database connection. The application progress marker in memory moves
@@ -69,8 +77,9 @@ every node.
 Deterministic tests cover round-trip capture and restore, malformed/corrupt and
 truncated images, wrong progress boundaries, preservation of existing state after
 validation or backup failure, and restart recovery when durable Raft state is
-ahead of the SQL database. The regular release and ASan/UBSan CTest suites
-also exercise the library and examples.
+ahead of the SQL database. Compaction tests cover boundaries ending in an
+election no-op or a committed membership change. The regular release and
+ASan/UBSan CTest suites also exercise the library and examples.
 
 SQLite details: [database file format](https://www.sqlite.org/fileformat.html),
 [serialize](https://www.sqlite.org/c3ref/serialize.html),

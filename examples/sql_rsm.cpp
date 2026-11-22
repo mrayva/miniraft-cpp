@@ -145,25 +145,31 @@ TSnapshotDatabase OpenSnapshotDatabase(std::string_view bytes) {
     return result;
 }
 
-uint64_t SnapshotAppliedIndex(sqlite3* db) {
+std::optional<uint64_t> ReadAppliedIndex(sqlite3* db) {
     sqlite3_stmt* raw = nullptr;
     const int prepared = sqlite3_prepare_v2(db,
         "SELECT value FROM raft_metadata_ WHERE key='LastAppliedIndex'", -1, &raw, nullptr);
     TStatement statement(raw, sqlite3_finalize);
-    if (prepared != SQLITE_OK || !statement) throw TMessageError("SQL snapshot has no progress metadata");
+    if (prepared != SQLITE_OK || !statement) throw TMessageError("Cannot read SQL application progress");
     int rc = sqlite3_step(statement.get());
+    if (rc == SQLITE_DONE) return std::nullopt;
     if (rc != SQLITE_ROW || sqlite3_column_type(statement.get(), 0) != SQLITE_TEXT)
-        throw TMessageError("Invalid SQL snapshot progress metadata");
+        throw TMessageError("Invalid SQL application progress");
     const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(statement.get(), 0));
     const auto length = sqlite3_column_bytes(statement.get(), 0);
-    if (!text || length <= 0) throw TMessageError("Invalid SQL snapshot progress metadata");
+    if (!text || length <= 0) throw TMessageError("Invalid SQL application progress");
     uint64_t index = 0;
     const auto parsed = std::from_chars(text, text + length, index);
-    if (parsed.ec != std::errc{} || parsed.ptr != text + length || !index || index > uint64_t(INT64_MAX))
-        throw TMessageError("Invalid SQL snapshot progress metadata");
+    if (parsed.ec != std::errc{} || parsed.ptr != text + length)
+        throw TMessageError("Invalid SQL application progress");
     if (sqlite3_step(statement.get()) != SQLITE_DONE)
-        throw TMessageError("Duplicate SQL snapshot progress metadata");
+        throw TMessageError("Cannot finish reading SQL application progress");
     return index;
+}
+
+std::string AppliedIndexUpdate(uint64_t index) {
+    return "INSERT INTO raft_metadata_ (key, value) VALUES ('LastAppliedIndex','" +
+        std::to_string(index) + "') ON CONFLICT(key) DO UPDATE SET value=excluded.value";
 }
 
 void ValidateSnapshotDatabase(sqlite3* db, uint64_t index) {
@@ -183,7 +189,7 @@ void ValidateSnapshotDatabase(sqlite3* db, uint64_t index) {
             std::string(result ? result : "<null>", result ? size_t(length) : 6));
     if (sqlite3_step(statement.get()) != SQLITE_DONE)
         throw TMessageError("SQL snapshot integrity check failed");
-    if (SnapshotAppliedIndex(db) != index)
+    if (ReadAppliedIndex(db) != index)
         throw TMessageError("SQL snapshot application progress does not match its boundary");
 }
 
@@ -199,6 +205,19 @@ uint64_t ReadPragmaInteger(sqlite3* db, const char* pragma) {
     if (value <= 0 || sqlite3_step(statement.get()) != SQLITE_DONE)
         throw TMessageError("Invalid SQL snapshot size metadata");
     return uint64_t(value);
+}
+
+uint64_t CheckedSnapshotBytes(sqlite3* db, uint64_t pageSize) {
+    const auto pages = ReadPragmaInteger(db, "page_count");
+    if (pages > MaxSqlSnapshotBytes / pageSize)
+        throw TMessageError("SQL snapshot exceeds the maximum image size");
+    return pages * pageSize;
+}
+
+uint64_t CheckSnapshotCapture(sqlite3* db, uint64_t index) {
+    if (!index || index > uint64_t(INT64_MAX) || !sqlite3_get_autocommit(db))
+        throw TMessageError("SQL snapshot requires committed application progress");
+    return ReadPragmaInteger(db, "page_size");
 }
 
 void ValidateSnapshotForTarget(sqlite3* snapshot, sqlite3* target, uint64_t index) {
@@ -304,26 +323,7 @@ TSql::TSql(const std::string& path, int serverId, TSqlReadLimits readLimits)
     if (opened != SQLITE_OK) throw std::runtime_error("Cannot open SQL database");
     DisableReplicaLocalFunctions(Db);
     RequireExecute("CREATE TABLE IF NOT EXISTS raft_metadata_ (key TEXT PRIMARY KEY, value TEXT)");
-    sqlite3_stmt* raw = nullptr;
-    const int prepared = sqlite3_prepare_v2(Db,
-        "SELECT value FROM raft_metadata_ WHERE key='LastAppliedIndex'", -1, &raw, nullptr);
-    TStatement statement(raw, sqlite3_finalize);
-    if (prepared != SQLITE_OK || !statement) throw std::runtime_error("Cannot read SQL application progress");
-    int rc = sqlite3_step(statement.get());
-    if (rc == SQLITE_ROW) {
-        if (sqlite3_column_type(statement.get(), 0) != SQLITE_TEXT)
-            throw std::runtime_error("Invalid SQL application progress");
-        const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(statement.get(), 0));
-        if (!text) throw std::runtime_error("Cannot read SQL application progress");
-        const auto length = sqlite3_column_bytes(statement.get(), 0);
-        uint64_t index = 0;
-        const auto parsed = std::from_chars(text, text + length, index);
-        if (parsed.ec != std::errc{} || parsed.ptr != text + length)
-            throw std::runtime_error("Invalid SQL application progress");
-        LastAppliedIndex = index;
-        rc = sqlite3_step(statement.get());
-    }
-    if (rc != SQLITE_DONE) throw std::runtime_error("Invalid SQL application progress");
+    LastAppliedIndex = ReadAppliedIndex(Db).value_or(0);
     cleanup.release();
     std::cerr << "LastAppliedIndex: " << LastAppliedIndex << std::endl;
 }
@@ -386,9 +386,7 @@ TMessageHolder<TMessage> TSql::Write(TMessageHolder<TLogEntry> message, uint64_t
         // Start a new one to record the rejected entry; never ignore failure here.
         RequireExecute("BEGIN IMMEDIATE");
     }
-    const auto progress = std::to_string(index);
-    RequireExecute("INSERT INTO raft_metadata_ (key, value) VALUES ('LastAppliedIndex','" + progress +
-        "') ON CONFLICT(key) DO UPDATE SET value='" + progress + "'");
+    RequireExecute(AppliedIndexUpdate(index));
     RequireExecute("COMMIT");
     LastAppliedIndex = index;
     return Reply(error, index);
@@ -415,21 +413,36 @@ TMessageHolder<TLogEntry> TSql::Prepare(TMessageHolder<TCommandRequest> command)
 }
 
 std::optional<uint64_t> TSql::SnapshotSizeUpperBound() const {
-    if (!LastAppliedIndex || LastAppliedIndex > uint64_t(INT64_MAX) || !sqlite3_get_autocommit(Db))
-        throw TMessageError("SQL snapshot requires committed application progress");
-    const auto pages = ReadPragmaInteger(Db, "page_count");
-    const auto pageSize = ReadPragmaInteger(Db, "page_size");
-    if (pages > MaxSqlSnapshotBytes / pageSize)
-        throw TMessageError("SQL snapshot exceeds the maximum image size");
-    return pages * pageSize;
+    const auto pageSize = CheckSnapshotCapture(Db, LastAppliedIndex);
+    const auto bytes = CheckedSnapshotBytes(Db, pageSize);
+    // Updating the marker in the checkpoint can grow its SQLite page count.
+    if (ReadAppliedIndex(Db) != LastAppliedIndex) return std::nullopt;
+    return bytes;
 }
 
 std::string TSql::SaveSnapshot() const {
-    (void)SnapshotSizeUpperBound().value();
-    const auto pageSize = ReadPragmaInteger(Db, "page_size");
+    const auto pageSize = CheckSnapshotCapture(Db, LastAppliedIndex);
+    CheckedSnapshotBytes(Db, pageSize);
     auto consistent = CopyDatabaseToMemory(Db, pageSize);
+    auto* checkpoint = consistent.Db.get();
+    const auto storedIndex = ReadAppliedIndex(checkpoint).value_or(0);
+    if (storedIndex > LastAppliedIndex)
+        throw TMessageError("SQL database progress exceeds the snapshot boundary");
+    if (storedIndex < LastAppliedIndex) {
+        // Raft-only entries advance LastAppliedIndex without changing SQL data.
+        // Stamp the copy without allowing the internal update to fire triggers
+        // or foreign key actions on an existing schema.
+        if (sqlite3_db_config(checkpoint, SQLITE_DBCONFIG_ENABLE_TRIGGER, 0, static_cast<int*>(nullptr)) != SQLITE_OK ||
+            sqlite3_db_config(checkpoint, SQLITE_DBCONFIG_ENABLE_FKEY, 0, static_cast<int*>(nullptr)) != SQLITE_OK)
+            throw TMessageError("Cannot isolate SQL snapshot progress update");
+        const auto update = AppliedIndexUpdate(LastAppliedIndex);
+        if (sqlite3_exec(checkpoint, update.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK ||
+            ReadAppliedIndex(checkpoint) != LastAppliedIndex)
+            throw TMessageError("Cannot set SQL snapshot progress");
+        CheckedSnapshotBytes(checkpoint, pageSize);
+    }
     sqlite3_int64 size = 0;
-    auto* bytes = sqlite3_serialize(consistent.Db.get(), "main", &size, 0);
+    auto* bytes = sqlite3_serialize(checkpoint, "main", &size, 0);
     std::unique_ptr<unsigned char, decltype(&sqlite3_free)> image(bytes, sqlite3_free);
     if (!bytes || size <= 0 || uint64_t(size) > MaxSqlSnapshotBytes)
         throw TMessageError("Cannot serialize SQL snapshot within the size limit");

@@ -616,6 +616,64 @@ void test_sql_and_raft_restart_do_not_reapply_committed_insert(void**) {
         assert_true(ReadText(*sql, "SELECT count(*) AS n FROM t") == "n\n1\n");
         assert_int_equal(beforeElection, 3);
         assert_int_equal(sql->LastAppliedIndex, 4); // new-term stub advanced framework progress
+        const auto snapshot = raft->CompactShared();
+        assert_int_equal(snapshot->Index, 4);
+        sql->ValidateSnapshot(snapshot->Data, 4);
+        Reject([&] { sql->ValidateSnapshot(snapshot->Data, 3); });
+        assert_true(ReadText(*sql, "SELECT value FROM raft_metadata_ WHERE key='LastAppliedIndex'") ==
+            "value\n3\n");
+    }
+    {
+        auto state = std::make_shared<TDiskState>(logPath, 1);
+        auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+        auto sql = std::make_shared<TSql>(file.Path, 1);
+        assert_int_equal(sql->LastAppliedIndex, 3);
+        TRequestProcessor processor(raft, sql, {});
+        assert_int_equal(sql->LastAppliedIndex, 4);
+        assert_true(ReadText(*sql, "SELECT count(*) AS n FROM t") == "n\n1\n");
+    }
+}
+
+void test_sql_compaction_at_raft_only_boundaries(void**) {
+    {
+        auto raft = std::make_shared<TRaft>(std::make_shared<TState>(), 1, TNodeDict{});
+        auto sql = std::make_shared<TSql>(":memory:", 1);
+        TRequestProcessor processor(raft, sql, {});
+        raft->ProcessTimeout({});
+        processor.ProcessCommitted();
+        assert_int_equal(sql->LastAppliedIndex, 1);
+        const auto snapshot = raft->CompactShared();
+        assert_int_equal(snapshot->Index, 1);
+        sql->ValidateSnapshot(snapshot->Data, 1);
+        assert_true(ReadText(*sql, "SELECT count(*) FROM raft_metadata_") == "count(*)\n0\n");
+    }
+    {
+        TDatabase file;
+        auto state = std::make_shared<TDiskState>(file.Path + "-raft", 1);
+        auto sql = std::make_shared<TSql>(file.Path, 1);
+        const std::vector<uint32_t> oldVoters{1, 2}, newVoters{1};
+        state->BindVoters(oldVoters);
+        auto command = Query("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('kept')");
+        command->Flags = TCommandRequest::EWrite;
+        auto entry = sql->Prepare(command);
+        entry->Term = 1;
+        state->Append(entry);
+        state->Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Joint, 1, 0, 0, oldVoters, newVoters}));
+        state->Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Stable, 1, 2, 1, oldVoters, newVoters}));
+        state->CommitIndex = 3;
+        state->Commit();
+        auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+        TRequestProcessor processor(raft, sql, {});
+        processor.ProcessCommitted();
+        const auto snapshot = raft->CompactShared();
+        assert_int_equal(snapshot->Index, 3);
+        assert_true(snapshot->StableConfiguration);
+        assert_true(snapshot->Voters == newVoters);
+        TSql restored(":memory:", 1);
+        restored.LoadSnapshot(snapshot->Data, 3);
+        assert_true(ReadText(restored, "SELECT v FROM t") == "v\nkept\n");
     }
 }
 
@@ -659,6 +717,7 @@ int main() {
         cmocka_unit_test(test_sql_read_rejects_invalid_limits),
         cmocka_unit_test(test_sql_read_value_limit_is_restored_before_writes),
         cmocka_unit_test(test_sql_and_raft_restart_do_not_reapply_committed_insert),
+        cmocka_unit_test(test_sql_compaction_at_raft_only_boundaries),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }
