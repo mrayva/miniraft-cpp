@@ -954,7 +954,7 @@ void test_snapshot_install_budget_releases_after_conflicting_duplicate(void**) {
     assert_int_equal(budget->UsedBytes(), image.size());
 }
 void test_covered_snapshot_metadata_uses_shared_install_budget(void**) {
-    auto budget = std::make_shared<TSnapshotInstallBudget>(200);
+    auto budget = std::make_shared<TSnapshotInstallBudget>(60);
     TRaft::TLogLimits limits;
     limits.SnapshotInstallBudget = budget;
     std::vector<TMessageHolder<TMessage>> replies;
@@ -970,54 +970,49 @@ void test_covered_snapshot_metadata_uses_shared_install_budget(void**) {
     auto raft2 = std::make_shared<TRaft>(makeState(), 2, peers, std::vector<uint32_t>{}, limits);
     auto raft3 = std::make_shared<TRaft>(makeState(), 3, peers, std::vector<uint32_t>{}, limits);
 
-    auto request = [](uint32_t target, uint64_t totalBytes = 128) {
-        constexpr std::string_view prefix = "MRFT";
-        auto chunk = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + prefix.size());
-        chunk->Src = 1; chunk->Dst = target; chunk->Term = 1; chunk->Seqno = 1;
+    auto request = [](uint32_t target, const std::string& image, size_t offset, size_t count) {
+        auto chunk = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
+        chunk->Src = 1; chunk->Dst = target; chunk->Term = 1; chunk->Seqno = offset + 1;
         chunk->SnapshotIndex = 1; chunk->SnapshotTerm = 1;
-        chunk->TotalBytes = totalBytes; chunk->Offset = 0; chunk->LeaderId = 1; chunk->Done = 0;
-        memcpy(chunk->Data, prefix.data(), prefix.size());
+        chunk->TotalBytes = image.size(); chunk->Offset = offset; chunk->LeaderId = 1;
+        chunk->Done = offset + count == image.size();
+        memcpy(chunk->Data, image.data() + offset, count);
         return chunk;
     };
+    const auto image2 = EncodeSnapshot(TSnapshot{1, 1, {1, 2}, std::string(200, 'a')});
+    const auto replacement = EncodeSnapshot(TSnapshot{1, 1, {1, 2}, std::string(201, 'b')});
+    const auto image3 = EncodeSnapshot(TSnapshot{1, 1, {1, 3}, std::string(200, 'c')});
 
-    raft2->Process(ITimeSource::Time{}, request(2));
+    raft2->Process(ITimeSource::Time{}, request(2, image2, 0, 20));
     auto first = replies.back().Cast<TInstallSnapshotResponse>();
-    assert_true(first->Success); assert_int_equal(first->NextOffset, 4);
-    assert_int_equal(budget->UsedBytes(), 128);
+    assert_true(first->Success); assert_int_equal(first->NextOffset, 20);
+    assert_int_equal(budget->UsedBytes(), 20);
 
-    replies.clear();
-    raft2->Process(ITimeSource::Time{}, request(2, 150));
+    raft2->Process(ITimeSource::Time{}, request(2, replacement, 0, 20));
     auto replaced = replies.back().Cast<TInstallSnapshotResponse>();
-    assert_true(replaced->Success); assert_int_equal(replaced->NextOffset, 4);
-    assert_int_equal(budget->UsedBytes(), 150);
+    assert_true(replaced->Success); assert_int_equal(replaced->NextOffset, 20);
+    assert_int_equal(budget->UsedBytes(), 20);
 
-    replies.clear();
-    raft3->Process(ITimeSource::Time{}, request(3));
+    raft3->Process(ITimeSource::Time{}, request(3, image3, 0, 20));
+    assert_true(replies.back().Cast<TInstallSnapshotResponse>()->Success);
+    assert_int_equal(budget->UsedBytes(), 40);
+    raft2->Process(ITimeSource::Time{}, request(2, replacement, 20, 8));
     auto overBudget = replies.back().Cast<TInstallSnapshotResponse>();
     assert_false(overBudget->Success); assert_int_equal(overBudget->NextOffset, 0);
-    assert_int_equal(budget->UsedBytes(), 150);
+    assert_int_equal(budget->UsedBytes(), 20);
 
     const auto expiredAt = ITimeSource::Time{} + TTimeout::SnapshotTransferIdle;
-    raft2->ProcessTimeout(expiredAt);
+    raft3->ProcessTimeout(expiredAt);
     assert_int_equal(budget->UsedBytes(), 0);
-    replies.clear();
-    raft3->Process(expiredAt, request(3));
+    raft3->Process(expiredAt, request(3, image3, 0, 8));
     auto retried = replies.back().Cast<TInstallSnapshotResponse>();
-    assert_true(retried->Success); assert_int_equal(retried->NextOffset, 4);
-    assert_int_equal(budget->UsedBytes(), 128);
-
-    TKv source;
-    const auto image = EncodeSnapshot(TSnapshot{1, 1, {1, 3}, source.SaveSnapshot()});
-    auto complete = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + image.size());
-    complete->Src = 1; complete->Dst = 3; complete->Term = 1; complete->Seqno = 2;
-    complete->SnapshotIndex = 1; complete->SnapshotTerm = 1; complete->Offset = 0;
-    complete->TotalBytes = image.size(); complete->LeaderId = 1; complete->Done = 1;
-    memcpy(complete->Data, image.data(), image.size());
-    replies.clear();
-    raft3->Process(expiredAt, complete);
+    assert_true(retried->Success); assert_int_equal(retried->NextOffset, 8);
+    assert_int_equal(budget->UsedBytes(), 8);
+    const auto metadataBytes = image3.size() - 200 - sizeof(uint32_t);
+    raft3->Process(expiredAt, request(3, image3, 8, metadataBytes - 8));
     auto covered = replies.back().Cast<TInstallSnapshotResponse>();
     assert_true(covered->Success); assert_true(covered->Installed);
-    assert_int_equal(covered->NextOffset, image.size());
+    assert_int_equal(covered->NextOffset, image3.size());
     assert_int_equal(budget->UsedBytes(), 0);
 }
 void test_snapshot_install_accepts_every_small_fixed_chunk_size(void**) {

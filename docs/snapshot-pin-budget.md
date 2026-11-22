@@ -24,10 +24,11 @@ succeeds while the other peer still owns its older image. Existing tests continu
 to verify catch-up progress under compaction during every chunk.
 
 This caps the number of distinct outgoing transfer generations, not total process
-heap usage. Incomplete incoming InstallSnapshot images and covered-boundary
-metadata probes also reserve their declared sizes against a 256 MiB
-process-wide byte budget by default, configurable through a shared
-`TSnapshotInstallBudget`. Current application/log state, outgoing snapshots,
+heap usage. Incomplete incoming InstallSnapshot images reserve their declared
+sizes against a 256 MiB process-wide byte budget by default. Covered-boundary
+probes use the same budget for the prefix they buffer, including both buffers
+when growing it. Callers can configure a shared `TSnapshotInstallBudget`.
+Current application/log state, outgoing snapshots,
 snapshot capture, transport buffers and other allocations remain outside these
 limits; disk-streamed snapshot transfer remains open. Voter membership changes
 are available through [live membership](configuration-entries.md), with leader

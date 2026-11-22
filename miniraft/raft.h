@@ -592,6 +592,8 @@ private:
         uint64_t ReceivedBytes = 0;
         bool Preallocated = false;
         std::shared_ptr<void> MemoryReservation;
+        std::unique_ptr<char[]> CoveredPrefix;
+        size_t CoveredPrefixCapacity = 0;
     };
     std::optional<TIncomingSnapshot> IncomingSnapshot;
     std::shared_ptr<const TSnapshotEncoding> EncodedSnapshot;

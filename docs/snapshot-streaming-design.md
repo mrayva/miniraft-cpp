@@ -25,14 +25,14 @@ application also supplies that bound. Existing applications retain the
 `SaveSnapshot()` path. This avoids an intermediate application-owned string,
 but capture still materializes one complete image and remains capped at 64 MiB.
 
-Incoming InstallSnapshot assemblies reserve their declared image size against
-a shared 256 MiB process-wide budget by default. Raft instances can share a
-custom `TSnapshotInstallBudget` through `TLogLimits`; a transfer that cannot
-reserve space is rejected at offset zero and can retry after capacity is
-released. Full-image transfers and covered-boundary metadata probes both
-reserve their declared image size, even though the latter retains only a
-metadata prefix. Full-image receive buffers allocate their declared length
-before chunks arrive, so chunk appends do not grow the buffer geometrically.
+Full InstallSnapshot assemblies reserve their declared image size against a
+shared 256 MiB process-wide budget by default. Raft instances can share a
+custom `TSnapshotInstallBudget` through `TLogLimits`. Covered-boundary probes
+reserve the capacity of the prefix they buffer. Both the old and new buffers
+count while the prefix grows. A transfer that cannot reserve space receives a
+rejection with offset zero and can retry after capacity is released.
+Full-image receive buffers allocate their declared length before accepting
+chunks, so chunk appends do not grow the buffer geometrically.
 Completion, rejection, term change and idle expiry release the reservation.
 This accounts for incomplete receive buffers only; retained
 snapshots, outgoing pins, capture buffers, application memory and transport
@@ -42,10 +42,10 @@ buffers remain outside this budget.
 
 InstallSnapshot already sends bounded chunks, but the receiver assembles the
 whole encoded image in memory before decoding it. `IRsm::SaveSnapshot()` returns
-one `std::string`, `ValidateSnapshot()` receives a complete view, and the
-durable Raft image embeds the snapshot payload. Raising `TSnapshot::MaxBytes`
-would therefore raise peak memory and full-image rewrite costs without making
-the path streaming.
+one `std::string` and `ValidateSnapshot()` receives a complete view. The durable
+backend stores snapshot bytes in an immutable sidecar and still materializes
+the application payload when opening it. Raising `TSnapshot::MaxBytes` would
+raise peak memory without making the path streaming.
 
 The SQL example independently copies the complete image into a zero-padded
 buffer before SQLite deserialization. A Raft-only streaming decoder would

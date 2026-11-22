@@ -3116,33 +3116,49 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             if (request->Offset != 0 || (IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
                 IncomingSnapshot->Index > request->SnapshotIndex)) { reply(false, false, 0); return; }
             IncomingSnapshot.reset(); // Release the superseded assembly before reserving its replacement.
-            // Covered snapshots buffer only metadata, but a large history prefix
-            // can still consume substantial memory. Charge its declared image
-            // against the same aggregate receive budget before appending bytes.
-            auto reservation = SnapshotInstallBudget->TryReserve(request->TotalBytes);
-            if (!reservation) { reply(false, false, 0); return; }
             IncomingSnapshot = TIncomingSnapshot{request->Term, request->SnapshotIndex, request->SnapshotTerm,
-                request->TotalBytes, request->LeaderId, now, {}, 0, false, std::move(reservation)};
+                request->TotalBytes, request->LeaderId, now, {}};
         }
-        auto& prefix = IncomingSnapshot->Bytes;
+        auto& incoming = *IncomingSnapshot;
+        char* prefix = incoming.Preallocated ? incoming.Bytes.data() : incoming.CoveredPrefix.get();
         const auto count = request->Len - sizeof(TInstallSnapshotRequest);
-        auto& receivedBytes = IncomingSnapshot->ReceivedBytes;
+        auto& receivedBytes = incoming.ReceivedBytes;
         const bool advanced = request->Offset == receivedBytes;
         if (request->Offset > receivedBytes) { reply(false, false, 0); return; }
         if (request->Offset < receivedBytes) {
             if (count > receivedBytes - request->Offset ||
-                std::string_view(prefix).substr(request->Offset, count) != std::string_view(request->Data, count)) {
+                std::string_view(prefix + request->Offset, count) != std::string_view(request->Data, count)) {
                 IncomingSnapshot.reset(); reply(false, false, 0); return;
             }
         } else {
-            if (IncomingSnapshot->Preallocated)
-                memcpy(prefix.data() + receivedBytes, request->Data, count);
-            else
-                prefix.append(request->Data, count);
+            const auto needed = size_t(receivedBytes + count);
+            if (!incoming.Preallocated && needed > incoming.CoveredPrefixCapacity) {
+                // Charge both allocations while moving the prefix. Try an exact
+                // size when there is insufficient budget for spare capacity.
+                auto capacity = std::min(size_t(incoming.Total),
+                    std::max(needed, 2 * incoming.CoveredPrefixCapacity));
+                try {
+                    auto reservation = SnapshotInstallBudget->TryReserve(capacity);
+                    if (!reservation && capacity != needed) {
+                        capacity = needed;
+                        reservation = SnapshotInstallBudget->TryReserve(capacity);
+                    }
+                    if (!reservation) { IncomingSnapshot.reset(); reply(false, false, 0); return; }
+                    auto replacement = std::make_unique_for_overwrite<char[]>(capacity);
+                    if (receivedBytes) memcpy(replacement.get(), prefix, size_t(receivedBytes));
+                    incoming.CoveredPrefix = std::move(replacement);
+                    incoming.CoveredPrefixCapacity = capacity;
+                    incoming.MemoryReservation = std::move(reservation);
+                    prefix = incoming.CoveredPrefix.get();
+                } catch (const std::bad_alloc&) {
+                    IncomingSnapshot.reset(); reply(false, false, 0); return;
+                }
+            }
+            memcpy(prefix + receivedBytes, request->Data, count);
             receivedBytes += count;
         }
         if (advanced) IncomingSnapshot->LastProgress = now;
-        const std::string_view receivedPrefix(prefix.data(), size_t(receivedBytes));
+        const std::string_view receivedPrefix(prefix, size_t(receivedBytes));
         if (!IsSupportedSnapshotMagicPrefix(receivedPrefix)) {
             IncomingSnapshot.reset(); reply(false, false, 0); return;
         }
