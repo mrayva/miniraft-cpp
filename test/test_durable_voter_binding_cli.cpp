@@ -127,6 +127,44 @@ TSnapshot SeedUnboundSplitSnapshotStore(const std::string& base) {
     return expectedSnapshot;
 }
 
+TSnapshot SeedCompactedSplitMigrationStore(const std::string& base) {
+    const std::vector<uint32_t> original{5, 6, 7};
+    const std::vector<uint32_t> intermediate{6, 7, 8};
+    const std::vector<uint32_t> finalVoters{7, 8, 9};
+    const TSnapshotConfigurationTransition anchor{original, intermediate, 0, 0, 6, 3, 7, 3};
+    TSnapshot snapshot{7, 3, intermediate, "compacted CLI snapshot"};
+    snapshot.StableConfiguration = true;
+    snapshot.ConfigurationIndex = 7;
+    snapshot.ConfigurationTerm = 3;
+    snapshot.PreviousVoters = original;
+    snapshot.PreviousJointIndex = 6;
+    snapshot.PreviousJointTerm = 3;
+    snapshot.ConfigurationTransitions = {anchor};
+    {
+        TDiskState state(base, 7);
+        state.BindVoters(original);
+        state.CurrentTerm = 5;
+        state.VotedFor = 9;
+        state.Commit();
+        for (uint64_t term : {1, 2, 2, 3, 3}) state.Append(MakeEntry(term, "prefix"));
+        state.Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Joint, 3, 0, 0, original, intermediate}));
+        state.Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Stable, 3, 6, 3, original, intermediate}));
+        state.CommitIndex = 7;
+        state.Commit();
+        state.InstallSnapshot(snapshot);
+        state.Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Joint, 4, 7, 3, intermediate, finalVoters}));
+        state.Append(EncodeConfigurationEntry({
+            EConfigurationPhase::Stable, 4, 8, 4, intermediate, finalVoters}));
+        state.Append(MakeEntry(4, "retained CLI suffix"));
+        state.CommitIndex = 9;
+        state.Commit();
+    }
+    return snapshot;
+}
+
 TSnapshot SeedConfigurationSnapshotStore(const std::string& base) {
     auto history = TConfigurationHistory::Stable({1, 2, 3}, 0, 0, 0, 0);
     TConfigurationRecord joint{EConfigurationPhase::Joint, 1, 0, 0, {1, 2, 3}, {1, 2, 4}};
@@ -175,6 +213,17 @@ int main(int argc, char** argv) {
             if (dryRun) command += " --dry-run";
             command += " > /dev/null 2>&1";
             return std::system(command.c_str());
+        };
+        auto invokeMigration = [&](const std::string& inputBase, const std::string& outputBase,
+                                   bool dryRun) {
+            auto command = Quote(argv[1]) + " --input-base " + Quote(inputBase) +
+                " --output-base " + Quote(outputBase) + " --node-id 7 --voters 5,6,7 --commit-index 9";
+            if (dryRun) command += " --dry-run";
+            const auto log = directory / "migration.log";
+            command += " > " + Quote(log.string()) + " 2>&1";
+            const auto status = std::system(command.c_str());
+            if (status) std::cerr << ReadFile(log) << '\n';
+            return status;
         };
 
         const auto validBase = (directory / "valid").string();
@@ -323,6 +372,43 @@ int main(int argc, char** argv) {
                 recovered.LastLogTerm == 3 && recovered.GetSnapshot() &&
                 *recovered.GetSnapshot() == expectedSplitSnapshot,
                 "split snapshot binding did not preserve state and validated history");
+        }
+
+        const auto compactedMigrationBase = (directory / "compacted-migration-source").string();
+        const auto compactedMigrationOutput = (directory / "compacted-migration-output").string();
+        const auto expectedMigrationSnapshot = SeedCompactedSplitMigrationStore(compactedMigrationBase);
+        auto readMigrationFiles = [&](const std::string& base) {
+            std::vector<std::pair<std::string, std::string>> result;
+            for (const auto* suffix : {".entries.7", ".index.7", ".state.7",
+                    ".entries.7.g1", ".index.7.g1", ".state.7.snapshot.g1",
+                    ".entries.7.g2", ".index.7.g2", ".state.7.snapshot.g2"}) {
+                const auto path = base + suffix;
+                if (fs::exists(path)) result.emplace_back(suffix, ReadFile(path));
+            }
+            return result;
+        };
+        const auto beforeCompactedMigration = readMigrationFiles(compactedMigrationBase);
+        Require(invokeMigration(compactedMigrationBase, compactedMigrationOutput, true) == 0,
+            "compacted split-store migration dry run failed");
+        Require(readMigrationFiles(compactedMigrationBase) == beforeCompactedMigration,
+            "compacted migration dry run changed source files");
+        Require(!fs::exists(compactedMigrationOutput + ".durable.7"),
+            "compacted migration dry run created a destination");
+        Require(invokeMigration(compactedMigrationBase, compactedMigrationOutput, false) == 0,
+            "compacted split-store migration failed");
+        Require(readMigrationFiles(compactedMigrationBase) == beforeCompactedMigration,
+            "compacted migration changed source files");
+        {
+            TDurableState recovered(compactedMigrationOutput, 7);
+            Require(recovered.GetBoundVoters() == std::vector<uint32_t>({5, 6, 7}) &&
+                recovered.GetSnapshot() && *recovered.GetSnapshot() == expectedMigrationSnapshot &&
+                recovered.SnapshotIndex == 7 && recovered.SnapshotTerm == 3 &&
+                recovered.LastLogIndex == 10 && recovered.LastLogTerm == 4 &&
+                recovered.CommitIndex == 9 && recovered.VotedFor == 9,
+                "compacted migration did not preserve the snapshot and durable boundaries");
+            const auto suffix = recovered.Get(10);
+            Require(suffix && std::string(suffix->Data, suffix->Len - sizeof(TLogEntry)) ==
+                "retained CLI suffix", "compacted migration changed the retained suffix");
         }
 
         const auto invalidBase = (directory / "invalid").string();
