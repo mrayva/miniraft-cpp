@@ -93,6 +93,7 @@ durable sidecar serialization and outgoing InstallSnapshot ranges, avoiding
 the full payload's heap copy. Linux durable recovery also retains external
 `TDurableState` sidecars and `TDiskState` snapshot generations as read-only
 mapped range sources, so the active snapshot stays range-backed after restart.
+The standalone `TSnapshotStore::Load()` path also returns a mapped source.
 The SQL RSM uses its streaming installer for both received and recovered
 snapshots. Legacy RSMs, receives without staging, older embedded durable images,
 and non-Linux `TDiskState` recovery may still materialize the payload. The

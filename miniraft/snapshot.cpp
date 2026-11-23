@@ -10,6 +10,7 @@
 #ifdef __linux__
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -382,6 +383,44 @@ void Sync(int fd) {
     do { rc = fsync(fd); } while (rc < 0 && errno == EINTR);
     Require(rc == 0, "sync snapshot");
 }
+class TSnapshotImageMap final : public TSnapshotDataSource {
+public:
+    explicit TSnapshotImageMap(int fd) {
+        struct stat info{};
+        Require(fstat(fd, &info) == 0, "stat snapshot image");
+        if (!S_ISREG(info.st_mode) || info.st_size < 44 ||
+            uint64_t(info.st_size) > TSnapshot::MaxBytes)
+            throw std::runtime_error("Invalid snapshot file type/size");
+        SizeBytes = size_t(info.st_size);
+        Mapping = mmap(nullptr, SizeBytes, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (Mapping == MAP_FAILED) Require(false, "map snapshot image");
+        if (!Mapping) {
+            munmap(Mapping, SizeBytes);
+            Mapping = MAP_FAILED;
+            throw std::runtime_error("Invalid snapshot mapping address");
+        }
+    }
+    ~TSnapshotImageMap() override {
+        if (Mapping != MAP_FAILED) munmap(Mapping, SizeBytes);
+    }
+    TSnapshotImageMap(const TSnapshotImageMap&) = delete;
+    TSnapshotImageMap& operator=(const TSnapshotImageMap&) = delete;
+
+    std::string_view Bytes() const {
+        return {static_cast<const char*>(Mapping), SizeBytes};
+    }
+    uint64_t Size() const override { return SizeBytes; }
+    size_t Read(uint64_t offset, std::span<char> destination) const override {
+        if (offset >= SizeBytes || destination.empty()) return 0;
+        const auto count = size_t(std::min<uint64_t>(destination.size(), SizeBytes - offset));
+        memcpy(destination.data(), static_cast<const char*>(Mapping) + size_t(offset), count);
+        return count;
+    }
+
+private:
+    void* Mapping = MAP_FAILED;
+    size_t SizeBytes = 0;
+};
 #endif
 }
 
@@ -981,20 +1020,8 @@ std::optional<TSnapshot> TSnapshotStore::Load() {
     TFd file(openat(Impl->Directory.Value, Impl->File.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
     if (file.Value < 0 && errno == ENOENT) return {};
     Require(file.Value >= 0, "open snapshot");
-    struct stat info;
-    Require(fstat(file.Value, &info) == 0, "stat snapshot");
-    if (!S_ISREG(info.st_mode) || info.st_size < 44 || uint64_t(info.st_size) > TSnapshot::MaxBytes)
-        throw std::runtime_error("Invalid snapshot file type/size");
-    std::string bytes(size_t(info.st_size), '\0');
-    size_t done = 0;
-    while (done < bytes.size()) {
-        const auto n = read(file.Value, bytes.data() + done, bytes.size() - done);
-        if (n < 0 && errno == EINTR) continue;
-        if (!n) throw std::runtime_error("Truncated snapshot file");
-        Require(n > 0, "read snapshot");
-        done += size_t(n);
-    }
-    auto snapshot = DecodeSnapshotOwned(std::move(bytes));
+    auto image = std::make_shared<TSnapshotImageMap>(file.Value);
+    auto snapshot = DecodeSnapshotBacked(image->Bytes(), image);
     Sync(file.Value);
     Sync(Impl->Directory.Value);
     return snapshot;

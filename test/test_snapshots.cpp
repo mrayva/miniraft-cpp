@@ -830,13 +830,21 @@ void test_snapshot_store_rejects_oversized_files_and_temp_symlinks(void**) {
 }
 void test_snapshot_store_roundtrip_lock_and_corrupt_recovery(void**) {
     TFiles files;
+    std::optional<TSnapshot> loaded;
     {
         TSnapshotStore store(files.Name, 1);
         assert_false(store.Load().has_value());
         Reject([&] { TSnapshotStore second(files.Name, 1); });
         store.Save(Sample());
-        assert_true(store.Load() == std::optional<TSnapshot>{Sample()});
+        loaded = store.Load();
+        assert_true(loaded.has_value());
+        assert_true(loaded->Data.empty());
+        assert_true(bool(loaded->DataSource));
+        assert_true(*loaded == Sample());
+        store.Save(JointSample()); // Atomic replacement must not invalidate a loaded image.
+        assert_true(loaded->MaterializeData() == Sample().Data);
     }
+    assert_true(loaded->MaterializeData() == Sample().Data);
     std::ifstream input(files.Image(), std::ios::binary);
     std::string bytes(std::istreambuf_iterator<char>(input), {});
     input.close();
