@@ -3435,6 +3435,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     auto application = SnapshotApplication.lock();
     if (!State->SupportsSnapshots() || !application) { reply(false, false, 0); return; }
     auto* streamingInstallApplication = dynamic_cast<IStreamingSnapshotInstallRsm*>(application.get());
+    const bool supportsSourceBackedInstall = streamingInstallApplication ||
+        dynamic_cast<IIdempotentRsm*>(application.get());
     const bool same = IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
         IncomingSnapshot->Leader == request->LeaderId && IncomingSnapshot->Index == request->SnapshotIndex &&
         IncomingSnapshot->BoundaryTerm == request->SnapshotTerm && IncomingSnapshot->Total == request->TotalBytes;
@@ -3442,7 +3444,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         if (request->Offset != 0 || (IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
             IncomingSnapshot->Index > request->SnapshotIndex)) { reply(false, false, 0); return; }
         // Legacy installs materialize the complete image in heap memory.
-        if (!streamingInstallApplication && request->TotalBytes > SnapshotInstallBudget->LimitBytes()) {
+        if (!supportsSourceBackedInstall && request->TotalBytes > SnapshotInstallBudget->LimitBytes()) {
             reply(false, false, 0); return;
         }
         IncomingSnapshot.reset(); // Release a superseded image before reserving its replacement.
@@ -3543,7 +3545,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     std::unique_ptr<IStagedSnapshotInstallation> stagedApplicationInstall;
     TSnapshot snapshot;
     try {
-        const bool sourceBackedInstall = incoming.File && streamingInstallApplication;
+        const bool sourceBackedInstall = incoming.File && supportsSourceBackedInstall;
         installationReservation = sourceBackedInstall ? std::shared_ptr<void>{} :
             incoming.File ? SnapshotInstallBudget->TryReserve(incoming.Total) :
                 std::move(incoming.ReceiveReservation);

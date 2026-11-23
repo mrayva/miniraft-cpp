@@ -91,6 +91,78 @@ uint64_t EncodedSize(const TIdempotencySnapshot& snapshot) {
     }
     return result;
 }
+
+class TIdempotencySnapshotSourceReader {
+public:
+    TIdempotencySnapshotSourceReader(const TSnapshotDataSource& source, uint64_t totalBytes)
+        : Source(source), TotalBytes(totalBytes), BodyBytes(totalBytes - ChecksumBytes) { }
+
+    uint64_t Take(unsigned width) {
+        if (!width || width > sizeof(uint64_t)) Invalid("Invalid idempotency snapshot integer width");
+        std::array<char, sizeof(uint64_t)> bytes{};
+        ReadBody(std::span<char>(bytes.data(), width));
+        uint64_t value = 0;
+        for (unsigned i = 0; i < width; ++i)
+            value |= uint64_t(static_cast<unsigned char>(bytes[i])) << (8 * i);
+        return value;
+    }
+
+    std::string ReadString(size_t size) {
+        if (uint64_t(size) > BodyBytes - Position)
+            Invalid("Truncated idempotency snapshot source");
+        std::string result(size, '\0');
+        ReadBody(std::span<char>(result.data(), result.size()));
+        return result;
+    }
+
+    uint64_t RemainingBodyBytes() const { return BodyBytes - Position; }
+
+    uint32_t ReadExpectedChecksum() {
+        if (Position != BodyBytes) Invalid("Trailing bytes in idempotency snapshot");
+        std::array<char, ChecksumBytes> bytes{};
+        ReadRaw(BodyBytes, bytes);
+        if (Source.Size() != TotalBytes) Invalid("Idempotency snapshot source changed size");
+        uint32_t value = 0;
+        for (unsigned i = 0; i < ChecksumBytes; ++i)
+            value |= uint32_t(static_cast<unsigned char>(bytes[i])) << (8 * i);
+        return value;
+    }
+
+    uint32_t ActualChecksum() const { return Checksum.Finish(); }
+
+private:
+    void ReadRaw(uint64_t offset, std::span<char> destination) const {
+        if (offset > TotalBytes || destination.size() > TotalBytes - offset)
+            Invalid("Truncated idempotency snapshot source");
+        size_t copied = 0;
+        while (copied < destination.size()) {
+            const auto count = Source.Read(offset + copied, destination.subspan(copied));
+            if (!count || count > destination.size() - copied)
+                Invalid("Idempotency snapshot source returned an invalid read length");
+            copied += count;
+        }
+    }
+
+    void ReadBody(std::span<char> destination) {
+        if (Position > BodyBytes || destination.size() > BodyBytes - Position)
+            Invalid("Truncated idempotency snapshot source");
+        size_t copied = 0;
+        while (copied < destination.size()) {
+            const auto count = Source.Read(Position + copied, destination.subspan(copied));
+            if (!count || count > destination.size() - copied)
+                Invalid("Idempotency snapshot source returned an invalid read length");
+            Checksum.Update(reinterpret_cast<const uint8_t*>(destination.data() + copied), count);
+            copied += count;
+        }
+        Position += destination.size();
+    }
+
+    const TSnapshotDataSource& Source;
+    const uint64_t TotalBytes;
+    const uint64_t BodyBytes;
+    uint64_t Position = 0;
+    TChecksum Checksum;
+};
 }
 
 std::array<uint8_t, 32> ComputeIdempotentPayloadDigest(std::string_view payload) {
@@ -491,6 +563,62 @@ TIdempotencySnapshot DecodeIdempotencySnapshot(std::string_view bytes,
         snapshot.Sessions.push_back(std::move(session));
     }
     if (!reader.Input.empty()) Invalid("Trailing bytes in idempotency snapshot");
+    ValidateIdempotencySnapshot(snapshot, limits);
+    return snapshot;
+}
+
+TIdempotencySnapshot DecodeIdempotencySnapshot(const TSnapshotDataSource& source,
+        const TIdempotencySnapshotLimits& limits) {
+    ValidateIdempotencySnapshotLimits(limits);
+    const auto totalBytes = source.Size();
+    if (totalBytes < FixedHeaderBytes + ChecksumBytes || totalBytes > limits.MaxEncodedBytes)
+        Invalid("Invalid idempotency snapshot size");
+
+    TIdempotencySnapshotSourceReader reader(source, totalBytes);
+    if (reader.ReadString(Magic.size()) != Magic || reader.Take(4) != EncodedVersion)
+        Invalid("Unknown idempotency snapshot format");
+    TIdempotencySnapshot snapshot;
+    snapshot.LastAppliedIndex = reader.Take(8);
+    snapshot.Epoch = reader.Take(8);
+    const auto applicationBytes = reader.Take(8);
+    const auto sessionCount = reader.Take(4);
+    if (applicationBytes > limits.MaxApplicationBytes ||
+        applicationBytes > reader.RemainingBodyBytes() ||
+        sessionCount > uint64_t(limits.MaxActiveSessions) + limits.MaxClosedSessions)
+        Invalid("Idempotency snapshot metadata exceeds limits");
+    snapshot.ApplicationData = reader.ReadString(static_cast<size_t>(applicationBytes));
+    if (sessionCount > reader.RemainingBodyBytes() / FixedRecordBytes)
+        Invalid("Idempotency snapshot session count exceeds its encoded size");
+    snapshot.Sessions.reserve(static_cast<size_t>(sessionCount));
+
+    uint64_t cachedResponseBytes = 0;
+    for (uint64_t i = 0; i < sessionCount; ++i) {
+        TIdempotencySessionRecord session;
+        session.SessionIdHigh = reader.Take(8);
+        session.SessionIdLow = reader.Take(8);
+        session.HighestSequence = reader.Take(8);
+        const auto digest = reader.ReadString(session.PayloadDigest.size());
+        std::memcpy(session.PayloadDigest.data(), digest.data(), digest.size());
+        session.LogIndex = reader.Take(8);
+        session.ErrorCode = static_cast<uint32_t>(reader.Take(4));
+        const auto flags = reader.Take(4);
+        if (flags > 1) Invalid("Invalid idempotency session flags");
+        session.Closed = flags != 0;
+        const auto responseBytes = reader.Take(8);
+        if (responseBytes > limits.MaxResponseBytes || responseBytes > reader.RemainingBodyBytes())
+            Invalid("Idempotency response exceeds byte limit");
+        if (!session.Closed) {
+            if (cachedResponseBytes > limits.MaxCachedResponseBytes ||
+                responseBytes > limits.MaxCachedResponseBytes - cachedResponseBytes)
+                Invalid("Idempotency cached responses exceed byte limit");
+            cachedResponseBytes += responseBytes;
+        }
+        session.ResponseData = reader.ReadString(static_cast<size_t>(responseBytes));
+        snapshot.Sessions.push_back(std::move(session));
+    }
+    if (reader.RemainingBodyBytes()) Invalid("Trailing bytes in idempotency snapshot");
+    if (reader.ActualChecksum() != reader.ReadExpectedChecksum())
+        Invalid("Idempotency snapshot checksum mismatch");
     ValidateIdempotencySnapshot(snapshot, limits);
     return snapshot;
 }

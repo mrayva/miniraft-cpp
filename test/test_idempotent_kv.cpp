@@ -58,6 +58,29 @@ std::string Read(TIdempotentKvRsm& rsm, std::string_view key, uint64_t index) {
     auto response = rsm.Read(request, index).Cast<TCommandResponse>();
     return {response->Data, response->Len - sizeof(TCommandResponse)};
 }
+
+struct TStringSnapshotDataSource final : TSnapshotDataSource {
+    std::string Bytes;
+    size_t MaxReadBytes;
+    mutable uint64_t BytesRead = 0;
+    explicit TStringSnapshotDataSource(std::string bytes, size_t maxReadBytes = 5)
+        : Bytes(std::move(bytes)), MaxReadBytes(maxReadBytes) { }
+    uint64_t Size() const override { return Bytes.size(); }
+    size_t Read(uint64_t offset, std::span<char> destination) const override {
+        if (offset >= Bytes.size() || destination.empty()) return 0;
+        const auto count = std::min({destination.size(), MaxReadBytes,
+            Bytes.size() - size_t(offset)});
+        std::memcpy(destination.data(), Bytes.data() + offset, count);
+        BytesRead += count;
+        return count;
+    }
+};
+
+struct TEndpoint final : INode {
+    std::vector<TMessageHolder<TMessage>> Messages;
+    void Send(TMessageHolder<TMessage> message) override { Messages.push_back(std::move(message)); }
+    void Drain() override { }
+};
 }
 
 void test_idempotent_kv_application_snapshot_and_session_controls(void**) {
@@ -145,6 +168,114 @@ void test_idempotent_kv_application_snapshot_and_session_controls(void**) {
         EncodeWrite(recovered, lowerSessionId), 8);
     assert_int_equal(lowerResult.ErrorCode, TCommandResponse::Success);
     assert_true(!recovered.SaveSnapshot().empty());
+}
+
+void test_idempotent_snapshot_source_install_avoids_wrapper_materialization(void**) {
+    TIdempotentKvRsm source;
+    auto first = Put(1, 7, 1, "key", "one");
+    source.ApplyIdempotentLogRecord(EncodeWrite(source, first), 1);
+    auto second = Put(1, 7, 2, "key", "two");
+    source.ApplyIdempotentLogRecord(EncodeWrite(source, second), 2);
+    const auto encoded = source.SaveSnapshot();
+
+    TIdempotentKvRsm target;
+    auto stale = Put(1, 8, 1, "stale", "old");
+    target.ApplyIdempotentLogRecord(EncodeWrite(target, stale), 1);
+    TSnapshot snapshot;
+    snapshot.Index = 2;
+    auto sourceBytes = std::make_shared<TStringSnapshotDataSource>(encoded);
+    snapshot.DataSource = sourceBytes;
+
+    auto installation = PrepareApplicationSnapshotInstallation(target, snapshot);
+    assert_true(bool(installation));
+    assert_int_equal(sourceBytes->BytesRead, encoded.size());
+    assert_int_equal(target.LastAppliedIndex, 1);
+    assert_true(Read(target, "stale", 1) == "old");
+    assert_true(Read(target, "key", 1).empty());
+
+    auto corruptBytes = encoded;
+    corruptBytes.back() ^= 1;
+    TSnapshot corruptSnapshot;
+    corruptSnapshot.Index = 2;
+    corruptSnapshot.DataSource = std::make_shared<TStringSnapshotDataSource>(std::move(corruptBytes));
+    Reject([&] { PrepareApplicationSnapshotInstallation(target, corruptSnapshot); });
+    assert_int_equal(target.LastAppliedIndex, 1);
+    assert_true(Read(target, "stale", 1) == "old");
+
+    InstallApplicationSnapshot(target, snapshot, std::move(installation));
+    assert_int_equal(target.LastAppliedIndex, 2);
+    assert_true(Read(target, "key", 2) == "two");
+    assert_true(Read(target, "stale", 2).empty());
+    const auto retry = target.ApplyIdempotentLogRecord(EncodeWrite(target, second), 3);
+    assert_int_equal(retry.ErrorCode, TCommandResponse::Success);
+    assert_int_equal(retry.Index, 2);
+    assert_true(retry.Data == "two");
+    assert_int_equal(target.LastAppliedIndex, 3);
+    assert_true(Read(target, "key", 3) == "two");
+}
+
+void test_disk_staged_idempotent_install_uses_source_decoder(void**) {
+#ifdef __linux__
+    char directoryTemplate[] = "/tmp/miniraft-idempotent-install-XXXXXX";
+    auto* createdDirectory = mkdtemp(directoryTemplate);
+    assert_non_null(createdDirectory);
+    struct TDirectoryCleanup {
+        std::filesystem::path Path;
+        ~TDirectoryCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(Path, ignored);
+        }
+    } cleanup{createdDirectory};
+
+    auto operation = Put(1, 7, 1, "installed", "value");
+    TIdempotentKvRsm source;
+    source.ApplyIdempotentLogRecord(EncodeWrite(source, operation), 1);
+    const auto image = EncodeSnapshot(TSnapshot{1, 1, {1, 3}, source.SaveSnapshot()});
+    assert_true(image.size() <= TInstallSnapshotRequest::MaxChunkBytes);
+
+    auto heapBudget = std::make_shared<TSnapshotInstallBudget>(1);
+    auto stagingBudget = std::make_shared<TSnapshotInstallBudget>(image.size());
+    TRaft::TLogLimits limits;
+    limits.SnapshotInstallBudget = heapBudget;
+    limits.SnapshotStagingBudget = stagingBudget;
+    limits.SnapshotStagingDirectory = createdDirectory;
+    auto peer = std::make_shared<TEndpoint>();
+    TNodeDict peers{{1, peer}};
+    auto application = std::make_shared<TIdempotentKvRsm>();
+    auto state = std::make_shared<TState>();
+    {
+        auto raft = std::make_shared<TRaft>(state, 3, peers, std::vector<uint32_t>{}, limits);
+        TRequestProcessor processor(raft, application, peers);
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + image.size());
+        request->Src = 1;
+        request->Dst = 3;
+        request->Term = 1;
+        request->Seqno = 1;
+        request->SnapshotIndex = 1;
+        request->SnapshotTerm = 1;
+        request->TotalBytes = image.size();
+        request->LeaderId = 1;
+        request->Done = 1;
+        std::memcpy(request->Data, image.data(), image.size());
+        raft->Process(ITimeSource::Time{}, request);
+
+        assert_int_equal(peer->Messages.size(), 1);
+        const auto response = peer->Messages.back().Cast<TInstallSnapshotResponse>();
+        assert_true(response->Success);
+        assert_true(response->Installed);
+        assert_int_equal(application->LastAppliedIndex, 1);
+        assert_true(Read(*application, "installed", 1) == "value");
+        const auto installedSnapshot = state->GetSnapshot();
+        assert_non_null(installedSnapshot.get());
+        assert_true(bool(installedSnapshot->DataSource));
+        assert_true(installedSnapshot->Data.empty());
+        assert_int_equal(heapBudget->UsedBytes(), 0);
+        assert_int_equal(stagingBudget->UsedBytes(), image.size());
+    }
+    state.reset();
+    assert_int_equal(heapBudget->UsedBytes(), 0);
+    assert_int_equal(stagingBudget->UsedBytes(), 0);
+#endif
 }
 
 void test_idempotent_kv_rejects_aggregate_response_cache_overflow(void**) {
@@ -240,6 +371,8 @@ void test_idempotent_snapshot_capture_uses_staging_budget(void**) {
 int main() {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_idempotent_kv_application_snapshot_and_session_controls),
+        cmocka_unit_test(test_idempotent_snapshot_source_install_avoids_wrapper_materialization),
+        cmocka_unit_test(test_disk_staged_idempotent_install_uses_source_decoder),
         cmocka_unit_test(test_idempotent_kv_rejects_aggregate_response_cache_overflow),
         cmocka_unit_test(test_idempotent_snapshot_capture_uses_staging_budget),
     };

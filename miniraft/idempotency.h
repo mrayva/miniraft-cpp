@@ -103,3 +103,5 @@ uint64_t WriteIdempotencySnapshot(const TIdempotencySnapshot& snapshot,
                                  ISnapshotSink& sink);
 TIdempotencySnapshot DecodeIdempotencySnapshot(std::string_view bytes,
                                                const TIdempotencySnapshotLimits& limits = {});
+TIdempotencySnapshot DecodeIdempotencySnapshot(const TSnapshotDataSource& source,
+                                               const TIdempotencySnapshotLimits& limits = {});

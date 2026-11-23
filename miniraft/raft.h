@@ -137,20 +137,6 @@ inline void InstallApplicationSnapshot(IRsm& rsm, std::string_view bytes, uint64
     else rsm.LoadSnapshot(bytes, index);
 }
 
-inline std::unique_ptr<IStagedSnapshotInstallation> PrepareApplicationSnapshotInstallation(
-        IRsm& rsm, const TSnapshot& snapshot) {
-    if (snapshot.DataSource) {
-        if (auto* streaming = dynamic_cast<IStreamingSnapshotInstallRsm*>(&rsm)) {
-            auto installation = streaming->PrepareSnapshotInstallation(*snapshot.DataSource, snapshot.Index);
-            if (!installation) throw std::logic_error("Streaming snapshot preparation returned no installation");
-            return installation;
-        }
-        const auto bytes = snapshot.MaterializeData();
-        return PrepareApplicationSnapshotInstallation(rsm, bytes, snapshot.Index);
-    }
-    return PrepareApplicationSnapshotInstallation(rsm, snapshot.Data, snapshot.Index);
-}
-
 inline void InstallApplicationSnapshot(IRsm& rsm, const TSnapshot& snapshot,
         std::unique_ptr<IStagedSnapshotInstallation> installation) {
     if (installation) {
@@ -282,9 +268,63 @@ struct IIdempotentRsm : IRsm {
             throw std::runtime_error("Idempotent RSM failed to restore snapshot progress");
     }
 
+    // Non-virtual source-backed restore keeps the existing IIdempotentRsm
+    // virtual ABI while avoiding a full encoded-image materialization.
+    std::unique_ptr<IStagedSnapshotInstallation> PrepareSnapshotInstallation(
+            const TSnapshotDataSource& source, uint64_t index) {
+        const auto expectedCurrentIndex = LastAppliedIndex;
+        if (!index || expectedCurrentIndex > index)
+            throw std::runtime_error("Idempotency snapshot would regress application progress");
+        auto snapshot = DecodeIdempotencySnapshot(source, SnapshotLimits);
+        if (snapshot.LastAppliedIndex != index)
+            throw std::runtime_error("Idempotency snapshot progress does not match its Raft boundary");
+        ValidateIdempotencySnapshot(snapshot, index);
+        if (LastAppliedIndex != expectedCurrentIndex)
+            throw std::logic_error("Idempotent RSM advanced during snapshot preparation");
+        return std::make_unique<TStreamingSnapshotInstallation>(
+            *this, std::move(snapshot), index, expectedCurrentIndex);
+    }
+
+private:
+    struct TStreamingSnapshotInstallation final : IStagedSnapshotInstallation {
+        IIdempotentRsm& Application;
+        TIdempotencySnapshot Snapshot;
+        uint64_t Index;
+        uint64_t ExpectedCurrentIndex;
+
+        TStreamingSnapshotInstallation(IIdempotentRsm& application,
+                TIdempotencySnapshot snapshot, uint64_t index, uint64_t expectedCurrentIndex)
+            : Application(application), Snapshot(std::move(snapshot)), Index(index),
+              ExpectedCurrentIndex(expectedCurrentIndex) { }
+
+        void Install() override {
+            if (Application.LastAppliedIndex != ExpectedCurrentIndex)
+                throw std::logic_error("Idempotent RSM advanced after snapshot preparation");
+            Application.RestoreIdempotencySnapshot(std::move(Snapshot), Index);
+            if (Application.LastAppliedIndex != Index)
+                throw std::runtime_error("Idempotent RSM failed to restore snapshot progress");
+        }
+    };
+
 protected:
     const TIdempotencySnapshotLimits SnapshotLimits;
 };
+
+inline std::unique_ptr<IStagedSnapshotInstallation> PrepareApplicationSnapshotInstallation(
+        IRsm& rsm, const TSnapshot& snapshot) {
+    if (snapshot.DataSource) {
+        if (auto* streaming = dynamic_cast<IStreamingSnapshotInstallRsm*>(&rsm)) {
+            auto installation = streaming->PrepareSnapshotInstallation(*snapshot.DataSource, snapshot.Index);
+            if (!installation) throw std::logic_error("Streaming snapshot preparation returned no installation");
+            return installation;
+        }
+        if (auto* idempotent = dynamic_cast<IIdempotentRsm*>(&rsm))
+            return idempotent->PrepareSnapshotInstallation(*snapshot.DataSource, snapshot.Index);
+        const auto bytes = snapshot.MaterializeData();
+        return PrepareApplicationSnapshotInstallation(rsm, bytes, snapshot.Index);
+    }
+    return PrepareApplicationSnapshotInstallation(rsm, snapshot.Data, snapshot.Index);
+}
 
 struct TDummyRsm: public IRsm {
     void Validate(TMessageHolder<TCommandRequest> message) const override;
