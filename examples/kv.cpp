@@ -530,7 +530,7 @@ int main(int argc, char** argv) {
 
         std::shared_ptr<IRsm> rsm = idempotent
             ? std::static_pointer_cast<IRsm>(std::make_shared<TIdempotentKvRsm>())
-            : std::static_pointer_cast<IRsm>(std::make_shared<TKv>());
+            : std::static_pointer_cast<IRsm>(std::make_shared<TStreamingKv>());
         std::shared_ptr<IState> state = std::make_shared<TState>();
         if (persist) {
             if (durable) state = std::make_shared<TDurableState>("state", myHost.Id);

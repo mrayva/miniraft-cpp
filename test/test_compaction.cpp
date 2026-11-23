@@ -182,6 +182,22 @@ struct TGeneratedSnapshotDataSource : TSnapshotDataSource, ISnapshotSource {
         return count;
     }
 };
+struct TStringSnapshotDataSource : TSnapshotDataSource {
+    std::string Bytes;
+    size_t MaxReadBytes;
+    mutable uint64_t BytesRead = 0;
+    TStringSnapshotDataSource(std::string bytes, size_t maxReadBytes = SIZE_MAX)
+        : Bytes(std::move(bytes)), MaxReadBytes(maxReadBytes) { }
+    uint64_t Size() const override { return Bytes.size(); }
+    size_t Read(uint64_t offset, std::span<char> destination) const override {
+        if (offset >= Bytes.size() || destination.empty()) return 0;
+        const auto count = std::min({destination.size(), MaxReadBytes,
+            Bytes.size() - size_t(offset)});
+        memcpy(destination.data(), Bytes.data() + offset, count);
+        BytesRead += count;
+        return count;
+    }
+};
 struct TNoopSnapshotInstallation : IStagedSnapshotInstallation {
     void Install() override { }
 };
@@ -304,6 +320,39 @@ void test_snapshot_capture_reserves_declared_bound_before_materializing(void**) 
     }
     state.reset();
     assert_int_equal(budget->UsedBytes(), 0);
+}
+void test_example_kv_streaming_install_validates_before_atomic_publish(void**) {
+    TStreamingKv source;
+    source.Write(source.Prepare(Command("alpha", "one")), 1);
+    source.Write(source.Prepare(Command("bravo", "two")), 2);
+    const auto encoded = source.SaveSnapshot();
+
+    TStreamingKv target;
+    target.Write(target.Prepare(Command("stale", "keep")), 1);
+    TSnapshot snapshot;
+    snapshot.Index = 2;
+    auto sourceBytes = std::make_shared<TStringSnapshotDataSource>(encoded, 3);
+    snapshot.DataSource = sourceBytes;
+
+    auto installation = PrepareApplicationSnapshotInstallation(target, snapshot);
+    assert_true(bool(installation));
+    assert_int_equal(sourceBytes->BytesRead, encoded.size());
+    assert_int_equal(target.LastAppliedIndex, 1);
+    assert_true(Read(target, "stale") == "keep");
+    assert_true(Read(target, "alpha").empty());
+
+    InstallApplicationSnapshot(target, snapshot, std::move(installation));
+    assert_int_equal(target.LastAppliedIndex, 2);
+    assert_true(Read(target, "alpha") == "one");
+    assert_true(Read(target, "bravo") == "two");
+    assert_true(Read(target, "stale").empty());
+
+    TSnapshot malformed;
+    malformed.Index = 2;
+    malformed.DataSource = std::make_shared<TStringSnapshotDataSource>(encoded + "x", 5);
+    Reject([&] { PrepareApplicationSnapshotInstallation(target, malformed); });
+    assert_int_equal(target.LastAppliedIndex, 2);
+    assert_true(Read(target, "alpha") == "one");
 }
 void test_incremental_snapshot_capture_charges_each_growth_before_writing(void**) {
     auto makeState = [] {
@@ -3521,6 +3570,7 @@ void test_durable_v6_semantic_corruption_rejects_without_rewriting(void**) {
 int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_kv_snapshot_precomputes_size_without_changing_encoding),
+        cmocka_unit_test(test_example_kv_streaming_install_validates_before_atomic_publish),
         cmocka_unit_test(test_snapshot_capture_preflights_application_size_bound),
         cmocka_unit_test(test_snapshot_capture_reserves_declared_bound_before_materializing),
         cmocka_unit_test(test_incremental_snapshot_capture_charges_each_growth_before_writing),

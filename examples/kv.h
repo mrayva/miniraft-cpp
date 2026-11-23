@@ -18,6 +18,22 @@ public:
     void LoadSnapshot(std::string_view bytes, uint64_t index) override;
     bool SupportsApplicationSnapshotInstall() const override { return true; }
 
+protected:
+    using TEntries = std::unordered_map<std::string, std::string>;
+    void InstallSnapshotEntries(TEntries&& entries, uint64_t index);
+
 private:
-    std::unordered_map<std::string, std::string> H;
+    TEntries H;
+};
+
+// Range-based installer variant for deployments that enable disk-staged
+// InstallSnapshot. It validates into a temporary map, then swaps it in after
+// Raft has durably published the snapshot.
+class TStreamingKv final : public TKv, public IStreamingSnapshotInstallRsm {
+public:
+    std::unique_ptr<IStagedSnapshotInstallation> PrepareSnapshotInstallation(
+        const TSnapshotDataSource& source, uint64_t index) override;
+
+private:
+    struct TInstallation;
 };
