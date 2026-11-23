@@ -14,6 +14,8 @@ def main():
     binary = str(pathlib.Path(sys.argv[1]).resolve())
     with tempfile.TemporaryDirectory(prefix="miniraft-sql-snapshot-cli-") as temporary:
         root = pathlib.Path(temporary)
+        staging = root / "snapshot-staging"
+        staging.mkdir()
         endpoint = port()
         node = f"127.0.0.1:{endpoint}:1"
         args = [binary, "--server", "--id", "1", "--node", node, "--durable"]
@@ -22,6 +24,7 @@ def main():
         with log_path.open("w+") as log:
             def start(periodic):
                 extra = ["--snapshots", "1"] if periodic else []
+                extra += ["--snapshot-staging-dir", str(staging)]
                 return subprocess.Popen([*args, *extra], cwd=root, stdout=log, stderr=log, preexec_fn=no_core)
 
             def stop(child):
@@ -47,7 +50,11 @@ def main():
             try:
                 for options in (["--server", "--snapshots", "1"],
                                 ["--server", "--durable", "--snapshots", "0"],
-                                ["--server", "--durable", "--snapshots"]):
+                                ["--server", "--durable", "--snapshots"],
+                                ["--client", "--snapshot-staging-dir", str(staging)],
+                                ["--server", "--durable", "--snapshot-staging-dir"],
+                                ["--server", "--durable", "--snapshot-staging-dir",
+                                    str(root / "missing-staging")]):
                     rejected = subprocess.run([binary, *options], cwd=root, stdout=log,
                         stderr=log, timeout=5, preexec_fn=no_core)
                     assert rejected.returncode != 0, options

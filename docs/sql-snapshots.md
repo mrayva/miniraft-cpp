@@ -46,7 +46,8 @@ header counters make it authoritative. On Linux, SQL writes the image to a
 through validation and, for a prepared install, until the durable Raft snapshot
 has been published and the application database has been replaced. This avoids
 SQL's additional full-size padded heap copy; Raft still materializes the
-received application image. Non-Linux builds retain the in-memory deserialize
+received application image unless range-backed installation is enabled.
+Non-Linux builds retain the in-memory deserialize
 path, including its 20 zeroed guard bytes for SQLite's malformed-image checks.
 Before restore or installation, SQL checks that the image can be opened,
 passes `PRAGMA quick_check(1)`, and has exactly one valid progress marker equal
@@ -58,6 +59,23 @@ validation. The receiver also
 requires the target database page size to match before Raft publishes the
 snapshot durably. Invalid or incompatible images do not replace the live
 database.
+
+When `--snapshot-staging-dir PATH` is configured, a SQL server can install a
+received snapshot from a range-backed view of the staged InstallSnapshot file.
+The option requires `--server --durable`, Linux, an existing directory, and a
+filesystem that supports `O_TMPFILE`.
+Raft validates the full image without copying its SQL payload into
+`TSnapshot::Data`; SQL reads bounded ranges into its private SQLite staging
+file. The active Raft snapshot keeps the anonymous receive file open so later
+outgoing snapshot transfers can read it. Its disk use continues until that
+snapshot and any transfer pins are released, but it no longer consumes the
+in-flight staging quota after full-image decoding and checksum validation.
+Configure the staging filesystem with room for these retained images as well
+as active transfers. Legacy RSMs, receives without a staging directory, and
+startup recovery retain the materializing path. Code that reads
+`TSnapshot::Data` directly must use
+`DataSize()`, `ReadDataRange()`, or `MaterializeData()` for a range-backed
+snapshot.
 
 The live database's page count gives an exact size bound when the marker
 already matches. If capture needs to update the backup, SQLite can allocate

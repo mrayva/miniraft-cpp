@@ -81,6 +81,14 @@ struct IStagedSnapshotRsm {
         std::string_view bytes, uint64_t index) = 0;
 };
 
+// Optional range-based counterpart for RSMs that can validate and stage a
+// snapshot without first materializing its application payload in memory.
+struct IStreamingSnapshotInstallRsm {
+    virtual ~IStreamingSnapshotInstallRsm() = default;
+    virtual std::unique_ptr<IStagedSnapshotInstallation> PrepareSnapshotInstallation(
+        const TSnapshotDataSource& source, uint64_t index) = 0;
+};
+
 // CommandRequest -> Write? -> LogEntry -> Append -> Committed As Index -> Applied As Index (Same) -> Index -> CommandResponse
 // CommandRequest -> Read? -> CurrentIndex (fixate) >= CommittedIndex -> CommandResponse
 struct IRsm {
@@ -123,6 +131,32 @@ inline void InstallApplicationSnapshot(IRsm& rsm, std::string_view bytes, uint64
         std::unique_ptr<IStagedSnapshotInstallation> installation) {
     if (installation) installation->Install();
     else rsm.LoadSnapshot(bytes, index);
+}
+
+inline std::unique_ptr<IStagedSnapshotInstallation> PrepareApplicationSnapshotInstallation(
+        IRsm& rsm, const TSnapshot& snapshot) {
+    if (snapshot.DataSource) {
+        if (auto* streaming = dynamic_cast<IStreamingSnapshotInstallRsm*>(&rsm)) {
+            auto installation = streaming->PrepareSnapshotInstallation(*snapshot.DataSource, snapshot.Index);
+            if (!installation) throw std::logic_error("Streaming snapshot preparation returned no installation");
+            return installation;
+        }
+        const auto bytes = snapshot.MaterializeData();
+        return PrepareApplicationSnapshotInstallation(rsm, bytes, snapshot.Index);
+    }
+    return PrepareApplicationSnapshotInstallation(rsm, snapshot.Data, snapshot.Index);
+}
+
+inline void InstallApplicationSnapshot(IRsm& rsm, const TSnapshot& snapshot,
+        std::unique_ptr<IStagedSnapshotInstallation> installation) {
+    if (installation) {
+        installation->Install();
+    } else if (snapshot.DataSource) {
+        const auto bytes = snapshot.MaterializeData();
+        rsm.LoadSnapshot(bytes, snapshot.Index);
+    } else {
+        rsm.LoadSnapshot(snapshot.Data, snapshot.Index);
+    }
 }
 
 struct TIdempotentWriteResult {

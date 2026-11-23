@@ -1,5 +1,6 @@
 #include <sqlite3.h>
 #include <charconv>
+#include <filesystem>
 #include <iostream>
 
 #include <miniraft/raft.h>
@@ -84,7 +85,7 @@ NNet::TVoidTask CompactLoop(TPoller& poller, std::shared_ptr<TRaft> raft,
 }
 
 void usage(const char* prog) {
-    std::cerr << prog << "--client|--server --id myid --node ip:port:id [--node ip:port:id ...] [--durable] [--snapshots entries]" << "\n";
+    std::cerr << prog << "--client|--server --id myid --node ip:port:id [--node ip:port:id ...] [--durable] [--snapshots entries] [--snapshot-staging-dir path]" << "\n";
     exit(0);
 }
 
@@ -98,6 +99,7 @@ int main(int argc, char** argv)
     bool server = false;
     bool durable = false;
     uint64_t snapshotInterval = 0;
+    std::string snapshotStagingDirectory;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--server")) {
             server = true;
@@ -115,6 +117,11 @@ int main(int argc, char** argv)
             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || !snapshotInterval) {
                 std::cerr << "--snapshots requires a positive entry interval\n"; return 1;
             }
+        } else if (!strcmp(argv[i], "--snapshot-staging-dir")) {
+            if (!snapshotStagingDirectory.empty() || i + 1 >= argc || !argv[i + 1][0]) {
+                std::cerr << "--snapshot-staging-dir requires one directory\n"; return 1;
+            }
+            snapshotStagingDirectory = argv[++i];
         } else if (!strcmp(argv[i], "--help")) {
             usage(argv[0]);
         }
@@ -122,6 +129,17 @@ int main(int argc, char** argv)
 
     if (snapshotInterval && (!server || !durable)) {
         std::cerr << "--snapshots requires --server --durable\n"; return 1;
+    }
+    if (!snapshotStagingDirectory.empty()) {
+#ifdef __linux__
+        std::error_code error;
+        if (!server || !durable || !std::filesystem::is_directory(snapshotStagingDirectory, error)) {
+            std::cerr << "--snapshot-staging-dir requires --server --durable and an existing directory\n";
+            return 1;
+        }
+#else
+        std::cerr << "--snapshot-staging-dir requires Linux\n"; return 1;
+#endif
     }
 
     using TPoller = NNet::TDefaultPoller;
@@ -152,7 +170,10 @@ int main(int argc, char** argv)
         std::shared_ptr<IState> state = durable
             ? std::static_pointer_cast<IState>(std::make_shared<TDurableState>("sql_state", myHost.Id))
             : std::static_pointer_cast<IState>(std::make_shared<TDiskState>("sql_state", myHost.Id));
-        auto raft = std::make_shared<TRaft>(state, myHost.Id, nodes);
+        TRaft::TLogLimits logLimits;
+        logLimits.SnapshotStagingDirectory = std::move(snapshotStagingDirectory);
+        auto raft = std::make_shared<TRaft>(state, myHost.Id, nodes,
+            std::vector<uint32_t>{}, std::move(logLimits));
         const auto savedSnapshot = state->SnapshotIndex;
         TPoller::TSocket socket(NNet::TAddress{myHost.Address, myHost.Port}, loop.Poller());
         socket.Bind();

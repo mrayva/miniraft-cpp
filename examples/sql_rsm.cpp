@@ -1,5 +1,6 @@
 #include "sql_rsm.h"
 #include "payload_validation.h"
+#include <array>
 #include <iostream>
 #include <climits>
 #include <charconv>
@@ -155,30 +156,34 @@ struct TSnapshotDatabase {
     std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)> Db{nullptr, sqlite3_close_v2};
 };
 
-TSnapshotDatabase OpenSnapshotDatabase(std::string_view bytes) {
-    if (bytes.size() < 100 || bytes.size() > MaxSqlSnapshotBytes)
+void ValidateSnapshotImageHeader(std::string_view header, uint64_t imageSize) {
+    if (imageSize < 100 || imageSize > MaxSqlSnapshotBytes || header.size() < 100)
         throw TMessageError("Invalid SQL snapshot size");
-    if (bytes.substr(0, 16) != std::string_view("SQLite format 3\0", 16))
+    if (header.substr(0, 16) != std::string_view("SQLite format 3\0", 16))
         throw TMessageError("Invalid SQL snapshot database header");
     const auto readBigEndian = [&](size_t offset) {
-        return (uint32_t(static_cast<unsigned char>(bytes[offset])) << 24) |
-            (uint32_t(static_cast<unsigned char>(bytes[offset + 1])) << 16) |
-            (uint32_t(static_cast<unsigned char>(bytes[offset + 2])) << 8) |
-            uint32_t(static_cast<unsigned char>(bytes[offset + 3]));
+        return (uint32_t(static_cast<unsigned char>(header[offset])) << 24) |
+            (uint32_t(static_cast<unsigned char>(header[offset + 1])) << 16) |
+            (uint32_t(static_cast<unsigned char>(header[offset + 2])) << 8) |
+            uint32_t(static_cast<unsigned char>(header[offset + 3]));
     };
-    const auto encodedPageSize = (uint32_t(static_cast<unsigned char>(bytes[16])) << 8) |
-        static_cast<unsigned char>(bytes[17]);
+    const auto encodedPageSize = (uint32_t(static_cast<unsigned char>(header[16])) << 8) |
+        static_cast<unsigned char>(header[17]);
     const uint32_t pageSize = encodedPageSize == 1 ? 65536 : encodedPageSize;
     if (pageSize < 512 || pageSize > 65536 || (pageSize & (pageSize - 1)) != 0 ||
-        bytes.size() % pageSize != 0)
+        imageSize % pageSize != 0)
         throw TMessageError("SQL snapshot is not a complete SQLite page image");
-    if (static_cast<unsigned char>(bytes[18]) != 1 || static_cast<unsigned char>(bytes[19]) != 1)
+    if (static_cast<unsigned char>(header[18]) != 1 || static_cast<unsigned char>(header[19]) != 1)
         throw TMessageError("SQL snapshot is not a standalone rollback-mode image");
     const auto headerPageCount = readBigEndian(28);
-    const auto actualPageCount = uint64_t(bytes.size() / pageSize);
+    const auto actualPageCount = imageSize / pageSize;
     if (headerPageCount && readBigEndian(24) == readBigEndian(92) &&
         headerPageCount != actualPageCount)
         throw TMessageError("SQL snapshot page count does not match its image length");
+}
+
+TSnapshotDatabase OpenSnapshotDatabase(std::string_view bytes) {
+    ValidateSnapshotImageHeader(bytes, bytes.size());
 
     TSnapshotDatabase result;
 #ifdef __linux__
@@ -230,6 +235,80 @@ TSnapshotDatabase OpenSnapshotDatabase(std::string_view bytes) {
     if (rc != SQLITE_OK) throw TMessageError("Invalid SQL snapshot database image");
 #endif
     return result;
+}
+
+TSnapshotDatabase OpenSnapshotDatabase(const TSnapshotDataSource& source) {
+    const auto imageSize = source.Size();
+    if (imageSize > SIZE_MAX) throw TMessageError("Invalid SQL snapshot size");
+    std::array<char, 100> header{};
+    size_t headerRead = 0;
+    while (headerRead < header.size()) {
+        const auto count = source.Read(headerRead,
+            std::span<char>(header.data() + headerRead, header.size() - headerRead));
+        if (!count || count > header.size() - headerRead)
+            throw TMessageError("Cannot read SQL snapshot header");
+        headerRead += count;
+    }
+    ValidateSnapshotImageHeader(std::string_view(header.data(), header.size()), imageSize);
+#ifdef __linux__
+    TSnapshotDatabase result;
+    result.TempDirectory = std::make_unique<TSqlSnapshotTempDirectory>();
+    TSnapshotFileDescriptor stagedFile(open(result.TempDirectory->DatabasePath().c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600));
+    if (stagedFile.Get() < 0)
+        throw std::system_error(errno, std::generic_category(), "Cannot create staged SQL snapshot image");
+    struct stat fileInfo{};
+    if (fstat(stagedFile.Get(), &fileInfo) != 0 || !S_ISREG(fileInfo.st_mode) || fileInfo.st_size != 0)
+        throw TMessageError("Cannot safely create staged SQL snapshot image");
+
+    std::array<char, 64 * 1024> buffer{};
+    for (uint64_t offset = 0; offset < imageSize;) {
+        const auto count = size_t(std::min<uint64_t>(buffer.size(), imageSize - offset));
+        size_t readOffset = 0;
+        while (readOffset < count) {
+            const auto read = source.Read(offset + readOffset,
+                std::span<char>(buffer.data() + readOffset, count - readOffset));
+            if (!read || read > count - readOffset)
+                throw TMessageError("Cannot read staged SQL snapshot image");
+            readOffset += read;
+        }
+        size_t written = 0;
+        while (written < count) {
+            ssize_t resultBytes;
+            do {
+                resultBytes = write(stagedFile.Get(), buffer.data() + written, count - written);
+            } while (resultBytes < 0 && errno == EINTR);
+            if (resultBytes <= 0) {
+                if (resultBytes == 0) errno = EIO;
+                throw std::system_error(errno, std::generic_category(),
+                    "Cannot write staged SQL snapshot image");
+            }
+            written += size_t(resultBytes);
+        }
+        offset += count;
+    }
+
+    sqlite3* raw = nullptr;
+    const int opened = sqlite3_open_v2(result.TempDirectory->DatabasePath().c_str(), &raw,
+        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nullptr);
+    result.Db.reset(raw);
+    if (opened != SQLITE_OK) throw TMessageError("Cannot open staged SQL snapshot database");
+    if (sqlite3_exec(result.Db.get(), "PRAGMA cache_size=-2048; PRAGMA mmap_size=0;",
+            nullptr, nullptr, nullptr) != SQLITE_OK)
+        throw TMessageError("Cannot bound staged SQL snapshot database reads");
+    return result;
+#else
+    std::string bytes(size_t(imageSize), '\0');
+    size_t copied = 0;
+    while (copied < bytes.size()) {
+        const auto count = source.Read(copied,
+            std::span<char>(bytes.data() + copied, bytes.size() - copied));
+        if (!count || count > bytes.size() - copied)
+            throw TMessageError("Cannot read SQL snapshot image");
+        copied += count;
+    }
+    return OpenSnapshotDatabase(bytes);
+#endif
 }
 
 std::optional<uint64_t> ReadAppliedIndex(sqlite3* db) {
@@ -745,6 +824,14 @@ void TSql::LoadSnapshot(std::string_view bytes, uint64_t index) {
 std::unique_ptr<IStagedSnapshotInstallation> TSql::PrepareSnapshotInstallation(
         std::string_view bytes, uint64_t index) {
     auto image = OpenSnapshotDatabase(bytes);
+    ValidateSnapshotForTarget(image.Db.get(), Db, index);
+    return std::make_unique<TSqlSnapshotInstallation>(Db, &LastAppliedIndex, index,
+        std::move(image));
+}
+
+std::unique_ptr<IStagedSnapshotInstallation> TSql::PrepareSnapshotInstallation(
+        const TSnapshotDataSource& source, uint64_t index) {
+    auto image = OpenSnapshotDatabase(source);
     ValidateSnapshotForTarget(image.Db.get(), Db, index);
     return std::make_unique<TSqlSnapshotInstallation>(Db, &LastAppliedIndex, index,
         std::move(image));

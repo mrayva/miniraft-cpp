@@ -78,17 +78,25 @@ written at their validated offsets, and Raft reads the received bytes through
 a read-only mapping for duplicate, metadata and checksum checks. Staged files
 reserve their declared sizes against a separate 256 MiB process-wide quota.
 Embedders can share a custom quota through `TLogLimits::SnapshotStagingBudget`.
-Completion reserves space in the heap budget before decoding. If there is
-temporary heap contention, the receiver keeps the staged file and leaves the
-final chunk unacknowledged. The sender can retry that chunk once capacity is
-free. Duplicate chunks do not extend the receiver's idle deadline. Staged data
-is discarded when Raft clears the assembly, after decoding, or on process exit.
+The staging quota lease covers an in-flight assembly and is released after
+the complete image has been decoded and its wire checksum verified. Duplicate
+chunks do not extend the receiver's idle deadline. Without a streaming install
+RSM, completion reserves the full image in the heap budget and uses the
+materializing decoder. If heap capacity is temporarily unavailable, the
+receiver keeps the staged file and leaves the final chunk unacknowledged for
+retry.
 
-The decoder still materializes the final application image for validation
-and installation. The staging file is temporary and partial transfers restart
-at offset zero after process restart. The wire format, 64 MiB limit and
-ordering of durable publication, application load and acknowledgement stay
-the same.
+The decoder validates the full wire checksum and metadata through the mapping,
+then retains a source for the application bytes. The SQL example validates and
+stages directly from this source. The retained Raft snapshot uses it for
+durable sidecar serialization and outgoing InstallSnapshot ranges, avoiding
+the full payload's heap copy. Legacy RSMs, receives without staging, and
+startup recovery still materialize the payload. The active snapshot pins its
+anonymous file until replaced and all transfer pins are released. That retained
+disk use is outside the in-flight staging quota and must be allowed for on the
+configured filesystem. Partial transfers restart at offset zero after process
+restart. The wire format, 64 MiB limit and publication, application-installation
+and acknowledgement ordering stay the same.
 
 After a full transfer's metadata is verified, intermediate payload chunks
 reuse that result while the sender is still the recognized leader in the
@@ -105,12 +113,12 @@ backend stores snapshot bytes in an immutable sidecar and still materializes
 the application payload when opening it. Raising `TSnapshot::MaxBytes` would
 raise peak memory without making the path streaming.
 
-The SQL adapter still receives a complete application-image view. On Linux it
-now stages that view in a private file for SQLite validation and installation,
-while non-Linux builds retain the padded deserialize buffer. The Raft decoder
-still materializes the complete application payload before calling the
-application, so end-to-end streaming and durable application generations
-remain open gaps.
+The SQL adapter can validate and stage a range-backed application image from
+the received mapping on Linux; non-Linux builds retain the padded deserialize
+buffer. This avoids the Raft heap copy but still keeps the complete received
+wire image on disk while it is the active in-memory snapshot. Startup recovery
+still materializes durable snapshot payloads, and durable application
+generations remain open gaps.
 
 The replacement needs an immutable application-image reference that Raft can
 publish atomically with the snapshot boundary, commit index, membership

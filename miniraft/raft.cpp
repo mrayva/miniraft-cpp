@@ -917,20 +917,20 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
 
 } // namespace
 
-class TRaft::TIncomingSnapshotFile {
+class TRaft::TIncomingSnapshotFile final : public TSnapshotDataSource {
 public:
     TIncomingSnapshotFile(const std::string& directory, size_t size)
-        : Size(size) {
+        : SizeBytes(size) {
 #ifdef __linux__
         Fd = open(directory.c_str(), O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
         if (Fd < 0) throw std::runtime_error("Cannot open anonymous snapshot staging file");
-        if (ftruncate(Fd, off_t(Size)) == 0) {
-            void* mapped = mmap(nullptr, Size, PROT_READ, MAP_SHARED, Fd, 0);
+        if (ftruncate(Fd, off_t(SizeBytes)) == 0) {
+            void* mapped = mmap(nullptr, SizeBytes, PROT_READ, MAP_SHARED, Fd, 0);
             if (mapped != MAP_FAILED && mapped) {
                 Mapping = static_cast<const char*>(mapped);
                 return;
             }
-            if (!mapped) munmap(mapped, Size);
+            if (!mapped) munmap(mapped, SizeBytes);
         }
         close(Fd);
         throw std::runtime_error("Cannot size or map snapshot staging file");
@@ -942,12 +942,21 @@ public:
 
     ~TIncomingSnapshotFile() {
 #ifdef __linux__
-        munmap(const_cast<char*>(Mapping), Size);
+        munmap(const_cast<char*>(Mapping), SizeBytes);
         close(Fd);
 #endif
     }
     TIncomingSnapshotFile(const TIncomingSnapshotFile&) = delete;
     TIncomingSnapshotFile& operator=(const TIncomingSnapshotFile&) = delete;
+
+    uint64_t Size() const override { return SizeBytes; }
+
+    size_t Read(uint64_t offset, std::span<char> destination) const override {
+        if (offset >= SizeBytes || destination.empty()) return 0;
+        const auto count = size_t(std::min<uint64_t>(destination.size(), SizeBytes - offset));
+        memcpy(destination.data(), Mapping + size_t(offset), count);
+        return count;
+    }
 
     const char* Data() const { return Mapping; }
 
@@ -969,7 +978,7 @@ public:
     }
 
 private:
-    size_t Size;
+    size_t SizeBytes;
     const char* Mapping = nullptr;
 #ifdef __linux__
     int Fd = -1;
@@ -1197,9 +1206,9 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
         if (snapshot->HeapReservation) {
             if (snapshot->HeapReservationBudget != SnapshotInstallBudget)
                 throw std::invalid_argument("Stored snapshot is charged to a different heap budget");
-        } else {
-            auto reservation = SnapshotInstallBudget->TryReserve(snapshot->Data.size());
-            if (!snapshot->Data.empty() && !reservation)
+        } else if (!snapshot->DataSource) {
+            auto reservation = SnapshotInstallBudget->TryReserve(snapshot->DataSize());
+            if (snapshot->DataSize() && !reservation)
                 throw std::runtime_error("Stored snapshot exceeds the available heap budget");
             snapshot->HeapReservation = std::move(reservation);
             if (snapshot->HeapReservation)
@@ -3317,14 +3326,17 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     }
     auto application = SnapshotApplication.lock();
     if (!State->SupportsSnapshots() || !application) { reply(false, false, 0); return; }
+    auto* streamingInstallApplication = dynamic_cast<IStreamingSnapshotInstallRsm*>(application.get());
     const bool same = IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
         IncomingSnapshot->Leader == request->LeaderId && IncomingSnapshot->Index == request->SnapshotIndex &&
         IncomingSnapshot->BoundaryTerm == request->SnapshotTerm && IncomingSnapshot->Total == request->TotalBytes;
     if (!same) {
         if (request->Offset != 0 || (IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
             IncomingSnapshot->Index > request->SnapshotIndex)) { reply(false, false, 0); return; }
-        // A complete transfer still needs room for the decoded image.
-        if (request->TotalBytes > SnapshotInstallBudget->LimitBytes()) { reply(false, false, 0); return; }
+        // Legacy installs materialize the complete image in heap memory.
+        if (!streamingInstallApplication && request->TotalBytes > SnapshotInstallBudget->LimitBytes()) {
+            reply(false, false, 0); return;
+        }
         IncomingSnapshot.reset(); // Release a superseded image before reserving its replacement.
         const auto& receiveBudget = LogLimits.SnapshotStagingBudget ?
             LogLimits.SnapshotStagingBudget : SnapshotInstallBudget;
@@ -3423,14 +3435,18 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     std::unique_ptr<IStagedSnapshotInstallation> stagedApplicationInstall;
     TSnapshot snapshot;
     try {
-        installationReservation = incoming.File ? SnapshotInstallBudget->TryReserve(incoming.Total) :
-            std::move(incoming.ReceiveReservation);
+        const bool sourceBackedInstall = incoming.File && streamingInstallApplication;
+        installationReservation = sourceBackedInstall ? std::shared_ptr<void>{} :
+            incoming.File ? SnapshotInstallBudget->TryReserve(incoming.Total) :
+                std::move(incoming.ReceiveReservation);
         // A full staged image can wait for transient heap contention. Leave
         // the final chunk unacknowledged so the leader retries it. Retries
         // do not move LastProgress, so a blocked image still expires.
-        if (!installationReservation) return;
-        snapshot = incoming.File ? DecodeSnapshot(receivedImage) :
-            DecodeSnapshotOwned(std::move(incoming.Bytes));
+        if (!installationReservation && !sourceBackedInstall) return;
+        snapshot = sourceBackedInstall
+            ? DecodeSnapshotBacked(receivedImage, incoming.File)
+            : incoming.File ? DecodeSnapshot(receivedImage) :
+                DecodeSnapshotOwned(std::move(incoming.Bytes));
         IncomingSnapshot.reset();
         auto inheritTrustedLineage = [&](const TConfigurationHistory& history) {
             if (snapshot.HasConfigurationMetadata() && history.IsJoint() &&
@@ -3587,8 +3603,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         for (auto voter : snapshot.JointVoters)
             if (voter != Id && !Nodes.contains(voter))
                 throw TMessageError("Snapshot configuration is missing a voter peer target");
-        stagedApplicationInstall = PrepareApplicationSnapshotInstallation(
-            *application, snapshot.Data, snapshot.Index);
+        stagedApplicationInstall = PrepareApplicationSnapshotInstallation(*application, snapshot);
         snapshot.HeapReservation = std::move(installationReservation);
         snapshot.HeapReservationBudget = SnapshotInstallBudget;
     } catch (const std::exception&) {
@@ -3599,8 +3614,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         installedSnapshot = std::make_shared<const TSnapshot>(std::move(snapshot));
         TRaftInstallSnapshotPermit permit;
         State->InstallRaftSnapshot(installedSnapshot, permit); // publish Raft state before app replacement or ACK
-        InstallApplicationSnapshot(*application, installedSnapshot->Data,
-            installedSnapshot->Index, std::move(stagedApplicationInstall));
+        InstallApplicationSnapshot(*application, *installedSnapshot,
+            std::move(stagedApplicationInstall));
         if (application->LastAppliedIndex != installedSnapshot->Index) std::terminate();
     } catch (...) { std::terminate(); }
     VolatileState->CommitIndex = State->CommitIndex;

@@ -138,7 +138,7 @@ void Validate(const TSnapshot& snapshot, size_t dataSize) {
         validateVoters(snapshot.JointVoters);
     }
 }
-void Validate(const TSnapshot& snapshot) { Validate(snapshot, snapshot.Data.size()); }
+void Validate(const TSnapshot& snapshot) { Validate(snapshot, snapshot.DataSize()); }
 void CheckSnapshotConfigurationContinuity(const TSnapshot* current, const TSnapshot& incoming) {
     if (!current || !current->HasConfigurationMetadata()) return;
     if (!incoming.ConfigurationTransitions.empty() && !current->ConfigurationTransitions.empty()) {
@@ -329,7 +329,7 @@ std::string EncodeSnapshotMetadata(const TSnapshot& snapshot, size_t maxConfigur
     Put(out, snapshot.Index, 8);
     Put(out, snapshot.Term, 8);
     Put(out, snapshot.Voters.size(), 4);
-    Put(out, snapshot.Data.size(), 8);
+    Put(out, snapshot.DataSize(), 8);
     if (snapshot.HasConfigurationMetadata()) {
         Put(out, snapshot.ConfigurationIndex, 8);
         Put(out, snapshot.ConfigurationTerm, 8);
@@ -390,6 +390,75 @@ struct TSnapshotEncoding {
     uint32_t Checksum = 0;
     uint64_t TotalBytes = 0;
 };
+
+size_t TSnapshot::DataSize() const {
+    if (!DataSource) return Data.size();
+    if (!Data.empty()) throw std::logic_error("Snapshot cannot own and source the payload at once");
+    const auto size = DataSource->Size();
+    if (size > TSnapshot::MaxBytes || size > SIZE_MAX)
+        throw std::runtime_error("Snapshot payload source exceeds the size limit");
+    return size_t(size);
+}
+
+size_t TSnapshot::ReadDataRange(uint64_t offset, std::span<char> destination) const {
+    const auto size = DataSize();
+    if (offset >= size || destination.empty()) return 0;
+    const auto requested = size_t(std::min<uint64_t>(destination.size(), size - offset));
+    if (!DataSource) {
+        memcpy(destination.data(), Data.data() + size_t(offset), requested);
+        return requested;
+    }
+    const auto copied = DataSource->Read(offset, destination.first(requested));
+    if (!copied || copied > requested)
+        throw std::runtime_error("Snapshot payload source returned an invalid range");
+    return copied;
+}
+
+std::string TSnapshot::MaterializeData() const {
+    std::string result(DataSize(), '\0');
+    size_t copied = 0;
+    while (copied < result.size()) {
+        const auto count = ReadDataRange(copied,
+            std::span<char>(result.data() + copied, result.size() - copied));
+        if (!count || count > result.size() - copied)
+            throw std::runtime_error("Cannot materialize snapshot payload source");
+        copied += count;
+    }
+    return result;
+}
+
+bool TSnapshot::operator==(const TSnapshot& other) const {
+    if (Index != other.Index || Term != other.Term || Voters != other.Voters ||
+        JointVoters != other.JointVoters || ConfigurationIndex != other.ConfigurationIndex ||
+        ConfigurationTerm != other.ConfigurationTerm || StableConfiguration != other.StableConfiguration ||
+        PreviousVoters != other.PreviousVoters ||
+        PreviousConfigurationIndex != other.PreviousConfigurationIndex ||
+        PreviousConfigurationTerm != other.PreviousConfigurationTerm ||
+        PreviousJointIndex != other.PreviousJointIndex || PreviousJointTerm != other.PreviousJointTerm ||
+        ConfigurationTransitions != other.ConfigurationTransitions || DataSize() != other.DataSize())
+        return false;
+    std::array<char, 4096> left{}, right{};
+    const auto size = DataSize();
+    for (size_t offset = 0; offset < size;) {
+        const auto count = std::min(left.size(), size - offset);
+        size_t leftRead = 0, rightRead = 0;
+        while (leftRead < count) {
+            const auto read = ReadDataRange(offset + leftRead,
+                std::span<char>(left.data() + leftRead, count - leftRead));
+            if (!read || read > count - leftRead) return false;
+            leftRead += read;
+        }
+        while (rightRead < count) {
+            const auto read = other.ReadDataRange(offset + rightRead,
+                std::span<char>(right.data() + rightRead, count - rightRead));
+            if (!read || read > count - rightRead) return false;
+            rightRead += read;
+        }
+        if (memcmp(left.data(), right.data(), count) != 0) return false;
+        offset += count;
+    }
+    return true;
+}
 
 void ValidateSnapshot(const TSnapshot& snapshot) { Validate(snapshot); }
 
@@ -462,12 +531,26 @@ std::shared_ptr<const TSnapshotEncoding> PrepareSnapshotEncoding(
     Validate(snapshot);
     auto encoding = std::make_shared<TSnapshotEncoding>();
     encoding->Metadata = EncodeSnapshotMetadata(snapshot, maxConfigurationTransitions, includeMembershipHistory);
-    encoding->TotalBytes = encoding->Metadata.size() + snapshot.Data.size() + 4;
+    const auto dataSize = snapshot.DataSize();
+    encoding->TotalBytes = encoding->Metadata.size() + dataSize + 4;
     if (encoding->TotalBytes > TSnapshot::MaxBytes)
         throw std::runtime_error("Snapshot exceeds size limit");
     TChecksum checksum;
     checksum.Update(encoding->Metadata);
-    checksum.Update(snapshot.Data);
+    std::array<char, 64 * 1024> buffer{};
+    for (size_t offset = 0; offset < dataSize;) {
+        const auto count = std::min(buffer.size(), dataSize - offset);
+        size_t copied = 0;
+        while (copied < count) {
+            const auto read = snapshot.ReadDataRange(offset + copied,
+                std::span<char>(buffer.data() + copied, count - copied));
+            if (!read || read > count - copied)
+                throw std::runtime_error("Cannot checksum snapshot payload source");
+            copied += read;
+        }
+        checksum.Update(reinterpret_cast<const uint8_t*>(buffer.data()), count);
+        offset += count;
+    }
     encoding->Checksum = checksum.Finish();
     return encoding;
 }
@@ -479,7 +562,7 @@ uint64_t SnapshotEncodingSize(const TSnapshotEncoding& encoding) {
 void CopySnapshotEncodingRange(const TSnapshot& snapshot, const TSnapshotEncoding& encoding,
         uint64_t offset, char* destination, size_t length) {
     if (offset > encoding.TotalBytes || length > encoding.TotalBytes - offset ||
-        (length && !destination) || encoding.TotalBytes != encoding.Metadata.size() + snapshot.Data.size() + 4)
+        (length && !destination) || encoding.TotalBytes != encoding.Metadata.size() + snapshot.DataSize() + 4)
         throw std::invalid_argument("Invalid snapshot encoding range");
     char checksumBytes[4];
     for (unsigned i = 0; i < 4; ++i) checksumBytes[i] = char(encoding.Checksum >> (8 * i));
@@ -494,13 +577,53 @@ void CopySnapshotEncodingRange(const TSnapshot& snapshot, const TSnapshotEncodin
         offset += count;
     };
     copyPart(encoding.Metadata, 0);
-    copyPart(snapshot.Data, encoding.Metadata.size());
-    copyPart(checksum, encoding.Metadata.size() + snapshot.Data.size());
+    const auto dataSize = snapshot.DataSize();
+    const auto dataStart = uint64_t(encoding.Metadata.size());
+    if (written < length && offset < dataStart + dataSize) {
+        const auto begin = offset > dataStart ? offset - dataStart : 0;
+        const auto count = size_t(std::min<uint64_t>(length - written, dataSize - begin));
+        size_t copied = 0;
+        while (copied < count) {
+            const auto read = snapshot.ReadDataRange(begin + copied,
+                std::span<char>(destination + written + copied, count - copied));
+            if (!read || read > count - copied)
+                throw std::runtime_error("Cannot copy snapshot payload source range");
+            copied += read;
+        }
+        written += count;
+        offset += count;
+    }
+    copyPart(checksum, dataStart + dataSize);
     if (written != length) throw std::logic_error("Incomplete snapshot encoding range");
 }
 
 namespace {
-TSnapshot DecodeSnapshotImpl(std::string_view bytes, std::string* reusableStorage) {
+class TSnapshotDataSlice final : public TSnapshotDataSource {
+public:
+    TSnapshotDataSlice(std::shared_ptr<const TSnapshotDataSource> image,
+            uint64_t offset, uint64_t length)
+        : Image(std::move(image)), Offset(offset), Length(length) { }
+    uint64_t Size() const override { return Length; }
+    size_t Read(uint64_t offset, std::span<char> destination) const override {
+        if (offset >= Length || destination.empty()) return 0;
+        const auto count = size_t(std::min<uint64_t>(destination.size(), Length - offset));
+        size_t copied = 0;
+        while (copied < count) {
+            const auto read = Image->Read(Offset + offset + copied,
+                destination.subspan(copied, count - copied));
+            if (!read || read > count - copied)
+                throw std::runtime_error("Cannot read staged snapshot image range");
+            copied += read;
+        }
+        return copied;
+    }
+private:
+    std::shared_ptr<const TSnapshotDataSource> Image;
+    uint64_t Offset, Length;
+};
+
+TSnapshot DecodeSnapshotImpl(std::string_view bytes, std::string* reusableStorage,
+        std::shared_ptr<const TSnapshotDataSource> image) {
     if (bytes.size() < 44 || bytes.size() > TSnapshot::MaxBytes)
         throw std::runtime_error("Invalid snapshot size");
     if (reusableStorage && bytes.data() != reusableStorage->data())
@@ -583,12 +706,18 @@ TSnapshot DecodeSnapshotImpl(std::string_view bytes, std::string* reusableStorag
     const auto dataOffset = bytes.size() - 4 - reader.Input.size();
     const auto data = reader.Read(size_t(length));
     if (!reader.Input.empty()) throw std::runtime_error("Trailing snapshot data");
+    if (image) {
+        if (image->Size() != bytes.size())
+            throw std::invalid_argument("Snapshot image source size does not match its view");
+        snapshot.DataSource = std::make_shared<TSnapshotDataSlice>(
+            std::move(image), dataOffset, length);
+    }
     Validate(snapshot, size_t(length));
     if (reusableStorage) {
         reusableStorage->erase(0, dataOffset);
         reusableStorage->resize(size_t(length));
         snapshot.Data = std::move(*reusableStorage);
-    } else {
+    } else if (!snapshot.DataSource) {
         snapshot.Data = data;
     }
     return snapshot;
@@ -596,11 +725,36 @@ TSnapshot DecodeSnapshotImpl(std::string_view bytes, std::string* reusableStorag
 }
 
 TSnapshot DecodeSnapshot(std::string_view bytes) {
-    return DecodeSnapshotImpl(bytes, nullptr);
+    return DecodeSnapshotImpl(bytes, nullptr, {});
 }
 
 TSnapshot DecodeSnapshotOwned(std::string&& bytes) {
-    return DecodeSnapshotImpl(bytes, &bytes);
+    return DecodeSnapshotImpl(bytes, &bytes, {});
+}
+
+TSnapshot DecodeSnapshotBacked(std::string_view bytes,
+        std::shared_ptr<const TSnapshotDataSource> image) {
+    if (!image) throw std::invalid_argument("Missing snapshot image source");
+    if (bytes.size() < 44 || bytes.size() > TSnapshot::MaxBytes)
+        throw std::runtime_error("Invalid snapshot size");
+    if (image->Size() != bytes.size())
+        throw std::invalid_argument("Snapshot image source size does not match its view");
+    std::array<char, 64 * 1024> buffer{};
+    for (size_t offset = 0; offset < bytes.size();) {
+        const auto count = std::min(buffer.size(), bytes.size() - offset);
+        size_t copied = 0;
+        while (copied < count) {
+            const auto read = image->Read(offset + copied,
+                std::span<char>(buffer.data() + copied, count - copied));
+            if (!read || read > count - copied)
+                throw std::runtime_error("Cannot verify snapshot image source range");
+            copied += read;
+        }
+        if (memcmp(buffer.data(), bytes.data() + offset, count) != 0)
+            throw std::invalid_argument("Snapshot image source does not match its view");
+        offset += count;
+    }
+    return DecodeSnapshotImpl(bytes, nullptr, std::move(image));
 }
 
 TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm) {
@@ -779,8 +933,8 @@ void RestoreSnapshot(const TSnapshot& snapshot, const TRaft& raft, IRsm& rsm) {
     CheckLocalLog(snapshot, raft, configurationAtBoundary);
     if (rsm.LastAppliedIndex >= snapshot.Index)
         throw std::runtime_error("Application is not behind the snapshot");
-    auto installation = PrepareApplicationSnapshotInstallation(rsm, snapshot.Data, snapshot.Index);
-    InstallApplicationSnapshot(rsm, snapshot.Data, snapshot.Index, std::move(installation));
+    auto installation = PrepareApplicationSnapshotInstallation(rsm, snapshot);
+    InstallApplicationSnapshot(rsm, snapshot, std::move(installation));
     if (rsm.LastAppliedIndex != snapshot.Index) throw std::runtime_error("Application failed to restore snapshot progress");
 }
 

@@ -10,6 +10,21 @@ extern "C" {
 #include <cmocka.h>
 }
 namespace {
+class TMemorySnapshotDataSource final : public TSnapshotDataSource {
+public:
+    explicit TMemorySnapshotDataSource(std::shared_ptr<const std::string> bytes)
+        : Bytes(std::move(bytes)) { }
+    uint64_t Size() const override { return Bytes->size(); }
+    size_t Read(uint64_t offset, std::span<char> destination) const override {
+        if (offset >= Bytes->size() || destination.empty()) return 0;
+        const auto count = std::min<size_t>({destination.size(), Bytes->size() - size_t(offset), 97});
+        memcpy(destination.data(), Bytes->data() + size_t(offset), count);
+        return count;
+    }
+private:
+    std::shared_ptr<const std::string> Bytes;
+};
+
 TMessageHolder<TReadSql> Query(const std::string& text) {
     auto message = NewHoldedMessage<TReadSql>(sizeof(TReadSql) + text.size());
     message->QuerySize = text.size();
@@ -274,6 +289,44 @@ void test_sql_staged_snapshot_install_reuses_validated_image(void**) {
     assert_true(ReadText(target, "SELECT value FROM t") == "value\noriginal\n");
 
     installation->Install();
+    assert_int_equal(target.LastAppliedIndex, 2);
+    assert_true(ReadText(target, "SELECT value FROM t ORDER BY rowid") ==
+        "value\noriginal\nsnapshot\n");
+}
+void test_sql_streaming_install_uses_range_backed_snapshot_payload(void**) {
+    TSql source(":memory:", 1), target(":memory:", 2);
+    Seed(source);
+    Seed(target);
+    Apply(source, "INSERT INTO t VALUES ('snapshot')", 2);
+
+    TSnapshot encodedSnapshot;
+    encodedSnapshot.Index = 2;
+    encodedSnapshot.Term = 1;
+    encodedSnapshot.Voters = {1};
+    encodedSnapshot.Data = source.SaveSnapshot();
+    const auto encoded = EncodeSnapshot(encodedSnapshot);
+    auto immutableImage = std::make_shared<const std::string>(encoded);
+    auto imageSource = std::make_shared<TMemorySnapshotDataSource>(immutableImage);
+    auto decoded = DecodeSnapshotBacked(encoded, imageSource);
+    auto mismatchedImage = std::make_shared<std::string>(encoded);
+    (*mismatchedImage)[mismatchedImage->size() - 5] ^= 1;
+    auto mismatchedSource = std::make_shared<TMemorySnapshotDataSource>(mismatchedImage);
+    bool mismatchRejected = false;
+    try {
+        (void)DecodeSnapshotBacked(encoded, mismatchedSource);
+    } catch (const std::invalid_argument&) {
+        mismatchRejected = true;
+    }
+    assert_true(mismatchRejected);
+    assert_true(decoded.Data.empty());
+    assert_int_equal(decoded.DataSize(), encodedSnapshot.Data.size());
+    assert_true(decoded.MaterializeData() == encodedSnapshot.Data);
+    assert_true(EncodeSnapshot(decoded) == encoded);
+    assert_true(decoded == DecodeSnapshot(encoded));
+
+    auto installation = PrepareApplicationSnapshotInstallation(target, decoded);
+    assert_non_null(installation.get());
+    InstallApplicationSnapshot(target, decoded, std::move(installation));
     assert_int_equal(target.LastAppliedIndex, 2);
     assert_true(ReadText(target, "SELECT value FROM t ORDER BY rowid") ==
         "value\noriginal\nsnapshot\n");
@@ -747,6 +800,7 @@ int main() {
         cmocka_unit_test(test_sql_snapshot_roundtrip_and_rejection_are_atomic),
         cmocka_unit_test(test_sql_snapshot_source_is_stable_and_matches_requested_index),
         cmocka_unit_test(test_sql_staged_snapshot_install_reuses_validated_image),
+        cmocka_unit_test(test_sql_streaming_install_uses_range_backed_snapshot_payload),
         cmocka_unit_test(test_sql_snapshot_truncation_rejects_before_replacement),
         cmocka_unit_test(test_sql_snapshot_installation_busy_failure_preserves_database),
         cmocka_unit_test(test_sql_snapshot_includes_committed_wal_pages),

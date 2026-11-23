@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <utility>
 #include <string>
@@ -15,6 +16,15 @@
 class TRaft;
 class TSnapshotInstallBudget;
 struct IRsm;
+
+// Immutable, range-readable snapshot payload. Sources must remain stable while
+// a snapshot retains them. Reads may be partial but cannot return zero before
+// the requested range reaches the end of the source.
+struct TSnapshotDataSource {
+    virtual ~TSnapshotDataSource() = default;
+    virtual uint64_t Size() const = 0;
+    virtual size_t Read(uint64_t offset, std::span<char> destination) const = 0;
+};
 
 // One committed stable -> joint -> stable voter transition. A zero stable
 // successor identifies the final, currently active joint phase.
@@ -37,6 +47,10 @@ struct TSnapshot {
     uint64_t Index = 0, Term = 0;
     std::vector<uint32_t> Voters;
     std::string Data;
+    // Optional file-backed payload used by disk-staged InstallSnapshot. When
+    // set, Data is empty and consumers should use DataSize/ReadDataRange or
+    // MaterializeData. Ordinary captures and legacy restores keep using Data.
+    std::shared_ptr<const TSnapshotDataSource> DataSource;
     // Optional joint configuration effective at this snapshot boundary.
     std::vector<uint32_t> JointVoters;
     uint64_t ConfigurationIndex = 0, ConfigurationTerm = 0;
@@ -56,23 +70,14 @@ struct TSnapshot {
     // fields are neither serialized nor part of snapshot identity.
     mutable std::shared_ptr<void> HeapReservation;
     mutable std::shared_ptr<TSnapshotInstallBudget> HeapReservationBudget;
+    size_t DataSize() const;
+    size_t ReadDataRange(uint64_t offset, std::span<char> destination) const;
+    std::string MaterializeData() const;
     bool HasConfigurationLineage() const { return !PreviousVoters.empty(); }
     bool HasStablePredecessor() const { return StableConfiguration && !PreviousVoters.empty(); }
     bool IsJoint() const { return !JointVoters.empty() || (!StableConfiguration && (ConfigurationIndex || ConfigurationTerm)); }
     bool HasConfigurationMetadata() const { return StableConfiguration || IsJoint(); }
-    bool operator==(const TSnapshot& other) const {
-        return Index == other.Index && Term == other.Term && Voters == other.Voters &&
-            Data == other.Data && JointVoters == other.JointVoters &&
-            ConfigurationIndex == other.ConfigurationIndex &&
-            ConfigurationTerm == other.ConfigurationTerm &&
-            StableConfiguration == other.StableConfiguration &&
-            PreviousVoters == other.PreviousVoters &&
-            PreviousConfigurationIndex == other.PreviousConfigurationIndex &&
-            PreviousConfigurationTerm == other.PreviousConfigurationTerm &&
-            PreviousJointIndex == other.PreviousJointIndex &&
-            PreviousJointTerm == other.PreviousJointTerm &&
-            ConfigurationTransitions == other.ConfigurationTransitions;
-    }
+    bool operator==(const TSnapshot& other) const;
 };
 
 // Shares an aggregate heap limit across snapshot transfers and retained images.
@@ -164,6 +169,10 @@ private:
 
 std::string EncodeSnapshot(const TSnapshot& snapshot);
 TSnapshot DecodeSnapshot(std::string_view bytes);
+// Decodes metadata from a complete range-readable image while retaining its
+// application-payload range instead of allocating another full image buffer.
+TSnapshot DecodeSnapshotBacked(std::string_view bytes,
+    std::shared_ptr<const TSnapshotDataSource> image);
 // Reuses the input allocation for application data after the image checksum
 // and metadata validate, avoiding another full-size copy during installation.
 TSnapshot DecodeSnapshotOwned(std::string&& bytes);
