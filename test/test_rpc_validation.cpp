@@ -134,6 +134,25 @@ void test_configuration_barrier_requires_current_term_and_committed_leader_conta
     assert_int_equal(reply->ConfigurationIndex, 1);
     assert_false(reply->Accepted);
 }
+void test_snapshot_install_requires_application_restore_support_before_term_advance(void**) {
+    TFixture fixture;
+    auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + 1);
+    request->Src = 2;
+    request->Dst = 1;
+    request->Term = 4;
+    request->Seqno = 1;
+    request->LeaderId = 2;
+    request->SnapshotIndex = 1;
+    request->SnapshotTerm = 1;
+    request->TotalBytes = 44;
+    request->Offset = 0;
+    request->Done = 0;
+    request->Data[0] = '\0';
+
+    fixture.Raft.Process(fixture.Now, request);
+    assert_int_equal(fixture.State->CurrentTerm, 3);
+    assert_int_equal(fixture.State->VotedFor, 1);
+}
 void test_out_of_range_ack_cannot_wrap_next_index(void**) {
     TFixture fixture;
     fixture.Append(3);
@@ -336,6 +355,7 @@ int main() {
         cmocka_unit_test(test_high_term_pre_vote_cannot_disrupt_recent_leader),
         cmocka_unit_test(test_malformed_pre_vote_is_ignored),
         cmocka_unit_test(test_configuration_barrier_requires_current_term_and_committed_leader_contact),
+        cmocka_unit_test(test_snapshot_install_requires_application_restore_support_before_term_advance),
         cmocka_unit_test(test_out_of_range_ack_cannot_wrap_next_index),
         cmocka_unit_test(test_unknown_sequence_cannot_commit),
         cmocka_unit_test(test_ack_cannot_confirm_an_entry_not_in_its_rpc),

@@ -110,6 +110,10 @@ struct IRsm {
     // and LastAppliedIndex. Invoked at startup or during serialized installation;
     // a failure after durable installation is fatal and requires restart.
     virtual void LoadSnapshot(std::string_view, uint64_t) { throw std::logic_error("Application snapshots are unsupported"); }
+    // True only when this application can validate and atomically restore the
+    // snapshots it emits. Storage install support alone is not sufficient for a
+    // peer that may receive a compacted prefix.
+    virtual bool SupportsApplicationSnapshotInstall() const { return false; }
 
     // Durable RSMs restore this atomically with application data before constructing
     // TRequestProcessor. It must identify committed progress in the same Raft log.
@@ -227,6 +231,7 @@ struct IIdempotentRsm : IRsm {
         const TIdempotencySnapshot&, uint64_t index) const = 0;
     virtual void RestoreIdempotencySnapshot(
         TIdempotencySnapshot, uint64_t index) = 0;
+    bool SupportsApplicationSnapshotInstall() const final { return true; }
     // Upper bound for the complete encoded wrapper returned by SaveSnapshot.
     virtual std::optional<uint64_t> IdempotencySnapshotSizeUpperBound() const {
         return std::nullopt;
@@ -292,6 +297,9 @@ struct TJointConfigurationReadiness {
     std::vector<uint32_t> AddedVotersWithoutCommitAck;
     // Missing/unknown peer capability advertisements fail closed before promotion.
     std::vector<uint32_t> AddedVotersWithoutSnapshotInstallSupport;
+    // Every voter in the proposed stable set must be able to restore application
+    // data from an installed Raft snapshot.
+    std::vector<uint32_t> ProposedVotersWithoutApplicationSnapshotInstallSupport;
     // Every current and proposed voter must understand joint-consensus entries.
     std::vector<uint32_t> VotersWithoutJointConsensusSupport;
     // When this RSM enables idempotent writes, every replication target must
@@ -305,6 +313,7 @@ struct TJointConfigurationReadiness {
         return IsLeader && HasDurableMembershipStorage && HasStableConfiguration &&
             HasCommittedCurrentTermEntry && ChangesVoterSet && HasLogCapacity && MissingPeerTargets.empty() &&
             AddedVotersWithoutCommitAck.empty() && AddedVotersWithoutSnapshotInstallSupport.empty() &&
+            ProposedVotersWithoutApplicationSnapshotInstallSupport.empty() &&
             VotersWithoutJointConsensusSupport.empty() && MembersWithoutIdempotentLogSupport.empty() &&
             MembersWithoutIdempotencyControlSupport.empty();
     }
@@ -321,14 +330,19 @@ struct TCompactionMembershipReadiness {
     bool IsActiveVoter = false;
     bool RequiresLeaderAcknowledgementBarrier = false;
     bool HasLeaderAcknowledgementBarrier = false;
+    bool LocalApplicationSnapshotInstallSupported = false;
     // Populated on leaders with active voters still behind the committed config.
     std::vector<uint32_t> ActiveVotersWithoutConfigurationAck;
     // Remote active voters whose InstallSnapshot support is not positively known.
     std::vector<uint32_t> ActiveVotersWithoutSnapshotInstallSupport;
+    // Remote active voters whose RSM cannot restore an installed snapshot.
+    std::vector<uint32_t> ActiveVotersWithoutApplicationSnapshotInstallSupport;
 
     bool Ready() const {
-        return ActiveVotersWithoutConfigurationAck.empty() &&
+        return LocalApplicationSnapshotInstallSupported &&
+            ActiveVotersWithoutConfigurationAck.empty() &&
             ActiveVotersWithoutSnapshotInstallSupport.empty() &&
+            ActiveVotersWithoutApplicationSnapshotInstallSupport.empty() &&
             (!RequiresLeaderAcknowledgementBarrier || HasLeaderAcknowledgementBarrier);
     }
 };
@@ -375,6 +389,7 @@ struct TVolatileState {
         bool SnapshotHistory32 = false, SnapshotHistory256 = false;
         bool SnapshotHistory1024 = false;
         bool InstallSnapshot = false;
+        bool ApplicationSnapshotInstall = false;
         bool JointConsensus = false;
         bool IdempotentLogEntries = false;
         bool IdempotencyControlEntries = false;
@@ -499,6 +514,11 @@ public:
     // traffic. Peers advertise the capability only when their RSM can apply it.
     void SetLocalIdempotentLogSupport(bool supported) noexcept {
         LocalIdempotentLogSupport = supported;
+    }
+    // Set from the request processor's actual application contract before the
+    // node serves traffic; peers advertise this independently of storage support.
+    void SetLocalApplicationSnapshotInstallSupport(bool supported) noexcept {
+        LocalApplicationSnapshotInstallSupport = supported;
     }
     bool CanAppendIdempotentLogEntries() const;
     bool CanAppendIdempotencyControlEntries() const;
@@ -663,6 +683,7 @@ private:
     // force); Learners is derived from that active membership.
     std::vector<uint32_t> InitialVoters, Voters, Learners;
     bool LocalIdempotentLogSupport = false;
+    bool LocalApplicationSnapshotInstallSupport = false;
     std::optional<TConfigurationHistory> ConfigurationBaseline;
     std::optional<TConfigurationScan> Configuration;
     bool ConfigurationScanRequired = false;

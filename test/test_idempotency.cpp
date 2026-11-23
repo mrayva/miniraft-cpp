@@ -778,11 +778,11 @@ void test_idempotent_log_requires_every_member_capability_including_joint_additi
 
     auto* volatileState = const_cast<TVolatileState*>(raft->GetVolatileState());
     volatileState->PeerCapabilities[2] = {
-        .AppendAckSeqno = 1, .Term = state->CurrentTerm, .IdempotentLogEntries = true,
-        .IdempotencyControlEntries = true};
+        .AppendAckSeqno = 1, .Term = state->CurrentTerm, .ApplicationSnapshotInstall = true,
+        .IdempotentLogEntries = true, .IdempotencyControlEntries = true};
     volatileState->PeerCapabilities[3] = {
-        .AppendAckSeqno = 1, .Term = state->CurrentTerm, .IdempotentLogEntries = true,
-        .IdempotencyControlEntries = true};
+        .AppendAckSeqno = 1, .Term = state->CurrentTerm, .ApplicationSnapshotInstall = true,
+        .IdempotentLogEntries = true, .IdempotencyControlEntries = true};
     assert_false(raft->CanAppendIdempotentLogEntries());
 
     auto readiness = raft->CheckJointConfigurationReadiness({1, 2, 4});
@@ -790,7 +790,8 @@ void test_idempotent_log_requires_every_member_capability_including_joint_additi
     assert_true(readiness.MembersWithoutIdempotencyControlSupport == (std::vector<uint32_t>{4}));
 
     volatileState->PeerCapabilities[4] = {
-        .AppendAckSeqno = 1, .Term = state->CurrentTerm, .IdempotentLogEntries = true};
+        .AppendAckSeqno = 1, .Term = state->CurrentTerm, .ApplicationSnapshotInstall = true,
+        .IdempotentLogEntries = true};
     assert_true(raft->CanAppendIdempotentLogEntries());
     assert_false(raft->CanAppendIdempotencyControlEntries());
     readiness = raft->CheckJointConfigurationReadiness({1, 2, 4});

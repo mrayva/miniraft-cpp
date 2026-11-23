@@ -16,6 +16,7 @@ public:
     std::optional<uint64_t> SnapshotSizeUpperBound() const override;
     void ValidateSnapshot(std::string_view bytes, uint64_t index) const override;
     void LoadSnapshot(std::string_view bytes, uint64_t index) override;
+    bool SupportsApplicationSnapshotInstall() const override { return true; }
 
 private:
     std::unordered_map<std::string, std::string> H;

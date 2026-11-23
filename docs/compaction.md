@@ -25,7 +25,12 @@ Snapshot capture and InstallSnapshot support complete images up to 128 MiB.
 Peers that do not advertise the snapshot-size capability remain limited to
 64 MiB; the leader includes the minimum active-voter limit in its configuration
 barrier before allowing compaction. Learners without that all-voter certificate
-also keep the 64 MiB local-compaction limit.
+also keep the 64 MiB local-compaction limit. Application snapshot restore is
+negotiated separately from storage installation. Custom RSMs opt in through
+`SupportsApplicationSnapshotInstall()` after implementing complete validation
+and restore; the default is unsupported. A proposed voter must advertise this
+capability, and compaction waits until the local application and every active
+voter can restore installed images.
 
 ## Operation and compatibility
 
@@ -122,18 +127,16 @@ explicitly promoted again. This does not permit compaction while the node is
 still an active voter.
 
 `TRaft::CheckCompactionMembershipReadiness()` reports active voter IDs that
-still need to acknowledge the committed configuration and remote active voters
-whose `InstallSnapshot` capability has not been positively advertised on a
-leader. The leader blocks compaction until each remote voter advertises support;
-it also sends the all-voter acknowledgement barrier only after that check. A
-follower relies on that barrier and does not need its own outbound capability
-cache. The follower accepts the certificate only in the Raft term in which it
-arrived; after a term change, the current leader must establish it again. The
-barrier also covers the fixed initial voter set with configuration index zero;
-the explicit zero-index marker prevents that baseline from bypassing the check.
-A ready result still does not guarantee that storage or the application can
-create and validate the snapshot. Serialize the check with Raft work, as with
-`CompactShared()`.
+still need to acknowledge the committed configuration, remote active voters
+whose storage or application restore support is unknown, and whether the local
+RSM can restore snapshots. The leader blocks compaction until every active
+voter advertises both installation capabilities; its barrier carries an
+application-restore certificate as well as the size limit. A follower accepts
+that certificate only in the Raft term in which it arrived; after a term
+change, the current leader must establish it again. The barrier also covers the
+fixed initial voter set with configuration index zero. A ready result still
+does not guarantee that storage or the application can create and validate the
+snapshot. Serialize the check with Raft work, as with `CompactShared()`.
 
 ## Transfer protocol
 
@@ -226,8 +229,11 @@ when the sender belongs to the new set. Fresh learners use a separate
 constrained bootstrap path. These formats cannot recover a stale store across
 unknown membership transitions. An unsupported learner cannot receive a
 snapshot and must catch up before compaction or be removed and re-added after
-its storage is upgraded. Application capture and restore callbacks remain a
-deployment requirement and are not negotiated. Asynchronous/COW capture, disk-streamed
+its storage is upgraded. Application restore capability is negotiated, but
+applications still own correct, atomic image validation and restore behavior.
+Upgrade the voters before enabling the capability because older binaries
+cannot distinguish storage support from application restore support.
+Asynchronous/COW capture, disk-streamed
 transfer, process-wide heap quotas, cluster/store authentication, and
 independent review remain open. `TRaftServer` now applies configurable aggregate
 message and byte budgets to its real peer-node outbound queues (defaults: 4096

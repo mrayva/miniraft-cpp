@@ -101,6 +101,7 @@ struct TBoundedSnapshotApplication : IRsm {
     std::string SaveSnapshot() const override { ++SaveCalls; return std::string(PayloadBytes, 's'); }
     void ValidateSnapshot(std::string_view, uint64_t) const override { }
     void LoadSnapshot(std::string_view, uint64_t index) override { LastAppliedIndex = index; }
+    bool SupportsApplicationSnapshotInstall() const override { return true; }
 };
 struct TStreamingWriterSnapshotApplication : TApplication {
     mutable size_t SaveCalls = 0;
@@ -166,6 +167,7 @@ struct TLargeSourceSnapshotApplication : IRsm, IStreamingSnapshotRsm, IStreaming
         return std::make_unique<TNoopSnapshotInstallation>();
     }
     void LoadSnapshot(std::string_view, uint64_t index) override { LastAppliedIndex = index; }
+    bool SupportsApplicationSnapshotInstall() const override { return true; }
 };
 void test_kv_snapshot_precomputes_size_without_changing_encoding(void**) {
     TKv source;
@@ -571,7 +573,8 @@ void test_snapshot_size_negotiation_keeps_legacy_fallback_and_certifies_voter_li
             .MatchIndex = oldPeerAppend->PrevLogIndex + oldPeerAppend->Nentries,
             .Success = 1,
             .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier |
-                TAppendEntriesResponse::SupportsInstallSnapshot,
+                TAppendEntriesResponse::SupportsInstallSnapshot |
+                TAppendEntriesResponse::SupportsApplicationSnapshotInstall,
         });
     cluster.Deliver(oldPeerResponse);
     cluster.Deliver(currentPeerAppend);
@@ -581,8 +584,10 @@ void test_snapshot_size_negotiation_keeps_legacy_fallback_and_certifies_voter_li
         .Cast<TConfigurationBarrierRequest>();
     auto currentPeerBarrier = cluster.Take(1, 3, EMessageType::CONFIGURATION_BARRIER_REQUEST)
         .Cast<TConfigurationBarrierRequest>();
-    assert_int_equal(oldPeerBarrier->Padding, 0);
-    assert_int_equal(currentPeerBarrier->Padding, 0);
+    assert_int_equal(oldPeerBarrier->Padding,
+        TAppendEntriesResponse::SupportsApplicationSnapshotInstall);
+    assert_int_equal(currentPeerBarrier->Padding,
+        TAppendEntriesResponse::SupportsApplicationSnapshotInstall);
     cluster.Deliver(oldPeerBarrier);
     cluster.Deliver(currentPeerBarrier);
     assert_int_equal(cluster.Nodes[1]->GetVolatileState()->CompactionSafeMaxSnapshotBytes, legacyLimit);
@@ -676,7 +681,8 @@ void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
             if (message->Type == uint32_t(EMessageType::APPEND_ENTRIES_REQUEST)) {
                 auto append = message.template Cast<TAppendEntriesRequest>();
                 uint32_t features = TAppendEntriesResponse::SupportsConfigurationBarrier;
-                if (id != 5) features |= TAppendEntriesResponse::SupportsInstallSnapshot;
+                if (id != 5) features |= TAppendEntriesResponse::SupportsInstallSnapshot |
+                    TAppendEntriesResponse::SupportsApplicationSnapshotInstall;
                 if (id == 2 && !downgradePeer2AfterRejection)
                     features |= TAppendEntriesResponse::SupportsSnapshotHistory1024;
                 if (id == 3) features |= TAppendEntriesResponse::SupportsSnapshotHistory256;
@@ -1082,6 +1088,7 @@ void test_rejected_snapshot_reprobes_peer_capabilities_before_retry(void**) {
 
     auto readiness = cluster.Nodes[0]->CheckCompactionMembershipReadiness();
     assert_true(readiness.ActiveVotersWithoutSnapshotInstallSupport == (std::vector<uint32_t>{3}));
+    assert_true(readiness.ActiveVotersWithoutApplicationSnapshotInstallSupport == (std::vector<uint32_t>{3}));
     assert_false(readiness.Ready());
 
     // A current capability probe distinguishes an old or restarted peer from
@@ -1094,6 +1101,7 @@ void test_rejected_snapshot_reprobes_peer_capabilities_before_retry(void**) {
     cluster.Deliver(probeResponse);
     const auto& capability = cluster.Nodes[0]->GetVolatileState()->PeerCapabilities.at(3);
     assert_true(capability.InstallSnapshot);
+    assert_true(capability.ApplicationSnapshotInstall);
     assert_int_equal(capability.Term, cluster.Nodes[0]->GetState()->CurrentTerm);
 
     cluster.Packets.clear();
@@ -1374,6 +1382,10 @@ void test_covered_snapshot_metadata_uses_shared_install_budget(void**) {
     };
     auto raft2 = std::make_shared<TRaft>(makeState(), 2, peers, std::vector<uint32_t>{}, limits);
     auto raft3 = std::make_shared<TRaft>(makeState(), 3, peers, std::vector<uint32_t>{}, limits);
+    auto application2 = std::make_shared<TBoundedSnapshotApplication>();
+    auto application3 = std::make_shared<TBoundedSnapshotApplication>();
+    TRequestProcessor processor2(raft2, application2, peers);
+    TRequestProcessor processor3(raft3, application3, peers);
 
     auto request = [](uint32_t target, const std::string& image, size_t offset, size_t count) {
         auto chunk = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);

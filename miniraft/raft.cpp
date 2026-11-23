@@ -25,7 +25,8 @@
 
 namespace {
 
-uint32_t LocalAppendCapabilityBits(const IState& state, bool idempotentLogSupport) {
+uint32_t LocalAppendCapabilityBits(const IState& state, bool idempotentLogSupport,
+        bool applicationSnapshotInstallSupport) {
     return TAppendEntriesResponse::EncodeSnapshotMaxBytes(uint32_t(TSnapshot::MaxBytes)) |
         TAppendEntriesResponse::SupportsConfigurationBarrier |
         TAppendEntriesResponse::SupportsSnapshotHistory256 |
@@ -35,7 +36,9 @@ uint32_t LocalAppendCapabilityBits(const IState& state, bool idempotentLogSuppor
         TAppendEntriesResponse::SupportsSnapshotLineage |
         TAppendEntriesResponse::SupportsJointConsensus |
         (idempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotentLogEntries : 0u) |
-        (idempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotencyControlEntries : 0u);
+        (idempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotencyControlEntries : 0u) |
+        (applicationSnapshotInstallSupport
+            ? TAppendEntriesResponse::SupportsApplicationSnapshotInstall : 0u);
 }
 
 uint64_t AllocateForwardingSession() {
@@ -1464,7 +1467,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             TAppendEntriesResponse {
                 .MatchIndex = 0,
                 .Success = false,
-                .Padding = LocalAppendCapabilityBits(*State, LocalIdempotentLogSupport),
+                .Padding = LocalAppendCapabilityBits(*State, LocalIdempotentLogSupport,
+                    LocalApplicationSnapshotInstallSupport),
             });
         (void)Nodes[reply->Dst]->TrySend(std::move(reply));
         return;
@@ -1583,7 +1587,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
         TAppendEntriesResponse {
             .MatchIndex = matchIndex,
             .Success = success,
-            .Padding = LocalAppendCapabilityBits(*State, LocalIdempotentLogSupport),
+            .Padding = LocalAppendCapabilityBits(*State, LocalIdempotentLogSupport,
+                LocalApplicationSnapshotInstallSupport),
         });
 
     AdvanceCommitIndex(commitIndex);
@@ -1634,6 +1639,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             message->Padding & TAppendEntriesResponse::SupportsSnapshotHistory32;
         capabilities.InstallSnapshot =
             message->Padding & TAppendEntriesResponse::SupportsInstallSnapshot;
+        capabilities.ApplicationSnapshotInstall =
+            message->Padding & TAppendEntriesResponse::SupportsApplicationSnapshotInstall;
         capabilities.JointConsensus =
             message->Padding & TAppendEntriesResponse::SupportsJointConsensus;
         capabilities.IdempotentLogEntries =
@@ -1934,6 +1941,8 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
             length <= request->TotalBytes - request->Offset &&
             bool(request->Done) == (request->Offset + length == request->TotalBytes);
         if (!valid) return false;
+        const auto application = SnapshotApplication.lock();
+        if (!application || !application->SupportsApplicationSnapshotInstall()) return false;
         if (header->Term > State->CurrentTerm || !IsVoter(header->Src)) {
             // Do not persist a higher term based on an InstallSnapshot request
             // whose format cannot be accepted by this runtime. A continuation
@@ -1947,7 +1956,6 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
             const auto* committedConfiguration = Configuration ? &Configuration->Committed : nullptr;
             const auto* pendingConfiguration = Configuration && Configuration->HasUncommittedConfiguration()
                 ? &Configuration->Latest : nullptr;
-            const auto application = SnapshotApplication.lock();
             const auto snapshotVoters = committedConfiguration
                 ? ConfigurationVoterUnion(*committedConfiguration) : std::vector<uint32_t>{};
             const auto probe = ProbeSnapshotMetadata(std::string_view(request->Data, length),
@@ -2007,8 +2015,10 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
     }
     case EMessageType::CONFIGURATION_BARRIER_REQUEST: {
         auto request = message.Cast<TConfigurationBarrierRequest>();
-        const auto certifiedSnapshotLimit = request->Padding
-            ? uint64_t(request->Padding) * TAppendEntriesResponse::SnapshotSizeUnitBytes
+        const auto encodedSnapshotLimit = request->Padding &
+            ~TAppendEntriesResponse::SupportsApplicationSnapshotInstall;
+        const auto certifiedSnapshotLimit = encodedSnapshotLimit
+            ? uint64_t(encodedSnapshotLimit) * TAppendEntriesResponse::SnapshotSizeUnitBytes
             : uint64_t(TSnapshot::LegacyMaxBytes);
         return header->Term == State->CurrentTerm && request->LeaderId == header->Src &&
             certifiedSnapshotLimit <= TSnapshot::MaxBytes &&
@@ -2230,7 +2240,8 @@ void TRaft::LeaderTimeout(ITimeSource::Time now) {
             VolatileState->RpcDue[id] = now + TTimeout::Rpc;
             if (VolatileState->NextIndex[id] <= State->SnapshotIndex) {
                 const auto capability = VolatileState->PeerCapabilities.find(id);
-                if (capability != VolatileState->PeerCapabilities.end() && capability->second.InstallSnapshot) {
+                if (capability != VolatileState->PeerCapabilities.end() && capability->second.InstallSnapshot &&
+                    capability->second.ApplicationSnapshotInstall) {
                     if (auto snapshot = CreateInstallSnapshot(id))
                         (void)node->TrySend(std::move(snapshot));
                 } else {
@@ -2590,6 +2601,18 @@ TJointConfigurationReadiness TRaft::CheckJointConfigurationReadiness(
                 capability->second.Term != State->CurrentTerm || !capability->second.JointConsensus)
                 readiness.VotersWithoutJointConsensusSupport.push_back(id);
         }
+    for (auto id : newVoters) {
+        if (id == Id) {
+            if (!LocalApplicationSnapshotInstallSupport)
+                readiness.ProposedVotersWithoutApplicationSnapshotInstallSupport.push_back(id);
+            continue;
+        }
+        const auto capability = VolatileState->PeerCapabilities.find(id);
+        if (capability == VolatileState->PeerCapabilities.end() ||
+            capability->second.Term != State->CurrentTerm ||
+            !capability->second.ApplicationSnapshotInstall)
+            readiness.ProposedVotersWithoutApplicationSnapshotInstallSupport.push_back(id);
+    }
     if (LocalIdempotentLogSupport) {
         std::vector<uint32_t> requiredMembers = requiredVoters;
         requiredMembers.insert(requiredMembers.end(), Learners.begin(), Learners.end());
@@ -2632,6 +2655,8 @@ uint64_t TRaft::ProposeJointConfiguration(std::vector<uint32_t> newVoters) {
         throw std::logic_error("Every added voter must be a staged learner with a committed catch-up ACK");
     if (!readiness.AddedVotersWithoutSnapshotInstallSupport.empty())
         throw std::logic_error("Every added voter must support InstallSnapshot before promotion");
+    if (!readiness.ProposedVotersWithoutApplicationSnapshotInstallSupport.empty())
+        throw std::logic_error("Every proposed voter must support application snapshot installation");
     if (!readiness.VotersWithoutJointConsensusSupport.empty())
         throw std::logic_error("Every current and proposed voter must advertise joint-consensus support in this term");
     if (!readiness.MembersWithoutIdempotentLogSupport.empty())
@@ -2743,10 +2768,14 @@ void TRaft::OnTimeoutNow(ITimeSource::Time now, TMessageHolder<TTimeoutNowReques
 }
 
 void TRaft::OnConfigurationBarrier(TMessageHolder<TConfigurationBarrierRequest> request) {
-    const auto certifiedSnapshotLimit = request->Padding
-        ? uint64_t(request->Padding) * TAppendEntriesResponse::SnapshotSizeUnitBytes
+    const auto encodedSnapshotLimit = request->Padding &
+        ~TAppendEntriesResponse::SupportsApplicationSnapshotInstall;
+    const auto certifiedSnapshotLimit = encodedSnapshotLimit
+        ? uint64_t(encodedSnapshotLimit) * TAppendEntriesResponse::SnapshotSizeUnitBytes
         : uint64_t(TSnapshot::LegacyMaxBytes);
-    const bool accepted = certifiedSnapshotLimit <= TSnapshot::MaxBytes &&
+    const bool accepted =
+        (request->Padding & TAppendEntriesResponse::SupportsApplicationSnapshotInstall) &&
+        LocalApplicationSnapshotInstallSupport && certifiedSnapshotLimit <= TSnapshot::MaxBytes &&
         StateName == EState::FOLLOWER && IsVoter(request->LeaderId) &&
         VolatileState->LeaderId == request->LeaderId && Configuration &&
         !Configuration->HasUncommittedConfiguration() &&
@@ -2794,7 +2823,7 @@ void TRaft::OnConfigurationBarrier(ITimeSource::Time now,
 }
 
 void TRaft::MaybeDistributeConfigurationBarrier(ITimeSource::Time now) {
-    if (StateName != EState::LEADER || !Configuration ||
+    if (StateName != EState::LEADER || !LocalApplicationSnapshotInstallSupport || !Configuration ||
         Configuration->HasUncommittedConfiguration()) return;
     const auto index = Configuration->Committed.ConfigurationIndex();
     const auto term = Configuration->Committed.ConfigurationTerm();
@@ -2809,6 +2838,7 @@ void TRaft::MaybeDistributeConfigurationBarrier(ITimeSource::Time now) {
             lastSent == VolatileState->LastSentSeqno.end() ||
             !capability->second.ConfigurationBarrier ||
             !capability->second.InstallSnapshot ||
+            !capability->second.ApplicationSnapshotInstall ||
             capability->second.AppendAckSeqno != lastSent->second) return;
         maxSnapshotBytes = std::min(maxSnapshotBytes, capability->second.MaxSnapshotBytes);
     }
@@ -2839,7 +2869,7 @@ void TRaft::MaybeDistributeConfigurationBarrier(ITimeSource::Time now) {
             TConfigurationBarrierRequest{
                 .LeaderId = Id,
                 .Padding = TAppendEntriesResponse::EncodeConfigurationBarrierSnapshotLimit(
-                    maxSnapshotBytes, TSnapshot::LegacyMaxBytes),
+                    maxSnapshotBytes, TSnapshot::LegacyMaxBytes, true),
                 .ConfigurationIndex = index,
                 .ConfigurationTerm = term,
             });
@@ -2868,6 +2898,7 @@ TCompactionMembershipReadiness TRaft::CheckCompactionMembershipReadiness() const
     TCompactionMembershipReadiness readiness;
     readiness.IsLeader = StateName == EState::LEADER;
     readiness.IsActiveVoter = IsVoter(Id);
+    readiness.LocalApplicationSnapshotInstallSupported = LocalApplicationSnapshotInstallSupport;
     if (!Configuration || !readiness.IsActiveVoter) return readiness;
 
     readiness.ConfigurationIndex = Configuration->Committed.ConfigurationIndex();
@@ -2878,6 +2909,10 @@ TCompactionMembershipReadiness TRaft::CheckCompactionMembershipReadiness() const
             if (capability == VolatileState->PeerCapabilities.end() ||
                 capability->second.Term != State->CurrentTerm || !capability->second.InstallSnapshot)
                 readiness.ActiveVotersWithoutSnapshotInstallSupport.push_back(voter);
+            if (capability == VolatileState->PeerCapabilities.end() ||
+                capability->second.Term != State->CurrentTerm ||
+                !capability->second.ApplicationSnapshotInstall)
+                readiness.ActiveVotersWithoutApplicationSnapshotInstallSupport.push_back(voter);
         }
     }
     if (readiness.IsLeader) {
@@ -3036,6 +3071,10 @@ std::shared_ptr<const TSnapshot> TRaft::CompactShared() {
     const auto membershipReadiness = CheckCompactionMembershipReadiness();
     if (!membershipReadiness.ActiveVotersWithoutSnapshotInstallSupport.empty())
         throw std::logic_error("Compaction requires every active voter to advertise InstallSnapshot support");
+    if (!membershipReadiness.ActiveVotersWithoutApplicationSnapshotInstallSupport.empty())
+        throw std::logic_error("Compaction requires every active voter to support application snapshot installation");
+    if (!membershipReadiness.LocalApplicationSnapshotInstallSupported)
+        throw std::logic_error("Compaction requires the local application to support snapshot installation");
     if (!membershipReadiness.ActiveVotersWithoutConfigurationAck.empty())
         throw std::logic_error("Compaction requires every active voter to acknowledge the committed configuration");
     if (membershipReadiness.RequiresLeaderAcknowledgementBarrier &&
@@ -3043,6 +3082,8 @@ std::shared_ptr<const TSnapshot> TRaft::CompactShared() {
         throw std::logic_error("Compaction requires the leader's all-voter configuration acknowledgement barrier");
     auto application = SnapshotApplication.lock();
     if (!application) throw std::logic_error("Compaction requires a bound application");
+    if (!application->SupportsApplicationSnapshotInstall())
+        throw std::logic_error("Compaction requires the local application to support snapshot installation");
     if (application->LastAppliedIndex == State->SnapshotIndex && State->GetSnapshot()) return State->GetSnapshot();
     std::unordered_set<uint64_t> pinnedGenerations;
     for (const auto& [_, rpc] : VolatileState->SnapshotRpcs)
@@ -3831,6 +3872,7 @@ TRequestProcessor::TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_pt
                 throw std::invalid_argument("Retained idempotency log entries require an idempotent RSM");
     }
     Raft->SetLocalIdempotentLogSupport(supportsIdempotentLog);
+    Raft->SetLocalApplicationSnapshotInstallSupport(Rsm->SupportsApplicationSnapshotInstall());
     Raft->RestoreAppliedIndex(Rsm->LastAppliedIndex);
     Raft->SnapshotApplication = Rsm;
 }

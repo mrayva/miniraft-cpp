@@ -327,7 +327,9 @@ void test_fragmented_snapshot_request_and_response_roundtrip(void**) {
 void test_configuration_barrier_rpc_roundtrip(void**) {
     auto request = NewHoldedMessage(
         TMessageEx{.Src = 1, .Dst = 2, .Term = 3, .Seqno = 9},
-        TConfigurationBarrierRequest{.LeaderId = 1, .ConfigurationIndex = 12, .ConfigurationTerm = 2});
+        TConfigurationBarrierRequest{.LeaderId = 1,
+            .Padding = TAppendEntriesResponse::SupportsApplicationSnapshotInstall,
+            .ConfigurationIndex = 12, .ConfigurationTerm = 2});
     auto response = NewHoldedMessage(
         TMessageEx{.Src = 2, .Dst = 1, .Term = 3, .Seqno = 9},
         TConfigurationBarrierResponse{.ConfigurationIndex = 12, .ConfigurationTerm = 2, .Accepted = 1});
@@ -336,7 +338,8 @@ void test_configuration_barrier_rpc_roundtrip(void**) {
         TAppendEntriesResponse::SupportsSnapshotHistory32 |
         TAppendEntriesResponse::SupportsSnapshotHistory256 |
         TAppendEntriesResponse::SupportsSnapshotHistory1024 |
-        TAppendEntriesResponse::SupportsInstallSnapshot;
+        TAppendEntriesResponse::SupportsInstallSnapshot |
+        TAppendEntriesResponse::SupportsApplicationSnapshotInstall;
     auto appendResponse = NewHoldedMessage(
         TMessageEx{.Src = 2, .Dst = 1, .Term = 3, .Seqno = 10},
         TAppendEntriesResponse{.MatchIndex = 12, .Success = 1, .Padding = features});
@@ -349,6 +352,7 @@ void test_configuration_barrier_rpc_roundtrip(void**) {
     assert_true(receivedRequest.IsEx());
     auto barrier = receivedRequest.Cast<TConfigurationBarrierRequest>();
     assert_int_equal(barrier->LeaderId, 1);
+    assert_int_equal(barrier->Padding, TAppendEntriesResponse::SupportsApplicationSnapshotInstall);
     assert_int_equal(barrier->ConfigurationIndex, 12);
     auto receivedResponse = Read(stream);
     assert_true(receivedResponse.IsEx());

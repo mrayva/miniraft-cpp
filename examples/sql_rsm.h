@@ -47,6 +47,7 @@ public:
         const TSnapshotDataSource& source, uint64_t index) override;
     void ValidateSnapshot(std::string_view bytes, uint64_t index) const override;
     void LoadSnapshot(std::string_view bytes, uint64_t index) override;
+    bool SupportsApplicationSnapshotInstall() const override { return true; }
 
 private:
     int Execute(const std::string& q);

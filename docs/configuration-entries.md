@@ -35,6 +35,11 @@ a current-term capability response from every existing and proposed remote
 voter. Older binaries leave the reserved response bits zero and therefore block
 the change. This catches incomplete rolling upgrades before a joint entry can
 reach a voter that would apply fixed-membership quorum rules.
+Every voter in the proposed stable set must separately advertise application
+snapshot restore support; newly added voters must advertise storage and
+application snapshot installation support. This lets an operator remove a
+legacy voter that blocks compaction while preventing another incapable voter
+from replacing it.
 `GetConfigurationState()` returns a copy of the validated committed and latest
 configurations. During a pending joint entry, `Latest` is joint and `Committed`
 remains stable. After the joint entry commits but before its stable successor

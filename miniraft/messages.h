@@ -146,6 +146,12 @@ struct TAppendEntriesResponse: public TMessageEx {
     // Padding's upper bits carry the receiver's maximum snapshot image size in
     // 64 KiB units. A missing bit identifies a legacy peer with the 64 MiB cap.
     static constexpr uint32_t SupportsSnapshotSizeNegotiation = 1u << 9;
+    // Application snapshot restore is a separate requirement from the storage
+    // backend's ability to adopt the Raft snapshot. This high bit was outside
+    // the range emitted by the uint32_t size encoder and is ignored by older
+    // peers, which may decode it as a larger maximum that is still capped by
+    // their own TSnapshot::MaxBytes.
+    static constexpr uint32_t SupportsApplicationSnapshotInstall = 1u << 31;
     static constexpr uint32_t SnapshotSizeUnitBytes = 64u * 1024;
     static constexpr uint32_t SnapshotSizeShift = 10;
     static constexpr uint32_t EncodeSnapshotMaxBytes(uint32_t bytes) {
@@ -153,7 +159,8 @@ struct TAppendEntriesResponse: public TMessageEx {
             ((bytes / SnapshotSizeUnitBytes) << SnapshotSizeShift);
     }
     static constexpr uint64_t DecodeSnapshotMaxBytes(uint32_t padding) {
-        return uint64_t(padding >> SnapshotSizeShift) * SnapshotSizeUnitBytes;
+        return uint64_t((padding & ~SupportsApplicationSnapshotInstall) >> SnapshotSizeShift) *
+            SnapshotSizeUnitBytes;
     }
     static constexpr uint64_t DecodeSnapshotMaxBytesOrLegacy(
             uint32_t padding, uint64_t legacyMaxBytes) {
@@ -162,11 +169,14 @@ struct TAppendEntriesResponse: public TMessageEx {
             ? decoded : legacyMaxBytes;
     }
     static constexpr uint32_t EncodeConfigurationBarrierSnapshotLimit(
-            uint64_t maxBytes, uint64_t legacyMaxBytes) {
-        // Preserve the zero-padding certificate understood by nodes that
-        // support barriers but predate snapshot-size negotiation.
-        return maxBytes == legacyMaxBytes
+            uint64_t maxBytes, uint64_t legacyMaxBytes,
+            bool certifiesApplicationSnapshotInstall = false) {
+        // Preserve a zero size field for the legacy 64 MiB limit; a separate
+        // capability marker can still certify application restore support.
+        const auto limit = maxBytes == legacyMaxBytes
             ? 0u : uint32_t(maxBytes / SnapshotSizeUnitBytes);
+        return limit | (certifiesApplicationSnapshotInstall
+            ? SupportsApplicationSnapshotInstall : 0u);
     }
     // Success: matched index. Failure: zero or a compacted-boundary probe hint;
     // a hint never advances MatchIndex or confirms a read.
@@ -213,7 +223,8 @@ struct TConfigurationBarrierRequest: public TMessageEx {
     static constexpr EMessageType MessageType = EMessageType::CONFIGURATION_BARRIER_REQUEST;
     uint32_t LeaderId = 0;
     // Maximum snapshot size accepted by every active voter, in 64 KiB units.
-    // Zero is the legacy 64 MiB certificate.
+    // Zero is the legacy 64 MiB certificate. The high bit certifies that every
+    // voter can restore the application image as well as install it in storage.
     uint32_t Padding = 0;
     uint64_t ConfigurationIndex = 0, ConfigurationTerm = 0;
 };

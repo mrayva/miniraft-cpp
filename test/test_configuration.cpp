@@ -69,6 +69,7 @@ struct TSnapshotRsm : TCountingRsm {
         ValidateSnapshot(data, index);
         LastAppliedIndex = index;
     }
+    bool SupportsApplicationSnapshotInstall() const override { return true; }
 };
 TMessageHolder<TLogEntry> Ordinary(uint64_t term) {
     auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = term; return entry;
@@ -947,8 +948,10 @@ void test_compaction_membership_readiness_reports_acknowledgement_blockers(void*
         TNodeDict peers{{2, std::make_shared<TEndpoint>()}, {3, std::make_shared<TEndpoint>()}};
         TRaft raft(state, 1, peers);
         raft.Become(EState::LEADER);
+        raft.SetLocalApplicationSnapshotInstallSupport(true);
         auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
         volatileState->CommitAckIndex[2] = 2;
+        volatileState->PeerCapabilities[2].Term = state->CurrentTerm;
 
         auto readiness = raft.CheckCompactionMembershipReadiness();
         assert_int_equal(readiness.ConfigurationIndex, 3);
@@ -957,6 +960,7 @@ void test_compaction_membership_readiness_reports_acknowledgement_blockers(void*
         assert_false(readiness.RequiresLeaderAcknowledgementBarrier);
         assert_true(readiness.ActiveVotersWithoutConfigurationAck == (std::vector<uint32_t>{2}));
         assert_true(readiness.ActiveVotersWithoutSnapshotInstallSupport == (std::vector<uint32_t>{2}));
+        assert_true(readiness.ActiveVotersWithoutApplicationSnapshotInstallSupport == (std::vector<uint32_t>{2}));
         assert_false(readiness.Ready());
         std::string compactionError;
         try { (void)raft.Compact(); }
@@ -968,6 +972,16 @@ void test_compaction_membership_readiness_reports_acknowledgement_blockers(void*
         readiness = raft.CheckCompactionMembershipReadiness();
         assert_true(readiness.ActiveVotersWithoutSnapshotInstallSupport == (std::vector<uint32_t>{2}));
         volatileState->PeerCapabilities[2].InstallSnapshot = true;
+        readiness = raft.CheckCompactionMembershipReadiness();
+        assert_true(readiness.ActiveVotersWithoutSnapshotInstallSupport.empty());
+        assert_true(readiness.ActiveVotersWithoutApplicationSnapshotInstallSupport == (std::vector<uint32_t>{2}));
+        assert_false(readiness.Ready());
+        compactionError.clear();
+        try { (void)raft.Compact(); }
+        catch (const std::logic_error& error) { compactionError = error.what(); }
+        assert_string_equal(compactionError.c_str(),
+            "Compaction requires every active voter to support application snapshot installation");
+        volatileState->PeerCapabilities[2].ApplicationSnapshotInstall = true;
         volatileState->CommitAckIndex[2] = 3;
         volatileState->PeerCapabilities[2].Term = state->CurrentTerm - 1;
         readiness = raft.CheckCompactionMembershipReadiness();
@@ -982,12 +996,14 @@ void test_compaction_membership_readiness_reports_acknowledgement_blockers(void*
         volatileState->PeerCapabilities[2].Term = state->CurrentTerm;
         readiness = raft.CheckCompactionMembershipReadiness();
         assert_true(readiness.ActiveVotersWithoutSnapshotInstallSupport.empty());
+        assert_true(readiness.ActiveVotersWithoutApplicationSnapshotInstallSupport.empty());
         assert_true(readiness.Ready());
 
         raft.Become(EState::FOLLOWER);
         volatileState->PeerCapabilities.clear();
         readiness = raft.CheckCompactionMembershipReadiness();
         assert_true(readiness.ActiveVotersWithoutSnapshotInstallSupport.empty());
+        assert_true(readiness.ActiveVotersWithoutApplicationSnapshotInstallSupport.empty());
         assert_true(readiness.RequiresLeaderAcknowledgementBarrier);
         assert_false(readiness.HasLeaderAcknowledgementBarrier);
         assert_false(readiness.Ready());
@@ -1016,6 +1032,7 @@ void test_new_voter_requires_snapshot_install_capability(void**) {
         auto endpoint = std::make_shared<TEndpoint>();
         TRaft raft(state, 1, {{2, endpoint}}, {2});
         raft.Become(EState::LEADER);
+        raft.SetLocalApplicationSnapshotInstallSupport(true);
         auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
         volatileState->MatchIndex[2] = state->LastLogIndex;
         volatileState->CommitAckIndex[2] = state->CommitIndex;
@@ -1025,6 +1042,8 @@ void test_new_voter_requires_snapshot_install_capability(void**) {
         auto readiness = raft.CheckJointConfigurationReadiness({1, 2});
         assert_true(readiness.AddedVotersWithoutCommitAck.empty());
         assert_true(readiness.AddedVotersWithoutSnapshotInstallSupport == (std::vector<uint32_t>{2}));
+        assert_true(readiness.ProposedVotersWithoutApplicationSnapshotInstallSupport ==
+            (std::vector<uint32_t>{2}));
         assert_true(readiness.VotersWithoutJointConsensusSupport == (std::vector<uint32_t>{2}));
         assert_false(readiness.Ready());
         const auto before = static_cast<TStateFields>(*state);
@@ -1037,6 +1056,8 @@ void test_new_voter_requires_snapshot_install_capability(void**) {
         readiness = raft.CheckJointConfigurationReadiness({1, 2});
         assert_true(readiness.AddedVotersWithoutSnapshotInstallSupport.empty());
         assert_true(readiness.VotersWithoutJointConsensusSupport == (std::vector<uint32_t>{2}));
+        assert_true(readiness.ProposedVotersWithoutApplicationSnapshotInstallSupport ==
+            (std::vector<uint32_t>{2}));
         assert_false(readiness.Ready());
 
         volatileState->PeerCapabilities[2].JointConsensus = true;
@@ -1048,6 +1069,12 @@ void test_new_voter_requires_snapshot_install_capability(void**) {
         volatileState->PeerCapabilities[2].Term = state->CurrentTerm;
         readiness = raft.CheckJointConfigurationReadiness({1, 2});
         assert_true(readiness.VotersWithoutJointConsensusSupport.empty());
+        assert_true(readiness.ProposedVotersWithoutApplicationSnapshotInstallSupport == (std::vector<uint32_t>{2}));
+        assert_false(readiness.Ready());
+
+        volatileState->PeerCapabilities[2].ApplicationSnapshotInstall = true;
+        readiness = raft.CheckJointConfigurationReadiness({1, 2});
+        assert_true(readiness.ProposedVotersWithoutApplicationSnapshotInstallSupport.empty());
         assert_true(readiness.Ready());
 
         // A newer unacknowledged append makes the previous catch-up and
@@ -1089,6 +1116,7 @@ void test_joint_configuration_requires_every_member_capability(void**) {
         TRaft raft(state, 1, {{2, joining}, {3, existing}}, {2});
         raft.Become(EState::LEADER);
         raft.SetLocalIdempotentLogSupport(true);
+        raft.SetLocalApplicationSnapshotInstallSupport(true);
         auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
         volatileState->MatchIndex[2] = state->LastLogIndex;
         volatileState->CommitAckIndex[2] = state->CommitIndex;
@@ -1098,6 +1126,7 @@ void test_joint_configuration_requires_every_member_capability(void**) {
             .AppendAckSeqno = 1,
             .Term = state->CurrentTerm,
             .InstallSnapshot = true,
+            .ApplicationSnapshotInstall = true,
             .JointConsensus = true,
             .IdempotentLogEntries = true,
             .IdempotencyControlEntries = true,
@@ -1134,6 +1163,7 @@ void test_joint_configuration_requires_every_member_capability(void**) {
         assert_true(static_cast<TStateFields>(*state) == beforeMissingControlSupport);
 
         volatileState->PeerCapabilities[3].IdempotencyControlEntries = true;
+        volatileState->PeerCapabilities[3].ApplicationSnapshotInstall = true;
         readiness = raft.CheckJointConfigurationReadiness({1, 2, 3});
         assert_true(readiness.Ready());
         const auto jointIndex = raft.ProposeJointConfiguration({1, 2, 3});
@@ -1159,9 +1189,11 @@ void test_versioned_disk_state_can_start_voter_removal(void**) {
         auto peer3 = std::make_shared<TEndpoint>();
         TRaft raft(state, 1, {{2, peer2}, {3, peer3}});
         raft.Become(EState::LEADER);
+        raft.SetLocalApplicationSnapshotInstallSupport(true);
         auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
         volatileState->PeerCapabilities[2] = {
             .Term = state->CurrentTerm,
+            .ApplicationSnapshotInstall = true,
             .JointConsensus = true,
         };
         volatileState->PeerCapabilities[3] = {
@@ -1542,6 +1574,9 @@ void test_runtime_peer_provisioning_commits_joint_membership_across_replicas(voi
         TRaft leader(leaderState, 1, {{2, leaderToJoining}, {3, leaderToFollower}}, {2});
         TRaft follower(followerState, 3, {{1, followerToLeader}});
         TRaft joining(joiningState, 2, {{1, joiningToLeader}, {3, joiningToFollower}}, {2});
+        leader.SetLocalApplicationSnapshotInstallSupport(true);
+        follower.SetLocalApplicationSnapshotInstallSupport(true);
+        joining.SetLocalApplicationSnapshotInstallSupport(true);
 
         ITimeSource::Time rpcNow{};
         auto routeLeaderToJoining = [&](auto message) { joining.Process(rpcNow, std::move(message)); };
@@ -2115,6 +2150,8 @@ void test_joint_membership_addition_and_finalization_replicate_deterministically
         auto learnerState = std::make_shared<TDurableState>(name, 2);
         TRaft leader(leaderState, 1, {{2, toLearner}}, {2});
         TRaft learner(learnerState, 2, {{1, toLeader}}, {2});
+        leader.SetLocalApplicationSnapshotInstallSupport(true);
+        learner.SetLocalApplicationSnapshotInstallSupport(true);
         const auto now = ITimeSource::Time{};
         auto rpcNow = now;
         toLearner->Route = [&](auto message) { learner.Process(rpcNow, std::move(message)); };
@@ -2324,6 +2361,7 @@ void test_live_joint_transition_waits_for_both_nontrivial_majorities(void**) {
                         .Seqno = append->Seqno},
                         TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1,
                             .Padding = TAppendEntriesResponse::SupportsInstallSnapshot |
+                                TAppendEntriesResponse::SupportsApplicationSnapshotInstall |
                                 TAppendEntriesResponse::SupportsJointConsensus}));
                 return matchIndex;
             };
@@ -2652,6 +2690,8 @@ void test_live_disjoint_joint_entry_waits_for_old_majority_over_network(void**) 
             if (peer != id) peers.emplace(peer, endpoints[id][peer]);
         rafts[id] = std::make_shared<TRaft>(states[id], id, peers, newVoters);
     }
+    for (uint32_t id = 1; id <= 6; ++id)
+        rafts[id]->SetLocalApplicationSnapshotInstallSupport(true);
     for (uint32_t from = 1; from <= 6; ++from) {
         for (uint32_t to = 1; to <= 6; ++to) {
             if (from == to) continue;
@@ -2771,7 +2811,8 @@ void test_joint_strong_read_waits_for_both_disjoint_majorities(void**) {
                     NewHoldedMessage(TMessageEx{.Src = voter, .Dst = 4, .Term = append->Term,
                         .Seqno = append->Seqno},
                         TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1,
-                            .Padding = TAppendEntriesResponse::SupportsInstallSnapshot}));
+                            .Padding = TAppendEntriesResponse::SupportsInstallSnapshot |
+                                TAppendEntriesResponse::SupportsApplicationSnapshotInstall}));
                 return matchIndex;
             };
 
@@ -2840,6 +2881,8 @@ void test_timeout_now_retries_and_falls_back_under_joint_quorum(void**) {
             auto learnerState = std::make_shared<TDurableState>(name, 2);
             TRaft leader(leaderState, 1, {{2, toLearner}}, {2});
             TRaft learner(learnerState, 2, {{1, toLeader}}, {2});
+            leader.SetLocalApplicationSnapshotInstallSupport(true);
+            learner.SetLocalApplicationSnapshotInstallSupport(true);
             const auto start = ITimeSource::Time{};
             auto rpcNow = start;
             unsigned timeoutNowRequests = 0;
@@ -3063,7 +3106,8 @@ void test_old_side_leader_can_transfer_after_joint_snapshot_with_pending_stable_
                 .Seqno = append->Cast<TMessageEx>()->Seqno},
                 TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1,
                     .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier |
-                        TAppendEntriesResponse::SupportsInstallSnapshot}));
+                        TAppendEntriesResponse::SupportsInstallSnapshot |
+                        TAppendEntriesResponse::SupportsApplicationSnapshotInstall}));
         return matchIndex;
     };
     const auto firstProbe = acknowledgeTargetAppend(1, targetToOne);
@@ -4195,7 +4239,8 @@ void test_raft_recovers_joint_quorum_for_candidate_election(void**) {
             raft->Process(now + std::chrono::milliseconds(responseMillis),
                 NewHoldedMessage(TMessageEx{.Src = source, .Dst = 4, .Term = 3, .Seqno = request->Seqno},
                     TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1,
-                        .Padding = TAppendEntriesResponse::SupportsInstallSnapshot}));
+                        .Padding = TAppendEntriesResponse::SupportsInstallSnapshot |
+                            TAppendEntriesResponse::SupportsApplicationSnapshotInstall}));
         };
         ack(3, 1, 3);
         ack(5, 1, 3);

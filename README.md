@@ -115,8 +115,11 @@ learners have a separate bootstrap path. These formats cannot recover a stale
 store across an unknown membership transition; recovery may require a fresh
 learner if the trusted history anchor predates the metadata the peer supports.
 Leader compaction rejects active voters that advertise no storage support for
-InstallSnapshot. Offline peers must still support it when they return;
-application capture and restore callbacks remain a deployment requirement.
+InstallSnapshot or application snapshot restore. Offline peers must still
+advertise both capabilities when they return. Custom RSMs default to
+unsupported and must opt in after implementing complete validation and atomic
+restore; older peers cannot distinguish application restore from storage
+installation.
 The [stable snapshot membership follow-up](docs/stable-snapshot-membership-install.md)
 documents the committed-history checks for snapshot transfer after a voter
 change.

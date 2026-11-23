@@ -432,6 +432,15 @@ void test_server_stages_and_removes_runtime_learner(void**) {
 
 void test_server_forwards_successful_membership_operations(void**) {
 #ifdef __linux__
+    struct TMembershipRsm : IRsm {
+        TMessageHolder<TMessage> Read(TMessageHolder<TCommandRequest>, uint64_t) override { return {}; }
+        TMessageHolder<TMessage> Write(TMessageHolder<TLogEntry>, uint64_t) override { return {}; }
+        TMessageHolder<TLogEntry> Prepare(TMessageHolder<TCommandRequest>) override { return {}; }
+        std::string SaveSnapshot() const override { return {}; }
+        void ValidateSnapshot(std::string_view, uint64_t) const override { }
+        void LoadSnapshot(std::string_view, uint64_t index) override { LastAppliedIndex = index; }
+        bool SupportsApplicationSnapshotInstall() const override { return true; }
+    };
     struct TEndpoint : INode {
         std::function<void(TMessageHolder<TMessage>)> Route;
         bool SawTimeoutNow = false;
@@ -455,7 +464,7 @@ void test_server_forwards_successful_membership_operations(void**) {
         auto makeServer = [&](const std::shared_ptr<TRaft>& raft, const TNodeDict& peers) {
             NNet::TSocket listener(NNet::TAddress{"127.0.0.1", 0}, loop.Poller());
             return std::make_unique<TRaftServer<NNet::TSocket>>(
-                loop.Poller(), std::move(listener), raft, std::make_shared<TDummyRsm>(), peers, timeSource);
+                loop.Poller(), std::move(listener), raft, std::make_shared<TMembershipRsm>(), peers, timeSource);
         };
         const std::vector<uint32_t> oldVoters{1, 2};
         const std::vector<uint32_t> newVoters{2, 3};
@@ -481,6 +490,8 @@ void test_server_forwards_successful_membership_operations(void**) {
         }
         for (uint32_t id = 1; id <= 3; ++id)
             rafts[id] = std::make_shared<TRaft>(states[id], id, peers[id], std::vector<uint32_t>{3});
+        for (uint32_t id = 1; id <= 3; ++id)
+            rafts[id]->SetLocalApplicationSnapshotInstallSupport(true);
         for (uint32_t from = 1; from <= 3; ++from) {
             for (uint32_t to = 1; to <= 3; ++to) {
                 if (from == to) continue;
@@ -585,6 +596,7 @@ int RunSocketJointSnapshotMembershipTest(const std::filesystem::path& dir) {
             LastAppliedIndex = index;
             ++Loads;
         }
+        bool SupportsApplicationSnapshotInstall() const override { return true; }
     };
     struct TDummyPeer : INode {
         void Send(TMessageHolder<TMessage>) override { }
@@ -726,6 +738,8 @@ int RunSocketJointSnapshotMembershipTest(const std::filesystem::path& dir) {
         printMissing("missing targets", readiness.MissingPeerTargets);
         printMissing("added voter commit ACKs", readiness.AddedVotersWithoutCommitAck);
         printMissing("snapshot support", readiness.AddedVotersWithoutSnapshotInstallSupport);
+        printMissing("application snapshot install support",
+            readiness.ProposedVotersWithoutApplicationSnapshotInstallSupport);
         printMissing("joint support", readiness.VotersWithoutJointConsensusSupport);
         return 5;
     }
@@ -810,6 +824,8 @@ int RunSocketJointSnapshotMembershipTest(const std::filesystem::path& dir) {
     const auto compactionReady = [&] {
         const auto readiness = servers[2]->CheckCompactionMembershipReadiness();
         return readiness.ActiveVotersWithoutSnapshotInstallSupport.empty() &&
+            readiness.ActiveVotersWithoutApplicationSnapshotInstallSupport.empty() &&
+            readiness.LocalApplicationSnapshotInstallSupported &&
             readiness.ActiveVotersWithoutConfigurationAck.empty() &&
             (!readiness.RequiresLeaderAcknowledgementBarrier || readiness.HasLeaderAcknowledgementBarrier);
     };
