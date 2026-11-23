@@ -1,6 +1,6 @@
 # Design: streamed application snapshots
 
-This design describes the staged work to remove the current 64 MiB
+This design describes the staged work to remove the current 128 MiB
 complete-image limit. The application capture-source API and optional receive
 staging files are implemented. Durable application generations and
 crash-recoverable activation remain open. The current
@@ -15,7 +15,7 @@ membership metadata, before calling `SaveSnapshot()`. The KV example reports
 its encoded size and the SQL example reports its database page-size bound. An
 application that does not implement the callback keeps the legacy post-capture
 size check. This preflight still uses complete in-memory images and does not
-change the 64 MiB limit.
+change the 128 MiB limit.
 
 `IStreamingSnapshotRsm::OpenSnapshotSource(index)` now optionally returns an immutable,
 range-readable source for exactly the requested applied index. Capture retains
@@ -32,7 +32,7 @@ example backs up into a private temporary database with a bounded SQLite page
 cache and serves ranges from a read-only file descriptor. This avoids a
 full-size `sqlite3_serialize()` allocation and a second complete payload
 allocation during capture. Durable publication still copies ranges into its own
-snapshot generation, and images remain capped at 64 MiB. Non-Linux builds
+snapshot generation, and images remain capped at 128 MiB. Non-Linux builds
 retain the in-memory serialized source.
 
 `IStreamingSnapshotWriterRsm` is an alternative for applications that generate
@@ -109,7 +109,7 @@ active snapshot pins its anonymous receive file or durable snapshot mapping
 until replaced and all transfer pins are released. Retained anonymous receive
 files remain charged to the shared staging quota; durable storage's own snapshot
 files are governed by its storage and filesystem capacity. Partial transfers
-restart at offset zero after process restart. The wire format, 64 MiB limit and
+restart at offset zero after process restart. The wire format, 128 MiB limit and
 publication, application-installation and acknowledgement ordering stay the same.
 
 After a full transfer's metadata is verified, intermediate payload chunks
@@ -191,7 +191,8 @@ Add an optional streaming application interface alongside the existing
 string-based callbacks. It should expose a snapshot source for capture and a
 staging writer for installation, with explicit `Publish`, `Activate` and
 `Abort` operations. Existing applications continue using the current API and
-64 MiB format. Streaming applications opt in only when their storage can keep
+128 MiB format. Peers without size negotiation remain limited to 64 MiB.
+Streaming applications opt in only when their storage can keep
 immutable generations durable across restart.
 
 The Raft storage interface needs a manifest plus generation reference instead

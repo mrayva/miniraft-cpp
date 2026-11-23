@@ -25,6 +25,19 @@
 
 namespace {
 
+uint32_t LocalAppendCapabilityBits(const IState& state, bool idempotentLogSupport) {
+    return TAppendEntriesResponse::EncodeSnapshotMaxBytes(uint32_t(TSnapshot::MaxBytes)) |
+        TAppendEntriesResponse::SupportsConfigurationBarrier |
+        TAppendEntriesResponse::SupportsSnapshotHistory256 |
+        TAppendEntriesResponse::SupportsSnapshotHistory1024 |
+        (state.SupportsInstallSnapshot() ? TAppendEntriesResponse::SupportsInstallSnapshot : 0u) |
+        TAppendEntriesResponse::SupportsSnapshotHistory32 |
+        TAppendEntriesResponse::SupportsSnapshotLineage |
+        TAppendEntriesResponse::SupportsJointConsensus |
+        (idempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotentLogEntries : 0u) |
+        (idempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotencyControlEntries : 0u);
+}
+
 uint64_t AllocateForwardingSession() {
     static std::atomic<uint64_t> next{1};
     auto current = next.load(std::memory_order_relaxed);
@@ -1451,15 +1464,7 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             TAppendEntriesResponse {
                 .MatchIndex = 0,
                 .Success = false,
-                .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier |
-                    TAppendEntriesResponse::SupportsSnapshotHistory256 |
-                    TAppendEntriesResponse::SupportsSnapshotHistory1024 |
-                    (State->SupportsInstallSnapshot() ? TAppendEntriesResponse::SupportsInstallSnapshot : 0u) |
-                    TAppendEntriesResponse::SupportsSnapshotHistory32 |
-                    TAppendEntriesResponse::SupportsSnapshotLineage |
-                    TAppendEntriesResponse::SupportsJointConsensus |
-                    (LocalIdempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotentLogEntries : 0u) |
-                    (LocalIdempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotencyControlEntries : 0u),
+                .Padding = LocalAppendCapabilityBits(*State, LocalIdempotentLogSupport),
             });
         (void)Nodes[reply->Dst]->TrySend(std::move(reply));
         return;
@@ -1578,15 +1583,7 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
         TAppendEntriesResponse {
             .MatchIndex = matchIndex,
             .Success = success,
-            .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier |
-                TAppendEntriesResponse::SupportsSnapshotHistory256 |
-                TAppendEntriesResponse::SupportsSnapshotHistory1024 |
-                (State->SupportsInstallSnapshot() ? TAppendEntriesResponse::SupportsInstallSnapshot : 0u) |
-                TAppendEntriesResponse::SupportsSnapshotHistory32 |
-                TAppendEntriesResponse::SupportsSnapshotLineage |
-                TAppendEntriesResponse::SupportsJointConsensus |
-                (LocalIdempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotentLogEntries : 0u) |
-                (LocalIdempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotencyControlEntries : 0u),
+            .Padding = LocalAppendCapabilityBits(*State, LocalIdempotentLogSupport),
         });
 
     AdvanceCommitIndex(commitIndex);
@@ -1623,6 +1620,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
     if (message->Seqno >= capabilities.AppendAckSeqno) {
         capabilities.AppendAckSeqno = message->Seqno;
         capabilities.Term = message->Term;
+        capabilities.MaxSnapshotBytes = TAppendEntriesResponse::DecodeSnapshotMaxBytesOrLegacy(
+            message->Padding, TSnapshot::LegacyMaxBytes);
         capabilities.ConfigurationBarrier =
             message->Padding & TAppendEntriesResponse::SupportsConfigurationBarrier;
         capabilities.SnapshotLineage =
@@ -2008,8 +2007,11 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
     }
     case EMessageType::CONFIGURATION_BARRIER_REQUEST: {
         auto request = message.Cast<TConfigurationBarrierRequest>();
+        const auto certifiedSnapshotLimit = request->Padding
+            ? uint64_t(request->Padding) * TAppendEntriesResponse::SnapshotSizeUnitBytes
+            : uint64_t(TSnapshot::LegacyMaxBytes);
         return header->Term == State->CurrentTerm && request->LeaderId == header->Src &&
-            request->Padding == 0 &&
+            certifiedSnapshotLimit <= TSnapshot::MaxBytes &&
             request->ConfigurationIndex <= maxIndex &&
             request->ConfigurationTerm <= header->Term &&
             ((request->ConfigurationIndex == 0) == (request->ConfigurationTerm == 0));
@@ -2228,10 +2230,12 @@ void TRaft::LeaderTimeout(ITimeSource::Time now) {
             VolatileState->RpcDue[id] = now + TTimeout::Rpc;
             if (VolatileState->NextIndex[id] <= State->SnapshotIndex) {
                 const auto capability = VolatileState->PeerCapabilities.find(id);
-                if (capability != VolatileState->PeerCapabilities.end() && capability->second.InstallSnapshot)
-                    (void)node->TrySend(CreateInstallSnapshot(id));
-                else
+                if (capability != VolatileState->PeerCapabilities.end() && capability->second.InstallSnapshot) {
+                    if (auto snapshot = CreateInstallSnapshot(id))
+                        (void)node->TrySend(std::move(snapshot));
+                } else {
                     (void)node->TrySend(CreateAppendEntries(id, true));
+                }
             } else {
                 (void)node->TrySend(CreateAppendEntries(id));
             }
@@ -2309,10 +2313,12 @@ uint64_t TRaft::ApproveRead() {
     for (auto& [id, node] : Nodes) {
         if (VolatileState->NextIndex[id] <= State->SnapshotIndex) {
             const auto capability = VolatileState->PeerCapabilities.find(id);
-            if (capability != VolatileState->PeerCapabilities.end() && capability->second.InstallSnapshot)
-                (void)node->TrySend(CreateInstallSnapshot(id));
-            else
+            if (capability != VolatileState->PeerCapabilities.end() && capability->second.InstallSnapshot) {
+                if (auto snapshot = CreateInstallSnapshot(id))
+                    (void)node->TrySend(std::move(snapshot));
+            } else {
                 (void)node->TrySend(CreateAppendEntries(id, true));
+            }
         } else {
             (void)node->TrySend(CreateAppendEntries(id));
         }
@@ -2737,13 +2743,18 @@ void TRaft::OnTimeoutNow(ITimeSource::Time now, TMessageHolder<TTimeoutNowReques
 }
 
 void TRaft::OnConfigurationBarrier(TMessageHolder<TConfigurationBarrierRequest> request) {
-    const bool accepted = StateName == EState::FOLLOWER && IsVoter(request->LeaderId) &&
+    const auto certifiedSnapshotLimit = request->Padding
+        ? uint64_t(request->Padding) * TAppendEntriesResponse::SnapshotSizeUnitBytes
+        : uint64_t(TSnapshot::LegacyMaxBytes);
+    const bool accepted = certifiedSnapshotLimit <= TSnapshot::MaxBytes &&
+        StateName == EState::FOLLOWER && IsVoter(request->LeaderId) &&
         VolatileState->LeaderId == request->LeaderId && Configuration &&
         !Configuration->HasUncommittedConfiguration() &&
         Configuration->Committed.ConfigurationIndex() == request->ConfigurationIndex &&
         Configuration->Committed.ConfigurationTerm() == request->ConfigurationTerm;
     if (accepted) {
         VolatileState->CompactionSafeConfigurationTerm = request->Term;
+        VolatileState->CompactionSafeMaxSnapshotBytes = certifiedSnapshotLimit;
         if (!request->ConfigurationIndex) {
             VolatileState->HasCompactionSafeInitialConfigurationBarrier = true;
         } else {
@@ -2787,6 +2798,7 @@ void TRaft::MaybeDistributeConfigurationBarrier(ITimeSource::Time now) {
         Configuration->HasUncommittedConfiguration()) return;
     const auto index = Configuration->Committed.ConfigurationIndex();
     const auto term = Configuration->Committed.ConfigurationTerm();
+    uint64_t maxSnapshotBytes = TSnapshot::MaxBytes;
     for (auto voter : Voters) {
         if (voter == Id) continue;
         const auto ack = VolatileState->CommitAckIndex.find(voter);
@@ -2798,6 +2810,14 @@ void TRaft::MaybeDistributeConfigurationBarrier(ITimeSource::Time now) {
             !capability->second.ConfigurationBarrier ||
             !capability->second.InstallSnapshot ||
             capability->second.AppendAckSeqno != lastSent->second) return;
+        maxSnapshotBytes = std::min(maxSnapshotBytes, capability->second.MaxSnapshotBytes);
+    }
+
+    if (VolatileState->CompactionSafeMaxSnapshotBytes != maxSnapshotBytes) {
+        VolatileState->CompactionSafeMaxSnapshotBytes = maxSnapshotBytes;
+        VolatileState->ConfigurationBarrierRpcs.clear();
+        VolatileState->ConfigurationBarrierAckIndex.clear();
+        VolatileState->ConfigurationBarrierAckDue.clear();
     }
 
     VolatileState->CompactionSafeConfigurationIndex = std::max(
@@ -2818,6 +2838,8 @@ void TRaft::MaybeDistributeConfigurationBarrier(ITimeSource::Time now) {
             TMessageEx{.Src = Id, .Dst = voter, .Term = State->CurrentTerm, .Seqno = seqno},
             TConfigurationBarrierRequest{
                 .LeaderId = Id,
+                .Padding = TAppendEntriesResponse::EncodeConfigurationBarrierSnapshotLimit(
+                    maxSnapshotBytes, TSnapshot::LegacyMaxBytes),
                 .ConfigurationIndex = index,
                 .ConfigurationTerm = term,
             });
@@ -3029,6 +3051,25 @@ std::shared_ptr<const TSnapshot> TRaft::CompactShared() {
         throw std::runtime_error("Compaction deferred while snapshot transfers pin multiple generations");
     auto captured = CaptureSnapshot(*this, *application, SnapshotInstallBudget);
     auto snapshot = std::make_shared<const TSnapshot>(std::move(captured));
+    uint64_t maxSnapshotBytes = TSnapshot::MaxBytes;
+    if (membershipReadiness.IsLeader) {
+        for (auto voter : Voters) {
+            if (voter == Id) continue;
+            const auto capability = VolatileState->PeerCapabilities.find(voter);
+            maxSnapshotBytes = std::min(maxSnapshotBytes,
+                capability == VolatileState->PeerCapabilities.end()
+                    ? uint64_t(TSnapshot::LegacyMaxBytes) : capability->second.MaxSnapshotBytes);
+        }
+    } else if (membershipReadiness.RequiresLeaderAcknowledgementBarrier) {
+        maxSnapshotBytes = VolatileState->CompactionSafeMaxSnapshotBytes;
+    } else if (!membershipReadiness.IsActiveVoter) {
+        // Learners have no all-voter certificate. Keep their locally compacted
+        // image consumable by legacy voters if this node is later promoted.
+        maxSnapshotBytes = TSnapshot::LegacyMaxBytes;
+    }
+    const auto encoding = PrepareSnapshotEncoding(*snapshot);
+    if (SnapshotEncodingSize(*encoding) > maxSnapshotBytes)
+        throw std::logic_error("Snapshot exceeds the maximum size accepted by an active voter");
     if (snapshot->DataSource) {
         // Validate through the range-based installer when available. Legacy
         // application validators still receive a materialized payload.
@@ -3062,10 +3103,10 @@ std::shared_ptr<const TSnapshot> TRaft::CompactShared() {
     return snapshot;
 }
 
-TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t nodeId) {
-    if (auto capability = VolatileState->PeerCapabilities.find(nodeId);
-        capability != VolatileState->PeerCapabilities.end())
-        capability->second.AppendAckSeqno = 0; // Require a fresh AppendEntries capability ACK afterward.
+TMessageHolder<TMessage> TRaft::CreateInstallSnapshot(uint32_t nodeId) {
+    const auto capability = VolatileState->PeerCapabilities.find(nodeId);
+    const auto maxSnapshotBytes = capability == VolatileState->PeerCapabilities.end()
+        ? uint64_t(TSnapshot::LegacyMaxBytes) : capability->second.MaxSnapshotBytes;
     auto& rpc = VolatileState->SnapshotRpcs[nodeId];
     if (!rpc.Snapshot) {
         auto snapshot = State->GetSnapshot();
@@ -3139,6 +3180,12 @@ TMessageHolder<TInstallSnapshotRequest> TRaft::CreateInstallSnapshot(uint32_t no
     // start a separate transfer of the newest image.
     const auto& snapshot = rpc.Snapshot;
     const auto totalBytes = SnapshotEncodingSize(*rpc.Encoding);
+    if (totalBytes > maxSnapshotBytes) {
+        VolatileState->SnapshotRpcs.erase(nodeId);
+        return {};
+    }
+    if (capability != VolatileState->PeerCapabilities.end())
+        capability->second.AppendAckSeqno = 0; // Require a fresh AppendEntries capability ACK afterward.
     const auto count = std::min<uint64_t>(TInstallSnapshotRequest::MaxChunkBytes, totalBytes - rpc.Offset);
     auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
     request->Src = Id; request->Dst = nodeId; request->Term = State->CurrentTerm;

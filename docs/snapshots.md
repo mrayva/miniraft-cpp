@@ -62,9 +62,16 @@ The versioned image contains little-endian fields in this order:
 | Application bytes | declared length |
 | CRC32 covering every preceding byte | 4 |
 
-The complete image is capped at 64 MiB and the voter count at 4,096. Decoding
+The complete image is capped at 128 MiB and the voter count at 4,096. Decoding
 checks lengths/counts against remaining input before allocation/copying, rejects
 unknown versions and trailing bytes, and validates metadata after CRC verification.
+AppendEntries capability acknowledgements advertise each peer's image limit;
+older peers without that bit are treated as accepting at most 64 MiB. The
+leader's current-term all-voter compaction certificate carries the minimum limit,
+so an image above 64 MiB is compacted only when every active voter accepts it.
+Learners without that certificate retain the 64 MiB local-compaction limit.
+Older binaries cannot reopen a snapshot larger than 64 MiB, so do not downgrade
+while any node's authoritative snapshot exceeds that legacy limit.
 The KV payload has its own `MRKV0001` version, count and length-prefixed entries.
 
 TSnapshotStore takes an exclusive advisory writer lock and publishes through temp

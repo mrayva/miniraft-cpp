@@ -34,15 +34,18 @@ MRFTS004 places the lineage fields after the stable configuration index/term,
 then stores the active and predecessor voter lists before application data.
 MRFTS005 places them after the joint new-voter count, then stores the old,
 new, and predecessor voter lists. Both formats retain the CRC32 trailer and the
-64 MiB snapshot bound.
+128 MiB snapshot bound. Peers without snapshot-size negotiation remain limited
+to 64 MiB; the all-voter compaction barrier certifies the limit accepted by the
+active configuration.
 
 MRFTS006 through MRFTS011 keep the corresponding MRFTS004/MRFTS005 header and
 voter lists, then append transition count[4] and transition records before
 application data. A record stores six 64-bit index/term fields, old and new
 voter counts[4 each], and sorted old and new voter IDs[4 each]. MRFTS006/007
 accept at most 32 records; MRFTS008/009 accept at most 256; MRFTS010/011
-accept at most 1,024. All retain the CRC32 trailer and the 64 MiB total
-snapshot bound.
+accept at most 1,024. All retain the CRC32 trailer and the 128 MiB total
+snapshot bound. A peer without snapshot-size negotiation remains limited to
+64 MiB.
 
 `TConfigurationHistory::FromStableSnapshot` initializes offline history from
 this identity. The retained-log scanner checks the baseline identity against

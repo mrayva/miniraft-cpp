@@ -21,8 +21,11 @@ remain readable.
 The disk backend writes the encoded snapshot sidecar in 64 KiB ranges, avoiding
 an additional full-size encoded string. Recovery decodes the owned sidecar
 buffer in place, avoiding a second heap allocation for the application payload.
-Snapshot capture and InstallSnapshot still hold a complete image in memory and
-retain the 64 MiB limit.
+Snapshot capture and InstallSnapshot support complete images up to 128 MiB.
+Peers that do not advertise the snapshot-size capability remain limited to
+64 MiB; the leader includes the minimum active-voter limit in its configuration
+barrier before allowing compaction. Learners without that all-voter certificate
+also keep the 64 MiB local-compaction limit.
 
 ## Operation and compatibility
 
@@ -139,7 +142,9 @@ responses. A request identifies leader/term, boundary index/term, total image si
 offset and final-chunk flag. Responses carry the boundary, next offset, success
 and an explicit Installed flag. Seqno correlates acknowledgements to the active
 per-peer RPC. Frames are capped at a 64 KiB body before allocation; complete
-images remain bounded at 64 MiB with at most 4,096 fixed voters.
+images remain bounded at 128 MiB with at most 4,096 fixed voters. The existing
+AppendEntries response padding carries the receiver's limit in 64 KiB units. A
+peer without the negotiation bit is treated as a 64 MiB receiver.
 
 Leaders use stop-and-wait chunks when NextIndex is at or below their compacted
 boundary. Offset and RPC context survive retries within the leadership term;

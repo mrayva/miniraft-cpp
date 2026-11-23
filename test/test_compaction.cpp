@@ -137,6 +137,36 @@ struct TOversizedBoundApplication : TKv {
     std::optional<uint64_t> SnapshotSizeUpperBound() const override { return TSnapshot::MaxBytes; }
     std::string SaveSnapshot() const override { ++SaveCalls; return "oversized"; }
 };
+struct TGeneratedSnapshotDataSource : TSnapshotDataSource, ISnapshotSource {
+    uint64_t Bytes;
+    explicit TGeneratedSnapshotDataSource(uint64_t bytes) : Bytes(bytes) { }
+    uint64_t Size() const override { return Bytes; }
+    size_t Read(uint64_t offset, std::span<char> destination) const override {
+        if (offset >= Bytes || destination.empty()) return 0;
+        const auto count = size_t(std::min<uint64_t>(destination.size(), Bytes - offset));
+        memset(destination.data(), 's', count);
+        return count;
+    }
+};
+struct TNoopSnapshotInstallation : IStagedSnapshotInstallation {
+    void Install() override { }
+};
+struct TLargeSourceSnapshotApplication : IRsm, IStreamingSnapshotRsm, IStreamingSnapshotInstallRsm {
+    uint64_t Bytes = uint64_t(TSnapshot::LegacyMaxBytes) + 1;
+    TMessageHolder<TMessage> Read(TMessageHolder<TCommandRequest>, uint64_t) override { return {}; }
+    TMessageHolder<TMessage> Write(TMessageHolder<TLogEntry>, uint64_t) override { return {}; }
+    TMessageHolder<TLogEntry> Prepare(TMessageHolder<TCommandRequest>) override { return {}; }
+    std::optional<uint64_t> SnapshotSizeUpperBound() const override { return Bytes; }
+    std::shared_ptr<const ISnapshotSource> OpenSnapshotSource(uint64_t) const override {
+        return std::make_shared<TGeneratedSnapshotDataSource>(Bytes);
+    }
+    void ValidateSnapshot(std::string_view, uint64_t) const override { }
+    std::unique_ptr<IStagedSnapshotInstallation> PrepareSnapshotInstallation(
+            const TSnapshotDataSource&, uint64_t) override {
+        return std::make_unique<TNoopSnapshotInstallation>();
+    }
+    void LoadSnapshot(std::string_view, uint64_t index) override { LastAppliedIndex = index; }
+};
 void test_kv_snapshot_precomputes_size_without_changing_encoding(void**) {
     TKv source;
     const std::string binaryKey("a\0", 2), binaryValue("\0v", 2);
@@ -451,6 +481,129 @@ void test_zero_index_follower_compaction_waits_for_capability_barrier(void**) {
     followerState->HasCompactionSafeInitialConfigurationBarrier = true;
     assert_true(cluster.Nodes[1]->CheckCompactionMembershipReadiness().Ready());
     assert_true(cluster.Nodes[1]->Compact().Index > 0);
+}
+void test_snapshot_size_negotiation_keeps_legacy_fallback_and_certifies_voter_limit(void**) {
+    constexpr auto legacyLimit = uint64_t(TSnapshot::LegacyMaxBytes);
+    constexpr auto currentLimit = uint64_t(TSnapshot::MaxBytes);
+    const auto legacyPadding = uint32_t(0);
+    const auto emptyNegotiatedPadding = TAppendEntriesResponse::SupportsSnapshotSizeNegotiation;
+    const auto currentPadding = TAppendEntriesResponse::EncodeSnapshotMaxBytes(
+        uint32_t(TSnapshot::MaxBytes));
+    assert_int_equal(TAppendEntriesResponse::DecodeSnapshotMaxBytesOrLegacy(legacyPadding, legacyLimit),
+        legacyLimit);
+    assert_int_equal(TAppendEntriesResponse::DecodeSnapshotMaxBytesOrLegacy(
+        emptyNegotiatedPadding, legacyLimit), legacyLimit);
+    assert_int_equal(TAppendEntriesResponse::DecodeSnapshotMaxBytesOrLegacy(currentPadding, legacyLimit),
+        currentLimit);
+    assert_int_equal(TAppendEntriesResponse::EncodeConfigurationBarrierSnapshotLimit(
+        legacyLimit, legacyLimit), 0);
+    assert_int_equal(TAppendEntriesResponse::EncodeConfigurationBarrierSnapshotLimit(
+        currentLimit, legacyLimit), currentLimit / TAppendEntriesResponse::SnapshotSizeUnitBytes);
+
+    TCluster cluster;
+    cluster.Elect(1);
+    cluster.Pump(1);
+    assert_int_equal(cluster.Nodes[0]->GetVolatileState()->PeerCapabilities.at(2).MaxSnapshotBytes,
+        currentLimit);
+    assert_int_equal(cluster.Nodes[0]->GetVolatileState()->PeerCapabilities.at(3).MaxSnapshotBytes,
+        currentLimit);
+    assert_int_equal(cluster.Nodes[1]->GetVolatileState()->CompactionSafeMaxSnapshotBytes, currentLimit);
+    assert_int_equal(cluster.Nodes[2]->GetVolatileState()->CompactionSafeMaxSnapshotBytes, currentLimit);
+
+    auto* firstFollowerState = const_cast<TVolatileState*>(cluster.Nodes[1]->GetVolatileState());
+    firstFollowerState->CompactionSafeMaxSnapshotBytes = legacyLimit;
+    auto impossibleCertificate = NewHoldedMessage(
+        TMessageEx{.Src = 1, .Dst = 2, .Term = cluster.Nodes[0]->GetState()->CurrentTerm, .Seqno = 999},
+        TConfigurationBarrierRequest{
+            .LeaderId = 1,
+            .Padding = uint32_t(currentLimit / TAppendEntriesResponse::SnapshotSizeUnitBytes + 1),
+            .ConfigurationIndex = 0,
+            .ConfigurationTerm = 0,
+        });
+    cluster.Nodes[1]->Process(cluster.Now, impossibleCertificate);
+    assert_int_equal(firstFollowerState->CompactionSafeMaxSnapshotBytes, legacyLimit);
+    assert_true(cluster.Packets.empty());
+    firstFollowerState->CompactionSafeMaxSnapshotBytes = currentLimit;
+
+    // A barrier-capable peer that predates size negotiation sends no size bit.
+    // Its 64 MiB limit must be represented by the old zero-padding certificate.
+    cluster.Now += TTimeout::Election / 2;
+    cluster.Nodes[0]->ProcessTimeout(cluster.Now);
+    const auto oldPeerAppend = cluster.Take(1, 2, EMessageType::APPEND_ENTRIES_REQUEST)
+        .Cast<TAppendEntriesRequest>();
+    const auto currentPeerAppend = cluster.Take(1, 3, EMessageType::APPEND_ENTRIES_REQUEST);
+    const auto oldPeerResponse = NewHoldedMessage(
+        TMessageEx{.Src = 2, .Dst = 1, .Term = oldPeerAppend->Term, .Seqno = oldPeerAppend->Seqno},
+        TAppendEntriesResponse{
+            .MatchIndex = oldPeerAppend->PrevLogIndex + oldPeerAppend->Nentries,
+            .Success = 1,
+            .Padding = TAppendEntriesResponse::SupportsConfigurationBarrier |
+                TAppendEntriesResponse::SupportsInstallSnapshot,
+        });
+    cluster.Deliver(oldPeerResponse);
+    cluster.Deliver(currentPeerAppend);
+    cluster.Deliver(cluster.Take(3, 1, EMessageType::APPEND_ENTRIES_RESPONSE));
+
+    auto oldPeerBarrier = cluster.Take(1, 2, EMessageType::CONFIGURATION_BARRIER_REQUEST)
+        .Cast<TConfigurationBarrierRequest>();
+    auto currentPeerBarrier = cluster.Take(1, 3, EMessageType::CONFIGURATION_BARRIER_REQUEST)
+        .Cast<TConfigurationBarrierRequest>();
+    assert_int_equal(oldPeerBarrier->Padding, 0);
+    assert_int_equal(currentPeerBarrier->Padding, 0);
+    cluster.Deliver(oldPeerBarrier);
+    cluster.Deliver(currentPeerBarrier);
+    assert_int_equal(cluster.Nodes[1]->GetVolatileState()->CompactionSafeMaxSnapshotBytes, legacyLimit);
+    assert_int_equal(cluster.Nodes[2]->GetVolatileState()->CompactionSafeMaxSnapshotBytes, legacyLimit);
+}
+void test_snapshot_encoder_accepts_image_above_legacy_limit(void**) {
+    TSnapshot snapshot;
+    snapshot.Index = 1;
+    snapshot.Term = 1;
+    snapshot.Voters = {1};
+    snapshot.DataSource = std::make_shared<TGeneratedSnapshotDataSource>(
+        TSnapshot::LegacyMaxBytes + 1);
+
+    const auto encoding = PrepareSnapshotEncoding(snapshot);
+    assert_true(SnapshotEncodingSize(*encoding) > TSnapshot::LegacyMaxBytes);
+    assert_true(SnapshotEncodingSize(*encoding) <= TSnapshot::MaxBytes);
+}
+void test_single_voter_compacts_snapshot_above_legacy_limit(void**) {
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 1;
+    auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = 1;
+    state->Append(entry);
+    state->CommitIndex = 1;
+
+    auto raft = std::make_shared<TRaft>(state, uint32_t(1), TNodeDict{});
+    auto application = std::make_shared<TLargeSourceSnapshotApplication>();
+    application->LastAppliedIndex = 1;
+    TRequestProcessor processor(raft, application, {});
+    const auto snapshot = raft->CompactShared();
+
+    assert_true(snapshot->DataSize() > TSnapshot::LegacyMaxBytes);
+    assert_true(snapshot->DataSize() <= TSnapshot::MaxBytes);
+    assert_int_equal(state->SnapshotIndex, 1);
+}
+void test_learner_without_voter_size_certificate_keeps_legacy_compaction_limit(void**) {
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 1;
+    state->BindVoters({1, 2});
+    auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = 1;
+    state->Append(entry);
+    state->CommitIndex = 1;
+
+    TNodeDict peers{
+        {1, std::make_shared<TEndpoint>([](auto) { })},
+        {2, std::make_shared<TEndpoint>([](auto) { })},
+    };
+    auto raft = std::make_shared<TRaft>(state, uint32_t(3), peers, std::vector<uint32_t>{3});
+    auto application = std::make_shared<TLargeSourceSnapshotApplication>();
+    application->LastAppliedIndex = 1;
+    TRequestProcessor processor(raft, application, peers);
+
+    Reject([&] { raft->Compact(); });
+    assert_int_equal(state->SnapshotIndex, 0);
+    assert_int_equal(state->LastLogIndex, 1);
 }
 void test_snapshot_history_encoding_is_negotiated_per_peer(void**) {
     const std::vector<uint32_t> stableVoters{1, 5}, addedVoters{1, 2, 5};
@@ -2897,6 +3050,10 @@ int main() {
         cmocka_unit_test(test_recovered_snapshot_retains_heap_budget_lease),
         cmocka_unit_test(test_shared_compaction_reuses_storage_snapshot_image),
         cmocka_unit_test(test_zero_index_follower_compaction_waits_for_capability_barrier),
+        cmocka_unit_test(test_snapshot_size_negotiation_keeps_legacy_fallback_and_certifies_voter_limit),
+        cmocka_unit_test(test_snapshot_encoder_accepts_image_above_legacy_limit),
+        cmocka_unit_test(test_single_voter_compacts_snapshot_above_legacy_limit),
+        cmocka_unit_test(test_learner_without_voter_size_certificate_keeps_legacy_compaction_limit),
         cmocka_unit_test(test_snapshot_history_encoding_is_negotiated_per_peer),
         cmocka_unit_test(test_idle_snapshot_transfer_discards_partial_image_and_restarts),
         cmocka_unit_test(test_snapshot_install_budget_is_shared_and_reclaimed_after_idle_expiry),

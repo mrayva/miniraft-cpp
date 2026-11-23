@@ -36,7 +36,7 @@ the in-memory serialized source. Save requires a nonzero committed Raft applied
 index and no open transaction. Raft no-ops and configuration entries advance
 this index without changing SQL data. If the SQLite progress marker trails the
 Raft index or is absent, capture writes the exact boundary into the backup copy.
-The live database is unaffected. The SQL payload is capped below 64 MiB to
+The live database is unaffected. The SQL payload is capped below 128 MiB to
 leave room for the Raft snapshot header and maximum voter metadata. Before
 SQLite opens the received image, SQL checks the format signature, rollback
 mode, page size, page alignment and the in-header page count when SQLite's
@@ -104,7 +104,7 @@ and database page size across a cluster.
 Serialization runs synchronously on the event loop and can pause request and
 replication processing for large databases. This feature does not provide
 background or copy-on-write capture, application database quotas below the
-64 MiB image cap, or live voter changes. Fixed voter IDs must still match on
+128 MiB image cap, or live voter changes. Fixed voter IDs must still match on
 every node.
 
 ## Validation

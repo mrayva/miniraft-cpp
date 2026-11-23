@@ -39,7 +39,10 @@ struct TSnapshotConfigurationTransition {
 
 // Versioned application snapshot, shared by local compaction and state transfer.
 struct TSnapshot {
-    static constexpr size_t MaxBytes = 64 * 1024 * 1024;
+    // The former limit remains the safe fallback for peers that predate
+    // snapshot-size capability advertisement.
+    static constexpr size_t LegacyMaxBytes = 64 * 1024 * 1024;
+    static constexpr size_t MaxBytes = 128 * 1024 * 1024;
     static constexpr uint32_t MaxVoters = 4096;
     static constexpr size_t MaxLegacyConfigurationTransitions = 32;
     static constexpr size_t MaxExtendedConfigurationTransitions = 256;

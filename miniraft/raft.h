@@ -370,6 +370,7 @@ struct TVolatileState {
     std::unordered_map<uint32_t, ITimeSource::Time> ConfigurationBarrierAckDue;
     struct TPeerCapabilities {
         uint64_t AppendAckSeqno = 0, Term = 0;
+        uint64_t MaxSnapshotBytes = TSnapshot::LegacyMaxBytes;
         bool ConfigurationBarrier = false, SnapshotLineage = false;
         bool SnapshotHistory32 = false, SnapshotHistory256 = false;
         bool SnapshotHistory1024 = false;
@@ -393,6 +394,8 @@ struct TVolatileState {
     uint64_t CompactionSafeConfigurationIndex = 0;
     // A certificate expires for readiness purposes when the Raft term changes.
     uint64_t CompactionSafeConfigurationTerm = 0;
+    // Minimum image size accepted by all active voters, certified by the leader.
+    uint64_t CompactionSafeMaxSnapshotBytes = TSnapshot::LegacyMaxBytes;
     bool HasCompactionSafeInitialConfigurationBarrier = false;
     uint32_t LeaderId = 0;
     std::unordered_map<uint32_t, uint64_t> NextIndex;
@@ -609,7 +612,7 @@ private:
     void OnConfigurationBarrier(TMessageHolder<TConfigurationBarrierRequest> message);
     void OnConfigurationBarrier(ITimeSource::Time now, TMessageHolder<TConfigurationBarrierResponse> message);
     void MaybeDistributeConfigurationBarrier(ITimeSource::Time now);
-    TMessageHolder<TInstallSnapshotRequest> CreateInstallSnapshot(uint32_t nodeId);
+    TMessageHolder<TMessage> CreateInstallSnapshot(uint32_t nodeId);
     void Candidate(ITimeSource::Time now, TMessageHolder<TMessage> message);
     void Follower(ITimeSource::Time now, TMessageHolder<TMessage> message);
     void Leader(ITimeSource::Time now, TMessageHolder<TMessage> message);

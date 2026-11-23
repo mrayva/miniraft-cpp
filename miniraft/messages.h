@@ -143,6 +143,31 @@ struct TAppendEntriesResponse: public TMessageEx {
     // Separate from the older idempotent-command bit so mixed-version peers
     // never apply session-control entries as ordinary application commands.
     static constexpr uint32_t SupportsIdempotencyControlEntries = 1u << 8;
+    // Padding's upper bits carry the receiver's maximum snapshot image size in
+    // 64 KiB units. A missing bit identifies a legacy peer with the 64 MiB cap.
+    static constexpr uint32_t SupportsSnapshotSizeNegotiation = 1u << 9;
+    static constexpr uint32_t SnapshotSizeUnitBytes = 64u * 1024;
+    static constexpr uint32_t SnapshotSizeShift = 10;
+    static constexpr uint32_t EncodeSnapshotMaxBytes(uint32_t bytes) {
+        return SupportsSnapshotSizeNegotiation |
+            ((bytes / SnapshotSizeUnitBytes) << SnapshotSizeShift);
+    }
+    static constexpr uint64_t DecodeSnapshotMaxBytes(uint32_t padding) {
+        return uint64_t(padding >> SnapshotSizeShift) * SnapshotSizeUnitBytes;
+    }
+    static constexpr uint64_t DecodeSnapshotMaxBytesOrLegacy(
+            uint32_t padding, uint64_t legacyMaxBytes) {
+        const auto decoded = DecodeSnapshotMaxBytes(padding);
+        return (padding & SupportsSnapshotSizeNegotiation) && decoded
+            ? decoded : legacyMaxBytes;
+    }
+    static constexpr uint32_t EncodeConfigurationBarrierSnapshotLimit(
+            uint64_t maxBytes, uint64_t legacyMaxBytes) {
+        // Preserve the zero-padding certificate understood by nodes that
+        // support barriers but predate snapshot-size negotiation.
+        return maxBytes == legacyMaxBytes
+            ? 0u : uint32_t(maxBytes / SnapshotSizeUnitBytes);
+    }
     // Success: matched index. Failure: zero or a compacted-boundary probe hint;
     // a hint never advances MatchIndex or confirms a read.
     uint64_t MatchIndex;
@@ -186,7 +211,10 @@ static_assert(sizeof(TTimeoutNowRequest) == sizeof(TMessageEx) + 56);
 // inferring peer progress from their own local commit index.
 struct TConfigurationBarrierRequest: public TMessageEx {
     static constexpr EMessageType MessageType = EMessageType::CONFIGURATION_BARRIER_REQUEST;
-    uint32_t LeaderId = 0, Padding = 0;
+    uint32_t LeaderId = 0;
+    // Maximum snapshot size accepted by every active voter, in 64 KiB units.
+    // Zero is the legacy 64 MiB certificate.
+    uint32_t Padding = 0;
     uint64_t ConfigurationIndex = 0, ConfigurationTerm = 0;
 };
 static_assert(sizeof(TConfigurationBarrierRequest) == sizeof(TMessageEx) + 24);
