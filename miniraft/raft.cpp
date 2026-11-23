@@ -3384,7 +3384,10 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     try {
         installationReservation = incoming.File ? SnapshotInstallBudget->TryReserve(incoming.Total) :
             std::move(incoming.ReceiveReservation);
-        if (!installationReservation) { IncomingSnapshot.reset(); reply(false, false, 0); return; }
+        // A full staged image can wait for transient heap contention. Leave
+        // the final chunk unacknowledged so the leader retries it. Retries
+        // do not move LastProgress, so a blocked image still expires.
+        if (!installationReservation) return;
         snapshot = incoming.File ? DecodeSnapshot(receivedImage) :
             DecodeSnapshotOwned(std::move(incoming.Bytes));
         IncomingSnapshot.reset();

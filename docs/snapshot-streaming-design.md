@@ -49,9 +49,10 @@ a read-only mapping for duplicate, metadata and checksum checks. Staged files
 reserve their declared sizes against a separate 256 MiB process-wide quota.
 Embedders can share a custom quota through `TLogLimits::SnapshotStagingBudget`.
 Completion reserves space in the heap budget before decoding. If there is
-insufficient heap capacity, the receiver releases the staged file and asks
-the sender to retry from offset zero. Staged data is discarded when Raft
-clears the assembly, after decoding, or on process exit.
+temporary heap contention, the receiver keeps the staged file and leaves the
+final chunk unacknowledged. The sender can retry that chunk once capacity is
+free. Duplicate chunks do not extend the receiver's idle deadline. Staged data
+is discarded when Raft clears the assembly, after decoding, or on process exit.
 
 The decoder still materializes the final application image for validation
 and installation. The staging file is temporary and partial transfers restart

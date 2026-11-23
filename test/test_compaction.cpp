@@ -2129,24 +2129,38 @@ void test_file_staging_and_decode_use_separate_shared_budgets(void**) {
     assert_false(response->Success);
     assert_int_equal(disk->UsedBytes(), bytes.size());
 
-    stagedReceiver->Process({}, last);
-    assert_false(response->Success);
-    assert_false(response->Installed);
-    assert_int_equal(response->NextOffset, 0);
+    const auto finalChunkTime = ITimeSource::Time{} + TTimeout::SnapshotTransferIdle / 2;
+    response = {};
+    stagedReceiver->Process(finalChunkTime, last);
+    assert_false(bool(response));
     assert_int_equal(stagedReceiver->GetState()->SnapshotIndex, 0);
     assert_int_equal(heap->UsedBytes(), bytes.size());
-    assert_int_equal(disk->UsedBytes(), 0);
+    assert_int_equal(disk->UsedBytes(), bytes.size());
 
     const auto retryTime = ITimeSource::Time{} + TTimeout::SnapshotTransferIdle;
     memoryReceiver->ProcessTimeout(retryTime);
     assert_int_equal(heap->UsedBytes(), 0);
-    stagedReceiver->Process(retryTime, first);
-    assert_true(response->Success);
     stagedReceiver->Process(retryTime, last);
+    assert_true(bool(response));
+    assert_true(response->Success);
     assert_true(response->Installed);
     assert_int_equal(stagedReceiver->GetState()->SnapshotIndex, 1);
     assert_int_equal(heap->UsedBytes(), 0);
     assert_int_equal(disk->UsedBytes(), 0);
+
+    auto heldHeap = heap->TryReserve(bytes.size());
+    assert_true(bool(heldHeap));
+    otherStagedReceiver->Process(retryTime, first);
+    assert_true(response->Success);
+    response = {};
+    otherStagedReceiver->Process(retryTime, last);
+    assert_false(bool(response));
+    otherStagedReceiver->Process(retryTime + TTimeout::SnapshotTransferIdle / 2, last);
+    assert_false(bool(response));
+    assert_int_equal(disk->UsedBytes(), bytes.size());
+    otherStagedReceiver->ProcessTimeout(retryTime + TTimeout::SnapshotTransferIdle);
+    assert_int_equal(disk->UsedBytes(), 0);
+    assert_int_equal(otherStagedReceiver->GetState()->SnapshotIndex, 0);
     assert_true(std::filesystem::is_empty(files.Directory));
 }
 void test_durable_stale_snapshot_membership_recovery_survives_restart(void**) {
