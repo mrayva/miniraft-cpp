@@ -104,6 +104,9 @@ struct TBoundedSnapshotApplication : IRsm {
     void LoadSnapshot(std::string_view, uint64_t index) override { LastAppliedIndex = index; }
     bool SupportsApplicationSnapshotInstall() const override { return true; }
 };
+struct TUnboundedSnapshotApplication : TBoundedSnapshotApplication {
+    std::optional<uint64_t> SnapshotSizeUpperBound() const override { return std::nullopt; }
+};
 struct TStreamingWriterSnapshotApplication : TApplication {
     mutable size_t SaveCalls = 0;
     mutable size_t WriteCalls = 0;
@@ -597,6 +600,72 @@ void test_legacy_bounded_snapshot_uses_disk_staging_quota(void**) {
     limits.SnapshotInstallBudget = rejectedHeapBudget;
     limits.SnapshotStagingBudget = rejectedStagingBudget;
     auto rejectedApp = std::make_shared<TBoundedSnapshotApplication>();
+    rejectedApp->LastAppliedIndex = 1;
+    {
+        auto raft = std::make_shared<TRaft>(rejectedState, 1, TNodeDict{},
+            std::vector<uint32_t>{}, limits);
+        TRequestProcessor processor(raft, rejectedApp, {});
+        Reject([&] { raft->Compact(); });
+    }
+    assert_int_equal(rejectedApp->SaveCalls, 1);
+    assert_int_equal(rejectedState->SnapshotIndex, 0);
+    assert_int_equal(rejectedHeapBudget->UsedBytes(), 0);
+    assert_int_equal(rejectedStagingBudget->UsedBytes(), 0);
+}
+void test_legacy_unbounded_snapshot_uses_disk_staging_quota(void**) {
+    char directoryTemplate[] = "/tmp/miniraft-legacy-unbounded-capture-XXXXXX";
+    auto* createdDirectory = mkdtemp(directoryTemplate);
+    assert_non_null(createdDirectory);
+    struct TDirectoryCleanup {
+        std::filesystem::path Path;
+        ~TDirectoryCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(Path, ignored);
+        }
+    } cleanup{createdDirectory};
+
+    auto makeState = [] {
+        auto state = std::make_shared<TState>();
+        auto entry = NewHoldedMessage<TLogEntry>();
+        entry->Term = 1;
+        state->Append(entry);
+        state->CommitIndex = 1;
+        return state;
+    };
+
+    auto state = makeState();
+    auto heapBudget = std::make_shared<TSnapshotInstallBudget>(40);
+    auto stagingBudget = std::make_shared<TSnapshotInstallBudget>(40);
+    TRaft::TLogLimits limits;
+    limits.SnapshotInstallBudget = heapBudget;
+    limits.SnapshotStagingBudget = stagingBudget;
+    limits.SnapshotStagingDirectory = createdDirectory;
+    auto app = std::make_shared<TUnboundedSnapshotApplication>();
+    app->LastAppliedIndex = 1;
+    std::shared_ptr<const TSnapshot> snapshot;
+    {
+        auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{},
+            std::vector<uint32_t>{}, limits);
+        TRequestProcessor processor(raft, app, {});
+        snapshot = raft->CompactShared();
+        assert_int_equal(app->SaveCalls, 1);
+        assert_true(snapshot->Data.empty());
+        assert_true(bool(snapshot->DataSource));
+        assert_true(snapshot->MaterializeData() == std::string(40, 's'));
+        assert_int_equal(heapBudget->UsedBytes(), 0);
+        assert_int_equal(stagingBudget->UsedBytes(), 40);
+    }
+    state.reset();
+    snapshot.reset();
+    assert_int_equal(heapBudget->UsedBytes(), 0);
+    assert_int_equal(stagingBudget->UsedBytes(), 0);
+
+    auto rejectedState = makeState();
+    auto rejectedHeapBudget = std::make_shared<TSnapshotInstallBudget>(40);
+    auto rejectedStagingBudget = std::make_shared<TSnapshotInstallBudget>(39);
+    limits.SnapshotInstallBudget = rejectedHeapBudget;
+    limits.SnapshotStagingBudget = rejectedStagingBudget;
+    auto rejectedApp = std::make_shared<TUnboundedSnapshotApplication>();
     rejectedApp->LastAppliedIndex = 1;
     {
         auto raft = std::make_shared<TRaft>(rejectedState, 1, TNodeDict{},
@@ -3512,6 +3581,7 @@ int main() {
         cmocka_unit_test(test_disk_staged_capture_becomes_durable_snapshot_across_restart),
         cmocka_unit_test(test_range_snapshot_source_uses_disk_staging_quota),
         cmocka_unit_test(test_legacy_bounded_snapshot_uses_disk_staging_quota),
+        cmocka_unit_test(test_legacy_unbounded_snapshot_uses_disk_staging_quota),
         cmocka_unit_test(test_file_staging_failure_releases_snapshot_reservation),
         cmocka_unit_test(test_file_staged_streaming_install_retains_source_quota),
         cmocka_unit_test(test_file_staging_and_decode_use_separate_shared_budgets),

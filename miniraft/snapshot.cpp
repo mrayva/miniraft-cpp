@@ -1091,7 +1091,7 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         if (upperBound && data.size() > *upperBound)
             throw std::logic_error("Application snapshot exceeded its declared size bound");
         if (heapBudget && !reservation) reserveCaptureBytes(data.size());
-        if (stagingDirectory.empty() || !upperBound) {
+        if (stagingDirectory.empty()) {
             snapshot.Data = std::move(data);
         } else {
             if (reservation && !heapBudget->TryResize(reservation, data.size()))
