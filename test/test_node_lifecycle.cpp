@@ -1,4 +1,5 @@
 #include <miniraft/net/server.h>
+#include <cerrno>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -123,6 +124,81 @@ struct TDeadlineSocket {
     void Shutdown() noexcept { }
     NNet::TValueTask<ssize_t> WriteSome(const void*, size_t size) { co_return ssize_t(size); }
 };
+struct TTlsHandshakeDeadlineState {
+    NNet::TTime ReadDeadline{};
+    size_t TimedReadCalls = 0;
+    size_t TimedWriteCalls = 0;
+    bool StallWrites = false;
+};
+struct TTlsHandshakeDeadlineSocket {
+    using TPoller = ::TPoller;
+
+    struct TReadAwaiter {
+        TPoller* Owner;
+        std::shared_ptr<TTlsHandshakeDeadlineState> State;
+        NNet::TTime Deadline;
+        unsigned TimerId = 0;
+
+        bool await_ready() const { return false; }
+        void await_suspend(std::coroutine_handle<> handle) {
+            TimerId = Owner->AddTimer(Deadline, handle);
+        }
+        ssize_t await_resume() {
+            if (Owner->RemoveTimer(TimerId, Deadline)) {
+                throw std::system_error(std::make_error_code(std::errc::timed_out));
+            }
+            return -1;
+        }
+    };
+
+    TPoller* Owner;
+    std::shared_ptr<TTlsHandshakeDeadlineState> State;
+
+    std::suspend_never Connect(NNet::TTime) { return {}; }
+    TReadAwaiter ReadSome(void*, size_t, NNet::TTime deadline) {
+        State->ReadDeadline = deadline;
+        ++State->TimedReadCalls;
+        return {Owner, State, deadline};
+    }
+    NNet::TValueTask<ssize_t> WriteSome(const void*, size_t size, NNet::TTime deadline) {
+        if (State->StallWrites) {
+            ++State->TimedWriteCalls;
+            co_await TReadAwaiter{Owner, State, deadline};
+        }
+        co_return ssize_t(size);
+    }
+};
+struct TTlsHandshakeDeadlineResult {
+    bool Completed = false;
+    bool TimedOut = false;
+};
+NNet::TVoidTask ConnectTlsWithDeadline(NNet::TSslSocket<TTlsHandshakeDeadlineSocket>& socket,
+        NNet::TTime deadline, TTlsHandshakeDeadlineResult& result) {
+    try {
+        co_await socket.Connect(deadline);
+    } catch (const std::system_error& ex) {
+        result.TimedOut = ex.code() == std::make_error_code(std::errc::timed_out);
+    }
+    result.Completed = true;
+}
+struct TSocketDeadlineResult {
+    bool Completed = false;
+    bool TimedOut = false;
+};
+NNet::TVoidTask ExerciseSocketIODeadline(NNet::TSocket& socket, bool write,
+        TSocketDeadlineResult& result) {
+    char byte = 'x';
+    try {
+        if (write) {
+            co_await socket.WriteSome(&byte, 1, NNet::TTime{});
+        } else {
+            co_await socket.ReadSome(&byte, 1, NNet::TTime{});
+        }
+    } catch (const std::system_error& ex) {
+        result.TimedOut = ex.code() == std::make_error_code(std::errc::timed_out);
+    }
+    result.Completed = true;
+}
 struct TCapabilitySocketState {
     TPoller* Owner = nullptr;
     size_t ProbeWrites = 0;
@@ -443,6 +519,68 @@ void test_connect_readiness_reports_socket_error(void**) {
     assert_int_equal(result.Error, std::make_error_code(std::errc::connection_refused).value());
     ::close(reserved);
 }
+void test_tls_handshake_obeys_connect_deadline(void**) {
+    TPoller poller;
+    auto clientContext = NNet::TSslContext::Client();
+    auto state = std::make_shared<TTlsHandshakeDeadlineState>();
+    NNet::TSslSocket<TTlsHandshakeDeadlineSocket> socket(
+        TTlsHandshakeDeadlineSocket{&poller, state}, clientContext);
+    const auto deadline = NNet::TTime{};
+    TTlsHandshakeDeadlineResult result;
+
+    auto connection = ConnectTlsWithDeadline(socket, deadline, result);
+    assert_false(result.Completed);
+    assert_int_equal(state->TimedReadCalls, 1);
+    assert_true(state->ReadDeadline == deadline);
+
+    poller.TickOne();
+    assert_true(result.Completed);
+    assert_true(result.TimedOut);
+}
+void test_tls_handshake_write_obeys_connect_deadline(void**) {
+    TPoller poller;
+    auto clientContext = NNet::TSslContext::Client();
+    auto state = std::make_shared<TTlsHandshakeDeadlineState>();
+    state->StallWrites = true;
+    NNet::TSslSocket<TTlsHandshakeDeadlineSocket> socket(
+        TTlsHandshakeDeadlineSocket{&poller, state}, clientContext);
+    TTlsHandshakeDeadlineResult result;
+
+    auto connection = ConnectTlsWithDeadline(socket, NNet::TTime{}, result);
+    assert_false(result.Completed);
+    assert_int_equal(state->TimedWriteCalls, 1);
+    assert_int_equal(state->TimedReadCalls, 0);
+
+    poller.TickOne();
+    assert_true(result.Completed);
+    assert_true(result.TimedOut);
+}
+void test_socket_read_and_write_deadlines_cancel_waits(void**) {
+    for (const bool write : {false, true}) {
+        int sockets[2]{};
+        assert_int_equal(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
+        TPoller poller;
+        NNet::TSocket socket(NNet::TAddress{}, sockets[0], poller);
+
+        if (write) {
+            char fill[4096]{};
+            ssize_t sent;
+            do {
+                sent = ::send(sockets[0], fill, sizeof(fill), MSG_DONTWAIT);
+            } while (sent > 0 || (sent < 0 && errno == EINTR));
+            assert_true(sent < 0);
+            assert_true(errno == EAGAIN || errno == EWOULDBLOCK);
+        }
+
+        TSocketDeadlineResult result;
+        auto operation = ExerciseSocketIODeadline(socket, write, result);
+        assert_false(result.Completed);
+        poller.TickOne();
+        assert_true(result.Completed);
+        assert_true(result.TimedOut);
+        ::close(sockets[1]);
+    }
+}
 
 using TRetirableTlsSocket = NNet::TRetirableSslSocket<NNet::TSocket>;
 struct TTlsAcceptState {
@@ -514,6 +652,9 @@ int main() {
 #ifdef __linux__
         cmocka_unit_test(test_socket_shutdown_wakes_a_real_pending_read),
         cmocka_unit_test(test_connect_readiness_reports_socket_error),
+        cmocka_unit_test(test_tls_handshake_obeys_connect_deadline),
+        cmocka_unit_test(test_tls_handshake_write_obeys_connect_deadline),
+        cmocka_unit_test(test_socket_read_and_write_deadlines_cancel_waits),
         cmocka_unit_test(test_tls_shutdown_wakes_retired_peer_reader),
 #endif
     };
