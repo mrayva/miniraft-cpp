@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <system_error>
 #ifdef __linux__
@@ -669,6 +670,57 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         if (!reservation)
             throw std::runtime_error("Snapshot capture exceeds the available heap budget");
     };
+    class TCaptureSink final : public ISnapshotSink {
+    public:
+        TCaptureSink(std::shared_ptr<TSnapshotInstallBudget> budget,
+                uint64_t maxBytes, std::optional<uint64_t> upperBound)
+            : Budget(std::move(budget)), MaxBytes(maxBytes), UpperBound(upperBound) { }
+
+        void Write(std::span<const char> bytes) override {
+            try {
+                WriteImpl(bytes);
+            } catch (...) {
+                if (!Failure) Failure = std::current_exception();
+                throw;
+            }
+        }
+
+        void RethrowFailure() const {
+            if (Failure) std::rethrow_exception(Failure);
+        }
+
+        std::string TakeData() { return std::move(Data); }
+        std::shared_ptr<TSnapshotInstallBudget::TReservation> TakeReservation() {
+            return std::move(Lease);
+        }
+
+    private:
+        void WriteImpl(std::span<const char> bytes) {
+            const auto currentBytes = uint64_t(Data.size());
+            if (bytes.size() > MaxBytes - currentBytes)
+                throw std::runtime_error("Application snapshot exceeds the Raft snapshot limit");
+            const auto nextBytes = currentBytes + bytes.size();
+            if (UpperBound && nextBytes > *UpperBound)
+                throw std::logic_error("Application snapshot exceeded its declared size bound");
+            if (Budget && nextBytes > currentBytes) {
+                if (!Lease) {
+                    Lease = Budget->TryReserveLease(nextBytes);
+                    if (!Lease)
+                        throw std::runtime_error("Snapshot capture exceeds the available heap budget");
+                } else if (!Budget->TryResize(Lease, nextBytes)) {
+                    throw std::runtime_error("Snapshot capture exceeds the available heap budget");
+                }
+            }
+            if (!bytes.empty()) Data.append(bytes.data(), bytes.size());
+        }
+
+        std::shared_ptr<TSnapshotInstallBudget> Budget;
+        uint64_t MaxBytes;
+        std::optional<uint64_t> UpperBound;
+        std::string Data;
+        std::shared_ptr<TSnapshotInstallBudget::TReservation> Lease;
+        std::exception_ptr Failure;
+    };
     const auto streamingRsm = dynamic_cast<const IStreamingSnapshotRsm*>(&rsm);
     if (auto source = streamingRsm ? streamingRsm->OpenSnapshotSource(index) : nullptr) {
         const auto dataBytes = source->Size();
@@ -692,6 +744,12 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
             }
             offset += count;
         }
+    } else if (const auto writerRsm = dynamic_cast<const IStreamingSnapshotWriterRsm*>(&rsm)) {
+        TCaptureSink sink(heapBudget, TSnapshot::MaxBytes - metadataBytes, upperBound);
+        writerRsm->WriteSnapshot(index, sink);
+        sink.RethrowFailure();
+        snapshot.Data = sink.TakeData();
+        reservation = sink.TakeReservation();
     } else {
         if (upperBound) reserveCaptureBytes(*upperBound);
         snapshot.Data = rsm.SaveSnapshot();

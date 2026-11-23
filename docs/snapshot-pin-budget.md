@@ -31,9 +31,11 @@ when growing it. Callers can configure a shared `TSnapshotInstallBudget`.
 Optional Linux staging files have their own shared quota. Completed staged
 images must reserve receive heap space before decoding.
 Retained snapshot payloads and outgoing pins share the install heap budget.
-Known-size capture reserves before materializing its final image. Current
-application/log state, legacy unbounded capture buffers, detached snapshot
-copies, transport buffers and other allocations remain outside these limits;
+Known-size capture reserves before materializing its final image, and the
+incremental snapshot writer charges each append before growing that image.
+Current application/log state, legacy unbounded `SaveSnapshot()` buffers,
+detached snapshot copies, transport buffers and other allocations remain
+outside these limits;
 disk-streamed snapshot transfer remains open. Voter membership changes
 are available through [live membership](configuration-entries.md), with leader
 removal supported by [leadership transfer](leadership-transfer.md). This alpha.43

@@ -111,12 +111,13 @@ publication, bounded chunked `InstallSnapshot`, non-voting learners, and
 replicated joint-consensus membership are implemented. The current support
 matrix and operational constraints are in [capability matrix](capability-matrix.md).
 
-The remaining work includes disk-streamed application snapshots and a shared
-heap budget across unbounded capture-time allocations, application state and
-transport. Known-size capture reserves its final image before materialization.
-Retained Raft snapshot images are charged to the install heap budget. Legacy
-capture callbacks without a size bound, application state and transport remain
-outside it. Partial incoming transfers are not persisted,
+The remaining work includes disk-streamed or logical-object application
+snapshots and a shared heap budget across application state and transport.
+Known-size capture reserves its final image before materialization, and the
+incremental writer charges each append before growing that image. Retained Raft
+snapshot images are charged to the install heap budget. Legacy `SaveSnapshot()`
+callbacks without a size bound, application state and transport remain outside
+it. Partial incoming transfers are not persisted,
 so a follower restart begins again at offset zero. Cluster-wide endpoint
 discovery and rollout, plus automatic stale store recovery without an accepted
 membership-history anchor, also remain open. See the [streaming

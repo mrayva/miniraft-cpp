@@ -45,10 +45,11 @@ design notes. This is a capability summary, not a production-readiness claim.
 
 - Cluster-wide endpoint discovery, rollout and administrator workflow.
 - End-to-end streaming or logical-object snapshots for large application state,
-  plus one heap budget across unbounded capture buffers, application state and
-  transport. Known-size capture reserves its final image before materialization;
-  retained payloads share the install heap budget. Legacy unbounded capture,
-  application and transport allocations remain outside it. The required
+  plus one heap budget across application state and transport. Known-size
+  capture reserves its final image before materialization; incremental snapshot
+  writers extend that lease before appending. Retained payloads share the
+  install heap budget. Legacy unbounded `SaveSnapshot()` buffers, application
+  and transport allocations remain outside it. The required
   staged-image and durable-manifest contract is outlined in [the streaming design](snapshot-streaming-design.md).
 - Automatic recovery when a stale store lacks an allowed history anchor, or
   its transition chain is disjoint from the sender's voter lineage.

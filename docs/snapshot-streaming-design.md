@@ -29,6 +29,14 @@ the final image, reducing capture's peak full-image copies. The serialized
 source and final Raft image still coexist during capture; capture still
 materializes one complete image and remains capped at 64 MiB.
 
+`IStreamingSnapshotWriterRsm` is an alternative for applications that generate
+snapshot bytes incrementally. Raft supplies a sink that checks the
+metadata-adjusted image limit and extends the shared heap lease before each
+append. This path does not require a size bound and avoids constructing a
+separate `SaveSnapshot()` result, but still materializes one complete final
+image in memory. Legacy `SaveSnapshot()` callbacks without a bound remain
+charged only after they return.
+
 `IStagedSnapshotRsm` lets an application validate and prepare an installation
 before Raft publishes the durable snapshot, then install that same prepared
 image after publication. The SQL example keeps the validated SQLite database
@@ -50,9 +58,11 @@ successful installation transfers its heap lease to the retained snapshot;
 local compaction and startup recovery also charge retained image data. Outgoing
 pins keep that same image lease alive. Capture reserves the declared upper bound
 or known range-source size before materializing the final image, then shrinks a
-bound-based lease to the captured size. Legacy `SaveSnapshot()` implementations
-without a bound can only be charged after the callback returns. Application
-memory, detached value copies and transport buffers remain outside this budget.
+bound-based lease to the captured size. Incremental snapshot writers extend the
+lease before each append even without a size bound. Legacy `SaveSnapshot()`
+implementations without a bound can only be charged after the callback returns.
+Application memory, detached value copies and transport buffers remain outside
+this budget.
 
 On Linux, set `TRaft::TLogLimits::SnapshotStagingDirectory` to stage full
 incoming images in a directory on a filesystem that supports anonymous

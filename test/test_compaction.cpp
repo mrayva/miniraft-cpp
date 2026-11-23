@@ -57,6 +57,31 @@ struct TBoundedSnapshotApplication : TApplication {
     std::string SaveSnapshot() const override { ++SaveCalls; return std::string(PayloadBytes, 's'); }
     void ValidateSnapshot(std::string_view, uint64_t) const override { }
 };
+struct TStreamingWriterSnapshotApplication : TApplication, IStreamingSnapshotWriterRsm {
+    mutable size_t SaveCalls = 0;
+    mutable size_t WriteCalls = 0;
+    std::string Payload = std::string(40, 'w');
+    bool IgnoreSinkFailures = false;
+    std::optional<uint64_t> SnapshotSizeUpperBound() const override { return std::nullopt; }
+    std::string SaveSnapshot() const override {
+        ++SaveCalls;
+        throw std::logic_error("Incremental capture must not call SaveSnapshot");
+    }
+    void WriteSnapshot(uint64_t index, ISnapshotSink& sink) const override {
+        if (index != LastAppliedIndex) throw std::logic_error("Snapshot writer index mismatch");
+        ++WriteCalls;
+        constexpr size_t ChunkBytes = 10;
+        for (size_t offset = 0; offset < Payload.size(); offset += ChunkBytes) {
+            const auto count = std::min(ChunkBytes, Payload.size() - offset);
+            try {
+                sink.Write(std::span<const char>(Payload.data() + offset, count));
+            } catch (...) {
+                if (!IgnoreSinkFailures) throw;
+            }
+        }
+    }
+    void ValidateSnapshot(std::string_view, uint64_t) const override { }
+};
 struct TRejectingSnapshotApplication : TApplication {
     void ValidateSnapshot(std::string_view, uint64_t) const override {
         throw std::runtime_error("Injected application snapshot validation failure");
@@ -164,6 +189,52 @@ void test_snapshot_capture_reserves_declared_bound_before_materializing(void**) 
         // atomically to the 40-byte retained image.
         assert_int_equal(budget->UsedBytes(), 40);
     }
+    state.reset();
+    assert_int_equal(budget->UsedBytes(), 0);
+}
+void test_incremental_snapshot_capture_charges_each_growth_before_writing(void**) {
+    auto makeState = [] {
+        auto state = std::make_shared<TState>();
+        auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = 1;
+        state->Append(entry);
+        state->CommitIndex = 1;
+        return state;
+    };
+
+    auto rejectedState = makeState();
+    auto rejectedBudget = std::make_shared<TSnapshotInstallBudget>(39);
+    TRaft::TLogLimits rejectedLimits;
+    rejectedLimits.SnapshotInstallBudget = rejectedBudget;
+    auto rejectedRaft = std::make_shared<TRaft>(rejectedState, 1, TNodeDict{},
+        std::vector<uint32_t>{}, rejectedLimits);
+    auto rejectedApp = std::make_shared<TStreamingWriterSnapshotApplication>();
+    rejectedApp->IgnoreSinkFailures = true;
+    rejectedApp->LastAppliedIndex = 1;
+    TRequestProcessor rejectedProcessor(rejectedRaft, rejectedApp, {});
+    Reject([&] { rejectedRaft->Compact(); });
+    assert_int_equal(rejectedApp->WriteCalls, 1);
+    assert_int_equal(rejectedApp->SaveCalls, 0);
+    assert_int_equal(rejectedBudget->UsedBytes(), 0);
+    assert_int_equal(rejectedState->SnapshotIndex, 0);
+
+    auto state = makeState();
+    auto budget = std::make_shared<TSnapshotInstallBudget>(40);
+    TRaft::TLogLimits limits;
+    limits.SnapshotInstallBudget = budget;
+    auto app = std::make_shared<TStreamingWriterSnapshotApplication>();
+    app->LastAppliedIndex = 1;
+    std::shared_ptr<const TSnapshot> snapshot;
+    {
+        auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{},
+            std::vector<uint32_t>{}, limits);
+        TRequestProcessor processor(raft, app, {});
+        snapshot = raft->CompactShared();
+    }
+    assert_int_equal(app->WriteCalls, 1);
+    assert_int_equal(app->SaveCalls, 0);
+    assert_true(snapshot->Data == app->Payload);
+    assert_int_equal(budget->UsedBytes(), 40);
+    snapshot.reset();
     state.reset();
     assert_int_equal(budget->UsedBytes(), 0);
 }
@@ -2718,6 +2789,7 @@ int main() {
         cmocka_unit_test(test_kv_snapshot_precomputes_size_without_changing_encoding),
         cmocka_unit_test(test_snapshot_capture_preflights_application_size_bound),
         cmocka_unit_test(test_snapshot_capture_reserves_declared_bound_before_materializing),
+        cmocka_unit_test(test_incremental_snapshot_capture_charges_each_growth_before_writing),
         cmocka_unit_test(test_recovered_snapshot_retains_heap_budget_lease),
         cmocka_unit_test(test_shared_compaction_reuses_storage_snapshot_image),
         cmocka_unit_test(test_zero_index_follower_compaction_waits_for_capability_barrier),

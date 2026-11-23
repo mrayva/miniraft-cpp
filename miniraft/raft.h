@@ -50,6 +50,20 @@ struct IStreamingSnapshotRsm {
     virtual std::shared_ptr<const ISnapshotSource> OpenSnapshotSource(uint64_t index) const = 0;
 };
 
+// Optional incremental capture contract. Writes are consumed synchronously;
+// the sink applies the Raft image limit and charges each growth before it
+// allocates the corresponding bytes. Implementations should propagate Write
+// failures and must emit one immutable image for the requested applied index.
+struct ISnapshotSink {
+    virtual ~ISnapshotSink() = default;
+    virtual void Write(std::span<const char> bytes) = 0;
+};
+
+struct IStreamingSnapshotWriterRsm {
+    virtual ~IStreamingSnapshotWriterRsm() = default;
+    virtual void WriteSnapshot(uint64_t index, ISnapshotSink& sink) const = 0;
+};
+
 // Optional two-phase application snapshot installation. Preparation validates
 // and stages an image without changing application state. Install publishes
 // that same staged image after Raft has durably published its snapshot. The
@@ -75,10 +89,11 @@ struct IRsm {
     virtual TMessageHolder<TMessage> Write(TMessageHolder<TLogEntry> message, uint64_t index) = 0;
     virtual TMessageHolder<TLogEntry> Prepare(TMessageHolder<TCommandRequest> message) = 0;
     virtual std::string SaveSnapshot() const { throw std::logic_error("Application snapshots are unsupported"); }
-    // Optional upper bound for SaveSnapshot() or IStreamingSnapshotRsm source
-    // data. Raft
-    // checks it against the metadata-adjusted image budget before allocating
-    // the final buffer. An empty result preserves the legacy post-capture check.
+    // Optional upper bound for SaveSnapshot(), IStreamingSnapshotRsm source data,
+    // or IStreamingSnapshotWriterRsm output. Raft checks it against the
+    // metadata-adjusted image limit. The writer sink can charge output
+    // incrementally when no bound is available; legacy SaveSnapshot() capture
+    // without a bound can only be charged after the callback returns.
     virtual std::optional<uint64_t> SnapshotSizeUpperBound() const { return std::nullopt; }
     virtual void ValidateSnapshot(std::string_view, uint64_t) const { throw std::logic_error("Application snapshots are unsupported"); }
     // Implementations must validate completely before atomically replacing state
