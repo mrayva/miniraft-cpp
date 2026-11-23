@@ -478,6 +478,71 @@ void test_disk_staged_capture_becomes_durable_snapshot_across_restart(void**) {
     captured.reset();
     assert_int_equal(stagingBudget->UsedBytes(), 0);
 }
+void test_range_snapshot_source_uses_disk_staging_quota(void**) {
+    char directoryTemplate[] = "/tmp/miniraft-range-capture-XXXXXX";
+    auto* createdDirectory = mkdtemp(directoryTemplate);
+    assert_non_null(createdDirectory);
+    struct TDirectoryCleanup {
+        std::filesystem::path Path;
+        ~TDirectoryCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(Path, ignored);
+        }
+    } cleanup{createdDirectory};
+
+    auto makeState = [] {
+        auto state = std::make_shared<TState>();
+        auto entry = NewHoldedMessage<TLogEntry>();
+        entry->Term = 1;
+        state->Append(entry);
+        state->CommitIndex = 1;
+        return state;
+    };
+
+    auto state = makeState();
+    auto heapBudget = std::make_shared<TSnapshotInstallBudget>(1);
+    auto stagingBudget = std::make_shared<TSnapshotInstallBudget>(40);
+    TRaft::TLogLimits limits;
+    limits.SnapshotInstallBudget = heapBudget;
+    limits.SnapshotStagingBudget = stagingBudget;
+    limits.SnapshotStagingDirectory = createdDirectory;
+    auto app = std::make_shared<TLargeSourceSnapshotApplication>();
+    app->Bytes = 40;
+    app->LastAppliedIndex = 1;
+    std::shared_ptr<const TSnapshot> snapshot;
+    {
+        auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{},
+            std::vector<uint32_t>{}, limits);
+        TRequestProcessor processor(raft, app, {});
+        snapshot = raft->CompactShared();
+        assert_true(snapshot->Data.empty());
+        assert_true(bool(snapshot->DataSource));
+        assert_true(snapshot->MaterializeData() == std::string(40, 's'));
+        assert_int_equal(heapBudget->UsedBytes(), 0);
+        assert_int_equal(stagingBudget->UsedBytes(), 40);
+    }
+    snapshot.reset();
+    state.reset();
+    assert_int_equal(stagingBudget->UsedBytes(), 0);
+
+    auto rejectedState = makeState();
+    auto rejectedHeapBudget = std::make_shared<TSnapshotInstallBudget>(1);
+    auto rejectedStagingBudget = std::make_shared<TSnapshotInstallBudget>(39);
+    limits.SnapshotInstallBudget = rejectedHeapBudget;
+    limits.SnapshotStagingBudget = rejectedStagingBudget;
+    auto rejectedApp = std::make_shared<TLargeSourceSnapshotApplication>();
+    rejectedApp->Bytes = 40;
+    rejectedApp->LastAppliedIndex = 1;
+    {
+        auto raft = std::make_shared<TRaft>(rejectedState, 1, TNodeDict{},
+            std::vector<uint32_t>{}, limits);
+        TRequestProcessor processor(raft, rejectedApp, {});
+        Reject([&] { raft->Compact(); });
+    }
+    assert_int_equal(rejectedState->SnapshotIndex, 0);
+    assert_int_equal(rejectedHeapBudget->UsedBytes(), 0);
+    assert_int_equal(rejectedStagingBudget->UsedBytes(), 0);
+}
 #endif
 void test_recovered_snapshot_retains_heap_budget_lease(void**) {
     auto state = std::make_shared<TState>();
@@ -3379,6 +3444,7 @@ int main() {
         cmocka_unit_test(test_file_staged_snapshot_install_accepts_every_small_fixed_chunk_size),
         cmocka_unit_test(test_incremental_snapshot_capture_uses_disk_staging_quota),
         cmocka_unit_test(test_disk_staged_capture_becomes_durable_snapshot_across_restart),
+        cmocka_unit_test(test_range_snapshot_source_uses_disk_staging_quota),
         cmocka_unit_test(test_file_staging_failure_releases_snapshot_reservation),
         cmocka_unit_test(test_file_staged_streaming_install_retains_source_quota),
         cmocka_unit_test(test_file_staging_and_decode_use_separate_shared_budgets),

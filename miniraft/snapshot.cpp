@@ -1042,7 +1042,14 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
             throw std::runtime_error("Application snapshot source exceeds the Raft snapshot limit");
         if (upperBound && dataBytes > *upperBound)
             throw std::logic_error("Application snapshot source exceeded its declared size bound");
-        reserveCaptureBytes(dataBytes);
+        std::shared_ptr<TSnapshotCaptureFile> stagedSource;
+        if (!stagingDirectory.empty()) {
+            if (!stagingBudget)
+                stagingBudget = heapBudget ? heapBudget : TSnapshotInstallBudget::DefaultProcessBudget();
+            stagedSource = std::make_shared<TSnapshotCaptureFile>(std::string(stagingDirectory));
+        } else {
+            reserveCaptureBytes(dataBytes);
+        }
         std::array<char, 64 * 1024> buffer{};
         for (uint64_t offset = 0; offset < dataBytes;) {
             const auto count = size_t(std::min<uint64_t>(buffer.size(), dataBytes - offset));
@@ -1055,9 +1062,14 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
                     throw std::runtime_error("Application snapshot source returned an invalid read length");
                 copied += read;
             }
+            if (stagedSource)
+                stagedSource->Append(std::span<const char>(buffer.data(), count), stagingBudget);
             offset += count;
         }
-        snapshot.DataSource = std::make_shared<TApplicationSnapshotSource>(std::move(source), dataBytes);
+        if (source->Size() != dataBytes)
+            throw std::logic_error("Application snapshot source changed size during capture");
+        if (stagedSource) snapshot.DataSource = std::move(stagedSource);
+        else snapshot.DataSource = std::make_shared<TApplicationSnapshotSource>(std::move(source), dataBytes);
     } else if (const auto writerRsm = dynamic_cast<const IStreamingSnapshotWriterRsm*>(&rsm)) {
         if (!stagingDirectory.empty() && !stagingBudget)
             stagingBudget = heapBudget ? heapBudget : TSnapshotInstallBudget::DefaultProcessBudget();
