@@ -2240,7 +2240,8 @@ void TRaft::LeaderTimeout(ITimeSource::Time now) {
             VolatileState->RpcDue[id] = now + TTimeout::Rpc;
             if (VolatileState->NextIndex[id] <= State->SnapshotIndex) {
                 const auto capability = VolatileState->PeerCapabilities.find(id);
-                if (capability != VolatileState->PeerCapabilities.end() && capability->second.InstallSnapshot &&
+                if (capability != VolatileState->PeerCapabilities.end() &&
+                    capability->second.Term == State->CurrentTerm && capability->second.InstallSnapshot &&
                     capability->second.ApplicationSnapshotInstall) {
                     if (auto snapshot = CreateInstallSnapshot(id))
                         (void)node->TrySend(std::move(snapshot));
@@ -2836,6 +2837,7 @@ void TRaft::MaybeDistributeConfigurationBarrier(ITimeSource::Time now) {
         const auto lastSent = VolatileState->LastSentSeqno.find(voter);
         if (capability == VolatileState->PeerCapabilities.end() ||
             lastSent == VolatileState->LastSentSeqno.end() ||
+            capability->second.Term != State->CurrentTerm ||
             !capability->second.ConfigurationBarrier ||
             !capability->second.InstallSnapshot ||
             !capability->second.ApplicationSnapshotInstall ||

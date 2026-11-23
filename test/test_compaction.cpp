@@ -605,6 +605,40 @@ void test_snapshot_encoder_accepts_image_above_legacy_limit(void**) {
     assert_true(SnapshotEncodingSize(*encoding) > TSnapshot::LegacyMaxBytes);
     assert_true(SnapshotEncodingSize(*encoding) <= TSnapshot::MaxBytes);
 }
+void test_stale_peer_capability_cannot_authorize_snapshot_or_barrier(void**) {
+    auto state = std::make_shared<TState>();
+    state->BindVoters({1, 2});
+    state->CurrentTerm = 2;
+    state->InstallSnapshot(TSnapshot{1, 1, {1, 2}, "snapshot"});
+
+    std::vector<TMessageHolder<TMessage>> sent;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) { sent.push_back(std::move(message)); });
+    auto raft = std::make_shared<TRaft>(state, uint32_t(1), TNodeDict{{2, peer}});
+    raft->SetLocalApplicationSnapshotInstallSupport(true);
+    raft->Become(EState::LEADER);
+
+    auto* volatileState = const_cast<TVolatileState*>(raft->GetVolatileState());
+    volatileState->NextIndex[2] = state->SnapshotIndex;
+    volatileState->CommitAckIndex[2] = state->CommitIndex;
+    volatileState->LastSentSeqno[2] = 7;
+    volatileState->PeerCapabilities[2] = {
+        .AppendAckSeqno = 7,
+        .Term = state->CurrentTerm - 1,
+        .ConfigurationBarrier = true,
+        .InstallSnapshot = true,
+        .ApplicationSnapshotInstall = true,
+    };
+
+    raft->ProcessTimeout(ITimeSource::Time{});
+    assert_false(sent.empty());
+    bool probedWithAppendEntries = false;
+    for (const auto& message : sent) {
+        assert_int_not_equal(message->Type, uint32_t(EMessageType::INSTALL_SNAPSHOT_REQUEST));
+        assert_int_not_equal(message->Type, uint32_t(EMessageType::CONFIGURATION_BARRIER_REQUEST));
+        probedWithAppendEntries |= message->Type == uint32_t(EMessageType::APPEND_ENTRIES_REQUEST);
+    }
+    assert_true(probedWithAppendEntries);
+}
 void test_single_voter_compacts_snapshot_above_legacy_limit(void**) {
     auto state = std::make_shared<TState>();
     state->CurrentTerm = 1;
@@ -3098,6 +3132,7 @@ int main() {
         cmocka_unit_test(test_restarted_follower_reacquires_compaction_certificate_without_new_term),
         cmocka_unit_test(test_snapshot_size_negotiation_keeps_legacy_fallback_and_certifies_voter_limit),
         cmocka_unit_test(test_snapshot_encoder_accepts_image_above_legacy_limit),
+        cmocka_unit_test(test_stale_peer_capability_cannot_authorize_snapshot_or_barrier),
         cmocka_unit_test(test_single_voter_compacts_snapshot_above_legacy_limit),
         cmocka_unit_test(test_learner_without_voter_size_certificate_keeps_legacy_compaction_limit),
         cmocka_unit_test(test_snapshot_history_encoding_is_negotiated_per_peer),
