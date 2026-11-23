@@ -2389,7 +2389,7 @@ void test_file_staging_failure_releases_snapshot_reservation(void**) {
     assert_int_equal(state->SnapshotIndex, 1);
     assert_int_equal(budget->UsedBytes(), 0);
 }
-void test_file_staged_streaming_install_releases_assembly_quota(void**) {
+void test_file_staged_streaming_install_retains_source_quota(void**) {
     TFiles files;
     TKv source;
     source.Write(source.Prepare(Command("key", "streamed value")), 1);
@@ -2397,45 +2397,51 @@ void test_file_staged_streaming_install_releases_assembly_quota(void**) {
     TSnapshot snapshot{1, 1, {1, 2}, applicationImage};
     const auto bytes = EncodeSnapshot(snapshot);
     auto heapBudget = std::make_shared<TSnapshotInstallBudget>(1);
-    auto stagingBudget = std::make_shared<TSnapshotInstallBudget>(bytes.size());
-    TMessageHolder<TInstallSnapshotResponse> response;
-    auto peer = std::make_shared<TEndpoint>([&](auto message) {
-        if (auto reply = message.template Maybe<TInstallSnapshotResponse>()) response = reply.Cast();
-    });
-    auto state = std::make_shared<TState>();
-    state->CurrentTerm = 3;
-    state->Commit();
-    TNodeDict peers{{1, peer}};
-    auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{},
-        TRaft::TLogLimits{.SnapshotInstallBudget = heapBudget,
-            .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingBudget = stagingBudget});
-    auto app = std::make_shared<TStreamingInstallApplication>();
-    app->ExpectedImage = applicationImage;
-    TRequestProcessor processor(raft, app, peers);
+    auto stagingBudget = std::make_shared<TSnapshotInstallBudget>(2 * bytes.size());
+    {
+        TMessageHolder<TInstallSnapshotResponse> response;
+        auto peer = std::make_shared<TEndpoint>([&](auto message) {
+            if (auto reply = message.template Maybe<TInstallSnapshotResponse>()) response = reply.Cast();
+        });
+        auto state = std::make_shared<TState>();
+        state->CurrentTerm = 3;
+        state->Commit();
+        TNodeDict peers{{1, peer}};
+        auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{},
+            TRaft::TLogLimits{.SnapshotInstallBudget = heapBudget,
+                .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingBudget = stagingBudget});
+        auto app = std::make_shared<TStreamingInstallApplication>();
+        app->ExpectedImage = applicationImage;
+        TRequestProcessor processor(raft, app, peers);
 
-    raft->Process({}, Chunk(snapshot, bytes, 0, uint32_t(bytes.size())));
-    assert_non_null(response);
-    assert_true(response->Success);
-    assert_true(response->Installed);
-    assert_int_equal(app->StreamingPreparations, 1);
-    assert_int_equal(app->Loads, 1);
-    assert_int_equal(heapBudget->UsedBytes(), 0);
-    assert_int_equal(stagingBudget->UsedBytes(), 0);
-    const auto firstSnapshot = state->GetSnapshot();
-    assert_true(firstSnapshot && firstSnapshot->Data.empty() && firstSnapshot->DataSource);
-    assert_true(firstSnapshot->MaterializeData() == applicationImage);
+        raft->Process({}, Chunk(snapshot, bytes, 0, uint32_t(bytes.size())));
+        assert_non_null(response);
+        assert_true(response->Success);
+        assert_true(response->Installed);
+        assert_int_equal(app->StreamingPreparations, 1);
+        assert_int_equal(app->Loads, 1);
+        assert_int_equal(heapBudget->UsedBytes(), 0);
+        assert_int_equal(stagingBudget->UsedBytes(), bytes.size());
+        auto firstSnapshot = state->GetSnapshot();
+        assert_true(firstSnapshot && firstSnapshot->Data.empty() && firstSnapshot->DataSource);
+        assert_true(firstSnapshot->MaterializeData() == applicationImage);
 
-    snapshot.Index = 2;
-    const auto nextBytes = EncodeSnapshot(snapshot);
-    assert_int_equal(nextBytes.size(), bytes.size());
-    raft->Process({}, Chunk(snapshot, nextBytes, 0, uint32_t(nextBytes.size())));
-    assert_true(response->Success);
-    assert_true(response->Installed);
-    assert_int_equal(app->StreamingPreparations, 2);
-    assert_int_equal(app->Loads, 2);
+        snapshot.Index = 2;
+        const auto nextBytes = EncodeSnapshot(snapshot);
+        assert_int_equal(nextBytes.size(), bytes.size());
+        raft->Process({}, Chunk(snapshot, nextBytes, 0, uint32_t(nextBytes.size())));
+        assert_true(response->Success);
+        assert_true(response->Installed);
+        assert_int_equal(app->StreamingPreparations, 2);
+        assert_int_equal(app->Loads, 2);
+        assert_int_equal(stagingBudget->UsedBytes(), 2 * bytes.size());
+        assert_int_equal(state->SnapshotIndex, 2);
+        assert_true(firstSnapshot->MaterializeData() == applicationImage);
+
+        firstSnapshot.reset();
+        assert_int_equal(stagingBudget->UsedBytes(), bytes.size());
+    }
     assert_int_equal(stagingBudget->UsedBytes(), 0);
-    assert_int_equal(state->SnapshotIndex, 2);
-    assert_true(firstSnapshot->MaterializeData() == applicationImage);
 }
 void test_file_staging_and_decode_use_separate_shared_budgets(void**) {
     TFiles files;
@@ -2935,6 +2941,7 @@ int main() {
 #ifdef __linux__
         cmocka_unit_test(test_file_staged_snapshot_install_accepts_every_small_fixed_chunk_size),
         cmocka_unit_test(test_file_staging_failure_releases_snapshot_reservation),
+        cmocka_unit_test(test_file_staged_streaming_install_retains_source_quota),
         cmocka_unit_test(test_file_staging_and_decode_use_separate_shared_budgets),
         cmocka_unit_test(test_durable_snapshot_storage_rejects_term_regression),
         cmocka_unit_test(test_durable_snapshot_cannot_replace_committed_index_with_conflicting_term),

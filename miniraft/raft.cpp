@@ -960,6 +960,10 @@ public:
 
     const char* Data() const { return Mapping; }
 
+    void RetainStagingReservation(std::shared_ptr<void> reservation) noexcept {
+        StagingReservation = std::move(reservation);
+    }
+
     bool Write(size_t offset, std::string_view bytes) {
 #ifdef __linux__
         while (!bytes.empty()) {
@@ -980,6 +984,9 @@ public:
 private:
     size_t SizeBytes;
     const char* Mapping = nullptr;
+    // A source-backed installed snapshot keeps this anonymous file alive. Keep
+    // its disk quota lease for the same lifetime, including outstanding pins.
+    std::shared_ptr<void> StagingReservation;
 #ifdef __linux__
     int Fd = -1;
 #endif
@@ -3454,6 +3461,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             ? DecodeSnapshotBacked(receivedImage, incoming.File)
             : incoming.File ? DecodeSnapshot(receivedImage) :
                 DecodeSnapshotOwned(std::move(incoming.Bytes));
+        if (sourceBackedInstall)
+            incoming.File->RetainStagingReservation(std::move(incoming.ReceiveReservation));
         IncomingSnapshot.reset();
         auto inheritTrustedLineage = [&](const TConfigurationHistory& history) {
             if (snapshot.HasConfigurationMetadata() && history.IsJoint() &&

@@ -85,13 +85,14 @@ written at their validated offsets, and Raft reads the received bytes through
 a read-only mapping for duplicate, metadata and checksum checks. Staged files
 reserve their declared sizes against a separate 256 MiB process-wide quota.
 Embedders can share a custom quota through `TLogLimits::SnapshotStagingBudget`.
-The staging quota lease covers an in-flight assembly and is released after
-the complete image has been decoded and its wire checksum verified. Duplicate
-chunks do not extend the receiver's idle deadline. Without a streaming install
-RSM, completion reserves the full image in the heap budget and uses the
-materializing decoder. If heap capacity is temporarily unavailable, the
-receiver keeps the staged file and leaves the final chunk unacknowledged for
-retry.
+The staging quota lease covers an in-flight assembly. When a streaming install
+RSM lets Raft retain the staged file as the snapshot's range source, the lease
+moves to that source and remains charged until the snapshot is replaced and all
+transfer pins release it. Materializing installs release the disk lease after
+decode and checksum verification, and reserve the decoded image in the heap
+budget. Duplicate chunks do not extend the receiver's idle deadline. If heap
+capacity is temporarily unavailable, the receiver keeps the staged file and
+leaves the final chunk unacknowledged for retry.
 
 The decoder validates the full wire checksum and metadata through the mapping,
 then retains a source for the application bytes. The SQL example validates and
@@ -105,11 +106,11 @@ The SQL RSM uses its streaming installer for both received and recovered
 snapshots. Legacy RSMs, receives without staging, older embedded durable images,
 and non-Linux `TDiskState` recovery may still materialize the payload. The
 active snapshot pins its anonymous receive file or durable snapshot mapping
-until replaced and all transfer pins are released. Staged receive disk use is
-outside the in-flight staging quota and must be allowed for on the configured
-filesystem. Partial transfers restart at offset zero after process restart. The
-wire format, 64 MiB limit and publication, application-installation and
-acknowledgement ordering stay the same.
+until replaced and all transfer pins are released. Retained anonymous receive
+files remain charged to the shared staging quota; durable storage's own snapshot
+files are governed by its storage and filesystem capacity. Partial transfers
+restart at offset zero after process restart. The wire format, 64 MiB limit and
+publication, application-installation and acknowledgement ordering stay the same.
 
 After a full transfer's metadata is verified, intermediate payload chunks
 reuse that result while the sender is still the recognized leader in the
