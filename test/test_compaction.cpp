@@ -101,6 +101,30 @@ void test_snapshot_capture_preflights_application_size_bound(void**) {
     assert_int_equal(state->SnapshotIndex, 0);
     assert_int_equal(state->LastLogIndex, 1);
 }
+void test_recovered_snapshot_retains_heap_budget_lease(void**) {
+    auto state = std::make_shared<TState>();
+    const TSnapshot image{1, 1, {1}, std::string(40, 's')};
+    state->InstallSnapshot(image);
+
+    auto tooSmallBudget = std::make_shared<TSnapshotInstallBudget>(39);
+    TRaft::TLogLimits limits;
+    limits.SnapshotInstallBudget = tooSmallBudget;
+    Reject([&] { TRaft raft(state, 1, TNodeDict{}, {}, limits); });
+    assert_int_equal(tooSmallBudget->UsedBytes(), 0);
+    assert_false(bool(state->GetSnapshot()->HeapReservation));
+
+    auto budget = std::make_shared<TSnapshotInstallBudget>(40);
+    limits.SnapshotInstallBudget = budget;
+    {
+        TRaft raft(state, 1, TNodeDict{}, {}, limits);
+        assert_int_equal(budget->UsedBytes(), image.Data.size());
+        assert_true(*state->GetSnapshot() == image);
+    }
+    // The storage snapshot outlives the Raft object and keeps its lease.
+    assert_int_equal(budget->UsedBytes(), image.Data.size());
+    state.reset();
+    assert_int_equal(budget->UsedBytes(), 0);
+}
 struct TCluster {
     ITimeSource::Time Now{};
     uint32_t NodeCount;
@@ -201,9 +225,12 @@ void test_shared_compaction_reuses_storage_snapshot_image(void**) {
     cluster.Pump(1);
     cluster.Write(1, "key", "value");
 
+    auto budget = TSnapshotInstallBudget::DefaultProcessBudget();
+    const auto usedBefore = budget->UsedBytes();
     const auto snapshot = cluster.Nodes[0]->CompactShared();
     const auto stored = cluster.Nodes[0]->GetState()->GetSnapshot();
     assert_true(snapshot == stored);
+    assert_int_equal(budget->UsedBytes(), usedBefore + snapshot->Data.size());
     assert_int_equal(snapshot->Index, cluster.Apps[0]->LastAppliedIndex);
     assert_true(Read(*cluster.Apps[0], "key") == "value");
 }
@@ -812,12 +839,12 @@ void test_snapshot_install_budget_is_shared_and_reclaimed_after_idle_expiry(void
     auto app3 = std::make_shared<TApplication>();
     TRequestProcessor processor3(raft3, app3, peers);
 
-    auto request = [](uint32_t target) {
+    auto request = [](uint32_t target, uint64_t total = 128) {
         constexpr std::string_view prefix = "MRFT";
         auto chunk = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + prefix.size());
         chunk->Src = 1; chunk->Dst = target; chunk->Term = 1; chunk->Seqno = 1;
         chunk->SnapshotIndex = 1; chunk->SnapshotTerm = 1;
-        chunk->TotalBytes = 128; chunk->Offset = 0; chunk->LeaderId = 1; chunk->Done = 0;
+        chunk->TotalBytes = total; chunk->Offset = 0; chunk->LeaderId = 1; chunk->Done = 0;
         memcpy(chunk->Data, prefix.data(), prefix.size());
         return chunk;
     };
@@ -856,7 +883,14 @@ void test_snapshot_install_budget_is_shared_and_reclaimed_after_idle_expiry(void
     raft3->Process(expiredAt, complete);
     auto installed = replies.back().Cast<TInstallSnapshotResponse>();
     assert_true(installed->Success); assert_true(installed->Installed);
-    assert_int_equal(budget->UsedBytes(), 0);
+    assert_int_equal(budget->UsedBytes(), image.size());
+
+    replies.clear();
+    raft2->Process(expiredAt, request(2, 200));
+    auto retainedSnapshotBlocksAnotherImage = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_false(retainedSnapshotBlocksAnotherImage->Success);
+    assert_false(retainedSnapshotBlocksAnotherImage->Installed);
+    assert_int_equal(budget->UsedBytes(), image.size());
 }
 void test_snapshot_install_budget_releases_after_application_validation_failure(void**) {
     auto budget = std::make_shared<TSnapshotInstallBudget>(1024);
@@ -1374,14 +1408,14 @@ void test_truncated_snapshot_header_is_rejected_for_covered_and_new_boundaries(v
         assert_false(response->Installed);
         assert_int_equal(response->NextOffset, 0);
         assert_int_equal(state->CurrentTerm, term);
-        assert_int_equal(budget->UsedBytes(), 0);
+        assert_int_equal(budget->UsedBytes(), knownBytes.size());
 
         response = {};
         chunk->Term = term + 1;
         raft->Process({}, chunk);
         assert_false(bool(response));
         assert_int_equal(state->CurrentTerm, term);
-        assert_int_equal(budget->UsedBytes(), 0);
+        assert_int_equal(budget->UsedBytes(), knownBytes.size());
     }
     assert_int_equal(app->Loads, 1);
 }
@@ -2227,11 +2261,11 @@ void test_file_staging_and_decode_use_separate_shared_budgets(void**) {
     assert_true(response->Success);
     assert_true(response->Installed);
     assert_int_equal(stagedReceiver->GetState()->SnapshotIndex, 1);
-    assert_int_equal(heap->UsedBytes(), 0);
+    assert_int_equal(heap->UsedBytes(), bytes.size());
     assert_int_equal(disk->UsedBytes(), 0);
 
     auto heldHeap = heap->TryReserve(bytes.size());
-    assert_true(bool(heldHeap));
+    assert_false(bool(heldHeap));
     otherStagedReceiver->Process(retryTime, first);
     assert_true(response->Success);
     response = {};
@@ -2617,6 +2651,7 @@ int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_kv_snapshot_precomputes_size_without_changing_encoding),
         cmocka_unit_test(test_snapshot_capture_preflights_application_size_bound),
+        cmocka_unit_test(test_recovered_snapshot_retains_heap_budget_lease),
         cmocka_unit_test(test_shared_compaction_reuses_storage_snapshot_image),
         cmocka_unit_test(test_zero_index_follower_compaction_waits_for_capability_barrier),
         cmocka_unit_test(test_snapshot_history_encoding_is_negotiated_per_peer),

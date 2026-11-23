@@ -30,9 +30,10 @@ probes use the same budget for the prefix they buffer, including both buffers
 when growing it. Callers can configure a shared `TSnapshotInstallBudget`.
 Optional Linux staging files have their own shared quota. Completed staged
 images must reserve receive heap space before decoding.
-Current application/log state, outgoing snapshots,
-snapshot capture, transport buffers and other allocations remain outside these
-limits; disk-streamed snapshot transfer remains open. Voter membership changes
+Retained snapshot payloads and outgoing pins share the install heap budget.
+Current application/log state, capture-time buffers, detached snapshot copies,
+transport buffers and other allocations remain outside these limits;
+disk-streamed snapshot transfer remains open. Voter membership changes
 are available through [live membership](configuration-entries.md), with leader
 removal supported by [leadership transfer](leadership-transfer.md). This alpha.43
 milestone predates joint snapshot installation, which is now supported when the

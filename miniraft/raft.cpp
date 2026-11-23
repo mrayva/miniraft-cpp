@@ -1194,6 +1194,17 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
     const auto snapshot = State->GetSnapshot();
     if (snapshot) {
         ValidateSnapshot(*snapshot);
+        if (snapshot->HeapReservation) {
+            if (snapshot->HeapReservationBudget != SnapshotInstallBudget)
+                throw std::invalid_argument("Stored snapshot is charged to a different heap budget");
+        } else {
+            auto reservation = SnapshotInstallBudget->TryReserve(snapshot->Data.size());
+            if (!snapshot->Data.empty() && !reservation)
+                throw std::runtime_error("Stored snapshot exceeds the available heap budget");
+            snapshot->HeapReservation = std::move(reservation);
+            if (snapshot->HeapReservation)
+                snapshot->HeapReservationBudget = SnapshotInstallBudget;
+        }
     }
     bool hasConfigurationHistory = snapshot && snapshot->HasConfigurationMetadata();
     const bool durableBinding = State->SupportsVoterBinding() && State->SupportsCommitIndexPersistence();
@@ -3000,7 +3011,14 @@ std::shared_ptr<const TSnapshot> TRaft::CompactShared() {
         if (rpc.Snapshot) pinnedGenerations.insert(rpc.Snapshot->Index);
     if (pinnedGenerations.size() >= TVolatileState::MaxPinnedSnapshotGenerations)
         throw std::runtime_error("Compaction deferred while snapshot transfers pin multiple generations");
-    auto snapshot = std::make_shared<const TSnapshot>(CaptureSnapshot(*this, *application));
+    auto captured = CaptureSnapshot(*this, *application);
+    auto reservation = SnapshotInstallBudget->TryReserve(captured.Data.size());
+    if (!captured.Data.empty() && !reservation)
+        throw std::runtime_error("Compacted snapshot exceeds the available heap budget");
+    captured.HeapReservation = std::move(reservation);
+    if (captured.HeapReservation)
+        captured.HeapReservationBudget = SnapshotInstallBudget;
+    auto snapshot = std::make_shared<const TSnapshot>(std::move(captured));
     application->ValidateSnapshot(snapshot->Data, snapshot->Index);
     AdvanceCommitIndex(VolatileState->CommitIndex);
     TRaftInstallSnapshotPermit permit;
@@ -3577,6 +3595,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
                 throw TMessageError("Snapshot configuration is missing a voter peer target");
         stagedApplicationInstall = PrepareApplicationSnapshotInstallation(
             *application, snapshot.Data, snapshot.Index);
+        snapshot.HeapReservation = std::move(installationReservation);
+        snapshot.HeapReservationBudget = SnapshotInstallBudget;
     } catch (const std::exception&) {
         IncomingSnapshot.reset(); reply(false, false, 0); return;
     }

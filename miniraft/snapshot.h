@@ -13,6 +13,7 @@
 #include <vector>
 
 class TRaft;
+class TSnapshotInstallBudget;
 struct IRsm;
 
 // One committed stable -> joint -> stable voter transition. A zero stable
@@ -51,16 +52,32 @@ struct TSnapshot {
     // Bounded, contiguous committed history for online recovery of stores that
     // missed more than one compaction. Legacy snapshots retain only the tail.
     std::vector<TSnapshotConfigurationTransition> ConfigurationTransitions;
+    // Runtime-only quota lease for the retained application image. These
+    // fields are neither serialized nor part of snapshot identity.
+    mutable std::shared_ptr<void> HeapReservation;
+    mutable std::shared_ptr<TSnapshotInstallBudget> HeapReservationBudget;
     bool HasConfigurationLineage() const { return !PreviousVoters.empty(); }
     bool HasStablePredecessor() const { return StableConfiguration && !PreviousVoters.empty(); }
     bool IsJoint() const { return !JointVoters.empty() || (!StableConfiguration && (ConfigurationIndex || ConfigurationTerm)); }
     bool HasConfigurationMetadata() const { return StableConfiguration || IsJoint(); }
-    bool operator==(const TSnapshot&) const = default;
+    bool operator==(const TSnapshot& other) const {
+        return Index == other.Index && Term == other.Term && Voters == other.Voters &&
+            Data == other.Data && JointVoters == other.JointVoters &&
+            ConfigurationIndex == other.ConfigurationIndex &&
+            ConfigurationTerm == other.ConfigurationTerm &&
+            StableConfiguration == other.StableConfiguration &&
+            PreviousVoters == other.PreviousVoters &&
+            PreviousConfigurationIndex == other.PreviousConfigurationIndex &&
+            PreviousConfigurationTerm == other.PreviousConfigurationTerm &&
+            PreviousJointIndex == other.PreviousJointIndex &&
+            PreviousJointTerm == other.PreviousJointTerm &&
+            ConfigurationTransitions == other.ConfigurationTransitions;
+    }
 };
 
-// Shares an aggregate byte limit across InstallSnapshot operations. Raft uses
-// separate instances for receive and decode allocations and temporary files.
-// Callers can supply shared custom budgets through Raft limits.
+// Shares an aggregate heap limit across snapshot transfers and retained images.
+// Temporary file staging uses a separate budget. Callers can supply shared
+// custom budgets through Raft limits.
 class TSnapshotInstallBudget : public std::enable_shared_from_this<TSnapshotInstallBudget> {
     class TReservation {
     public:

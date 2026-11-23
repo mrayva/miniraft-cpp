@@ -45,10 +45,12 @@ cannot reserve space receives a
 rejection with offset zero and can retry after capacity is released.
 Full-image receive buffers allocate their declared length before accepting
 chunks, so chunk appends do not grow the buffer geometrically.
-Completion, rejection, term change and idle expiry release the reservation.
-The heap budget also covers decoding completed staging files. Retained
-snapshots, outgoing pins, capture buffers, application memory and transport
-buffers remain outside this budget.
+Rejection, term change and idle expiry release temporary reservations. A
+successful installation transfers its heap lease to the retained snapshot;
+local compaction and startup recovery also charge retained image data. Outgoing
+pins keep that same image lease alive. Capture-time buffers before reservation,
+application memory, detached value copies and transport buffers remain outside
+this budget.
 
 On Linux, set `TRaft::TLogLimits::SnapshotStagingDirectory` to stage full
 incoming images in a directory on a filesystem that supports anonymous

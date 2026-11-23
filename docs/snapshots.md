@@ -112,13 +112,15 @@ replicated joint-consensus membership are implemented. The current support
 matrix and operational constraints are in [capability matrix](capability-matrix.md).
 
 The remaining work includes disk-streamed application snapshots and a shared
-heap budget across capture, storage, application state and transport. Partial
-incoming transfers are not persisted, so a follower restart begins again at
-offset zero. Cluster-wide endpoint discovery and rollout, plus automatic stale
-store recovery without an accepted membership-history anchor, also remain open.
-See the [streaming design](snapshot-streaming-design.md) for the proposed
-storage contract. Snapshot capture can still block the event loop, and
-independent review remains an open release gate.
+heap budget across capture-time allocations, application state and transport.
+Retained Raft snapshot images are now charged to the install heap budget, but
+those other allocations are not. Partial incoming transfers are not persisted,
+so a follower restart begins again at offset zero. Cluster-wide endpoint
+discovery and rollout, plus automatic stale store recovery without an accepted
+membership-history anchor, also remain open. See the [streaming
+design](snapshot-streaming-design.md) for the proposed storage contract.
+Snapshot capture can still block the event loop, and independent review remains
+an open release gate.
 
 These features follow the snapshot metadata/state-transfer requirements in
 [Raft section 7](https://raft.github.io/raft.pdf) and the overlapping-quorum
