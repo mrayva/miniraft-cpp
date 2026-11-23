@@ -265,11 +265,13 @@ NNet::TVoidSuspendedTask TNode<TSocket>::DoConnect() {
             // the same connector coroutine.
             TimedOutCapabilityGeneration = 0;
             Socket = SocketFactory(*Address);
-            // The dependency's finite deadline can leave I/O and timer wakeups
-            // registered for the same coroutine after a timeout. Use its default
-            // I/O-only connect until cancellation of both sources is supported.
-            // TCP connect failure timing is therefore controlled by the OS.
-            co_await Socket.Connect();
+            if constexpr (requires(TSocket& socket, NNet::TTime deadline) {
+                    socket.Connect(deadline);
+                }) {
+                co_await Socket.Connect(NNet::TClock::now() + std::chrono::seconds(5));
+            } else {
+                co_await Socket.Connect();
+            }
             if (Retired) {
                 ShutdownSocket();
                 break;

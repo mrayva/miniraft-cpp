@@ -20,6 +20,10 @@ namespace {
 struct TPoller : NNet::TPollerBase {
     std::vector<std::coroutine_handle<>> Ready;
     void Tick() { ProcessTimers(); }
+    void QueueReadyWrite(int fd, std::coroutine_handle<> handle) {
+        ReadyEvents_.emplace_back(NNet::TEvent{fd, NNet::TEvent::WRITE, handle});
+    }
+    void WakePollerReady() { WakeupReadyHandles(); }
     void ResumeReady() {
         auto ready = std::move(Ready);
         Ready.clear();
@@ -76,19 +80,16 @@ struct TAsyncSocket {
 struct TSocket {
     TPoller* Owner = nullptr;
     bool FailWrite = false;
-    bool DuplicateDeadline = false;
-    auto Connect(NNet::TTime deadline = NNet::TTime::max()) {
+    auto Connect() {
         struct TAwaiter {
             TPoller* Owner;
-            bool DuplicateDeadline;
             bool await_ready() { return false; }
             void await_suspend(std::coroutine_handle<> h) {
-                Owner->AddTimer({}, h); // Controllable stand-in for I/O readiness.
-                if (DuplicateDeadline) Owner->AddTimer({}, h);
+                Owner->AddTimer({}, h);
             }
             void await_resume() {}
         };
-        return TAwaiter{Owner, DuplicateDeadline && deadline != NNet::TTime::max()};
+        return TAwaiter{Owner};
     }
     TPoller* Poller() { return Owner; }
     void Shutdown() noexcept {}
@@ -96,6 +97,31 @@ struct TSocket {
         if (FailWrite) throw std::runtime_error("injected write failure");
         co_return length;
     }
+};
+struct TDeadlineSocket {
+    struct TConnectAwaiter {
+        TPoller* Owner;
+        NNet::TTime Deadline;
+        unsigned TimerId = 0;
+        static constexpr int Fd = 77;
+        bool await_ready() const { return false; }
+        void await_suspend(std::coroutine_handle<> handle) {
+            Owner->AddWrite(Fd, handle);
+            TimerId = Owner->AddTimer(Deadline, handle);
+            Owner->QueueReadyWrite(Fd, handle);
+        }
+        void await_resume() {
+            if (Owner->RemoveTimer(TimerId, Deadline)) {
+                Owner->RemoveEvent(Fd);
+                throw std::system_error(std::make_error_code(std::errc::timed_out));
+            }
+        }
+    };
+    TPoller* Owner = nullptr;
+    TConnectAwaiter Connect(NNet::TTime deadline) { return {Owner, deadline}; }
+    TPoller* Poller() { return Owner; }
+    void Shutdown() noexcept { }
+    NNet::TValueTask<ssize_t> WriteSome(const void*, size_t size) { co_return ssize_t(size); }
 };
 struct TCapabilitySocketState {
     TPoller* Owner = nullptr;
@@ -273,17 +299,19 @@ void test_old_reader_failure_cannot_disconnect_writer_reconnect(void**) {
     node.Send(NewHoldedMessage<TCommandRequest>()); node.Drain();
     node.Disconnect(node.GetConnectionGeneration()); assert_false(node.IsConnected());
 }
-void test_connect_cannot_leave_a_second_deadline_wakeup_after_completion(void**) {
+void test_connect_timeout_cancels_a_ready_event_before_retry(void**) {
     TPoller poller;
-    // The dependency's finite-deadline connect registers the same coroutine for
-    // both I/O and a timer. Model a second wakeup surviving the first, as seen
-    // in CI when timeout/I/O completion races with the retry sleep.
-    TNode<TSocket> node([&](const auto&) { return TSocket{&poller, false, true}; }, "peer",
+    TNode<TDeadlineSocket> node([&](const auto&) { return TDeadlineSocket{&poller}; }, "peer",
         NNet::TAddress("127.0.0.1", 1), std::make_shared<TTimeSource>());
-    node.Drain(); poller.TickOne(); assert_true(node.IsConnected());
-    node.Disconnect();
-    poller.Tick(); // A leftover deadline must not resume the destroyed connector.
+    node.Drain();
+    poller.TickOne(); // Timeout wins after readiness has already been queued.
     assert_false(node.IsConnected());
+    poller.WakePollerReady(); // The ready queue must no longer contain the timed-out handle.
+    assert_false(node.IsConnected());
+    node.Retire();
+    poller.TickOne(); // Let the retry sleep observe retirement and unwind.
+    node.Drain();
+    assert_true(node.RetirementComplete());
 }
 void test_peer_response_readers_start_once_for_replication_targets(void**) {
     std::unordered_map<uint32_t, std::string> peers{{1, "old voter"}, {2, "staged learner"}};
@@ -375,6 +403,46 @@ void test_socket_shutdown_wakes_a_real_pending_read(void**) {
         "tls-peer", NNet::TSslSocket<NNet::TSocket>{}, std::make_shared<TTimeSource>());
     assert_false(tlsNode.SupportsRetirement());
 }
+struct TConnectFailureResult {
+    bool Completed = false;
+    bool Succeeded = false;
+    int Error = 0;
+};
+NNet::TVoidTask ConnectToRejectedPeer(NNet::TPoll& poller, const NNet::TAddress& address,
+        TConnectFailureResult& result) {
+    NNet::TSocket socket(address, poller);
+    try {
+        co_await socket.Connect(NNet::TClock::now() + std::chrono::seconds(5));
+        result.Succeeded = true;
+    } catch (const std::system_error& ex) {
+        result.Error = ex.code().value();
+    }
+    result.Completed = true;
+}
+void test_connect_readiness_reports_socket_error(void**) {
+    int reserved = ::socket(AF_INET, SOCK_STREAM, 0);
+    assert_true(reserved >= 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    assert_int_equal(::bind(reserved, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+    socklen_t addressSize = sizeof(address);
+    assert_int_equal(::getsockname(reserved, reinterpret_cast<sockaddr*>(&address), &addressSize), 0);
+
+    NNet::TPoll poller;
+    TConnectFailureResult result;
+    const NNet::TAddress peer(reinterpret_cast<sockaddr*>(&address), addressSize);
+    ConnectToRejectedPeer(poller, peer, result);
+    for (size_t step = 0; step < 100 && !result.Completed; ++step) {
+        poller.Poll();
+        poller.WakeupReadyHandles();
+    }
+    assert_true(result.Completed);
+    assert_false(result.Succeeded);
+    assert_int_equal(result.Error, std::make_error_code(std::errc::connection_refused).value());
+    ::close(reserved);
+}
 
 using TRetirableTlsSocket = NNet::TRetirableSslSocket<NNet::TSocket>;
 struct TTlsAcceptState {
@@ -440,11 +508,12 @@ int main() {
         cmocka_unit_test(test_capability_negotiation_timeout_unblocks_queue_and_accepts_late_response),
         cmocka_unit_test(test_queued_sessionized_request_is_dropped_on_legacy_fallback),
         cmocka_unit_test(test_old_reader_failure_cannot_disconnect_writer_reconnect),
-        cmocka_unit_test(test_connect_cannot_leave_a_second_deadline_wakeup_after_completion),
+        cmocka_unit_test(test_connect_timeout_cancels_a_ready_event_before_retry),
         cmocka_unit_test(test_peer_response_readers_start_once_for_replication_targets),
         cmocka_unit_test(test_retirement_wakes_reader_and_writer_before_socket_cleanup),
 #ifdef __linux__
         cmocka_unit_test(test_socket_shutdown_wakes_a_real_pending_read),
+        cmocka_unit_test(test_connect_readiness_reports_socket_error),
         cmocka_unit_test(test_tls_shutdown_wakes_retired_peer_reader),
 #endif
     };
