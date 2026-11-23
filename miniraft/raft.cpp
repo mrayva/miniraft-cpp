@@ -3094,7 +3094,9 @@ std::shared_ptr<const TSnapshot> TRaft::CompactShared() {
         if (rpc.Snapshot) pinnedGenerations.insert(rpc.Snapshot->Index);
     if (pinnedGenerations.size() >= TVolatileState::MaxPinnedSnapshotGenerations)
         throw std::runtime_error("Compaction deferred while snapshot transfers pin multiple generations");
-    auto captured = CaptureSnapshot(*this, *application, SnapshotInstallBudget);
+    auto captured = CaptureSnapshot(*this, *application, SnapshotInstallBudget,
+        LogLimits.SnapshotStagingBudget ? LogLimits.SnapshotStagingBudget : SnapshotInstallBudget,
+        LogLimits.SnapshotStagingDirectory);
     auto snapshot = std::make_shared<const TSnapshot>(std::move(captured));
     uint64_t maxSnapshotBytes = TSnapshot::MaxBytes;
     if (membershipReadiness.IsLeader) {

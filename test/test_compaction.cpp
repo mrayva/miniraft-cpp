@@ -4,6 +4,7 @@
 #include "../examples/kv.h"
 #include "../examples/kv_messages.h"
 #include <algorithm>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <set>
@@ -127,6 +128,35 @@ struct TStreamingWriterSnapshotApplication : TApplication {
         }
     }
     void ValidateSnapshot(std::string_view, uint64_t) const override { }
+};
+struct TStreamingWriterInstallApplication : TStreamingWriterSnapshotApplication,
+        IStreamingSnapshotInstallRsm {
+    struct TNoopInstallation : IStagedSnapshotInstallation {
+        void Install() override { }
+    };
+    size_t RangePreparations = 0;
+    std::unique_ptr<IStagedSnapshotInstallation> PrepareSnapshotInstallation(
+            const TSnapshotDataSource& source, uint64_t index) override {
+        if (index != LastAppliedIndex || source.Size() != Payload.size())
+            throw std::runtime_error("Unexpected staged capture image");
+        ++RangePreparations;
+        std::array<char, 7> buffer{};
+        for (uint64_t offset = 0; offset < source.Size();) {
+            const auto count = size_t(std::min<uint64_t>(buffer.size(), source.Size() - offset));
+            size_t copied = 0;
+            while (copied < count) {
+                const auto read = source.Read(offset + copied,
+                    std::span<char>(buffer.data() + copied, count - copied));
+                if (!read || read > count - copied)
+                    throw std::runtime_error("Truncated staged capture image");
+                copied += read;
+            }
+            if (memcmp(buffer.data(), Payload.data() + offset, count) != 0)
+                throw std::runtime_error("Staged capture image changed");
+            offset += count;
+        }
+        return std::make_unique<TNoopInstallation>();
+    }
 };
 struct TRejectingSnapshotApplication : TApplication {
     void ValidateSnapshot(std::string_view, uint64_t) const override {
@@ -318,6 +348,79 @@ void test_incremental_snapshot_capture_charges_each_growth_before_writing(void**
     state.reset();
     assert_int_equal(budget->UsedBytes(), 0);
 }
+#ifdef __linux__
+void test_incremental_snapshot_capture_uses_disk_staging_quota(void**) {
+    char directoryTemplate[] = "/tmp/miniraft-capture-XXXXXX";
+    auto* createdDirectory = mkdtemp(directoryTemplate);
+    assert_non_null(createdDirectory);
+    struct TDirectoryCleanup {
+        std::filesystem::path Path;
+        ~TDirectoryCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(Path, ignored);
+        }
+    } cleanup{createdDirectory};
+
+    auto makeState = [] {
+        auto state = std::make_shared<TState>();
+        auto entry = NewHoldedMessage<TLogEntry>();
+        entry->Term = 1;
+        state->Append(entry);
+        state->CommitIndex = 1;
+        return state;
+    };
+
+    auto state = makeState();
+    auto heapBudget = std::make_shared<TSnapshotInstallBudget>(1);
+    auto stagingBudget = std::make_shared<TSnapshotInstallBudget>(40);
+    TRaft::TLogLimits limits;
+    limits.SnapshotInstallBudget = heapBudget;
+    limits.SnapshotStagingBudget = stagingBudget;
+    limits.SnapshotStagingDirectory = createdDirectory;
+    auto app = std::make_shared<TStreamingWriterInstallApplication>();
+    app->LastAppliedIndex = 1;
+    {
+        auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{},
+            std::vector<uint32_t>{}, limits);
+        TRequestProcessor processor(raft, app, {});
+        auto snapshot = raft->CompactShared();
+        assert_true(snapshot->Data.empty());
+        assert_true(bool(snapshot->DataSource));
+        assert_int_equal(snapshot->DataSize(), app->Payload.size());
+        assert_int_equal(app->RangePreparations, 1);
+        std::array<char, 11> chunk{};
+        for (size_t offset = 0; offset < app->Payload.size();) {
+            const auto count = std::min(chunk.size(), app->Payload.size() - offset);
+            assert_int_equal(snapshot->ReadDataRange(offset, std::span<char>(chunk.data(), count)), count);
+            assert_true(memcmp(chunk.data(), app->Payload.data() + offset, count) == 0);
+            offset += count;
+        }
+        assert_true(DecodeSnapshot(EncodeSnapshot(*snapshot)) == *snapshot);
+        assert_int_equal(heapBudget->UsedBytes(), 0);
+        assert_int_equal(stagingBudget->UsedBytes(), app->Payload.size());
+    }
+    state.reset();
+    assert_int_equal(stagingBudget->UsedBytes(), 0);
+
+    auto rejectedState = makeState();
+    auto rejectedHeapBudget = std::make_shared<TSnapshotInstallBudget>(1);
+    auto rejectedStagingBudget = std::make_shared<TSnapshotInstallBudget>(39);
+    limits.SnapshotInstallBudget = rejectedHeapBudget;
+    limits.SnapshotStagingBudget = rejectedStagingBudget;
+    auto rejectedApp = std::make_shared<TStreamingWriterSnapshotApplication>();
+    rejectedApp->IgnoreSinkFailures = true;
+    rejectedApp->LastAppliedIndex = 1;
+    {
+        auto raft = std::make_shared<TRaft>(rejectedState, 1, TNodeDict{},
+            std::vector<uint32_t>{}, limits);
+        TRequestProcessor processor(raft, rejectedApp, {});
+        Reject([&] { raft->Compact(); });
+    }
+    assert_int_equal(rejectedState->SnapshotIndex, 0);
+    assert_int_equal(rejectedHeapBudget->UsedBytes(), 0);
+    assert_int_equal(rejectedStagingBudget->UsedBytes(), 0);
+}
+#endif
 void test_recovered_snapshot_retains_heap_budget_lease(void**) {
     auto state = std::make_shared<TState>();
     const TSnapshot image{1, 1, {1}, std::string(40, 's')};
@@ -3216,6 +3319,7 @@ int main() {
         cmocka_unit_test(test_memory_snapshot_boundary_retains_matching_suffix_and_replaces_conflict),
 #ifdef __linux__
         cmocka_unit_test(test_file_staged_snapshot_install_accepts_every_small_fixed_chunk_size),
+        cmocka_unit_test(test_incremental_snapshot_capture_uses_disk_staging_quota),
         cmocka_unit_test(test_file_staging_failure_releases_snapshot_reservation),
         cmocka_unit_test(test_file_staged_streaming_install_retains_source_quota),
         cmocka_unit_test(test_file_staging_and_decode_use_separate_shared_budgets),

@@ -484,8 +484,8 @@ public:
         // shared budget here to override the process-wide snapshot receive
         // heap cap, including decoding of completed staging files.
         std::shared_ptr<TSnapshotInstallBudget> SnapshotInstallBudget;
-        // On Linux, stage full incoming images in anonymous files in this
-        // directory.
+        // On Linux, stage streamed application captures and full incoming
+        // snapshot images in anonymous files in this directory.
         std::string SnapshotStagingDirectory;
         // Share this separately from SnapshotInstallBudget to limit staged
         // file bytes. Defaults to a separate 256 MiB process-wide budget.
@@ -622,6 +622,9 @@ private:
     friend TSnapshot CaptureSnapshot(const TRaft&, const IRsm&);
     friend TSnapshot CaptureSnapshot(const TRaft&, const IRsm&,
         std::shared_ptr<TSnapshotInstallBudget>);
+    friend TSnapshot CaptureSnapshot(const TRaft&, const IRsm&,
+        std::shared_ptr<TSnapshotInstallBudget>,
+        std::shared_ptr<TSnapshotInstallBudget>, std::string_view);
     friend void RestoreSnapshot(const TSnapshot&, const TRaft&, IRsm&);
     void RestoreAppliedIndex(uint64_t index);
     void AdvanceCommitIndex(uint64_t index);

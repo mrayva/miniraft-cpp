@@ -200,6 +200,12 @@ void PreserveStableSnapshotIdentity(const TSnapshot* current, TSnapshot& incomin
 TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm);
 TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
     std::shared_ptr<TSnapshotInstallBudget> heapBudget);
+// When a staging directory is supplied, incremental application writers emit
+// into an anonymous file and retain its quota lease with the range-backed image.
+TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
+    std::shared_ptr<TSnapshotInstallBudget> heapBudget,
+    std::shared_ptr<TSnapshotInstallBudget> stagingBudget,
+    std::string_view stagingDirectory);
 // Startup only, with an application behind the snapshot and
 // a matching local boundary/log. This can recover an app left behind by a crash
 // after durable Raft snapshot publication.

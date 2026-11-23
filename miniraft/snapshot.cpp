@@ -445,6 +445,86 @@ private:
     std::shared_ptr<const ISnapshotSource> Source;
     uint64_t SizeBytes = 0;
 };
+
+class TSnapshotCaptureFile final : public TSnapshotDataSource {
+public:
+    explicit TSnapshotCaptureFile(const std::string& directory)
+#ifdef __linux__
+        : File(open(directory.c_str(), O_TMPFILE | O_RDWR | O_CLOEXEC, 0600))
+#endif
+    {
+#ifdef __linux__
+        Require(File.Value >= 0, "create snapshot capture staging file");
+        struct stat info{};
+        Require(fstat(File.Value, &info) == 0, "stat snapshot capture staging file");
+        if (!S_ISREG(info.st_mode)) throw std::runtime_error("Invalid snapshot capture staging file type");
+#else
+        (void)directory;
+        throw std::runtime_error("Snapshot capture staging requires Linux");
+#endif
+    }
+
+    uint64_t Size() const override { return WrittenBytes; }
+
+    size_t Read(uint64_t offset, std::span<char> destination) const override {
+        if (offset >= WrittenBytes || destination.empty()) return 0;
+        const auto count = size_t(std::min<uint64_t>(destination.size(), WrittenBytes - offset));
+#ifdef __linux__
+        size_t copied = 0;
+        while (copied < count) {
+            const auto read = pread(File.Value, destination.data() + copied, count - copied,
+                off_t(offset + copied));
+            if (read < 0 && errno == EINTR) continue;
+            if (read < 0) throw std::system_error(errno, std::generic_category(), "read snapshot capture staging file");
+            if (!read) throw std::runtime_error("Snapshot capture staging file ended early");
+            copied += size_t(read);
+        }
+        return copied;
+#else
+        (void)offset;
+        (void)destination;
+        return 0;
+#endif
+    }
+
+    void Append(std::span<const char> bytes,
+            const std::shared_ptr<TSnapshotInstallBudget>& budget) {
+        if (bytes.empty()) return;
+        if (bytes.size() > UINT64_MAX - WrittenBytes)
+            throw std::length_error("Snapshot capture staging size overflow");
+        const auto nextBytes = WrittenBytes + bytes.size();
+        if (budget) {
+            if (!Lease) {
+                Lease = budget->TryReserveLease(nextBytes);
+                if (!Lease) throw std::runtime_error("Snapshot capture exceeds the staging budget");
+            } else if (!budget->TryResize(Lease, nextBytes)) {
+                throw std::runtime_error("Snapshot capture exceeds the staging budget");
+            }
+        }
+#ifdef __linux__
+        size_t written = 0;
+        while (written < bytes.size()) {
+            const auto count = pwrite(File.Value, bytes.data() + written, bytes.size() - written,
+                off_t(WrittenBytes + written));
+            if (count < 0 && errno == EINTR) continue;
+            if (count < 0) throw std::system_error(errno, std::generic_category(), "write snapshot capture staging file");
+            if (!count) throw std::runtime_error("Cannot write snapshot capture staging file");
+            written += size_t(count);
+        }
+        WrittenBytes = nextBytes;
+#else
+        (void)bytes;
+        throw std::runtime_error("Snapshot capture staging requires Linux");
+#endif
+    }
+
+private:
+#ifdef __linux__
+    TFd File;
+#endif
+    uint64_t WrittenBytes = 0;
+    std::shared_ptr<TSnapshotInstallBudget::TReservation> Lease;
+};
 }
 
 struct TSnapshotEncoding {
@@ -825,6 +905,13 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm) {
 
 TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         std::shared_ptr<TSnapshotInstallBudget> heapBudget) {
+    return CaptureSnapshot(raft, rsm, std::move(heapBudget), {}, {});
+}
+
+TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
+        std::shared_ptr<TSnapshotInstallBudget> heapBudget,
+        std::shared_ptr<TSnapshotInstallBudget> stagingBudget,
+        std::string_view stagingDirectory) {
     const auto index = rsm.LastAppliedIndex;
     if (!index || index > raft.GetVolatileState()->CommitIndex || index > raft.GetLastIndex())
         throw std::runtime_error("Snapshot requires applied committed progress");
@@ -889,8 +976,14 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
     class TCaptureSink final : public ISnapshotSink {
     public:
         TCaptureSink(std::shared_ptr<TSnapshotInstallBudget> budget,
+                std::shared_ptr<TSnapshotInstallBudget> stagingBudget,
+                std::string_view stagingDirectory,
                 uint64_t maxBytes, std::optional<uint64_t> upperBound)
-            : Budget(std::move(budget)), MaxBytes(maxBytes), UpperBound(upperBound) { }
+            : Budget(std::move(budget)), StagingBudget(std::move(stagingBudget)),
+              MaxBytes(maxBytes), UpperBound(upperBound) {
+            if (!stagingDirectory.empty())
+                File = std::make_shared<TSnapshotCaptureFile>(std::string(stagingDirectory));
+        }
 
         void Write(std::span<const char> bytes) override {
             try {
@@ -906,19 +999,22 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         }
 
         std::string TakeData() { return std::move(Data); }
+        std::shared_ptr<const TSnapshotDataSource> TakeSource() { return std::move(File); }
         std::shared_ptr<TSnapshotInstallBudget::TReservation> TakeReservation() {
             return std::move(Lease);
         }
 
     private:
         void WriteImpl(std::span<const char> bytes) {
-            const auto currentBytes = uint64_t(Data.size());
+            const auto currentBytes = File ? File->Size() : uint64_t(Data.size());
             if (bytes.size() > MaxBytes - currentBytes)
                 throw std::runtime_error("Application snapshot exceeds the Raft snapshot limit");
             const auto nextBytes = currentBytes + bytes.size();
             if (UpperBound && nextBytes > *UpperBound)
                 throw std::logic_error("Application snapshot exceeded its declared size bound");
-            if (Budget && nextBytes > currentBytes) {
+            if (File) {
+                File->Append(bytes, StagingBudget);
+            } else if (Budget && nextBytes > currentBytes) {
                 if (!Lease) {
                     Lease = Budget->TryReserveLease(nextBytes);
                     if (!Lease)
@@ -927,14 +1023,16 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
                     throw std::runtime_error("Snapshot capture exceeds the available heap budget");
                 }
             }
-            if (!bytes.empty()) Data.append(bytes.data(), bytes.size());
+            if (!File && !bytes.empty()) Data.append(bytes.data(), bytes.size());
         }
 
         std::shared_ptr<TSnapshotInstallBudget> Budget;
+        std::shared_ptr<TSnapshotInstallBudget> StagingBudget;
         uint64_t MaxBytes;
         std::optional<uint64_t> UpperBound;
         std::string Data;
         std::shared_ptr<TSnapshotInstallBudget::TReservation> Lease;
+        std::shared_ptr<TSnapshotCaptureFile> File;
         std::exception_ptr Failure;
     };
     const auto streamingRsm = dynamic_cast<const IStreamingSnapshotRsm*>(&rsm);
@@ -961,10 +1059,14 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         }
         snapshot.DataSource = std::make_shared<TApplicationSnapshotSource>(std::move(source), dataBytes);
     } else if (const auto writerRsm = dynamic_cast<const IStreamingSnapshotWriterRsm*>(&rsm)) {
-        TCaptureSink sink(heapBudget, TSnapshot::MaxBytes - metadataBytes, upperBound);
+        if (!stagingDirectory.empty() && !stagingBudget)
+            stagingBudget = heapBudget ? heapBudget : TSnapshotInstallBudget::DefaultProcessBudget();
+        TCaptureSink sink(heapBudget, stagingBudget, stagingDirectory,
+            TSnapshot::MaxBytes - metadataBytes, upperBound);
         writerRsm->WriteSnapshot(index, sink);
         sink.RethrowFailure();
-        snapshot.Data = sink.TakeData();
+        if (stagingDirectory.empty()) snapshot.Data = sink.TakeData();
+        else snapshot.DataSource = sink.TakeSource();
         reservation = sink.TakeReservation();
     } else {
         if (upperBound) reserveCaptureBytes(*upperBound);
