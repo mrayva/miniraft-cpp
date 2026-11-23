@@ -54,9 +54,16 @@ struct TCountingRsm : TDummyRsm {
     }
 };
 struct TSnapshotRsm : TCountingRsm {
-    std::string SaveSnapshot() const override { return std::to_string(LastAppliedIndex); }
+    size_t SnapshotPaddingBytes = 0;
+    std::string SaveSnapshot() const override {
+        return std::to_string(LastAppliedIndex) + std::string(SnapshotPaddingBytes, 's');
+    }
     void ValidateSnapshot(std::string_view data, uint64_t index) const override {
-        if (data != std::to_string(index)) throw std::runtime_error("Snapshot index mismatch");
+        const auto prefix = std::to_string(index);
+        if (data.size() != prefix.size() + SnapshotPaddingBytes ||
+            data.substr(0, prefix.size()) != prefix ||
+            data.substr(prefix.size()) != std::string(SnapshotPaddingBytes, 's'))
+            throw std::runtime_error("Snapshot index or payload mismatch");
     }
     void LoadSnapshot(std::string_view data, uint64_t index) override {
         ValidateSnapshot(data, index);
@@ -2395,6 +2402,9 @@ void test_disjoint_membership_change_transfers_finalizes_and_restarts(void**) {
     std::array<std::array<std::shared_ptr<TEndpoint>, 7>, 7> endpoints{};
     ITimeSource::Time now{};
     bool isolateNewMajority = false;
+    bool isolateSnapshotReceiver = false;
+    bool holdSnapshotChunks = false;
+    std::vector<TMessageHolder<TMessage>> heldSnapshotChunks;
 
     for (uint32_t id = 1; id <= 6; ++id) {
         states[id] = std::make_shared<TDurableState>((dir / "raft").string(), id);
@@ -2409,6 +2419,7 @@ void test_disjoint_membership_change_transfers_finalizes_and_restarts(void**) {
             if (peer != id) peers.emplace(peer, endpoints[id][peer]);
         rafts[id] = std::make_shared<TRaft>(states[id], id, peers, newVoters);
         applications[id] = std::make_shared<TSnapshotRsm>();
+        applications[id]->SnapshotPaddingBytes = 2 * TInstallSnapshotRequest::MaxChunkBytes + 17;
         processors[id] = std::make_shared<TRequestProcessor>(rafts[id], applications[id], peers);
     }
     for (uint32_t from = 1; from <= 6; ++from) {
@@ -2416,6 +2427,12 @@ void test_disjoint_membership_change_transfers_finalizes_and_restarts(void**) {
             if (from == to) continue;
             endpoints[from][to]->Route = [&, from, to](auto message) {
                 if (isolateNewMajority && from == 1 && (to == 5 || to == 6)) return;
+                if (isolateSnapshotReceiver && (from == 6 || to == 6)) return;
+                if (holdSnapshotChunks && from == 4 && to == 6 &&
+                    message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_REQUEST)) {
+                    heldSnapshotChunks.push_back(std::move(message));
+                    return;
+                }
                 rafts[to]->Process(now, std::move(message));
                 processors[to]->ProcessCommitted();
             };
@@ -2503,14 +2520,84 @@ void test_disjoint_membership_change_transfers_finalizes_and_restarts(void**) {
     }
     for (auto voter : newVoters)
         assert_true(rafts[voter]->GetVolatileState()->CompactionSafeConfigurationIndex >= stableIndex);
-    for (auto voter : newVoters) {
-        const auto snapshot = rafts[voter]->Compact();
-        assert_true(snapshot.StableConfiguration);
-        assert_true(snapshot.Voters == newVoters);
-        assert_int_equal(snapshot.ConfigurationIndex, stableIndex);
-        assert_int_equal(states[voter]->SnapshotIndex, stableIndex);
-        assert_true(states[voter]->GetBoundVoters() == oldVoters);
-    }
+
+    // Keep a newly promoted voter behind the log, then compact on the new
+    // leader. Its application image spans multiple chunks so restart loses a
+    // real partial transfer rather than a complete one-chunk snapshot.
+    isolateSnapshotReceiver = true;
+    const auto tailBeforeSnapshot = rafts[4]->Append(Ordinary(states[4]->CurrentTerm));
+    for (unsigned i = 0; i < 8 && rafts[4]->GetVolatileState()->CommitIndex < tailBeforeSnapshot; ++i)
+        tick(4);
+    assert_int_equal(rafts[4]->GetVolatileState()->CommitIndex, tailBeforeSnapshot);
+    for (unsigned i = 0; i < 8 && states[5]->CommitIndex < tailBeforeSnapshot; ++i) tick(4);
+    assert_int_equal(states[5]->CommitIndex, tailBeforeSnapshot);
+    assert_int_equal(states[6]->CommitIndex, stableIndex);
+    const auto snapshot = rafts[4]->Compact();
+    const auto snapshotIndex = snapshot.Index;
+    assert_true(snapshot.StableConfiguration);
+    assert_true(snapshot.Voters == newVoters);
+    assert_int_equal(snapshot.ConfigurationIndex, stableIndex);
+    assert_true(snapshotIndex > stableIndex);
+    assert_true(states[4]->GetBoundVoters() == oldVoters);
+    const auto followerSnapshot = rafts[5]->Compact();
+    assert_int_equal(followerSnapshot.Index, snapshotIndex);
+    assert_true(followerSnapshot.StableConfiguration);
+
+    holdSnapshotChunks = true;
+    isolateSnapshotReceiver = false;
+    for (unsigned i = 0; i < 8 && heldSnapshotChunks.empty(); ++i) tick(4);
+    assert_false(heldSnapshotChunks.empty());
+    auto partialChunk = std::move(heldSnapshotChunks.front());
+    heldSnapshotChunks.erase(heldSnapshotChunks.begin());
+    assert_false(partialChunk.Cast<TInstallSnapshotRequest>()->Done);
+    rafts[6]->Process(now, std::move(partialChunk));
+    processors[6]->ProcessCommitted();
+    assert_int_equal(states[6]->SnapshotIndex, 0);
+    assert_int_equal(applications[6]->LastAppliedIndex, stableIndex);
+
+    auto restartVoter = [&](uint32_t id) {
+        processors[id].reset();
+        applications[id].reset();
+        rafts[id].reset();
+        states[id].reset();
+        states[id] = std::make_shared<TDurableState>((dir / "raft").string(), id);
+        TNodeDict peers;
+        for (auto voter : newVoters)
+            if (voter != id) peers.emplace(voter, endpoints[id][voter]);
+        rafts[id] = std::make_shared<TRaft>(states[id], id, peers);
+        applications[id] = std::make_shared<TSnapshotRsm>();
+        applications[id]->SnapshotPaddingBytes = 2 * TInstallSnapshotRequest::MaxChunkBytes + 17;
+        processors[id] = std::make_shared<TRequestProcessor>(rafts[id], applications[id], peers);
+        processors[id]->ProcessCommitted();
+    };
+    restartVoter(6); // Partial transfer bytes are volatile and disappear here.
+    assert_int_equal(states[6]->SnapshotIndex, 0);
+    assert_int_equal(applications[6]->LastAppliedIndex, stableIndex);
+    holdSnapshotChunks = false;
+    for (unsigned i = 0; i < 48 && states[6]->SnapshotIndex < snapshotIndex; ++i) tick(4);
+    assert_int_equal(states[6]->SnapshotIndex, snapshotIndex);
+    assert_true(rafts[6]->IsVoter(6));
+    assert_true(rafts[6]->GetVoterIds() == newVoters);
+    assert_true(states[6]->GetBoundVoters() == oldVoters);
+    assert_true(states[6]->GetSnapshot()->StableConfiguration);
+    assert_true(states[6]->GetSnapshot()->Voters == newVoters);
+    assert_int_equal(states[6]->GetSnapshot()->ConfigurationIndex, stableIndex);
+    assert_int_equal(applications[6]->LastAppliedIndex, snapshotIndex);
+    assert_true(rafts[4]->GetVolatileState()->MatchIndex.at(6) >= snapshotIndex);
+
+    // Replicate a tail after installation, then restart again to prove the
+    // remote snapshot and final voter identity recover together.
+    const auto tailAfterSnapshot = rafts[4]->Append(Ordinary(states[4]->CurrentTerm));
+    for (unsigned i = 0; i < 8 && rafts[4]->GetVolatileState()->CommitIndex < tailAfterSnapshot; ++i)
+        tick(4);
+    for (unsigned i = 0; i < 8 && states[6]->CommitIndex < tailAfterSnapshot; ++i) tick(4);
+    assert_int_equal(states[6]->CommitIndex, tailAfterSnapshot);
+    restartVoter(6);
+    assert_true(rafts[6]->GetVoterIds() == newVoters);
+    assert_true(rafts[6]->IsVoter(6));
+    assert_true(states[6]->GetBoundVoters() == oldVoters);
+    assert_int_equal(states[6]->SnapshotIndex, snapshotIndex);
+    assert_int_equal(applications[6]->LastAppliedIndex, tailAfterSnapshot);
 
     // Restart every replica with endpoints only for the final voter set.
     processors = {};
@@ -2526,12 +2613,13 @@ void test_disjoint_membership_change_transfers_finalizes_and_restarts(void**) {
         rafts[id] = std::make_shared<TRaft>(states[id], id, peers);
         assert_true(rafts[id]->GetVoterIds() == newVoters);
         assert_true(rafts[id]->IsVoter(id) == (id >= 4));
-        assert_int_equal(rafts[id]->GetVolatileState()->CommitIndex, stableIndex);
+        assert_true(rafts[id]->GetVolatileState()->CommitIndex >= stableIndex);
         if (id >= 4) {
             const auto snapshot = states[id]->GetSnapshot();
             assert_true(snapshot && snapshot->StableConfiguration);
             assert_true(snapshot->Voters == newVoters);
             assert_int_equal(snapshot->ConfigurationIndex, stableIndex);
+            assert_true(rafts[id]->GetVolatileState()->CommitIndex >= snapshotIndex);
         }
     }
     std::error_code ignored;

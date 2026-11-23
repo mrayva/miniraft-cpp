@@ -189,6 +189,10 @@ three-process test compacts a two-voter majority, restarts both to clear queued
 old log traffic, starts an empty third voter, verifies local reads after snapshot
 installation, replicates a tail, then restarts that voter and checks recovery.
 It uses bounded waits, separately from deterministic virtual-time fault schedules.
+The disjoint membership test also takes a newly promoted voter offline after it
+acknowledges the stable configuration, compacts on the new leader, restarts the
+voter after a partial snapshot chunk, and verifies installation, tail replication,
+and stable voter identity after recovery.
 
 That integration test exposed a pre-existing election tie: all nodes used the
 same RNG seed and campaigned in lockstep. Node-specific nonzero deterministic
