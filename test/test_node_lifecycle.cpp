@@ -555,6 +555,28 @@ void test_tls_handshake_write_obeys_connect_deadline(void**) {
     assert_true(result.Completed);
     assert_true(result.TimedOut);
 }
+void test_tls_move_assignment_releases_replaced_ssl_session(void**) {
+    size_t contextFreeCalls = 0;
+    {
+        auto clientContext = NNet::TSslContext::Client();
+        const int freeIndex = SSL_CTX_get_ex_new_index(0, nullptr, nullptr, nullptr,
+            [](void*, void* value, CRYPTO_EX_DATA*, int, long, void*) {
+                if (value) ++*static_cast<size_t*>(value);
+            });
+        assert_true(freeIndex >= 0);
+        assert_int_equal(SSL_CTX_set_ex_data(clientContext.Ctx, freeIndex, &contextFreeCalls), 1);
+
+        TPoller poller;
+        auto oldState = std::make_shared<TTlsHandshakeDeadlineState>();
+        auto newState = std::make_shared<TTlsHandshakeDeadlineState>();
+        NNet::TSslSocket<TTlsHandshakeDeadlineSocket> socket(
+            TTlsHandshakeDeadlineSocket{&poller, oldState}, clientContext);
+        NNet::TSslSocket<TTlsHandshakeDeadlineSocket> replacement(
+            TTlsHandshakeDeadlineSocket{&poller, newState}, clientContext);
+        socket = std::move(replacement);
+    }
+    assert_true(contextFreeCalls == 1);
+}
 void test_socket_read_and_write_deadlines_cancel_waits(void**) {
     for (const bool write : {false, true}) {
         int sockets[2]{};
@@ -654,6 +676,7 @@ int main() {
         cmocka_unit_test(test_connect_readiness_reports_socket_error),
         cmocka_unit_test(test_tls_handshake_obeys_connect_deadline),
         cmocka_unit_test(test_tls_handshake_write_obeys_connect_deadline),
+        cmocka_unit_test(test_tls_move_assignment_releases_replaced_ssl_session),
         cmocka_unit_test(test_socket_read_and_write_deadlines_cancel_waits),
         cmocka_unit_test(test_tls_shutdown_wakes_retired_peer_reader),
 #endif
