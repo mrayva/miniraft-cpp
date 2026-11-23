@@ -1847,6 +1847,44 @@ void test_snapshot_is_rechecked_when_commit_advances_mid_transfer(void**) {
     assert_true(replies.back()->Installed); assert_true(Read(*app, "key") == "future");
 }
 
+void test_partial_snapshot_rechecks_membership_after_joint_append(void**) {
+    struct TPersistedCommitState : TState {
+        bool SupportsCommitIndexPersistence() const override { return true; }
+    };
+    TMessageHolder<TMessage> reply;
+    TNodeDict peers{{1, std::make_shared<TEndpoint>([&](auto message) { reply = std::move(message); })},
+        {3, std::make_shared<TEndpoint>([](auto) {})}};
+    auto state = std::make_shared<TPersistedCommitState>();
+    auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{3});
+    auto app = std::make_shared<TApplication>();
+    TRequestProcessor processor(raft, app, peers);
+    const TSnapshot snapshot{5, 2, {1, 2}, std::string(128, 'x')};
+    const auto bytes = EncodeSnapshot(snapshot);
+    const auto metadataBytes = bytes.size() - snapshot.Data.size() - sizeof(uint32_t);
+    raft->Process({}, Chunk(snapshot, bytes, 0, metadataBytes));
+    assert_true(reply.Cast<TInstallSnapshotResponse>()->Success);
+    assert_int_equal(raft->GetLeaderId(), 1);
+    raft->Process({}, Chunk(snapshot, bytes, metadataBytes, 1));
+    assert_true(reply.Cast<TInstallSnapshotResponse>()->Success);
+
+    auto append = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 2, .Term = 3},
+        TAppendEntriesRequest{.LeaderId = 1, .Nentries = 1});
+    append.InitPayload(1);
+    append.Payload[0] = EncodeConfigurationEntry({
+        EConfigurationPhase::Joint, 3, 0, 0, {1, 2}, {1, 2, 3}});
+    raft->Process({}, append);
+    assert_true(reply.Cast<TAppendEntriesResponse>()->Success);
+    assert_true(raft->GetConfigurationState().HasUncommittedConfiguration());
+    assert_int_equal(state->CommitIndex, 0);
+
+    raft->Process({}, Chunk(snapshot, bytes, metadataBytes + 1, 1));
+    const auto rejected = reply.Cast<TInstallSnapshotResponse>();
+    assert_false(rejected->Success);
+    assert_int_equal(rejected->NextOffset, 0);
+    assert_int_equal(state->SnapshotIndex, 0);
+    assert_int_equal(app->Loads, 0);
+}
+
 void CheckSnapshotStorageTerm(IState& state, std::function<std::string()> image = [] { return std::string{}; }) {
     state.CurrentTerm = 2; state.Commit();
     state.InstallSnapshot({2, 2, {1}, "committed"});
@@ -2508,6 +2546,7 @@ int main() {
         cmocka_unit_test(test_newer_snapshot_cannot_regress_committed_term),
         cmocka_unit_test(test_older_snapshot_cannot_exceed_compacted_boundary_term),
         cmocka_unit_test(test_snapshot_is_rechecked_when_commit_advances_mid_transfer),
+        cmocka_unit_test(test_partial_snapshot_rechecks_membership_after_joint_append),
         cmocka_unit_test(test_memory_snapshot_storage_rejects_term_regression),
         cmocka_unit_test(test_memory_snapshot_cannot_replace_committed_index_with_conflicting_term),
         cmocka_unit_test(test_joint_snapshot_is_rejected_without_matching_history_even_if_boundary_is_covered),

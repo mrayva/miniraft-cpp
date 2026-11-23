@@ -337,6 +337,57 @@ void test_fresh_learner_bootstraps_stable_and_joint_membership_snapshots(void**)
     // the ordinary exact-configuration validation in force.
     deliver(stable, {1, 2, 3}, false, true);
 }
+void test_partial_snapshot_rechecks_fresh_learner_after_append(void**) {
+    std::vector<TMessageHolder<TMessage>> replies;
+    TNodeDict peers{{1, std::make_shared<TEndpoint>([&](auto message) {
+        replies.push_back(std::move(message));
+    })}};
+    auto state = std::make_shared<TState>();
+    auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{2});
+    auto application = std::make_shared<TApp>();
+    TRequestProcessor processor(raft, application, peers);
+    TSnapshot snapshot{5, 2, {1}, std::string(128, 'x')};
+    snapshot.StableConfiguration = true;
+    snapshot.ConfigurationIndex = 2;
+    snapshot.ConfigurationTerm = 2;
+    const auto encoded = EncodeSnapshot(snapshot);
+    auto chunk = [&](size_t offset, size_t count) {
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
+        request->Src = 1; request->Dst = 2; request->Term = 3; request->Seqno = offset + 1;
+        request->SnapshotIndex = snapshot.Index; request->SnapshotTerm = snapshot.Term;
+        request->Offset = offset; request->TotalBytes = encoded.size(); request->LeaderId = 1;
+        request->Done = offset + count == encoded.size();
+        memcpy(request->Data, encoded.data() + offset, count);
+        raft->Process({}, request);
+        return replies.back().Cast<TInstallSnapshotResponse>();
+    };
+    const auto metadataBytes = encoded.size() - snapshot.Data.size() - sizeof(uint32_t);
+    assert_true(chunk(0, metadataBytes)->Success);
+    assert_int_equal(raft->GetLeaderId(), 1);
+    auto continuation = chunk(metadataBytes, 1);
+    assert_true(continuation->Success);
+    assert_false(continuation->Installed);
+
+    // A same-term append gives the learner existing log history without
+    // changing its voter set or committing through the snapshot boundary.
+    auto append = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 2, .Term = 3},
+        TAppendEntriesRequest{.LeaderId = 1, .Nentries = 1});
+    auto entry = NewHoldedMessage<TLogEntry>();
+    entry->Term = 3;
+    append.InitPayload(1);
+    append.Payload[0] = entry;
+    raft->Process({}, append);
+    assert_true(replies.back().Cast<TAppendEntriesResponse>()->Success);
+    assert_int_equal(state->LastLogIndex, 1);
+    assert_int_equal(state->CommitIndex, 0);
+
+    auto rejected = chunk(metadataBytes + 1, 1);
+    assert_false(rejected->Success);
+    assert_int_equal(rejected->NextOffset, 0);
+    assert_int_equal(state->SnapshotIndex, 0);
+    assert_int_equal(application->LastAppliedIndex, 0);
+}
+
 void test_restart_cannot_promote_learner_or_change_voters_but_can_add_transport(void**) {
     auto state = std::make_shared<TState>(); TRaft learner(state, 4, Peers(4), {4});
     const auto fields = static_cast<TStateFields>(*state);
@@ -1016,6 +1067,7 @@ int main() {
         cmocka_unit_test(test_learner_commit_ack_requires_latest_append_success),
         cmocka_unit_test(test_learner_snapshot_catchup_status_and_restart_preserve_role),
         cmocka_unit_test(test_fresh_learner_bootstraps_stable_and_joint_membership_snapshots),
+        cmocka_unit_test(test_partial_snapshot_rechecks_fresh_learner_after_append),
         cmocka_unit_test(test_restart_cannot_promote_learner_or_change_voters_but_can_add_transport),
         cmocka_unit_test(test_nonfresh_unbound_store_requires_snapshot_proof_for_learners),
         cmocka_unit_test(test_online_learner_staging_snapshot_catchup_and_quorum_isolation),

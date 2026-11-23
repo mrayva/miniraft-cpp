@@ -59,6 +59,12 @@ at offset zero after process restart. The wire format, 64 MiB limit and
 ordering of durable publication, application load and acknowledgement stay
 the same.
 
+After a full transfer's metadata is verified, intermediate payload chunks
+reuse that result while the sender is still the recognized leader in the
+same term and the receiver's configuration and recovery eligibility still
+match. Configuration refresh invalidates the result. The receiver probes the
+metadata again before decoding and installing the complete snapshot.
+
 ## Why this needs a storage contract
 
 InstallSnapshot sends bounded chunks and can stage the complete encoded image

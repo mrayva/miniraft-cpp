@@ -593,6 +593,11 @@ private:
     std::weak_ptr<IRsm> SnapshotApplication;
     class TIncomingSnapshotFile;
     struct TIncomingSnapshot {
+        struct TMetadataContext {
+            bool AllowFreshLearnerBootstrap;
+            bool AllowStaleStoreRecovery;
+            bool operator==(const TMetadataContext&) const = default;
+        };
         uint64_t Term, Index, BoundaryTerm, Total;
         uint32_t Leader;
         ITimeSource::Time LastProgress;
@@ -603,6 +608,7 @@ private:
         std::unique_ptr<char[]> CoveredPrefix;
         size_t CoveredPrefixCapacity = 0;
         std::shared_ptr<TIncomingSnapshotFile> File;
+        std::optional<TMetadataContext> ValidatedMetadata;
     };
     std::optional<TIncomingSnapshot> IncomingSnapshot;
     std::shared_ptr<const TSnapshotEncoding> EncodedSnapshot;

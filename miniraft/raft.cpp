@@ -1322,6 +1322,7 @@ void TRaft::RefreshConfiguration(uint64_t commitIndex) {
         else
             ++it;
     }
+    if (IncomingSnapshot) IncomingSnapshot->ValidatedMetadata.reset();
     Configuration = std::move(scan);
     const auto& baseline = *ConfigurationBaseline;
     const auto& latest = Configuration->Latest;
@@ -3337,14 +3338,28 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     const auto* committedConfiguration = Configuration ? &Configuration->Committed : nullptr;
     const auto* pendingConfiguration = Configuration && Configuration->HasUncommittedConfiguration()
         ? &Configuration->Latest : nullptr;
+    const TIncomingSnapshot::TMetadataContext metadataContext{
+        CanBootstrapFreshLearnerSnapshot(Id, *State, Voters, application.get(),
+            committedConfiguration, !pendingConfiguration),
+        MayRecoverMembershipFromSnapshot(Id, *State, Voters, committedConfiguration),
+    };
+    // The verified prefix is immutable. While receiving only payload bytes
+    // from the same-term leader, reuse its validation until the local
+    // membership or recovery eligibility changes. Always probe the final
+    // chunk again before installation.
+    if (receivedBytes < request->TotalBytes && request->Term == State->CurrentTerm &&
+        StateName == EState::FOLLOWER && VolatileState->LeaderId == request->LeaderId &&
+        incoming.ValidatedMetadata == metadataContext) {
+        acceptLeaderContact();
+        reply(true, false, receivedBytes);
+        return;
+    }
     const auto snapshotVoters = committedConfiguration
         ? ConfigurationVoterUnion(*committedConfiguration) : std::vector<uint32_t>{};
     const auto probe = ProbeSnapshotMetadata(receivedImage, request->TotalBytes,
         request->SnapshotIndex, request->SnapshotTerm, snapshotVoters, knownSnapshot.get(),
         committedConfiguration, pendingConfiguration,
-        CanBootstrapFreshLearnerSnapshot(Id, *State, GetVoterIds(), application.get(),
-            committedConfiguration, !pendingConfiguration),
-        MayRecoverMembershipFromSnapshot(Id, *State, GetVoterIds(), committedConfiguration),
+        metadataContext.AllowFreshLearnerBootstrap, metadataContext.AllowStaleStoreRecovery,
         request->LeaderId, Id);
     if (!probe.Complete) {
         // Term observation is independent of leader recognition: retain the
@@ -3357,7 +3372,11 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     }
     if (!probe.Supported) { IncomingSnapshot.reset(); reply(false, false, 0); return; }
     acceptLeaderContact();
-    if (receivedBytes < request->TotalBytes) { reply(true, false, receivedBytes); return; }
+    if (receivedBytes < request->TotalBytes) {
+        incoming.ValidatedMetadata = metadataContext;
+        reply(true, false, receivedBytes);
+        return;
+    }
     // Keep the heap allocation charged through validation and publication.
     // A staged file retains its separate disk reservation until we close it.
     std::shared_ptr<void> installationReservation;
