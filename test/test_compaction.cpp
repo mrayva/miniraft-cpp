@@ -420,6 +420,64 @@ void test_incremental_snapshot_capture_uses_disk_staging_quota(void**) {
     assert_int_equal(rejectedHeapBudget->UsedBytes(), 0);
     assert_int_equal(rejectedStagingBudget->UsedBytes(), 0);
 }
+void test_disk_staged_capture_becomes_durable_snapshot_across_restart(void**) {
+    char directoryTemplate[] = "/tmp/miniraft-durable-capture-XXXXXX";
+    auto* createdDirectory = mkdtemp(directoryTemplate);
+    assert_non_null(createdDirectory);
+    struct TDirectoryCleanup {
+        std::filesystem::path Path;
+        ~TDirectoryCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(Path, ignored);
+        }
+    } cleanup{createdDirectory};
+
+    const auto name = (std::filesystem::path(createdDirectory) / "raft").string();
+    auto heapBudget = std::make_shared<TSnapshotInstallBudget>(1);
+    auto stagingBudget = std::make_shared<TSnapshotInstallBudget>(40);
+    TRaft::TLogLimits limits;
+    limits.SnapshotInstallBudget = heapBudget;
+    limits.SnapshotStagingBudget = stagingBudget;
+    limits.SnapshotStagingDirectory = createdDirectory;
+    auto app = std::make_shared<TStreamingWriterInstallApplication>();
+    app->LastAppliedIndex = 1;
+    std::shared_ptr<const TSnapshot> captured;
+
+    auto state = std::make_shared<TDurableState>(name, 1);
+    state->CurrentTerm = 1;
+    state->BindVoters({1});
+    auto entry = NewHoldedMessage<TLogEntry>();
+    entry->Term = 1;
+    state->Append(entry);
+    state->CommitIndex = 1;
+    state->Commit();
+    {
+        auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{},
+            std::vector<uint32_t>{}, limits);
+        TRequestProcessor processor(raft, app, {});
+        captured = raft->CompactShared();
+        assert_true(bool(captured->DataSource));
+        assert_true(captured->Data.empty());
+        assert_int_equal(captured->DataSize(), app->Payload.size());
+        assert_int_equal(stagingBudget->UsedBytes(), app->Payload.size());
+        assert_int_equal(state->SnapshotIndex, 1);
+    }
+    state.reset();
+    assert_int_equal(stagingBudget->UsedBytes(), app->Payload.size());
+
+    {
+        TDurableState recovered(name, 1);
+        const auto snapshot = recovered.GetSnapshot();
+        assert_non_null(snapshot.get());
+        assert_int_equal(snapshot->Index, 1);
+        assert_int_equal(snapshot->DataSize(), app->Payload.size());
+        assert_true(snapshot->MaterializeData() == app->Payload);
+        assert_int_equal(recovered.CommitIndex, 1);
+    }
+
+    captured.reset();
+    assert_int_equal(stagingBudget->UsedBytes(), 0);
+}
 #endif
 void test_recovered_snapshot_retains_heap_budget_lease(void**) {
     auto state = std::make_shared<TState>();
@@ -3320,6 +3378,7 @@ int main() {
 #ifdef __linux__
         cmocka_unit_test(test_file_staged_snapshot_install_accepts_every_small_fixed_chunk_size),
         cmocka_unit_test(test_incremental_snapshot_capture_uses_disk_staging_quota),
+        cmocka_unit_test(test_disk_staged_capture_becomes_durable_snapshot_across_restart),
         cmocka_unit_test(test_file_staging_failure_releases_snapshot_reservation),
         cmocka_unit_test(test_file_staged_streaming_install_retains_source_quota),
         cmocka_unit_test(test_file_staging_and_decode_use_separate_shared_budgets),
