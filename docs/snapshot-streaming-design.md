@@ -29,8 +29,9 @@ but capture still materializes one complete image and remains capped at 64 MiB.
 Full in-memory InstallSnapshot assemblies reserve their declared image size
 against a shared 256 MiB process-wide heap budget by default. Raft instances can share a
 custom `TSnapshotInstallBudget` through `TLogLimits`. Covered-boundary probes
-reserve the capacity of the prefix they buffer. Both the old and new buffers
-count while the prefix grows. A transfer that cannot reserve space receives a
+reserve only the metadata prefix, even when a chunk also carries payload bytes.
+Both the old and new buffers count while the prefix grows. A transfer that
+cannot reserve space receives a
 rejection with offset zero and can retry after capacity is released.
 Full-image receive buffers allocate their declared length before accepting
 chunks, so chunk appends do not grow the buffer geometrically.

@@ -1008,11 +1008,18 @@ void test_covered_snapshot_metadata_uses_shared_install_budget(void**) {
     auto retried = replies.back().Cast<TInstallSnapshotResponse>();
     assert_true(retried->Success); assert_int_equal(retried->NextOffset, 8);
     assert_int_equal(budget->UsedBytes(), 8);
-    const auto metadataBytes = image3.size() - 200 - sizeof(uint32_t);
-    raft3->Process(expiredAt, request(3, image3, 8, metadataBytes - 8));
+    // The continuation carries the remaining metadata and application bytes.
+    // Only the metadata may count against the shared prefix budget.
+    raft3->Process(expiredAt, request(3, image3, 8, image3.size() - 8));
     auto covered = replies.back().Cast<TInstallSnapshotResponse>();
     assert_true(covered->Success); assert_true(covered->Installed);
     assert_int_equal(covered->NextOffset, image3.size());
+    assert_int_equal(budget->UsedBytes(), 0);
+
+    raft2->Process(expiredAt, request(2, image2, 0, image2.size()));
+    covered = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_true(covered->Success); assert_true(covered->Installed);
+    assert_int_equal(covered->NextOffset, image2.size());
     assert_int_equal(budget->UsedBytes(), 0);
 }
 void CheckSnapshotInstallChunkSizes(const TRaft::TLogLimits& limits) {

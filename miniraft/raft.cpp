@@ -3211,13 +3211,46 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         auto& receivedBytes = incoming.ReceivedBytes;
         const bool advanced = request->Offset == receivedBytes;
         if (request->Offset > receivedBytes) { reply(false, false, 0); return; }
+        const auto knownSnapshot = State->GetSnapshot();
+        const auto* committedConfiguration = Configuration ? &Configuration->Committed : nullptr;
+        const auto* pendingConfiguration = Configuration && Configuration->HasUncommittedConfiguration()
+            ? &Configuration->Latest : nullptr;
+        const auto snapshotVoters = committedConfiguration
+            ? ConfigurationVoterUnion(*committedConfiguration) : std::vector<uint32_t>{};
+        const bool allowStaleStoreRecovery =
+            MayRecoverMembershipFromSnapshot(Id, *State, GetVoterIds(), committedConfiguration);
+        TSnapshotMetadataProbe probe;
+        std::string candidatePrefix;
         if (request->Offset < receivedBytes) {
             if (count > receivedBytes - request->Offset ||
                 std::string_view(prefix + request->Offset, count) != std::string_view(request->Data, count)) {
                 IncomingSnapshot.reset(); reply(false, false, 0); return;
             }
+            const std::string_view receivedPrefix(prefix, size_t(receivedBytes));
+            probe = ProbeSnapshotMetadata(receivedPrefix, request->TotalBytes,
+                request->SnapshotIndex, request->SnapshotTerm, snapshotVoters, knownSnapshot.get(),
+                committedConfiguration, pendingConfiguration, false, allowStaleStoreRecovery,
+                request->LeaderId, Id);
         } else {
-            const auto needed = size_t(receivedBytes + count);
+            try {
+                candidatePrefix.reserve(size_t(receivedBytes) + count);
+                if (receivedBytes) candidatePrefix.append(prefix, size_t(receivedBytes));
+                candidatePrefix.append(request->Data, count);
+            } catch (const std::bad_alloc&) {
+                IncomingSnapshot.reset(); reply(false, false, 0); return;
+            }
+            if (!IsSupportedSnapshotMagicPrefix(candidatePrefix)) {
+                IncomingSnapshot.reset(); reply(false, false, 0); return;
+            }
+            probe = ProbeSnapshotMetadata(candidatePrefix, request->TotalBytes,
+                request->SnapshotIndex, request->SnapshotTerm, snapshotVoters, knownSnapshot.get(),
+                committedConfiguration, pendingConfiguration, false, allowStaleStoreRecovery,
+                request->LeaderId, Id);
+            if (probe.Complete && !probe.Supported) {
+                IncomingSnapshot.reset(); reply(false, false, 0); return;
+            }
+            const auto bufferedCount = probe.Complete ? probe.Need - receivedBytes : count;
+            const auto needed = size_t(receivedBytes) + bufferedCount;
             if (!incoming.Preallocated && needed > incoming.CoveredPrefixCapacity) {
                 // Charge both allocations while moving the prefix. Try an exact
                 // size when there is insufficient budget for spare capacity.
@@ -3241,31 +3274,21 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
                 }
             }
             if (incoming.File) {
-                if (!incoming.File->Write(size_t(receivedBytes), std::string_view(request->Data, count))) {
+                if (!incoming.File->Write(size_t(receivedBytes),
+                        std::string_view(request->Data, bufferedCount))) {
                     IncomingSnapshot.reset(); reply(false, false, 0); return;
                 }
             } else {
                 auto* destination = incoming.Preallocated ? incoming.Bytes.data() : incoming.CoveredPrefix.get();
-                memcpy(destination + receivedBytes, request->Data, count);
+                memcpy(destination + receivedBytes, request->Data, bufferedCount);
             }
-            receivedBytes += count;
+            receivedBytes += bufferedCount;
+            if (advanced) IncomingSnapshot->LastProgress = now;
         }
-        if (advanced) IncomingSnapshot->LastProgress = now;
         const std::string_view receivedPrefix(prefix, size_t(receivedBytes));
         if (!IsSupportedSnapshotMagicPrefix(receivedPrefix)) {
             IncomingSnapshot.reset(); reply(false, false, 0); return;
         }
-        const auto knownSnapshot = State->GetSnapshot();
-        const auto* committedConfiguration = Configuration ? &Configuration->Committed : nullptr;
-        const auto* pendingConfiguration = Configuration && Configuration->HasUncommittedConfiguration()
-            ? &Configuration->Latest : nullptr;
-        const auto snapshotVoters = committedConfiguration
-            ? ConfigurationVoterUnion(*committedConfiguration) : std::vector<uint32_t>{};
-        const auto probe = ProbeSnapshotMetadata(receivedPrefix, request->TotalBytes,
-            request->SnapshotIndex, request->SnapshotTerm, snapshotVoters, knownSnapshot.get(),
-            committedConfiguration, pendingConfiguration,
-            false, MayRecoverMembershipFromSnapshot(Id, *State, GetVoterIds(), committedConfiguration),
-            request->LeaderId, Id);
         if (!probe.Complete) {
             // Once the base voter lists authenticate this sender, record its
             // term even if configuration-history metadata spans later chunks.
