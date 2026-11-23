@@ -3,6 +3,7 @@
 #include <exception>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <coroutine>
@@ -30,6 +31,17 @@ void ReconcilePeerResponseReaders(const TPeerMap& peers,
         TStarted& started, TStartReader startReader) {
     for (const auto& [id, peer] : peers)
         if (started.insert(id).second) startReader(id, peer);
+}
+
+template<class TConnections, class TClose>
+void ExpireIdleConnections(TConnections& connections, ITimeSource::Time now,
+        std::chrono::milliseconds idleTimeout, TClose close) {
+    for (auto it = connections.begin(); it != connections.end();) {
+        if (now < it->second || now - it->second < idleTimeout || !close(it->first))
+            ++it;
+        else
+            it = connections.erase(it);
+    }
 }
 }
 
@@ -84,6 +96,7 @@ private:
 struct TInboundMessageBudgetLimits {
     uint64_t MaxBytes = 256ULL * 1024 * 1024;
     size_t MaxConnections = 1024;
+    std::chrono::milliseconds ConnectionIdleTimeout = std::chrono::seconds(60);
 };
 
 // Bounds serialized frame storage and AppendEntries payload-holder arrays while
@@ -111,7 +124,10 @@ class TInboundMessageBudget : public std::enable_shared_from_this<TInboundMessag
 
 public:
     explicit TInboundMessageBudget(TInboundMessageBudgetLimits limits = {})
-        : Limits(limits) { }
+        : Limits(limits) {
+        if (Limits.ConnectionIdleTimeout.count() < 0)
+            throw std::invalid_argument("Inbound connection idle timeout cannot be negative");
+    }
 
     std::shared_ptr<void> TryReserveConnection() {
         {
@@ -125,6 +141,10 @@ public:
             ReleaseConnection();
             throw;
         }
+    }
+
+    std::chrono::milliseconds ConnectionIdleTimeout() const {
+        return Limits.ConnectionIdleTimeout;
     }
 
     std::shared_ptr<void> TryReserve(uint64_t bytes) {
@@ -601,6 +621,7 @@ private:
     // then retains the node until its read and write coroutines unwind.
     std::unordered_set<uint32_t> PeerResponseReaders;
     std::unordered_set<std::shared_ptr<TNode<TSocket>>> RetiredPeerNodes;
+    std::unordered_map<std::shared_ptr<TNode<TSocket>>, ITimeSource::Time> InboundLastActivity;
     std::shared_ptr<ITimeSource> TimeSource;
     bool Serving = false;
 

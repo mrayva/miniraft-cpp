@@ -19,8 +19,10 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(
             "client", std::move(socket), TimeSource
         );
         Nodes.insert(client);
+        InboundLastActivity.emplace(client, TimeSource->Now());
         while (true) {
             auto mes = co_await TMessageReader(client->Sock(), {}, InboundMessageBudget).Read();
+            InboundLastActivity[client] = TimeSource->Now();
             // client request
             if (auto maybeCapabilities = mes.template Maybe<TPeerCapabilitiesRequest>()) {
                 auto request = maybeCapabilities.Cast();
@@ -67,6 +69,7 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(
     } catch (const std::exception & ex) {
         std::cerr << "Exception: " << ex.what() << "\n";
     }
+    InboundLastActivity.erase(client);
     Nodes.erase(client);
     RequestProcessor->CleanUp(client);
     co_return;
@@ -346,6 +349,13 @@ NNet::TVoidTask TRaftServer<TSocket>::Idle() {
     auto sleep = std::chrono::milliseconds(100);
     while (true) {
         try {
+            NNet::TDetail::ExpireIdleConnections(
+                InboundLastActivity, TimeSource->Now(), InboundMessageBudget->ConnectionIdleTimeout(),
+                [](const auto& client) {
+                    if (!client->SupportsRetirement()) return false;
+                    client->Retire();
+                    return true;
+                });
             Raft->ProcessTimeout(TimeSource->Now());
             ReconcilePeerReaders();
             RequestProcessor->CheckStateChange();

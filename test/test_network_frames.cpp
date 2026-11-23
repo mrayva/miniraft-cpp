@@ -208,6 +208,22 @@ void test_inbound_connection_budget_releases_admission_on_disconnect(void**) {
     replacement.reset();
     assert_true(bool(budget->TryReserveConnection()));
 }
+void test_idle_inbound_connection_expiry_uses_activity_deadline(void**) {
+    const auto start = ITimeSource::Time{};
+    std::unordered_map<uint32_t, ITimeSource::Time> activity{
+        {1, start}, {2, start}, {3, start + std::chrono::seconds(2)}};
+    std::vector<uint32_t> closed;
+    NNet::TDetail::ExpireIdleConnections(activity, start + std::chrono::seconds(1),
+        std::chrono::seconds(1), [&](uint32_t id) {
+            closed.push_back(id);
+            return id != 2;
+        });
+    std::sort(closed.begin(), closed.end());
+    assert_true(closed == std::vector<uint32_t>({1, 2}));
+    assert_int_equal(activity.size(), 2);
+    assert_true(activity.contains(2));
+    assert_true(activity.contains(3));
+}
 void test_inbound_frame_budget_covers_append_entries_payload_arrays(void**) {
     auto append = NewHoldedMessage(TAppendEntriesRequest{.Nentries = 1});
     const auto payloadArrayBytes = sizeof(TMessageHolder<TMessage>);
@@ -360,6 +376,7 @@ int main() {
         cmocka_unit_test(test_aggregate_budget_is_shared_between_entries),
         cmocka_unit_test(test_failed_reader_cannot_resume_at_another_frame),
         cmocka_unit_test(test_inbound_connection_budget_releases_admission_on_disconnect),
+        cmocka_unit_test(test_idle_inbound_connection_expiry_uses_activity_deadline),
         cmocka_unit_test(test_writer_validates_entire_batch_before_first_byte),
         cmocka_unit_test(test_fragmented_roundtrip_keeps_consecutive_frame_boundaries),
         cmocka_unit_test(test_fragmented_snapshot_request_and_response_roundtrip),

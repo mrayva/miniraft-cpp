@@ -44,6 +44,8 @@ notification; write outcomes may remain unknown.
 * Maximum AppendEntries child count: 4096.
 * Maximum accepted client connections per server: 1024 by default, configured
   with `TInboundMessageBudgetLimits::MaxConnections`.
+* Idle accepted client connections expire after 60 seconds by default,
+  configured with `TInboundMessageBudgetLimits::ConnectionIdleTimeout`.
 
 Raft log proposals are checked against the frame cap before mutating the log or
 the proposed entry's term. Batch construction now observes the same aggregate
@@ -96,9 +98,8 @@ This is structural framing validation, not authentication or complete validation
 of consensus fields. Sender/destination membership, index/term semantics and
 application payload lengths (KV/SQL/custom commands) still need their own checks.
 The bundled server now rejects accepted client sockets when its shared inbound
-connection limit is full. Reservations last for the connection task lifetime,
-including idle clients, and release when the socket closes or frame processing
-fails. General connection deadlines and broader fuzzing remain open. Native
-wire encoding, TLS lifecycle stress, retry deduplication and generated history
-checking also remain separate work. No library-wide security or linearizability
-claim is made.
+connection limit is full and retires supported sockets that exceed the idle
+timeout. Reservations last for the connection task lifetime and release when
+the socket closes or frame processing fails. Native wire encoding, TLS
+lifecycle stress, retry deduplication and broader fuzzing remain open. No
+library-wide security or linearizability claim is made.
