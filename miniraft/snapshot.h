@@ -79,17 +79,18 @@ struct TSnapshot {
 // Temporary file staging uses a separate budget. Callers can supply shared
 // custom budgets through Raft limits.
 class TSnapshotInstallBudget : public std::enable_shared_from_this<TSnapshotInstallBudget> {
+public:
     class TReservation {
     public:
-        TReservation(std::shared_ptr<TSnapshotInstallBudget> budget, uint64_t bytes)
-            : Budget(std::move(budget)), Bytes(bytes) { }
         ~TReservation() { Budget->Release(Bytes); }
     private:
+        friend class TSnapshotInstallBudget;
+        TReservation(std::shared_ptr<TSnapshotInstallBudget> budget, uint64_t bytes)
+            : Budget(std::move(budget)), Bytes(bytes) { }
         std::shared_ptr<TSnapshotInstallBudget> Budget;
         uint64_t Bytes;
     };
 
-public:
     static constexpr uint64_t DefaultMaxBytes = 256ULL * 1024 * 1024;
 
     explicit TSnapshotInstallBudget(uint64_t maxBytes = DefaultMaxBytes)
@@ -102,19 +103,44 @@ public:
         return budget;
     }
 
-    std::shared_ptr<void> TryReserve(uint64_t bytes) {
+    std::shared_ptr<TReservation> TryReserveLease(uint64_t bytes) {
         if (!bytes) return {};
         {
             std::lock_guard lock(Mutex);
             if (Used > MaxBytes || bytes > MaxBytes - Used) return {};
             Used += bytes;
         }
+        TReservation* lease = nullptr;
         try {
-            return std::make_shared<TReservation>(shared_from_this(), bytes);
+            lease = new TReservation(shared_from_this(), bytes);
         } catch (...) {
             Release(bytes);
             throw;
         }
+        // If allocating the shared_ptr control block throws, its constructor
+        // deletes lease, which releases the charge exactly once.
+        return std::shared_ptr<TReservation>(lease);
+    }
+
+    std::shared_ptr<void> TryReserve(uint64_t bytes) { return TryReserveLease(bytes); }
+
+    // Adjust a lease created by TryReserveLease. Shrinking never fails; growing
+    // atomically checks the shared limit before changing the charged byte count.
+    bool TryResize(const std::shared_ptr<TReservation>& reservation, uint64_t bytes) {
+        if (!reservation) return bytes == 0;
+        if (reservation->Budget.get() != this)
+            throw std::invalid_argument("Snapshot reservation belongs to a different budget");
+        std::lock_guard lock(Mutex);
+        const auto previous = reservation->Bytes;
+        if (bytes > previous) {
+            const auto additional = bytes - previous;
+            if (Used > MaxBytes || additional > MaxBytes - Used) return false;
+            Used += additional;
+        } else {
+            Used -= previous - bytes;
+        }
+        reservation->Bytes = bytes;
+        return true;
     }
 
     uint64_t UsedBytes() const {
@@ -159,6 +185,8 @@ void ValidateSnapshot(const TSnapshot& snapshot);
 // configuration continuity: stable -> joint -> stable, with voter-set checks.
 void PreserveStableSnapshotIdentity(const TSnapshot* current, TSnapshot& incoming);
 TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm);
+TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
+    std::shared_ptr<TSnapshotInstallBudget> heapBudget);
 // Startup only, with an application behind the snapshot and
 // a matching local boundary/log. This can recover an app left behind by a crash
 // after durable Raft snapshot publication.

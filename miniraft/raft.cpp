@@ -3011,13 +3011,7 @@ std::shared_ptr<const TSnapshot> TRaft::CompactShared() {
         if (rpc.Snapshot) pinnedGenerations.insert(rpc.Snapshot->Index);
     if (pinnedGenerations.size() >= TVolatileState::MaxPinnedSnapshotGenerations)
         throw std::runtime_error("Compaction deferred while snapshot transfers pin multiple generations");
-    auto captured = CaptureSnapshot(*this, *application);
-    auto reservation = SnapshotInstallBudget->TryReserve(captured.Data.size());
-    if (!captured.Data.empty() && !reservation)
-        throw std::runtime_error("Compacted snapshot exceeds the available heap budget");
-    captured.HeapReservation = std::move(reservation);
-    if (captured.HeapReservation)
-        captured.HeapReservationBudget = SnapshotInstallBudget;
+    auto captured = CaptureSnapshot(*this, *application, SnapshotInstallBudget);
     auto snapshot = std::make_shared<const TSnapshot>(std::move(captured));
     application->ValidateSnapshot(snapshot->Data, snapshot->Index);
     AdvanceCommitIndex(VolatileState->CommitIndex);

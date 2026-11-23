@@ -49,6 +49,14 @@ struct TApplication : TKv {
     size_t Loads = 0;
     void LoadSnapshot(std::string_view bytes, uint64_t index) override { TKv::LoadSnapshot(bytes, index); ++Loads; }
 };
+struct TBoundedSnapshotApplication : TApplication {
+    mutable size_t SaveCalls = 0;
+    uint64_t Bound = 80;
+    size_t PayloadBytes = 40;
+    std::optional<uint64_t> SnapshotSizeUpperBound() const override { return Bound; }
+    std::string SaveSnapshot() const override { ++SaveCalls; return std::string(PayloadBytes, 's'); }
+    void ValidateSnapshot(std::string_view, uint64_t) const override { }
+};
 struct TRejectingSnapshotApplication : TApplication {
     void ValidateSnapshot(std::string_view, uint64_t) const override {
         throw std::runtime_error("Injected application snapshot validation failure");
@@ -100,6 +108,64 @@ void test_snapshot_capture_preflights_application_size_bound(void**) {
     assert_int_equal(application->SaveCalls, 0);
     assert_int_equal(state->SnapshotIndex, 0);
     assert_int_equal(state->LastLogIndex, 1);
+}
+void test_snapshot_capture_reserves_declared_bound_before_materializing(void**) {
+    auto makeState = [] {
+        auto state = std::make_shared<TState>();
+        auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = 1;
+        state->Append(entry);
+        state->CommitIndex = 1;
+        return state;
+    };
+
+    auto rejectedState = makeState();
+    auto rejectedBudget = std::make_shared<TSnapshotInstallBudget>(79);
+    TRaft::TLogLimits rejectedLimits;
+    rejectedLimits.SnapshotInstallBudget = rejectedBudget;
+    auto rejectedRaft = std::make_shared<TRaft>(rejectedState, 1, TNodeDict{},
+        std::vector<uint32_t>{}, rejectedLimits);
+    auto rejectedApp = std::make_shared<TBoundedSnapshotApplication>();
+    rejectedApp->LastAppliedIndex = 1;
+    TRequestProcessor rejectedProcessor(rejectedRaft, rejectedApp, {});
+    Reject([&] { rejectedRaft->Compact(); });
+    assert_int_equal(rejectedApp->SaveCalls, 0);
+    assert_int_equal(rejectedBudget->UsedBytes(), 0);
+    assert_int_equal(rejectedState->SnapshotIndex, 0);
+
+    auto invalidState = makeState();
+    auto invalidBudget = std::make_shared<TSnapshotInstallBudget>(80);
+    TRaft::TLogLimits invalidLimits;
+    invalidLimits.SnapshotInstallBudget = invalidBudget;
+    auto invalidRaft = std::make_shared<TRaft>(invalidState, 1, TNodeDict{},
+        std::vector<uint32_t>{}, invalidLimits);
+    auto invalidApp = std::make_shared<TBoundedSnapshotApplication>();
+    invalidApp->Bound = 39;
+    invalidApp->LastAppliedIndex = 1;
+    TRequestProcessor invalidProcessor(invalidRaft, invalidApp, {});
+    Reject([&] { invalidRaft->Compact(); });
+    assert_int_equal(invalidApp->SaveCalls, 1);
+    assert_int_equal(invalidBudget->UsedBytes(), 0);
+    assert_int_equal(invalidState->SnapshotIndex, 0);
+
+    auto state = makeState();
+    auto budget = std::make_shared<TSnapshotInstallBudget>(80);
+    TRaft::TLogLimits limits;
+    limits.SnapshotInstallBudget = budget;
+    {
+        auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{},
+            std::vector<uint32_t>{}, limits);
+        auto app = std::make_shared<TBoundedSnapshotApplication>();
+        app->LastAppliedIndex = 1;
+        TRequestProcessor processor(raft, app, {});
+        auto snapshot = raft->CompactShared();
+        assert_int_equal(app->SaveCalls, 1);
+        assert_int_equal(snapshot->Data.size(), 40);
+        // The 80-byte declared bound is held before SaveSnapshot, then shrunk
+        // atomically to the 40-byte retained image.
+        assert_int_equal(budget->UsedBytes(), 40);
+    }
+    state.reset();
+    assert_int_equal(budget->UsedBytes(), 0);
 }
 void test_recovered_snapshot_retains_heap_budget_lease(void**) {
     auto state = std::make_shared<TState>();
@@ -2651,6 +2717,7 @@ int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_kv_snapshot_precomputes_size_without_changing_encoding),
         cmocka_unit_test(test_snapshot_capture_preflights_application_size_bound),
+        cmocka_unit_test(test_snapshot_capture_reserves_declared_bound_before_materializing),
         cmocka_unit_test(test_recovered_snapshot_retains_heap_budget_lease),
         cmocka_unit_test(test_shared_compaction_reuses_storage_snapshot_image),
         cmocka_unit_test(test_zero_index_follower_compaction_waits_for_capability_barrier),

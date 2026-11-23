@@ -603,6 +603,11 @@ TSnapshot DecodeSnapshotOwned(std::string&& bytes) {
 }
 
 TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm) {
+    return CaptureSnapshot(raft, rsm, {});
+}
+
+TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
+        std::shared_ptr<TSnapshotInstallBudget> heapBudget) {
     const auto index = rsm.LastAppliedIndex;
     if (!index || index > raft.GetVolatileState()->CommitIndex || index > raft.GetLastIndex())
         throw std::runtime_error("Snapshot requires applied committed progress");
@@ -657,6 +662,13 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm) {
     const auto upperBound = rsm.SnapshotSizeUpperBound();
     if (upperBound && *upperBound > TSnapshot::MaxBytes - metadataBytes)
         throw std::runtime_error("Application snapshot size bound exceeds the Raft snapshot limit");
+    std::shared_ptr<TSnapshotInstallBudget::TReservation> reservation;
+    auto reserveCaptureBytes = [&](uint64_t bytes) {
+        if (!heapBudget || !bytes) return;
+        reservation = heapBudget->TryReserveLease(bytes);
+        if (!reservation)
+            throw std::runtime_error("Snapshot capture exceeds the available heap budget");
+    };
     const auto streamingRsm = dynamic_cast<const IStreamingSnapshotRsm*>(&rsm);
     if (auto source = streamingRsm ? streamingRsm->OpenSnapshotSource(index) : nullptr) {
         const auto dataBytes = source->Size();
@@ -664,6 +676,7 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm) {
             throw std::runtime_error("Application snapshot source exceeds the Raft snapshot limit");
         if (upperBound && dataBytes > *upperBound)
             throw std::logic_error("Application snapshot source exceeded its declared size bound");
+        reserveCaptureBytes(dataBytes);
         snapshot.Data.resize(size_t(dataBytes));
         constexpr size_t ReadChunkBytes = 64 * 1024;
         for (uint64_t offset = 0; offset < dataBytes;) {
@@ -680,9 +693,19 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm) {
             offset += count;
         }
     } else {
+        if (upperBound) reserveCaptureBytes(*upperBound);
         snapshot.Data = rsm.SaveSnapshot();
+        if (upperBound && snapshot.Data.size() > *upperBound)
+            throw std::logic_error("Application snapshot exceeded its declared size bound");
+        if (heapBudget && !reservation) reserveCaptureBytes(snapshot.Data.size());
     }
+    if (reservation && !heapBudget->TryResize(reservation, snapshot.Data.size()))
+        throw std::runtime_error("Captured snapshot exceeds the available heap budget");
     Validate(snapshot);
+    if (reservation) {
+        snapshot.HeapReservation = std::move(reservation);
+        snapshot.HeapReservationBudget = std::move(heapBudget);
+    }
     return snapshot;
 }
 
