@@ -514,7 +514,12 @@ void test_disk_snapshot_generation_recovers_suffix_and_replaces_conflict(void**)
         expectedFirst.StableConfiguration = true;
         expectedFirst.ConfigurationIndex = 1;
         expectedFirst.ConfigurationTerm = 2;
-        assert_true(state.GetSnapshot() && *state.GetSnapshot() == expectedFirst);
+        const auto recoveredSnapshot = state.GetSnapshot();
+        assert_true(recoveredSnapshot && *recoveredSnapshot == expectedFirst);
+#ifdef __linux__
+        assert_true(recoveredSnapshot->Data.empty());
+        assert_true(bool(recoveredSnapshot->DataSource));
+#endif
         assert_true(state.GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
         assert_int_equal(state.LastLogTerm, 5);
         state.RemoveLast();
@@ -634,7 +639,7 @@ void test_disk_suffix_replacement_preserves_installed_snapshot(void**) {
     TDiskState recovered(files.Name, 1);
     assert_true(bool(recovered.GetSnapshot()));
     assert_int_equal(recovered.GetSnapshot()->Index, 1);
-    assert_true(recovered.GetSnapshot()->Data == "retained checkpoint");
+    assert_true(recovered.GetSnapshot()->MaterializeData() == "retained checkpoint");
     assert_int_equal(recovered.SnapshotIndex, 1);
     assert_int_equal(recovered.LastLogIndex, 2);
     assert_int_equal(recovered.CommitIndex, 2);

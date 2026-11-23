@@ -90,13 +90,18 @@ The decoder validates the full wire checksum and metadata through the mapping,
 then retains a source for the application bytes. The SQL example validates and
 stages directly from this source. The retained Raft snapshot uses it for
 durable sidecar serialization and outgoing InstallSnapshot ranges, avoiding
-the full payload's heap copy. Legacy RSMs, receives without staging, and
-startup recovery still materialize the payload. The active snapshot pins its
-anonymous file until replaced and all transfer pins are released. That retained
-disk use is outside the in-flight staging quota and must be allowed for on the
-configured filesystem. Partial transfers restart at offset zero after process
-restart. The wire format, 64 MiB limit and publication, application-installation
-and acknowledgement ordering stay the same.
+the full payload's heap copy. Linux durable recovery also retains external
+`TDurableState` sidecars and `TDiskState` snapshot generations as read-only
+mapped range sources, so the active snapshot stays range-backed after restart.
+The SQL RSM uses its streaming installer for both received and recovered
+snapshots. Legacy RSMs, receives without staging, older embedded durable images,
+and non-Linux `TDiskState` recovery may still materialize the payload. The
+active snapshot pins its anonymous receive file or durable snapshot mapping
+until replaced and all transfer pins are released. Staged receive disk use is
+outside the in-flight staging quota and must be allowed for on the configured
+filesystem. Partial transfers restart at offset zero after process restart. The
+wire format, 64 MiB limit and publication, application-installation and
+acknowledgement ordering stay the same.
 
 After a full transfer's metadata is verified, intermediate payload chunks
 reuse that result while the sender is still the recognized leader in the
@@ -109,16 +114,21 @@ metadata again before decoding and installing the complete snapshot.
 InstallSnapshot sends bounded chunks and can stage the complete encoded image
 on disk before decoding it. `IRsm::SaveSnapshot()` returns
 one `std::string` and `ValidateSnapshot()` receives a complete view. The durable
-backend stores snapshot bytes in an immutable sidecar and still materializes
-the application payload when opening it. Raising `TSnapshot::MaxBytes` would
-raise peak memory without making the path streaming.
+backend stores current snapshot bytes in an immutable sidecar; Linux recovery
+validates the mapped image and retains a range source for its application
+payload. The versioned `TDiskState` backend does the same for snapshot-generation
+files on Linux. Older embedded durable images and non-Linux generation recovery
+still use the materializing decoder. Raising `TSnapshot::MaxBytes` would raise
+peak memory without making the fallback path streaming.
 
 The SQL adapter can validate and stage a range-backed application image from
 the received mapping on Linux; non-Linux builds retain the padded deserialize
 buffer. This avoids the Raft heap copy but still keeps the complete received
-wire image on disk while it is the active in-memory snapshot. Startup recovery
-still materializes durable snapshot payloads, and durable application
-generations remain open gaps.
+wire image on disk while it is the active in-memory snapshot. Current durable
+sidecars and Linux snapshot generations remain mapped and range-backed after
+restart; older embedded formats and RSMs without the streaming-install contract
+can still materialize payloads. Durable application generations remain an open
+gap.
 
 The replacement needs an immutable application-image reference that Raft can
 publish atomically with the snapshot boundary, commit index, membership

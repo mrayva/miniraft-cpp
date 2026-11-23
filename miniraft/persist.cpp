@@ -22,6 +22,9 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 #endif
 
 namespace {
@@ -326,6 +329,59 @@ bool IsRegularFileNoFollow(const std::string& path) {
 #endif
 }
 
+#ifdef __linux__
+class TSnapshotGenerationMap final : public TSnapshotDataSource {
+public:
+    explicit TSnapshotGenerationMap(const std::string& path) {
+        const int file = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+        if (file < 0) throw std::runtime_error("Cannot open Raft snapshot: " + path);
+        try {
+            struct stat info{};
+            if (fstat(file, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 44 ||
+                uint64_t(info.st_size) > TSnapshot::MaxBytes || uint64_t(info.st_size) > SIZE_MAX)
+                throw std::runtime_error("Invalid Raft snapshot file type or size: " + path);
+            const auto size = size_t(info.st_size);
+            void* mapping = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, file, 0);
+            if (mapping == MAP_FAILED)
+                throw std::runtime_error("Cannot map Raft snapshot: " + path);
+            if (!mapping) {
+                munmap(mapping, size);
+                throw std::runtime_error("Invalid Raft snapshot mapping address: " + path);
+            }
+            File = file;
+            Mapping = mapping;
+            SizeBytes = size;
+        } catch (...) {
+            close(file);
+            throw;
+        }
+    }
+
+    ~TSnapshotGenerationMap() override {
+        if (Mapping != MAP_FAILED) munmap(Mapping, SizeBytes);
+        if (File >= 0) close(File);
+    }
+    TSnapshotGenerationMap(const TSnapshotGenerationMap&) = delete;
+    TSnapshotGenerationMap& operator=(const TSnapshotGenerationMap&) = delete;
+
+    std::string_view Bytes() const {
+        return {static_cast<const char*>(Mapping), SizeBytes};
+    }
+    uint64_t Size() const override { return SizeBytes; }
+    size_t Read(uint64_t offset, std::span<char> destination) const override {
+        if (offset >= SizeBytes || destination.empty()) return 0;
+        const auto count = size_t(std::min<uint64_t>(destination.size(), SizeBytes - offset));
+        memcpy(destination.data(), static_cast<const char*>(Mapping) + size_t(offset), count);
+        return count;
+    }
+
+private:
+    int File = -1;
+    void* Mapping = MAP_FAILED;
+    size_t SizeBytes = 0;
+};
+#endif
+
 bool WriteAndSyncFile(const std::string& path, const char* data, size_t size) {
     TSafeTempFile output;
     return output.Open(path) && output.Write(data, size) && output.SyncAndClose();
@@ -429,10 +485,22 @@ TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitH
         if (SnapshotIndex) {
             if (!IsRegularFileNoFollow(SnapshotFilePath))
                 throw std::runtime_error("Missing or invalid Raft snapshot: " + SnapshotFilePath);
+#ifdef __linux__
+            auto snapshotMap = std::make_shared<TSnapshotGenerationMap>(SnapshotFilePath);
+            Snapshot = std::make_shared<const TSnapshot>(DecodeSnapshotBacked(snapshotMap->Bytes(), snapshotMap));
+#else
             std::ifstream snapshotFile(SnapshotFilePath, std::ios::binary);
             if (!snapshotFile) throw std::runtime_error("Cannot open Raft snapshot: " + SnapshotFilePath);
-            std::string encodedSnapshot{std::istreambuf_iterator<char>(snapshotFile), std::istreambuf_iterator<char>()};
+            snapshotFile.seekg(0, std::ios::end);
+            const auto snapshotSize = static_cast<std::streamoff>(snapshotFile.tellg());
+            if (snapshotSize < 44 || snapshotSize > std::streamoff(TSnapshot::MaxBytes))
+                throw std::runtime_error("Invalid Raft snapshot file size: " + SnapshotFilePath);
+            std::string encodedSnapshot(size_t(snapshotSize), '\0');
+            snapshotFile.seekg(0);
+            if (!snapshotFile.read(encodedSnapshot.data(), std::streamsize(snapshotSize)))
+                throw std::runtime_error("Cannot read Raft snapshot: " + SnapshotFilePath);
             Snapshot = std::make_shared<const TSnapshot>(DecodeSnapshotOwned(std::move(encodedSnapshot)));
+#endif
             if (Snapshot->Index != SnapshotIndex || Snapshot->Term != SnapshotTerm)
                 throw std::runtime_error("Raft snapshot boundary disagrees with metadata: " + SnapshotFilePath);
         } else if (SnapshotTerm) {

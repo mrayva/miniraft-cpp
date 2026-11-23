@@ -687,7 +687,10 @@ void test_durable_snapshot_storage_preserves_stable_configuration_identity(void*
     assert_int_equal(snapshot->Index, 3);
     assert_int_equal(snapshot->ConfigurationIndex, 1);
     assert_int_equal(snapshot->ConfigurationTerm, 1);
-    assert_true(snapshot->Data == "legacy refresh");
+    assert_true(snapshot->Data.empty());
+    assert_true(bool(snapshot->DataSource));
+    assert_int_equal(snapshot->DataSize(), std::string("legacy refresh").size());
+    assert_true(snapshot->MaterializeData() == "legacy refresh");
 }
 void test_durable_snapshot_storage_checks_configuration_transition_continuity(void**) {
     TFiles files;

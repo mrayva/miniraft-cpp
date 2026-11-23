@@ -47,9 +47,10 @@ struct TSnapshot {
     uint64_t Index = 0, Term = 0;
     std::vector<uint32_t> Voters;
     std::string Data;
-    // Optional file-backed payload used by disk-staged InstallSnapshot. When
-    // set, Data is empty and consumers should use DataSize/ReadDataRange or
-    // MaterializeData. Ordinary captures and legacy restores keep using Data.
+    // Optional file-backed payload used by disk-staged InstallSnapshot and
+    // durable sidecar recovery. When set, Data is empty; consumers should use
+    // DataSize/ReadDataRange or MaterializeData. Ordinary captures and legacy
+    // embedded restores keep using Data.
     std::shared_ptr<const TSnapshotDataSource> DataSource;
     // Optional joint configuration effective at this snapshot boundary.
     std::vector<uint32_t> JointVoters;

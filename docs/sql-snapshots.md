@@ -72,7 +72,9 @@ snapshot and any transfer pins are released, but it no longer consumes the
 in-flight staging quota after full-image decoding and checksum validation.
 Configure the staging filesystem with room for these retained images as well
 as active transfers. Legacy RSMs, receives without a staging directory, and
-startup recovery retain the materializing path. Code that reads
+older embedded durable snapshots retain the materializing path. Current durable
+sidecar snapshots remain range-backed through restart, and SQL stages them
+through the same streaming installer used for received snapshots. Code that reads
 `TSnapshot::Data` directly must use
 `DataSize()`, `ReadDataRange()`, or `MaterializeData()` for a range-backed
 snapshot.

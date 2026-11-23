@@ -232,7 +232,7 @@ void test_snapshot_capture_reserves_declared_bound_before_materializing(void**) 
         TRequestProcessor processor(raft, app, {});
         auto snapshot = raft->CompactShared();
         assert_int_equal(app->SaveCalls, 1);
-        assert_int_equal(snapshot->Data.size(), 40);
+        assert_int_equal(snapshot->DataSize(), 40);
         // The 80-byte declared bound is held before SaveSnapshot, then shrunk
         // atomically to the 40-byte retained image.
         assert_int_equal(budget->UsedBytes(), 40);
@@ -280,7 +280,7 @@ void test_incremental_snapshot_capture_charges_each_growth_before_writing(void**
     }
     assert_int_equal(app->WriteCalls, 1);
     assert_int_equal(app->SaveCalls, 0);
-    assert_true(snapshot->Data == app->Payload);
+    assert_true(snapshot->MaterializeData() == app->Payload);
     assert_int_equal(budget->UsedBytes(), 40);
     snapshot.reset();
     state.reset();
@@ -302,11 +302,11 @@ void test_recovered_snapshot_retains_heap_budget_lease(void**) {
     limits.SnapshotInstallBudget = budget;
     {
         TRaft raft(state, 1, TNodeDict{}, {}, limits);
-        assert_int_equal(budget->UsedBytes(), image.Data.size());
+        assert_int_equal(budget->UsedBytes(), image.DataSize());
         assert_true(*state->GetSnapshot() == image);
     }
     // The storage snapshot outlives the Raft object and keeps its lease.
-    assert_int_equal(budget->UsedBytes(), image.Data.size());
+    assert_int_equal(budget->UsedBytes(), image.DataSize());
     state.reset();
     assert_int_equal(budget->UsedBytes(), 0);
 }
@@ -415,7 +415,7 @@ void test_shared_compaction_reuses_storage_snapshot_image(void**) {
     const auto snapshot = cluster.Nodes[0]->CompactShared();
     const auto stored = cluster.Nodes[0]->GetState()->GetSnapshot();
     assert_true(snapshot == stored);
-    assert_int_equal(budget->UsedBytes(), usedBefore + snapshot->Data.size());
+    assert_int_equal(budget->UsedBytes(), usedBefore + snapshot->DataSize());
     assert_int_equal(snapshot->Index, cluster.Apps[0]->LastAppliedIndex);
     assert_true(Read(*cluster.Apps[0], "key") == "value");
 }
@@ -2195,9 +2195,9 @@ void CheckSnapshotStorageTerm(IState& state, std::function<std::string()> image 
     Reject([&] { state.InstallSnapshot({4, 1, {1}, "regressed"}); });
     assert_true(static_cast<TStateFields>(state) == before);
     assert_true(image() == beforeImage);
-    assert_true(state.GetSnapshot()->Data == "committed"); assert_int_equal(state.LogTerm(3), 2);
+    assert_true(state.GetSnapshot()->MaterializeData() == "committed"); assert_int_equal(state.LogTerm(3), 2);
     state.InstallSnapshot({4, 2, {1}, "valid"});
-    assert_int_equal(state.SnapshotIndex, 4); assert_true(state.GetSnapshot()->Data == "valid");
+    assert_int_equal(state.SnapshotIndex, 4); assert_true(state.GetSnapshot()->MaterializeData() == "valid");
 }
 void test_memory_snapshot_storage_rejects_term_regression(void**) {
     TState state; CheckSnapshotStorageTerm(state);
@@ -2213,7 +2213,7 @@ void test_durable_snapshot_storage_rejects_term_regression(void**) {
         return std::string(std::istreambuf_iterator<char>(input), {});
       }); }
     { TDurableState state(name, 1); assert_int_equal(state.SnapshotIndex, 4);
-      assert_int_equal(state.SnapshotTerm, 2); assert_true(state.GetSnapshot()->Data == "valid"); }
+      assert_int_equal(state.SnapshotTerm, 2); assert_true(state.GetSnapshot()->MaterializeData() == "valid"); }
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 }
 #endif
@@ -2284,7 +2284,7 @@ void CheckStorageIndexExhaustion(IState& state, std::function<std::string()> ima
     const auto before = static_cast<TStateFields>(state); const auto beforeImage = image();
     Reject([&] { state.Append(entry); });
     assert_true(static_cast<TStateFields>(state) == before); assert_true(image() == beforeImage);
-    assert_int_equal(state.LogTerm(INT64_MAX), 1); assert_true(state.GetSnapshot()->Data == "boundary");
+    assert_int_equal(state.LogTerm(INT64_MAX), 1); assert_true(state.GetSnapshot()->MaterializeData() == "boundary");
 }
 void test_memory_storage_rejects_index_exhaustion(void**) {
     TState state; CheckStorageIndexExhaustion(state);
@@ -2711,7 +2711,8 @@ void test_durable_membership_snapshot_install_is_atomic_across_restart(void**) {
         const auto expectedIndex = updated ? snapshotIndex : known.Index;
         assert_int_equal(recovered->SnapshotIndex, expectedIndex);
         assert_int_equal(recovered->CommitIndex, expectedIndex);
-        assert_true(recovered->GetSnapshot()->Data == (updated ? incoming.Data : known.Data));
+        assert_true(recovered->GetSnapshot()->MaterializeData() ==
+            (updated ? incoming.MaterializeData() : known.MaterializeData()));
         auto application = std::make_shared<TApplication>();
         TNodeDict peers;
         for (uint32_t id : {1, 3, 4, 5, 6})
@@ -2756,7 +2757,7 @@ void test_durable_compacted_boundary_survives_restart(void**) {
     TDurableState state(files.Name, 1);
     assert_int_equal(state.SnapshotIndex, 3); assert_int_equal(state.LogTerm(3), 2);
     assert_int_equal(state.CurrentTerm, 3); assert_int_equal(state.VotedFor, 2);
-    assert_true(state.GetSnapshot()->Data == "different boundary");
+    assert_true(state.GetSnapshot()->MaterializeData() == "different boundary");
     auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = 3; state.Append(entry);
     assert_int_equal(state.LastLogIndex, 4); assert_int_equal(state.Get(4)->Term, 3);
 }
@@ -2782,8 +2783,8 @@ void test_snapshot_and_suffix_are_atomic_at_every_publication_stage(void**) {
         assert_int_equal(state.CurrentTerm, 3); assert_int_equal(state.VotedFor, 2);
         assert_int_equal(state.SnapshotIndex, updated ? retain ? 2 : 4 : priorSnapshot ? 1 : 0);
         assert_int_equal(state.LastLogIndex, updated && !retain ? 4 : 3);
-        if (updated) assert_true(state.GetSnapshot()->Data == "durable application");
-        else if (priorSnapshot) assert_true(state.GetSnapshot()->Data == "previous application");
+        if (updated) assert_true(state.GetSnapshot()->MaterializeData() == "durable application");
+        else if (priorSnapshot) assert_true(state.GetSnapshot()->MaterializeData() == "previous application");
         if (retain || !updated) assert_int_equal(state.Get(3)->Term, 3);
     }
 }
@@ -2830,7 +2831,8 @@ void test_remote_snapshot_install_crash_before_application_load_recovers_on_rest
         auto state = std::make_shared<TDurableState>(files.Name, 2);
         assert_int_equal(state->SnapshotIndex, snapshot.Index);
         assert_int_equal(state->CommitIndex, snapshot.Index);
-        assert_true(state->GetSnapshot() && state->GetSnapshot()->Data == snapshot.Data);
+        assert_true(state->GetSnapshot() && state->GetSnapshot()->MaterializeData() ==
+            snapshot.MaterializeData());
         auto raft = std::make_shared<TRaft>(state, 2,
             TNodeDict{{1, std::make_shared<TEndpoint>([](auto) {})}});
         auto application = std::make_shared<TKv>();

@@ -176,31 +176,38 @@ void RemoveOrphanedSnapshotFiles(int directory, const std::string& stateFile,
     }
     if (removed) Sync(directory);
 }
-class TReadOnlyMap {
+class TReadOnlyMap final : public TSnapshotDataSource {
 public:
     explicit TReadOnlyMap(int fd) {
         struct stat info;
         Require(fstat(fd, &info) == 0, "stat durable state");
         if (!S_ISREG(info.st_mode) || info.st_size < 20 || uint64_t(info.st_size) > SIZE_MAX)
             throw std::runtime_error("Invalid durable state file size/type");
-        Size = size_t(info.st_size);
-        Address = mmap(nullptr, Size, PROT_READ, MAP_PRIVATE, fd, 0);
+        SizeBytes = size_t(info.st_size);
+        Address = mmap(nullptr, SizeBytes, PROT_READ, MAP_PRIVATE, fd, 0);
         if (Address == MAP_FAILED) Require(false, "map durable state");
         if (!Address) {
-            munmap(Address, Size);
+            munmap(Address, SizeBytes);
             Address = MAP_FAILED;
             throw std::runtime_error("Invalid durable state mapping address");
         }
     }
-    ~TReadOnlyMap() { if (Address != MAP_FAILED) munmap(Address, Size); }
+    ~TReadOnlyMap() override { if (Address != MAP_FAILED) munmap(Address, SizeBytes); }
     TReadOnlyMap(const TReadOnlyMap&) = delete;
     TReadOnlyMap& operator=(const TReadOnlyMap&) = delete;
     std::span<const uint8_t> Bytes() const {
-        return {static_cast<const uint8_t*>(Address), Size};
+        return {static_cast<const uint8_t*>(Address), SizeBytes};
+    }
+    uint64_t Size() const override { return SizeBytes; }
+    size_t Read(uint64_t offset, std::span<char> destination) const override {
+        if (offset >= SizeBytes || destination.empty()) return 0;
+        const auto count = size_t(std::min<uint64_t>(destination.size(), SizeBytes - offset));
+        memcpy(destination.data(), static_cast<const char*>(Address) + size_t(offset), count);
+        return count;
     }
 private:
     void* Address = MAP_FAILED;
-    size_t Size = 0;
+    size_t SizeBytes = 0;
 };
 #endif
 }
@@ -309,8 +316,8 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
             const auto snapshotFileName = SnapshotImageName(Impl->File, SnapshotIndex, SnapshotTerm);
             TFd snapshotFile(openat(Impl->Directory.Value, snapshotFileName.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
             Require(snapshotFile.Value >= 0, "open external durable snapshot");
-            TReadOnlyMap snapshotMap(snapshotFile.Value);
-            const auto snapshotBytes = snapshotMap.Bytes();
+            auto snapshotMap = std::make_shared<TReadOnlyMap>(snapshotFile.Value);
+            const auto snapshotBytes = snapshotMap->Bytes();
             if (snapshotBytes.size() > TSnapshot::MaxBytes)
                 throw std::runtime_error("External durable snapshot exceeds size limit");
             const std::string_view image(reinterpret_cast<const char*>(snapshotBytes.data()), snapshotBytes.size());
@@ -319,7 +326,7 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
             const auto digest = ComputeIdempotentPayloadDigest(image);
             if (boundSnapshot && digest != expectedDigest)
                 throw std::runtime_error("External durable snapshot digest does not match its manifest");
-            auto snapshot = DecodeSnapshot(image);
+            auto snapshot = DecodeSnapshotBacked(image, snapshotMap);
             if (snapshot.Index != SnapshotIndex || snapshot.Term != SnapshotTerm || snapshot.Term > CurrentTerm ||
                 (!Impl->Voters.empty() && !SnapshotCompatibleWithVoterBinding(snapshot, Impl->Voters)))
                 throw std::runtime_error("External durable snapshot does not match its manifest");

@@ -844,7 +844,7 @@ void test_trusted_legacy_voter_baseline_migrates_durable_state(void**) {
             assert_true(std::string(std::istreambuf_iterator<char>(dryRunUnchanged), {}) == original);
             state->BindVotersFromTrustedBaseline({1, 2, 3});
             assert_true(static_cast<TStateFields>(*state) == before);
-            assert_true(state->GetSnapshot()->Data == application);
+            assert_true(state->GetSnapshot()->MaterializeData() == application);
             assert_true(state->GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
         }
         { std::ifstream migrated(path, std::ios::binary); std::string magic(8, '\0');
@@ -1002,14 +1002,14 @@ void test_durable_snapshot_adoption_preserves_vote_log_and_application(void**) {
         auto state = std::make_shared<TDurableState>(files.Name, 1);
         auto raft = std::make_shared<TRaft>(state, 1, Peers(1), std::vector<uint32_t>{4});
         assert_true(static_cast<TStateFields>(*state) == before);
-        assert_true(state->GetSnapshot()->Data == application); assert_true(bool(state->Get(2)));
+        assert_true(state->GetSnapshot()->MaterializeData() == application); assert_true(bool(state->Get(2)));
         auto app = std::make_shared<TKv>(); TRequestProcessor processor(raft, app, {});
         assert_true(Read(*app, "a") == "snapshot"); assert_true(Read(*app, "b").empty());
         Reject([&] { TRaft promoted(state, 1, Peers(1)); });
     }
     TDurableState state(files.Name, 1);
     assert_true(static_cast<TStateFields>(state) == before);
-    assert_true(state.GetSnapshot()->Data == application);
+    assert_true(state.GetSnapshot()->MaterializeData() == application);
     assert_true(state.GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
 }
 void test_versioned_disk_backend_persists_learner_baseline(void**) {

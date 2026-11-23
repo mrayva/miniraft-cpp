@@ -3953,7 +3953,7 @@ void test_configuration_application_advances_without_calling_state_machine(void*
     const auto fields = static_cast<TStateFields>(*compacted);
     Reject([&] { TRaft invalid(compacted, 1, {}); });
     assert_true(static_cast<TStateFields>(*compacted) == fields);
-    assert_true(compacted->GetSnapshot()->Data == "fixed image");
+    assert_true(compacted->GetSnapshot()->MaterializeData() == "fixed image");
 }
 #ifdef __linux__
 void test_durable_restart_rejects_reserved_entry_without_rewriting(void**) {
@@ -4029,7 +4029,7 @@ void test_offline_history_scan_after_durable_snapshot_and_restart(void**) {
         assert_false(history.IsJoint()); assert_true(history.OldVoters() == final.NewVoters);
         assert_int_equal(history.ConfigurationIndex(), 4);
         Reject([&] { TRaft disabled(state, 1, {}); });
-        assert_true(state->GetSnapshot()->Data == "fixed image");
+        assert_true(state->GetSnapshot()->MaterializeData() == "fixed image");
     }
     std::ifstream after(path, std::ios::binary);
     assert_true(std::string(std::istreambuf_iterator<char>(after), {}) == before);

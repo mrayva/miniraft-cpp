@@ -247,7 +247,7 @@ void test_v1_v2_v3_images_recover_conservatively_and_upgrade_on_publish(void**) 
             if (!configured) state.BindVotersFromTrustedBaseline({1, 2});
             assert_true((state.GetBoundVoters() == std::vector<uint32_t>{1, 2}));
             assert_true(state.SupportsCommitIndexPersistence());
-            if (hasSnapshot) assert_true(state.GetSnapshot()->Data == "legacy snapshot");
+            if (hasSnapshot) assert_true(state.GetSnapshot()->MaterializeData() == "legacy snapshot");
             assert_string_equal(Data(state, state.LastLogIndex).c_str(), "tail");
             state.Commit();
         }
@@ -1432,7 +1432,7 @@ void test_idempotent_retry_after_durable_snapshot_restart_returns_cached_result(
         const auto snapshot = raft->CompactShared();
         assert_int_equal(snapshot->Index, 1);
         assert_int_equal(state->SnapshotIndex, 1);
-        assert_true(state->GetSnapshot()->Data == snapshot->Data);
+        assert_true(state->GetSnapshot()->MaterializeData() == snapshot->MaterializeData());
     }
 
     auto state = std::make_shared<TDurableState>(files.Name, 1);
@@ -1806,7 +1806,7 @@ void test_reference_kv_idempotency_replays_from_durable_snapshot_and_log(void**)
         const auto savedSnapshot = state.GetSnapshot();
         assert_true(savedSnapshot && *savedSnapshot == raftSnapshot);
         TIdempotentKvRsm application;
-        application.LoadSnapshot(savedSnapshot->Data, savedSnapshot->Index);
+        application.LoadSnapshot(savedSnapshot->MaterializeData(), savedSnapshot->Index);
         auto retry = application.PrepareIdempotent(request);
         retry->Term = state.CurrentTerm;
         std::vector<TMessageHolder<TLogEntry>> suffix;
@@ -1824,7 +1824,7 @@ void test_reference_kv_idempotency_replays_from_durable_snapshot_and_log(void**)
         const auto savedSnapshot = state.GetSnapshot();
         assert_true(bool(savedSnapshot));
         TIdempotentKvRsm application;
-        application.LoadSnapshot(savedSnapshot->Data, savedSnapshot->Index);
+        application.LoadSnapshot(savedSnapshot->MaterializeData(), savedSnapshot->Index);
         const auto result = application.ApplyIdempotentLogRecord(state.Get(2), 2);
         assert_int_equal(result.ErrorCode, TCommandResponse::Success);
         assert_int_equal(result.Index, 1);

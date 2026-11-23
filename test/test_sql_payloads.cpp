@@ -716,8 +716,8 @@ void test_sql_and_raft_restart_do_not_reapply_committed_insert(void**) {
         assert_int_equal(sql->LastAppliedIndex, 4); // new-term stub advanced framework progress
         const auto snapshot = raft->CompactShared();
         assert_int_equal(snapshot->Index, 4);
-        sql->ValidateSnapshot(snapshot->Data, 4);
-        Reject([&] { sql->ValidateSnapshot(snapshot->Data, 3); });
+        sql->ValidateSnapshot(snapshot->MaterializeData(), 4);
+        Reject([&] { sql->ValidateSnapshot(snapshot->MaterializeData(), 3); });
         assert_true(ReadText(*sql, "SELECT value FROM raft_metadata_ WHERE key='LastAppliedIndex'") ==
             "value\n3\n");
     }
@@ -742,7 +742,7 @@ void test_sql_compaction_at_raft_only_boundaries(void**) {
         assert_int_equal(sql->LastAppliedIndex, 1);
         const auto snapshot = raft->CompactShared();
         assert_int_equal(snapshot->Index, 1);
-        sql->ValidateSnapshot(snapshot->Data, 1);
+        sql->ValidateSnapshot(snapshot->MaterializeData(), 1);
         assert_true(ReadText(*sql, "SELECT count(*) FROM raft_metadata_") == "count(*)\n0\n");
     }
     {
@@ -770,7 +770,7 @@ void test_sql_compaction_at_raft_only_boundaries(void**) {
         assert_true(snapshot->StableConfiguration);
         assert_true(snapshot->Voters == newVoters);
         TSql restored(":memory:", 1);
-        restored.LoadSnapshot(snapshot->Data, 3);
+        restored.LoadSnapshot(snapshot->MaterializeData(), 3);
         assert_true(ReadText(restored, "SELECT v FROM t") == "v\nkept\n");
     }
 }
