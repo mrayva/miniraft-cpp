@@ -482,6 +482,39 @@ void test_zero_index_follower_compaction_waits_for_capability_barrier(void**) {
     assert_true(cluster.Nodes[1]->CheckCompactionMembershipReadiness().Ready());
     assert_true(cluster.Nodes[1]->Compact().Index > 0);
 }
+void test_restarted_follower_reacquires_compaction_certificate_without_new_term(void**) {
+    TCluster cluster;
+    cluster.Elect(1);
+    cluster.Pump(1);
+
+    auto readiness = cluster.Nodes[1]->CheckCompactionMembershipReadiness();
+    assert_true(readiness.IsActiveVoter);
+    assert_true(readiness.HasLeaderAcknowledgementBarrier);
+    assert_true(readiness.Ready());
+    const auto term = cluster.Nodes[0]->GetState()->CurrentTerm;
+
+    // Restart drops volatile Raft certificates while retaining durable term,
+    // vote, commit, and log state.
+    cluster.Restart(2);
+    readiness = cluster.Nodes[1]->CheckCompactionMembershipReadiness();
+    assert_true(readiness.IsActiveVoter);
+    assert_true(readiness.RequiresLeaderAcknowledgementBarrier);
+    assert_false(readiness.HasLeaderAcknowledgementBarrier);
+    assert_false(readiness.Ready());
+    cluster.Processors[1]->ProcessCommitted();
+    Reject([&] { cluster.Nodes[1]->Compact(); });
+
+    // The leader refreshes the certificate every 30 seconds. Advance virtual
+    // time in heartbeat-sized steps so it maintains quorum throughout.
+    const auto refreshRounds = int(TTimeout::ConfigurationBarrierRefresh.count() / 100) + 20;
+    cluster.Pump(1, refreshRounds);
+    assert_int_equal(cluster.Nodes[0]->CurrentStateName(), EState::LEADER);
+    assert_int_equal(cluster.Nodes[0]->GetState()->CurrentTerm, term);
+    assert_int_equal(cluster.Nodes[1]->GetState()->CurrentTerm, term);
+    readiness = cluster.Nodes[1]->CheckCompactionMembershipReadiness();
+    assert_true(readiness.HasLeaderAcknowledgementBarrier);
+    assert_true(readiness.Ready());
+}
 void test_snapshot_size_negotiation_keeps_legacy_fallback_and_certifies_voter_limit(void**) {
     constexpr auto legacyLimit = uint64_t(TSnapshot::LegacyMaxBytes);
     constexpr auto currentLimit = uint64_t(TSnapshot::MaxBytes);
@@ -3050,6 +3083,7 @@ int main() {
         cmocka_unit_test(test_recovered_snapshot_retains_heap_budget_lease),
         cmocka_unit_test(test_shared_compaction_reuses_storage_snapshot_image),
         cmocka_unit_test(test_zero_index_follower_compaction_waits_for_capability_barrier),
+        cmocka_unit_test(test_restarted_follower_reacquires_compaction_certificate_without_new_term),
         cmocka_unit_test(test_snapshot_size_negotiation_keeps_legacy_fallback_and_certifies_voter_limit),
         cmocka_unit_test(test_snapshot_encoder_accepts_image_above_legacy_limit),
         cmocka_unit_test(test_single_voter_compacts_snapshot_above_legacy_limit),
