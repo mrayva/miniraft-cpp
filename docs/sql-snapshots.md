@@ -38,17 +38,23 @@ this index without changing SQL data. If the SQLite progress marker trails the
 Raft index or is absent, capture writes the exact boundary into the backup copy.
 The live database is unaffected. The SQL payload is capped below 64 MiB to
 leave room for the Raft snapshot header and maximum voter metadata. Before
-application validation allocates its padded image, SQL checks the format
-signature, rollback mode, page size, page alignment and the in-header page
-count when SQLite's header counters make it authoritative.
-It then copies the image into a buffer with 20 zeroed trailing guard bytes for
-SQLite's malformed-image checks. Before restore or installation,
-SQL checks that the image can be opened,
+SQLite opens the received image, SQL checks the format signature, rollback
+mode, page size, page alignment and the in-header page count when SQLite's
+header counters make it authoritative. On Linux, SQL writes the image to a
+0600 file in a private temporary directory, then opens it read-only with a
+2 MiB page cache and memory mapping disabled. The staged file remains alive
+through validation and, for a prepared install, until the durable Raft snapshot
+has been published and the application database has been replaced. This avoids
+SQL's additional full-size padded heap copy; Raft still materializes the
+received application image. Non-Linux builds retain the in-memory deserialize
+path, including its 20 zeroed guard bytes for SQLite's malformed-image checks.
+Before restore or installation, SQL checks that the image can be opened,
 passes `PRAGMA quick_check(1)`, and has exactly one valid progress marker equal
 to the Raft snapshot boundary. Raft installation keeps this validated SQLite
-image staged until the durable snapshot is published, then installs that same
-image instead of deserializing and checking it again. WAL-mode backup bytes are
-normalized to SQLite's standalone rollback-mode format before deserialization. The receiver also
+database staged until the durable snapshot is published, then installs that
+same database instead of reopening and checking the image again. WAL-mode
+backup bytes are normalized to SQLite's standalone rollback-mode format before
+validation. The receiver also
 requires the target database page size to match before Raft publishes the
 snapshot durably. Invalid or incompatible images do not replace the live
 database.
@@ -59,8 +65,8 @@ another page. Capture checks the SQLite size limit before backup and again
 before publishing the source, then Raft checks the complete snapshot and its
 metadata.
 
-Restore uses SQLite's backup API to copy the validated in-memory image into the
-existing database connection. The application progress marker in memory moves
+Restore uses SQLite's backup API to copy the validated staged database into
+the existing database connection. The application progress marker in memory moves
 only after the backup completes. A failed backup leaves the destination
 unchanged according to SQLite's backup transaction contract. Snapshot
 installation first publishes the Raft snapshot and retained suffix durably,

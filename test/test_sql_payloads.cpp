@@ -265,9 +265,11 @@ void test_sql_staged_snapshot_install_reuses_validated_image(void**) {
     Seed(source);
     Seed(target);
     Apply(source, "INSERT INTO t VALUES ('snapshot')", 2);
-    const auto image = source.SaveSnapshot();
-
-    auto installation = target.PrepareSnapshotInstallation(image, 2);
+    std::unique_ptr<IStagedSnapshotInstallation> installation;
+    {
+        const auto image = source.SaveSnapshot();
+        installation = target.PrepareSnapshotInstallation(image, 2);
+    }
     assert_int_equal(target.LastAppliedIndex, 1);
     assert_true(ReadText(target, "SELECT value FROM t") == "value\noriginal\n");
 

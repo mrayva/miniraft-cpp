@@ -41,10 +41,13 @@ callbacks without a bound remain charged only after they return.
 
 `IStagedSnapshotRsm` lets an application validate and prepare an installation
 before Raft publishes the durable snapshot, then install that same prepared
-image after publication. The SQL example keeps the validated SQLite database
-open across those phases, avoiding a second full-image allocation and integrity
-scan during activation. This is an in-memory staging step; it does not provide
-durable application generations or change crash recovery ordering.
+image after publication. On Linux, the SQL example writes the already
+materialized application image to a private temporary file and keeps a
+read-only SQLite connection open across those phases. It bounds SQLite's page
+cache, disables memory mapping, and avoids a second full-size padded heap copy
+and integrity scan during activation. Non-Linux builds retain in-memory
+deserialization. This staging file is temporary; it does not provide durable
+application generations or change crash recovery ordering.
 
 Full in-memory InstallSnapshot assemblies reserve their declared image size
 against a shared 256 MiB process-wide heap budget by default. Raft instances can share a
@@ -102,11 +105,12 @@ backend stores snapshot bytes in an immutable sidecar and still materializes
 the application payload when opening it. Raising `TSnapshot::MaxBytes` would
 raise peak memory without making the path streaming.
 
-The SQL example independently copies the complete image into a zero-padded
-buffer before SQLite deserialization. A Raft-only streaming decoder would
-therefore leave a second full-image allocation in that application path. The
-streaming application API must let SQL validate and stage a file-backed image
-while preserving the current malformed-image bounds.
+The SQL adapter still receives a complete application-image view. On Linux it
+now stages that view in a private file for SQLite validation and installation,
+while non-Linux builds retain the padded deserialize buffer. The Raft decoder
+still materializes the complete application payload before calling the
+application, so end-to-end streaming and durable application generations
+remain open gaps.
 
 The replacement needs an immutable application-image reference that Raft can
 publish atomically with the snapshot boundary, commit index, membership

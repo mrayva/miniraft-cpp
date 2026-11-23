@@ -107,9 +107,51 @@ struct TReadBudget {
 using TStatement = std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)>;
 constexpr size_t MaxSqlSnapshotBytes = TSnapshot::MaxBytes - 40 - 4 * TSnapshot::MaxVoters;
 
+#ifdef __linux__
+class TSnapshotFileDescriptor {
+public:
+    explicit TSnapshotFileDescriptor(int fd = -1) : Fd(fd) { }
+    ~TSnapshotFileDescriptor() { if (Fd >= 0) close(Fd); }
+    TSnapshotFileDescriptor(const TSnapshotFileDescriptor&) = delete;
+    TSnapshotFileDescriptor& operator=(const TSnapshotFileDescriptor&) = delete;
+    int Get() const { return Fd; }
+    void Release() { Fd = -1; }
+private:
+    int Fd;
+};
+
+class TSqlSnapshotTempDirectory {
+public:
+    TSqlSnapshotTempDirectory() {
+        auto pattern = (std::filesystem::temp_directory_path() /
+            "miniraft-sql-snapshot-XXXXXX").string();
+        std::vector<char> writable(pattern.begin(), pattern.end());
+        writable.push_back('\0');
+        const auto* created = mkdtemp(writable.data());
+        if (!created) throw std::system_error(errno, std::generic_category(),
+            "Cannot create private SQL snapshot directory");
+        Directory = created;
+        Database = (std::filesystem::path(Directory) / "image.sqlite").string();
+    }
+    ~TSqlSnapshotTempDirectory() {
+        std::error_code ignored;
+        std::filesystem::remove_all(Directory, ignored);
+    }
+    const std::string& DatabasePath() const { return Database; }
+private:
+    std::string Directory;
+    std::string Database;
+};
+#endif
+
 struct TSnapshotDatabase {
+#ifdef __linux__
+    // Keep the staged file until after SQLite closes its read-only connection.
+    std::unique_ptr<TSqlSnapshotTempDirectory> TempDirectory;
+#else
     // Keep the deserialize buffer alive until after the connection closes.
     std::unique_ptr<unsigned char, decltype(&sqlite3_free)> Buffer{nullptr, sqlite3_free};
+#endif
     std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)> Db{nullptr, sqlite3_close_v2};
 };
 
@@ -139,6 +181,39 @@ TSnapshotDatabase OpenSnapshotDatabase(std::string_view bytes) {
         throw TMessageError("SQL snapshot page count does not match its image length");
 
     TSnapshotDatabase result;
+#ifdef __linux__
+    result.TempDirectory = std::make_unique<TSqlSnapshotTempDirectory>();
+    TSnapshotFileDescriptor stagedFile(open(result.TempDirectory->DatabasePath().c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600));
+    if (stagedFile.Get() < 0)
+        throw std::system_error(errno, std::generic_category(), "Cannot create staged SQL snapshot image");
+    struct stat fileInfo{};
+    if (fstat(stagedFile.Get(), &fileInfo) != 0 || !S_ISREG(fileInfo.st_mode) || fileInfo.st_size != 0)
+        throw TMessageError("Cannot safely create staged SQL snapshot image");
+    size_t written = 0;
+    while (written < bytes.size()) {
+        const auto count = std::min<size_t>(bytes.size() - written,
+            size_t(std::numeric_limits<ssize_t>::max()));
+        ssize_t resultBytes;
+        do {
+            resultBytes = write(stagedFile.Get(), bytes.data() + written, count);
+        } while (resultBytes < 0 && errno == EINTR);
+        if (resultBytes <= 0) {
+            if (resultBytes == 0) errno = EIO;
+            throw std::system_error(errno, std::generic_category(), "Cannot write staged SQL snapshot image");
+        }
+        written += size_t(resultBytes);
+    }
+
+    sqlite3* raw = nullptr;
+    const int opened = sqlite3_open_v2(result.TempDirectory->DatabasePath().c_str(), &raw,
+        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nullptr);
+    result.Db.reset(raw);
+    if (opened != SQLITE_OK) throw TMessageError("Cannot open staged SQL snapshot database");
+    if (sqlite3_exec(result.Db.get(), "PRAGMA cache_size=-2048; PRAGMA mmap_size=0;",
+            nullptr, nullptr, nullptr) != SQLITE_OK)
+        throw TMessageError("Cannot bound staged SQL snapshot database reads");
+#else
     constexpr size_t MalformedImageReadSlack = 20;
     result.Buffer.reset(static_cast<unsigned char*>(sqlite3_malloc64(bytes.size() + MalformedImageReadSlack)));
     if (!result.Buffer) throw std::bad_alloc();
@@ -153,6 +228,7 @@ TSnapshotDatabase OpenSnapshotDatabase(std::string_view bytes) {
     const int rc = sqlite3_deserialize(result.Db.get(), "main", result.Buffer.get(),
         sqlite3_int64(bytes.size()), sqlite3_int64(bytes.size()), SQLITE_DESERIALIZE_READONLY);
     if (rc != SQLITE_OK) throw TMessageError("Invalid SQL snapshot database image");
+#endif
     return result;
 }
 
@@ -286,41 +362,6 @@ private:
 #endif
 
 #ifdef __linux__
-class TSnapshotFileDescriptor {
-public:
-    explicit TSnapshotFileDescriptor(int fd = -1) : Fd(fd) { }
-    ~TSnapshotFileDescriptor() { if (Fd >= 0) close(Fd); }
-    TSnapshotFileDescriptor(const TSnapshotFileDescriptor&) = delete;
-    TSnapshotFileDescriptor& operator=(const TSnapshotFileDescriptor&) = delete;
-    int Get() const { return Fd; }
-    void Release() { Fd = -1; }
-private:
-    int Fd;
-};
-
-class TSqlSnapshotTempDirectory {
-public:
-    TSqlSnapshotTempDirectory() {
-        auto pattern = (std::filesystem::temp_directory_path() /
-            "miniraft-sql-snapshot-XXXXXX").string();
-        std::vector<char> writable(pattern.begin(), pattern.end());
-        writable.push_back('\0');
-        const auto* created = mkdtemp(writable.data());
-        if (!created) throw std::system_error(errno, std::generic_category(),
-            "Cannot create private SQL snapshot directory");
-        Directory = created;
-        Database = (std::filesystem::path(Directory) / "image.sqlite").string();
-    }
-    ~TSqlSnapshotTempDirectory() {
-        std::error_code ignored;
-        std::filesystem::remove_all(Directory, ignored);
-    }
-    const std::string& DatabasePath() const { return Database; }
-private:
-    std::string Directory;
-    std::string Database;
-};
-
 class TSqlFileSnapshotSource final : public ISnapshotSource {
 public:
     TSqlFileSnapshotSource(int fd, uint64_t size) : Fd(fd), Length(size) { }
