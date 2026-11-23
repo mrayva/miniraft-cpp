@@ -95,6 +95,16 @@ struct TCluster {
             }
         }
     }
+    void AssertSafety() {
+        for (size_t i = 0; i < Nodes.size(); ++i) {
+            if (Nodes[i]->CurrentStateName() != EState::LEADER) continue;
+            for (size_t j = i + 1; j < Nodes.size(); ++j) {
+                if (Nodes[j]->CurrentStateName() != EState::LEADER) continue;
+                assert_false(Nodes[i]->GetState()->CurrentTerm == Nodes[j]->GetState()->CurrentTerm);
+            }
+        }
+        AssertCommittedPrefix();
+    }
     TMessageHolder<TMessage> DeliverOne(uint32_t src, uint32_t dst) {
         for (auto it = Packets.begin(); it != Packets.end(); ++it) {
             auto ex = it->Cast<TMessageEx>();
@@ -1475,6 +1485,99 @@ void test_cluster_restart_preserves_applied_history_and_rebuilds_volatile_applic
     cluster.AssertCommittedPrefix();
 }
 
+void test_generated_partition_restart_schedules_preserve_committed_application_history(void**) {
+    for (uint32_t seed = 1; seed <= 8; ++seed) {
+        const uint32_t nodeCount = 3 + seed % 3;
+        uint32_t random = UINT32_C(0x9e3779b9) ^ (seed * UINT32_C(0x85ebca6b));
+        auto next = [&] {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            return random;
+        };
+
+        TCluster cluster(nodeCount);
+        const uint32_t initialLeader = seed % nodeCount + 1;
+        cluster.Elect(initialLeader);
+        std::vector<std::shared_ptr<TEchoRsm>> applications;
+        std::vector<std::unique_ptr<TRequestProcessor>> processors;
+        for (auto& node : cluster.Nodes) {
+            auto application = std::make_shared<TEchoRsm>();
+            processors.push_back(std::make_unique<TRequestProcessor>(node, application, TNodeDict{}));
+            processors.back()->ProcessCommitted();
+            applications.push_back(std::move(application));
+        }
+
+        auto assertAppliedPrefix = [&] {
+            for (size_t i = 0; i < applications.size(); ++i) {
+                assert_true(applications[i]->LastAppliedIndex <=
+                    cluster.Nodes[i]->GetVolatileState()->CommitIndex);
+                size_t applied = 0;
+                for (uint64_t index = 1; index <= applications[i]->LastAppliedIndex; ++index) {
+                    const auto entry = cluster.Nodes[i]->GetState()->Get(index);
+                    if ((entry->Flags & TLogEntry::EConfiguration) || entry->Flags == TLogEntry::EStub ||
+                        entry->Flags == TLogEntry::EIdempotencyControl || (entry->Flags & TLogEntry::EIdempotent))
+                        continue;
+                    assert_true(applied < applications[i]->Applied.size());
+                    const std::string value(entry->Data, entry->Len - sizeof(TLogEntry));
+                    assert_true(applications[i]->Applied[applied++] == value);
+                }
+                assert_int_equal(applied, applications[i]->Applied.size());
+                for (size_t j = i + 1; j < applications.size(); ++j) {
+                    const auto common = std::min(applications[i]->Applied.size(),
+                        applications[j]->Applied.size());
+                    for (uint64_t index = 0; index < common; ++index)
+                        assert_true(applications[i]->Applied[index] == applications[j]->Applied[index]);
+                }
+            }
+        };
+
+        cluster.AssertSafety();
+        for (uint32_t wave = 0; wave < 4; ++wave) {
+            uint32_t leader = 0;
+            uint64_t leaderTerm = 0;
+            for (uint32_t id = 1; id <= nodeCount; ++id) {
+                if (cluster.Nodes[id - 1]->CurrentStateName() == EState::LEADER &&
+                    cluster.Nodes[id - 1]->GetState()->CurrentTerm >= leaderTerm) {
+                    leader = id;
+                    leaderTerm = cluster.Nodes[id - 1]->GetState()->CurrentTerm;
+                }
+            }
+            assert_true(leader != 0);
+
+            uint32_t isolated = 0;
+            do { isolated = next() % nodeCount + 1; } while (isolated == leader);
+            cluster.Isolated.insert(isolated);
+            const auto value = std::to_string(seed) + "/" + std::to_string(wave);
+            const auto proposed = cluster.Nodes[leader - 1]->Append(LogValue(value));
+            cluster.Replicate(leader, next() & 1, next() % 3 == 0);
+            for (auto& processor : processors) processor->ProcessCommitted();
+            assert_true(cluster.Nodes[leader - 1]->GetVolatileState()->CommitIndex >= proposed);
+            cluster.AssertSafety();
+            assertAppliedPrefix();
+
+            // Restart the isolated voter with its retained Raft state and
+            // recovered application history; its volatile protocol state and
+            // network progress must be rebuilt after healing.
+            processors[isolated - 1].reset();
+            cluster.Restart(isolated);
+            applications[isolated - 1] = RecoverApplication(*applications[isolated - 1]);
+            processors[isolated - 1] = std::make_unique<TRequestProcessor>(
+                cluster.Nodes[isolated - 1], applications[isolated - 1], TNodeDict{});
+            processors[isolated - 1]->ProcessCommitted();
+            cluster.Isolated.clear();
+            cluster.Replicate(leader, next() & 1, next() % 3 == 0);
+            for (auto& processor : processors) processor->ProcessCommitted();
+            cluster.AssertSafety();
+            assertAppliedPrefix();
+            for (const auto& application : applications) {
+                assert_true(application->Applied == applications.front()->Applied);
+                assert_int_equal(application->LastAppliedIndex, applications.front()->LastAppliedIndex);
+            }
+        }
+    }
+}
+
 }
 
 int main() {
@@ -1487,6 +1590,7 @@ int main() {
         cmocka_unit_test(test_recovered_applied_prefix_is_protected_and_suffix_can_change),
         cmocka_unit_test(test_application_ahead_of_recovered_log_is_rejected),
         cmocka_unit_test(test_cluster_restart_preserves_applied_history_and_rebuilds_volatile_application),
+        cmocka_unit_test(test_generated_partition_restart_schedules_preserve_committed_application_history),
         cmocka_unit_test(test_majority_all_cluster_sizes),
         cmocka_unit_test(test_read_fifo),
         cmocka_unit_test(test_strong_read_fifo),

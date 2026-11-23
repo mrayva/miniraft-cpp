@@ -34,8 +34,10 @@ Cluster scenarios check commit progress and equality of committed log prefixes.
 These are selected deterministic schedules, not exhaustive state-space exploration.
 The original baseline did not cover restarts or storage crash injection.
 The [application recovery follow-up](application-recovery.md) adds deterministic
-node restarts and committed application-history checks; torn-write simulation
-and broader generated schedules remain open.
+node restarts and committed application-history checks. Seeded schedules in the
+correctness harness also combine partitions, reordering, duplicates and restarts
+across three to five voters, checking leader uniqueness and applied histories.
+Torn-write simulation and broader generated schedules remain open.
 
 ## Reproduce
 
