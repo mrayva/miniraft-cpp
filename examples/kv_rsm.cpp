@@ -3,7 +3,9 @@
 #include "payload_validation.h"
 #include <string_view>
 #include <algorithm>
+#include <array>
 #include <climits>
+#include <vector>
 #include <miniraft/snapshot_codec.h>
 
 void TKv::Validate(TMessageHolder<TCommandRequest> message) const {
@@ -109,6 +111,33 @@ std::string TKv::SaveSnapshot() const {
     }
     if (bytes.size() != encodedSize) throw std::logic_error("KV snapshot size calculation mismatch");
     return bytes;
+}
+
+void TKv::WriteSnapshot(uint64_t index, ISnapshotSink& sink) const {
+    if (index != LastAppliedIndex) throw std::logic_error("KV snapshot writer index mismatch");
+    (void)SnapshotSizeUpperBound();
+
+    using TEntry = std::unordered_map<std::string, std::string>::value_type;
+    std::vector<const TEntry*> entries;
+    entries.reserve(H.size());
+    for (const auto& entry : H) entries.push_back(&entry);
+    std::sort(entries.begin(), entries.end(), [](const TEntry* lhs, const TEntry* rhs) {
+        return lhs->first < rhs->first;
+    });
+
+    std::string header = "MRKV0001";
+    NSnapshotCodec::Put(header, H.size(), 8);
+    sink.Write(std::span<const char>(header.data(), header.size()));
+    for (const auto* entry : entries) {
+        std::array<char, 8> lengths{};
+        for (unsigned i = 0; i < 4; ++i) {
+            lengths[i] = char(entry->first.size() >> (8 * i));
+            lengths[4 + i] = char(entry->second.size() >> (8 * i));
+        }
+        sink.Write(lengths);
+        sink.Write(std::span<const char>(entry->first.data(), entry->first.size()));
+        sink.Write(std::span<const char>(entry->second.data(), entry->second.size()));
+    }
 }
 
 void TKv::LoadSnapshot(std::string_view bytes, uint64_t index) {

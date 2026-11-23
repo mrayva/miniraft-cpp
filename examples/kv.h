@@ -5,13 +5,14 @@
 
 #include <miniraft/raft.h>
 
-class TKv: public IRsm {
+class TKv: public IRsm, public IStreamingSnapshotWriterRsm {
 public:
     void Validate(TMessageHolder<TCommandRequest> message) const override;
     TMessageHolder<TMessage> Read(TMessageHolder<TCommandRequest> message, uint64_t index) override;
     TMessageHolder<TMessage> Write(TMessageHolder<TLogEntry> message, uint64_t index) override;
     TMessageHolder<TLogEntry> Prepare(TMessageHolder<TCommandRequest> message) override;
     std::string SaveSnapshot() const override;
+    void WriteSnapshot(uint64_t index, ISnapshotSink& sink) const override;
     std::optional<uint64_t> SnapshotSizeUpperBound() const override;
     void ValidateSnapshot(std::string_view bytes, uint64_t index) const override;
     void LoadSnapshot(std::string_view bytes, uint64_t index) override;

@@ -34,8 +34,9 @@ snapshot bytes incrementally. Raft supplies a sink that checks the
 metadata-adjusted image limit and extends the shared heap lease before each
 append. This path does not require a size bound and avoids constructing a
 separate `SaveSnapshot()` result, but still materializes one complete final
-image in memory. Legacy `SaveSnapshot()` callbacks without a bound remain
-charged only after they return.
+image in memory. The KV example writes its sorted records directly to this
+sink, avoiding a second complete encoded buffer. Legacy `SaveSnapshot()`
+callbacks without a bound remain charged only after they return.
 
 `IStagedSnapshotRsm` lets an application validate and prepare an installation
 before Raft publishes the durable snapshot, then install that same prepared

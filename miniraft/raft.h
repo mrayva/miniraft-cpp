@@ -50,10 +50,12 @@ struct IStreamingSnapshotRsm {
     virtual std::shared_ptr<const ISnapshotSource> OpenSnapshotSource(uint64_t index) const = 0;
 };
 
-// Optional incremental capture contract. Writes are consumed synchronously;
-// the sink applies the Raft image limit and charges each growth before it
-// allocates the corresponding bytes. Implementations should propagate Write
-// failures and must emit one immutable image for the requested applied index.
+// Optional incremental capture contract. When present, Raft prefers this writer
+// over SaveSnapshot(); an available range-readable source takes precedence.
+// Writes are consumed synchronously; the sink applies the Raft image limit and
+// charges each growth before it allocates the corresponding bytes. Implementors
+// should propagate Write failures and emit one immutable image for the requested
+// applied index.
 struct ISnapshotSink {
     virtual ~ISnapshotSink() = default;
     virtual void Write(std::span<const char> bytes) = 0;

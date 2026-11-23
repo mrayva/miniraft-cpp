@@ -49,15 +49,25 @@ struct TApplication : TKv {
     size_t Loads = 0;
     void LoadSnapshot(std::string_view bytes, uint64_t index) override { TKv::LoadSnapshot(bytes, index); ++Loads; }
 };
-struct TBoundedSnapshotApplication : TApplication {
+struct TCollectingSnapshotSink : ISnapshotSink {
+    std::string Data;
+    void Write(std::span<const char> bytes) override {
+        if (!bytes.empty()) Data.append(bytes.data(), bytes.size());
+    }
+};
+struct TBoundedSnapshotApplication : IRsm {
     mutable size_t SaveCalls = 0;
     uint64_t Bound = 80;
     size_t PayloadBytes = 40;
+    TMessageHolder<TMessage> Read(TMessageHolder<TCommandRequest>, uint64_t) override { return {}; }
+    TMessageHolder<TMessage> Write(TMessageHolder<TLogEntry>, uint64_t) override { return {}; }
+    TMessageHolder<TLogEntry> Prepare(TMessageHolder<TCommandRequest>) override { return {}; }
     std::optional<uint64_t> SnapshotSizeUpperBound() const override { return Bound; }
     std::string SaveSnapshot() const override { ++SaveCalls; return std::string(PayloadBytes, 's'); }
     void ValidateSnapshot(std::string_view, uint64_t) const override { }
+    void LoadSnapshot(std::string_view, uint64_t index) override { LastAppliedIndex = index; }
 };
-struct TStreamingWriterSnapshotApplication : TApplication, IStreamingSnapshotWriterRsm {
+struct TStreamingWriterSnapshotApplication : TApplication {
     mutable size_t SaveCalls = 0;
     mutable size_t WriteCalls = 0;
     std::string Payload = std::string(40, 'w');
@@ -100,6 +110,9 @@ void test_kv_snapshot_precomputes_size_without_changing_encoding(void**) {
 
     const auto bytes = source.SaveSnapshot();
     assert_int_equal(source.SnapshotSizeUpperBound().value(), bytes.size());
+    TCollectingSnapshotSink streamed;
+    source.WriteSnapshot(source.LastAppliedIndex, streamed);
+    assert_true(streamed.Data == bytes);
     std::string expected = "MRKV0001";
     NSnapshotCodec::Put(expected, 2, 8);
     NSnapshotCodec::Put(expected, binaryKey.size(), 4);
