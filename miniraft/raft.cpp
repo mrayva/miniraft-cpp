@@ -3022,7 +3022,14 @@ std::shared_ptr<const TSnapshot> TRaft::CompactShared() {
         throw std::runtime_error("Compaction deferred while snapshot transfers pin multiple generations");
     auto captured = CaptureSnapshot(*this, *application, SnapshotInstallBudget);
     auto snapshot = std::make_shared<const TSnapshot>(std::move(captured));
-    application->ValidateSnapshot(snapshot->Data, snapshot->Index);
+    if (snapshot->DataSource) {
+        // Validate through the range-based installer when available. Legacy
+        // application validators still receive a materialized payload.
+        auto validation = PrepareApplicationSnapshotInstallation(*application, *snapshot);
+        (void)validation;
+    } else {
+        application->ValidateSnapshot(snapshot->Data, snapshot->Index);
+    }
     AdvanceCommitIndex(VolatileState->CommitIndex);
     TRaftInstallSnapshotPermit permit;
     State->InstallRaftSnapshot(snapshot, permit);

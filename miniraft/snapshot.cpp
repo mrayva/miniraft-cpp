@@ -422,6 +422,29 @@ private:
     size_t SizeBytes = 0;
 };
 #endif
+class TApplicationSnapshotSource final : public TSnapshotDataSource {
+public:
+    TApplicationSnapshotSource(std::shared_ptr<const ISnapshotSource> source, uint64_t size)
+        : Source(std::move(source)), SizeBytes(size) {
+        if (!Source) throw std::invalid_argument("Missing application snapshot source");
+        if (SizeBytes > TSnapshot::MaxBytes || SizeBytes > SIZE_MAX)
+            throw std::runtime_error("Application snapshot source exceeds the size limit");
+        if (Source->Size() != SizeBytes)
+            throw std::logic_error("Application snapshot source changed size during capture");
+    }
+
+    uint64_t Size() const override { return SizeBytes; }
+
+    size_t Read(uint64_t offset, std::span<char> destination) const override {
+        if (offset >= SizeBytes || destination.empty()) return 0;
+        const auto count = size_t(std::min<uint64_t>(destination.size(), SizeBytes - offset));
+        return Source->Read(offset, destination.first(count));
+    }
+
+private:
+    std::shared_ptr<const ISnapshotSource> Source;
+    uint64_t SizeBytes = 0;
+};
 }
 
 struct TSnapshotEncoding {
@@ -922,21 +945,21 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         if (upperBound && dataBytes > *upperBound)
             throw std::logic_error("Application snapshot source exceeded its declared size bound");
         reserveCaptureBytes(dataBytes);
-        snapshot.Data.resize(size_t(dataBytes));
-        constexpr size_t ReadChunkBytes = 64 * 1024;
+        std::array<char, 64 * 1024> buffer{};
         for (uint64_t offset = 0; offset < dataBytes;) {
-            const auto count = size_t(std::min<uint64_t>(ReadChunkBytes, dataBytes - offset));
+            const auto count = size_t(std::min<uint64_t>(buffer.size(), dataBytes - offset));
             size_t copied = 0;
             while (copied < count) {
                 const auto remaining = count - copied;
                 const auto read = source->Read(offset + copied,
-                    std::span<char>(snapshot.Data.data() + size_t(offset) + copied, remaining));
+                    std::span<char>(buffer.data() + copied, remaining));
                 if (!read || read > remaining)
                     throw std::runtime_error("Application snapshot source returned an invalid read length");
                 copied += read;
             }
             offset += count;
         }
+        snapshot.DataSource = std::make_shared<TApplicationSnapshotSource>(std::move(source), dataBytes);
     } else if (const auto writerRsm = dynamic_cast<const IStreamingSnapshotWriterRsm*>(&rsm)) {
         TCaptureSink sink(heapBudget, TSnapshot::MaxBytes - metadataBytes, upperBound);
         writerRsm->WriteSnapshot(index, sink);
@@ -950,7 +973,7 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
             throw std::logic_error("Application snapshot exceeded its declared size bound");
         if (heapBudget && !reservation) reserveCaptureBytes(snapshot.Data.size());
     }
-    if (reservation && !heapBudget->TryResize(reservation, snapshot.Data.size()))
+    if (reservation && !heapBudget->TryResize(reservation, snapshot.DataSize()))
         throw std::runtime_error("Captured snapshot exceeds the available heap budget");
     Validate(snapshot);
     if (reservation) {

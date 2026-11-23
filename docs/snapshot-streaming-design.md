@@ -18,17 +18,22 @@ size check. This preflight still uses complete in-memory images and does not
 change the 64 MiB limit.
 
 `IStreamingSnapshotRsm::OpenSnapshotSource(index)` now optionally returns an immutable,
-range-readable source for exactly the requested applied index. Capture copies
-it in 64 KiB ranges into the final `TSnapshot::Data` buffer and does not call
+range-readable source for exactly the requested applied index. Capture retains
+it directly as the range-backed payload in `TSnapshot` and does not call
 `SaveSnapshot()`. Its exact size is checked against the metadata-adjusted image
-limit before allocation and against `SnapshotSizeUpperBound()` when the
-application also supplies that bound. Existing applications retain the
-`SaveSnapshot()` path. On Linux, the SQL example backs up into a private
-temporary database with a bounded SQLite page cache and serves ranges from a
-read-only file descriptor. This avoids a full-size `sqlite3_serialize()`
-allocation during capture. The file-backed source and final Raft image still
-coexist; capture still materializes one complete image and remains capped at
-64 MiB. Non-Linux builds retain the in-memory serialized source.
+limit and `SnapshotSizeUpperBound()` when the application also supplies that
+bound. Capture then verifies that the complete source is readable using a
+fixed 64 KiB scratch buffer. The source must remain immutable and readable
+until the snapshot and all transfer pins are released. Raft conservatively
+charges its size against the retained snapshot heap budget even when the source
+is file-backed.
+Existing applications retain the `SaveSnapshot()` path. On Linux, the SQL
+example backs up into a private temporary database with a bounded SQLite page
+cache and serves ranges from a read-only file descriptor. This avoids a
+full-size `sqlite3_serialize()` allocation and a second complete payload
+allocation during capture. Durable publication still copies ranges into its own
+snapshot generation, and images remain capped at 64 MiB. Non-Linux builds
+retain the in-memory serialized source.
 
 `IStreamingSnapshotWriterRsm` is an alternative for applications that generate
 snapshot bytes incrementally. Raft supplies a sink that checks the
@@ -61,11 +66,13 @@ chunks, so chunk appends do not grow the buffer geometrically.
 Rejection, term change and idle expiry release temporary reservations. A
 successful installation transfers its heap lease to the retained snapshot;
 local compaction and startup recovery also charge retained image data. Outgoing
-pins keep that same image lease alive. Capture reserves the declared upper bound
-or known range-source size before materializing the final image, then shrinks a
-bound-based lease to the captured size. Incremental snapshot writers extend the
-lease before each append even without a size bound. Legacy `SaveSnapshot()`
-implementations without a bound can only be charged after the callback returns.
+pins keep that same image lease alive. Range-source capture reserves its exact
+size and retains the source after checking it in bounded ranges. Legacy
+`SaveSnapshot()` capture reserves a declared upper bound before invoking the
+callback, then shrinks the lease to the captured size. Incremental snapshot
+writers extend the lease before each append even without a size bound. Legacy
+`SaveSnapshot()` implementations without a bound can only be charged after the
+callback returns.
 Application memory, detached value copies and transport buffers remain outside
 this budget.
 

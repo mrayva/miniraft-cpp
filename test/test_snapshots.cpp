@@ -480,10 +480,27 @@ void test_capture_reads_immutable_snapshot_source_in_bounded_ranges(void**) {
 
     const auto snapshot = CaptureSnapshot(raft, application);
     assert_int_equal(snapshot.Index, 1);
-    assert_true(snapshot.Data == applicationImage);
+    assert_true(snapshot.Data.empty());
+    assert_true(bool(snapshot.DataSource));
+    assert_int_equal(snapshot.DataSize(), applicationImage.size());
     assert_int_equal(application.SaveCalls, 0);
     assert_int_equal(application.OpenCalls, 1);
     assert_int_equal(application.Source->ReadCalls, 9);
+
+    std::string materialized(applicationImage.size(), '\0');
+    for (size_t offset = 0; offset < materialized.size();) {
+        const auto count = std::min<size_t>(64 * 1024, materialized.size() - offset);
+        size_t copied = 0;
+        while (copied < count) {
+            const auto read = snapshot.ReadDataRange(offset + copied,
+                std::span<char>(materialized.data() + offset + copied, count - copied));
+            assert_true(read > 0 && read <= count - copied);
+            copied += read;
+        }
+        offset += count;
+    }
+    assert_true(materialized == applicationImage);
+    assert_int_equal(application.Source->ReadCalls, 18);
     assert_true(application.Source->MaxReadBytes <= 64 * 1024);
 
     const auto readsBeforeBoundViolation = application.Source->ReadCalls;

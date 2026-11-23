@@ -716,6 +716,8 @@ void test_sql_and_raft_restart_do_not_reapply_committed_insert(void**) {
         assert_int_equal(sql->LastAppliedIndex, 4); // new-term stub advanced framework progress
         const auto snapshot = raft->CompactShared();
         assert_int_equal(snapshot->Index, 4);
+        assert_true(snapshot->Data.empty());
+        assert_true(bool(snapshot->DataSource));
         sql->ValidateSnapshot(snapshot->MaterializeData(), 4);
         Reject([&] { sql->ValidateSnapshot(snapshot->MaterializeData(), 3); });
         assert_true(ReadText(*sql, "SELECT value FROM raft_metadata_ WHERE key='LastAppliedIndex'") ==
