@@ -1031,6 +1031,28 @@ void test_versioned_disk_leader_stages_learner_but_blocks_promotion_without_snap
     assert_false(readiness.Ready());
     assert_true(readiness.AddedVotersWithoutSnapshotInstallSupport == (std::vector<uint32_t>{2}));
 }
+void test_stale_snapshot_install_capability_does_not_satisfy_learner_admission(void**) {
+    TFiles files; auto state = std::make_shared<TDiskState>(files.Name, 1);
+    TRaft raft(state, 1, {}); raft.ProcessTimeout({});
+    assert_int_equal(raft.CurrentStateName(), EState::LEADER);
+    raft.AddLearnerTarget(2, std::make_shared<TEndpoint>());
+
+    auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
+    volatileState->PeerCapabilities[2] = {
+        .Term = state->CurrentTerm - 1,
+        .InstallSnapshot = true,
+        .ApplicationSnapshotInstall = true,
+        .JointConsensus = true,
+    };
+    assert_int_not_equal(volatileState->PeerCapabilities[2].Term, state->CurrentTerm);
+    const auto readiness = raft.CheckJointConfigurationReadiness({1, 2});
+    assert_false(readiness.Ready());
+    assert_true(readiness.AddedVotersWithoutSnapshotInstallSupport == (std::vector<uint32_t>{2}));
+    assert_true(readiness.ChangesVoterSet);
+    assert_true(readiness.ProposedVotersWithoutApplicationSnapshotInstallSupport ==
+        (std::vector<uint32_t>{1, 2}));
+    assert_true(readiness.VotersWithoutJointConsensusSupport == (std::vector<uint32_t>{2}));
+}
 void test_online_learner_staging_does_not_change_durable_binding(void**) {
     TFiles files; const auto path = files.Name + ".durable.1";
     {
@@ -1090,6 +1112,7 @@ int main() {
         cmocka_unit_test(test_trusted_legacy_voter_binding_is_atomic_at_each_publish_stage),
         cmocka_unit_test(test_versioned_disk_backend_persists_learner_baseline),
         cmocka_unit_test(test_versioned_disk_leader_stages_learner_but_blocks_promotion_without_snapshot_support),
+        cmocka_unit_test(test_stale_snapshot_install_capability_does_not_satisfy_learner_admission),
         cmocka_unit_test(test_online_learner_staging_does_not_change_durable_binding),
 #endif
     };

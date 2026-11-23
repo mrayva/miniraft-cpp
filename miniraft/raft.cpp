@@ -2583,7 +2583,8 @@ TJointConfigurationReadiness TRaft::CheckJointConfigurationReadiness(
                 const auto capability = VolatileState->PeerCapabilities.find(id);
                 const bool supportsSnapshotInstall = id == Id
                     ? State->SupportsInstallSnapshot()
-                    : capability != VolatileState->PeerCapabilities.end() && capability->second.InstallSnapshot;
+                    : capability != VolatileState->PeerCapabilities.end() &&
+                        capability->second.Term == State->CurrentTerm && capability->second.InstallSnapshot;
                 if (!supportsSnapshotInstall)
                     readiness.AddedVotersWithoutSnapshotInstallSupport.push_back(id);
             }
