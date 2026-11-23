@@ -4,7 +4,18 @@
 #include <climits>
 #include <charconv>
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <filesystem>
+#include <limits>
 #include <string_view>
+#include <system_error>
+#include <vector>
+#ifdef __linux__
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace {
 int ReadAuthorization(void*, int action, const char*, const char* second, const char*, const char*) {
@@ -228,6 +239,7 @@ void ValidateSnapshotForTarget(sqlite3* snapshot, sqlite3* target, uint64_t inde
         throw TMessageError("SQL snapshot page size does not match the target database");
 }
 
+#ifndef __linux__
 TSnapshotDatabase CopyDatabaseToMemory(sqlite3* source, uint64_t pageSize) {
     TSnapshotDatabase result;
     sqlite3* raw = nullptr;
@@ -250,7 +262,9 @@ TSnapshotDatabase CopyDatabaseToMemory(sqlite3* source, uint64_t pageSize) {
         throw TMessageError("Cannot complete SQL snapshot capture");
     return result;
 }
+#endif
 
+#ifndef __linux__
 class TSqlSnapshotSource final : public ISnapshotSource {
 public:
     TSqlSnapshotSource(std::unique_ptr<unsigned char, decltype(&sqlite3_free)> bytes, uint64_t size)
@@ -269,6 +283,70 @@ private:
     std::unique_ptr<unsigned char, decltype(&sqlite3_free)> Bytes{nullptr, sqlite3_free};
     uint64_t Length;
 };
+#endif
+
+#ifdef __linux__
+class TSnapshotFileDescriptor {
+public:
+    explicit TSnapshotFileDescriptor(int fd = -1) : Fd(fd) { }
+    ~TSnapshotFileDescriptor() { if (Fd >= 0) close(Fd); }
+    TSnapshotFileDescriptor(const TSnapshotFileDescriptor&) = delete;
+    TSnapshotFileDescriptor& operator=(const TSnapshotFileDescriptor&) = delete;
+    int Get() const { return Fd; }
+    void Release() { Fd = -1; }
+private:
+    int Fd;
+};
+
+class TSqlSnapshotTempDirectory {
+public:
+    TSqlSnapshotTempDirectory() {
+        auto pattern = (std::filesystem::temp_directory_path() /
+            "miniraft-sql-snapshot-XXXXXX").string();
+        std::vector<char> writable(pattern.begin(), pattern.end());
+        writable.push_back('\0');
+        const auto* created = mkdtemp(writable.data());
+        if (!created) throw std::system_error(errno, std::generic_category(),
+            "Cannot create private SQL snapshot directory");
+        Directory = created;
+        Database = (std::filesystem::path(Directory) / "image.sqlite").string();
+    }
+    ~TSqlSnapshotTempDirectory() {
+        std::error_code ignored;
+        std::filesystem::remove_all(Directory, ignored);
+    }
+    const std::string& DatabasePath() const { return Database; }
+private:
+    std::string Directory;
+    std::string Database;
+};
+
+class TSqlFileSnapshotSource final : public ISnapshotSource {
+public:
+    TSqlFileSnapshotSource(int fd, uint64_t size) : Fd(fd), Length(size) { }
+    ~TSqlFileSnapshotSource() override { if (Fd >= 0) close(Fd); }
+
+    uint64_t Size() const override { return Length; }
+
+    size_t Read(uint64_t offset, std::span<char> destination) const override {
+        if (offset >= Length || destination.empty()) return 0;
+        const auto requested = std::min<uint64_t>(destination.size(), Length - offset);
+        const auto count = size_t(std::min<uint64_t>(requested,
+            uint64_t(std::numeric_limits<ssize_t>::max())));
+        ssize_t readBytes;
+        do {
+            readBytes = pread(Fd, destination.data(), count, off_t(offset));
+        } while (readBytes < 0 && errno == EINTR);
+        if (readBytes < 0)
+            throw std::system_error(errno, std::generic_category(), "Cannot read SQL snapshot image");
+        return size_t(readBytes);
+    }
+
+private:
+    int Fd;
+    uint64_t Length;
+};
+#endif
 
 class TSqlSnapshotInstallation final : public IStagedSnapshotInstallation {
 public:
@@ -300,6 +378,94 @@ private:
 std::shared_ptr<const ISnapshotSource> CreateSqlSnapshotSource(sqlite3* db, uint64_t index) {
     const auto pageSize = CheckSnapshotCapture(db, index);
     CheckedSnapshotBytes(db, pageSize);
+#ifdef __linux__
+    TSqlSnapshotTempDirectory temp;
+    sqlite3* raw = nullptr;
+    const int opened = sqlite3_open_v2(temp.DatabasePath().c_str(), &raw,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nullptr);
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)> consistent(raw, sqlite3_close_v2);
+    if (opened != SQLITE_OK) throw TMessageError("Cannot open SQL snapshot staging database");
+    const auto setPageSize = std::string("PRAGMA page_size = ") + std::to_string(pageSize);
+    if (sqlite3_exec(consistent.get(), setPageSize.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK ||
+        sqlite3_exec(consistent.get(), "PRAGMA journal_mode=DELETE; PRAGMA cache_size=-2048;",
+            nullptr, nullptr, nullptr) != SQLITE_OK)
+        throw TMessageError("Cannot configure SQL snapshot staging database");
+    sqlite3_backup* backup = sqlite3_backup_init(consistent.get(), "main", db, "main");
+    if (!backup) throw TMessageError("Cannot begin SQL snapshot capture");
+    const int copied = sqlite3_backup_step(backup, -1);
+    const int finished = sqlite3_backup_finish(backup);
+    if (copied != SQLITE_DONE || finished != SQLITE_OK)
+        throw TMessageError("Cannot complete SQL snapshot capture");
+
+    auto* checkpoint = consistent.get();
+    const auto storedIndex = ReadAppliedIndex(checkpoint).value_or(0);
+    if (storedIndex > index)
+        throw TMessageError("SQL database progress exceeds the snapshot boundary");
+    if (storedIndex < index) {
+        // Raft-only entries advance LastAppliedIndex without changing SQL data.
+        // Stamp the copy without allowing the internal update to fire triggers
+        // or foreign key actions on an existing schema.
+        if (sqlite3_db_config(checkpoint, SQLITE_DBCONFIG_ENABLE_TRIGGER, 0, static_cast<int*>(nullptr)) != SQLITE_OK ||
+            sqlite3_db_config(checkpoint, SQLITE_DBCONFIG_ENABLE_FKEY, 0, static_cast<int*>(nullptr)) != SQLITE_OK)
+            throw TMessageError("Cannot isolate SQL snapshot progress update");
+        const auto update = AppliedIndexUpdate(index);
+        if (sqlite3_exec(checkpoint, update.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK ||
+            ReadAppliedIndex(checkpoint) != index)
+            throw TMessageError("Cannot set SQL snapshot progress");
+    }
+    const auto expectedSize = CheckedSnapshotBytes(checkpoint, pageSize);
+    if (sqlite3_close(consistent.get()) != SQLITE_OK)
+        throw TMessageError("Cannot close SQL snapshot staging database");
+    consistent.release();
+
+    TSnapshotFileDescriptor image(open(temp.DatabasePath().c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW));
+    if (image.Get() < 0)
+        throw std::system_error(errno, std::generic_category(), "Cannot open staged SQL snapshot image");
+    struct stat info;
+    if (fstat(image.Get(), &info) != 0)
+        throw std::system_error(errno, std::generic_category(), "Cannot stat staged SQL snapshot image");
+    if (!S_ISREG(info.st_mode) || info.st_size < 100 ||
+        uint64_t(info.st_size) > MaxSqlSnapshotBytes || uint64_t(info.st_size) != expectedSize)
+        throw TMessageError("Invalid staged SQL snapshot size");
+
+    char header[100];
+    size_t headerBytes = 0;
+    while (headerBytes < sizeof(header)) {
+        const auto n = pread(image.Get(), header + headerBytes, sizeof(header) - headerBytes,
+            off_t(headerBytes));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) throw TMessageError("Truncated staged SQL snapshot header");
+        headerBytes += size_t(n);
+    }
+    const uint32_t encodedPageSize = (uint32_t(static_cast<unsigned char>(header[16])) << 8) |
+        static_cast<unsigned char>(header[17]);
+    const uint32_t imagePageSize = encodedPageSize == 1 ? 65536 : encodedPageSize;
+    if (std::string_view(header, 16) != std::string_view("SQLite format 3\0", 16) ||
+        imagePageSize != pageSize || uint64_t(info.st_size) % pageSize)
+        throw TMessageError("Staged SQL snapshot is not a standalone page image");
+    if (static_cast<unsigned char>(header[18]) == 2 && static_cast<unsigned char>(header[19]) == 2) {
+        const char rollbackMode[2] = {1, 1};
+        size_t written = 0;
+        while (written < sizeof(rollbackMode)) {
+            const auto n = pwrite(image.Get(), rollbackMode + written, sizeof(rollbackMode) - written,
+                off_t(18 + written));
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) throw TMessageError("Cannot normalize staged SQL snapshot journal mode");
+            written += size_t(n);
+        }
+        header[18] = rollbackMode[0];
+        header[19] = rollbackMode[1];
+    }
+    if (static_cast<unsigned char>(header[18]) != 1 || static_cast<unsigned char>(header[19]) != 1)
+        throw TMessageError("Staged SQL snapshot has an unsupported journal mode");
+
+    TSnapshotFileDescriptor readOnlyImage(open(temp.DatabasePath().c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+    if (readOnlyImage.Get() < 0)
+        throw std::system_error(errno, std::generic_category(), "Cannot reopen staged SQL snapshot image");
+    auto source = std::make_unique<TSqlFileSnapshotSource>(readOnlyImage.Get(), uint64_t(info.st_size));
+    readOnlyImage.Release();
+    return std::shared_ptr<const ISnapshotSource>(std::move(source));
+#else
     auto consistent = CopyDatabaseToMemory(db, pageSize);
     auto* checkpoint = consistent.Db.get();
     const auto storedIndex = ReadAppliedIndex(checkpoint).value_or(0);
@@ -333,6 +499,7 @@ std::shared_ptr<const ISnapshotSource> CreateSqlSnapshotSource(sqlite3* db, uint
     bytes[19] = 1;
     const auto imageSize = uint64_t(size);
     return std::make_shared<TSqlSnapshotSource>(std::move(image), imageSize);
+#endif
 }
 }
 

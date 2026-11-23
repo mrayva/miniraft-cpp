@@ -23,11 +23,12 @@ it in 64 KiB ranges into the final `TSnapshot::Data` buffer and does not call
 `SaveSnapshot()`. Its exact size is checked against the metadata-adjusted image
 limit before allocation and against `SnapshotSizeUpperBound()` when the
 application also supplies that bound. Existing applications retain the
-`SaveSnapshot()` path. The SQL example exposes its SQLite serialization buffer
-as the source and releases the in-memory backup database before Raft allocates
-the final image, reducing capture's peak full-image copies. The serialized
-source and final Raft image still coexist during capture; capture still
-materializes one complete image and remains capped at 64 MiB.
+`SaveSnapshot()` path. On Linux, the SQL example backs up into a private
+temporary database with a bounded SQLite page cache and serves ranges from a
+read-only file descriptor. This avoids a full-size `sqlite3_serialize()`
+allocation during capture. The file-backed source and final Raft image still
+coexist; capture still materializes one complete image and remains capped at
+64 MiB. Non-Linux builds retain the in-memory serialized source.
 
 `IStreamingSnapshotWriterRsm` is an alternative for applications that generate
 snapshot bytes incrementally. Raft supplies a sink that checks the
