@@ -1793,6 +1793,43 @@ void test_valid_split_higher_term_covered_snapshot_accepts_leader_without_reload
     assert_true(Read(*app, "a") == "committed");
 }
 
+void test_snapshot_install_requires_nonzero_sequence(void**) {
+    TKv source;
+    source.Write(source.Prepare(Command("a", "snapshot")), 5);
+    const TSnapshot snapshot{5, 1, {1, 2}, source.SaveSnapshot()};
+    const auto bytes = EncodeSnapshot(snapshot);
+
+    auto run = [&](uint64_t sequence, bool expectInstall) {
+        std::vector<TMessageHolder<TInstallSnapshotResponse>> replies;
+        auto peer = std::make_shared<TEndpoint>([&](auto message) {
+            replies.push_back(message.template Cast<TInstallSnapshotResponse>());
+        });
+        auto state = std::make_shared<TState>();
+        auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}});
+        auto app = std::make_shared<TApplication>();
+        TRequestProcessor processor(raft, app, {});
+
+        auto request = Chunk(snapshot, bytes, 0, static_cast<uint32_t>(bytes.size()));
+        request->Seqno = sequence;
+        raft->Process({}, request);
+
+        if (expectInstall) {
+            assert_int_equal(replies.size(), 1);
+            assert_true(replies.back()->Success);
+            assert_true(replies.back()->Installed);
+            assert_int_equal(app->LastAppliedIndex, snapshot.Index);
+        } else {
+            assert_true(replies.empty());
+            assert_int_equal(state->CurrentTerm, 1);
+            assert_false(bool(state->GetSnapshot()));
+            assert_int_equal(app->LastAppliedIndex, 0);
+        }
+    };
+
+    run(1, true);
+    run(0, false);
+}
+
 void test_truncated_snapshot_header_is_rejected_for_covered_and_new_boundaries(void**) {
     TKv source;
     const TSnapshot known{5, 1, {1, 2}, source.SaveSnapshot()};
@@ -3165,6 +3202,7 @@ int main() {
         cmocka_unit_test(test_higher_term_snapshot_defers_term_change_until_split_metadata_is_validated),
         cmocka_unit_test(test_invalid_split_higher_term_snapshot_preserves_candidate_state),
         cmocka_unit_test(test_valid_split_higher_term_covered_snapshot_accepts_leader_without_reload),
+        cmocka_unit_test(test_snapshot_install_requires_nonzero_sequence),
         cmocka_unit_test(test_truncated_snapshot_header_is_rejected_for_covered_and_new_boundaries),
         cmocka_unit_test(test_unmatched_joint_snapshot_does_not_accept_leader_contact),
         cmocka_unit_test(test_stable_snapshot_completes_known_joint_membership_only_from_new_voter),

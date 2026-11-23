@@ -1929,7 +1929,8 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
         // A later boundary cannot have an older term than the committed prefix.
         // For an already committed, retained boundary, the terms must match;
         // an older compacted boundary cannot have a newer term than the snapshot.
-        const bool valid = request->LeaderId == header->Src && request->SnapshotIndex > 0 && request->SnapshotIndex <= maxIndex &&
+        const bool valid = header->Seqno != 0 && request->LeaderId == header->Src &&
+            request->SnapshotIndex > 0 && request->SnapshotIndex <= maxIndex &&
             request->SnapshotTerm > 0 && request->SnapshotTerm <= header->Term && request->Done <= 1 &&
             (request->SnapshotIndex <= VolatileState->CommitIndex ||
                 request->SnapshotTerm >= State->LogTerm(VolatileState->CommitIndex)) &&
