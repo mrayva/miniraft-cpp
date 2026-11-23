@@ -414,9 +414,28 @@ public:
             (PeerFeatures & TPeerCapabilitiesRequest::SessionizedForwarding);
     }
     bool IsCapabilityNegotiating() const { return CapabilityNegotiating; }
+    bool ExpireCapabilityNegotiation(
+            ITimeSource::Time now, ITimeSource::Time::duration timeout) {
+        if (timeout <= ITimeSource::Time::duration::zero())
+            throw std::invalid_argument("Capability negotiation timeout must be positive");
+        if (!CapabilityNegotiating || now < CapabilityNegotiationStarted ||
+            now - CapabilityNegotiationStarted < timeout)
+            return false;
+
+        TimedOutCapabilityGeneration = ConnectionGeneration;
+        FailCapabilityNegotiation(ConnectionGeneration);
+        // A probe write can also be suspended. Interrupt that writer so the
+        // connector can retry without a probe; a completed connection can keep
+        // carrying ordinary Raft traffic while its response reader waits.
+        if (!Connected) ShutdownSocket();
+        return true;
+    }
     bool CompleteCapabilityNegotiation(
             const TMessageHolder<TPeerCapabilitiesResponse>& response, uint64_t generation) {
-        if (!CapabilityNegotiating || generation != ConnectionGeneration ||
+        const bool currentNegotiation = CapabilityNegotiating && generation == ConnectionGeneration;
+        const bool lateNegotiation = !CapabilityNegotiating &&
+            TimedOutCapabilityGeneration == generation && generation == ConnectionGeneration && Connected;
+        if ((!currentNegotiation && !lateNegotiation) ||
             response->ConnectionId != generation || response->Reserved != 0 ||
             response->Version > TPeerCapabilitiesRequest::CurrentVersion ||
             (!response->Version && response->Features) ||
@@ -426,12 +445,16 @@ public:
         PeerFeatures = response->Version == TPeerCapabilitiesRequest::CurrentVersion
             ? response->Features : 0;
         CapabilityNegotiating = false;
+        CapabilityNegotiationStarted = {};
+        TimedOutCapabilityGeneration = 0;
+        SkipNextCapabilityProbe = false;
         DropUnsupportedForwardingMessages();
         return true;
     }
     void FailCapabilityNegotiation(uint64_t generation) {
         if (!CapabilityNegotiating || generation != ConnectionGeneration) return;
         CapabilityNegotiating = false;
+        CapabilityNegotiationStarted = {};
         PeerFeatures = 0;
         SkipNextCapabilityProbe = true;
         DiscardForwardedCommands();
@@ -502,6 +525,8 @@ private:
     bool Retired = false;
     bool CapabilityNegotiating = false;
     bool SkipNextCapabilityProbe = false;
+    ITimeSource::Time CapabilityNegotiationStarted{};
+    uint64_t TimedOutCapabilityGeneration = 0;
     uint64_t PeerFeatures = 0;
     bool ResponseReaderActive = false;
     bool RetiredCleaned = false;
@@ -599,6 +624,7 @@ public:
     }
 
 private:
+    static constexpr auto CapabilityNegotiationTimeout = std::chrono::seconds(5);
     NNet::TVoidTask InboundServe();
     NNet::TVoidTask InboundConnection(TSocket socket, std::shared_ptr<void> connectionReservation);
     NNet::TVoidTask OutboundServe(std::shared_ptr<TNode<TSocket>>);

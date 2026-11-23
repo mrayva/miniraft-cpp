@@ -349,14 +349,19 @@ NNet::TVoidTask TRaftServer<TSocket>::Idle() {
     auto sleep = std::chrono::milliseconds(100);
     while (true) {
         try {
+            const auto now = TimeSource->Now();
             NNet::TDetail::ExpireIdleConnections(
-                InboundLastActivity, TimeSource->Now(), InboundMessageBudget->ConnectionIdleTimeout(),
+                InboundLastActivity, now, InboundMessageBudget->ConnectionIdleTimeout(),
                 [](const auto& client) {
                     if (!client->SupportsRetirement()) return false;
                     client->Retire();
                     return true;
                 });
-            Raft->ProcessTimeout(TimeSource->Now());
+            for (const auto& [_, node] : PeerNodes) {
+                if (node->ExpireCapabilityNegotiation(now, CapabilityNegotiationTimeout))
+                    RequestProcessor->OnPeerDisconnected(node);
+            }
+            Raft->ProcessTimeout(now);
             ReconcilePeerReaders();
             RequestProcessor->CheckStateChange();
             RequestProcessor->ProcessCommitted();

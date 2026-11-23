@@ -32,6 +32,10 @@ struct TPoller : NNet::TPollerBase {
         if (timer.Handle) timer.Handle.resume();
     }
 };
+struct TManualTimeSource : ITimeSource {
+    Time Current{};
+    Time Now() override { return Current; }
+};
 struct TAsyncSocketState {
     TPoller* Poller = nullptr;
     bool Shutdown = false;
@@ -97,6 +101,7 @@ struct TCapabilitySocketState {
     TPoller* Owner = nullptr;
     size_t ProbeWrites = 0;
     size_t SessionForwardWrites = 0;
+    size_t CommandWrites = 0;
 };
 struct TCapabilitySocket {
     struct TConnectAwaiter {
@@ -115,6 +120,7 @@ struct TCapabilitySocket {
         if (type == uint32_t(EMessageType::PEER_CAPABILITIES_REQUEST)) ++State->ProbeWrites;
         if (type == uint32_t(EMessageType::SESSION_FORWARDED_COMMAND_REQUEST))
             ++State->SessionForwardWrites;
+        if (type == uint32_t(EMessageType::COMMAND_REQUEST)) ++State->CommandWrites;
         co_return ssize_t(size);
     }
     NNet::TValueTask<ssize_t> ReadSome(void*, size_t) { co_return 0; }
@@ -182,6 +188,47 @@ void test_peer_capability_probe_and_legacy_fallback(void**) {
     node.Drain(); poller.Tick();
     assert_true(node.IsCapabilityNegotiating());
     assert_int_equal(state->ProbeWrites, 3);
+    node.Disconnect();
+}
+void test_capability_negotiation_timeout_unblocks_queue_and_accepts_late_response(void**) {
+    TPoller poller;
+    auto state = std::make_shared<TCapabilitySocketState>();
+    state->Owner = &poller;
+    auto clock = std::make_shared<TManualTimeSource>();
+    TNode<TCapabilitySocket> node([&](const auto&) { return TCapabilitySocket{state}; }, "peer",
+        NNet::TAddress("127.0.0.1", 1), clock);
+
+    node.Drain(); poller.Tick();
+    assert_true(node.IsConnected());
+    assert_true(node.IsCapabilityNegotiating());
+    const auto generation = node.GetConnectionGeneration();
+
+    auto request = NewHoldedMessage<TCommandRequest>();
+    request->Flags = TCommandRequest::EWrite;
+    assert_true(node.TrySend(request));
+    node.Drain();
+    assert_int_equal(state->CommandWrites, 0);
+
+    constexpr auto timeout = std::chrono::seconds(5);
+    assert_false(node.ExpireCapabilityNegotiation(clock->Now(), timeout));
+    clock->Current += timeout;
+    assert_true(node.ExpireCapabilityNegotiation(clock->Now(), timeout));
+    assert_false(node.IsCapabilityNegotiating());
+    assert_false(node.SupportsExtendedForwarding());
+
+    node.Drain();
+    assert_int_equal(state->CommandWrites, 1);
+
+    // A response that arrives after fallback is still bound to this connection
+    // generation and may safely enable capabilities for future requests.
+    auto lateResponse = NewHoldedMessage<TPeerCapabilitiesResponse>();
+    lateResponse->ConnectionId = generation;
+    lateResponse->Version = TPeerCapabilitiesRequest::CurrentVersion;
+    lateResponse->Features = TPeerCapabilitiesRequest::ExtendedForwarding |
+        TPeerCapabilitiesRequest::SessionizedForwarding;
+    assert_true(node.CompleteCapabilityNegotiation(lateResponse, generation));
+    assert_true(node.SupportsExtendedForwarding());
+    assert_true(node.SupportsSessionizedForwarding());
     node.Disconnect();
 }
 void test_queued_sessionized_request_is_dropped_on_legacy_fallback(void**) {
@@ -390,6 +437,7 @@ int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_disconnect_during_pending_connect_does_not_destroy_timer_target),
         cmocka_unit_test(test_peer_capability_probe_and_legacy_fallback),
+        cmocka_unit_test(test_capability_negotiation_timeout_unblocks_queue_and_accepts_late_response),
         cmocka_unit_test(test_queued_sessionized_request_is_dropped_on_legacy_fallback),
         cmocka_unit_test(test_old_reader_failure_cannot_disconnect_writer_reconnect),
         cmocka_unit_test(test_connect_cannot_leave_a_second_deadline_wakeup_after_completion),

@@ -260,6 +260,10 @@ NNet::TVoidSuspendedTask TNode<TSocket>::DoConnect() {
     CapabilityNegotiating = false;
     while (!Connected && !Retired) {
         try {
+            // A timed-out probe write may have been interrupted. Each physical
+            // retry starts a fresh negotiation state, even though it belongs to
+            // the same connector coroutine.
+            TimedOutCapabilityGeneration = 0;
             Socket = SocketFactory(*Address);
             // The dependency's finite deadline can leave I/O and timer wakeups
             // registered for the same coroutine after a timeout. Use its default
@@ -275,6 +279,7 @@ NNet::TVoidSuspendedTask TNode<TSocket>::DoConnect() {
                 SkipNextCapabilityProbe = false;
                 if (!skipProbe) {
                     CapabilityNegotiating = true;
+                    CapabilityNegotiationStarted = TimeSource->Now();
                     auto probe = NewHoldedMessage<TPeerCapabilitiesRequest>();
                     probe->Features = TPeerCapabilitiesRequest::ExtendedForwarding |
                         TPeerCapabilitiesRequest::SessionizedForwarding;
