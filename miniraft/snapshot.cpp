@@ -1085,10 +1085,25 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         reservation = sink.TakeReservation();
     } else {
         if (upperBound) reserveCaptureBytes(*upperBound);
-        snapshot.Data = rsm.SaveSnapshot();
-        if (upperBound && snapshot.Data.size() > *upperBound)
+        auto data = rsm.SaveSnapshot();
+        if (data.size() > TSnapshot::MaxBytes - metadataBytes)
+            throw std::runtime_error("Application snapshot exceeds the Raft snapshot limit");
+        if (upperBound && data.size() > *upperBound)
             throw std::logic_error("Application snapshot exceeded its declared size bound");
-        if (heapBudget && !reservation) reserveCaptureBytes(snapshot.Data.size());
+        if (heapBudget && !reservation) reserveCaptureBytes(data.size());
+        if (stagingDirectory.empty() || !upperBound) {
+            snapshot.Data = std::move(data);
+        } else {
+            if (reservation && !heapBudget->TryResize(reservation, data.size()))
+                throw std::runtime_error("Captured snapshot exceeds the available heap budget");
+            if (!stagingBudget)
+                stagingBudget = heapBudget ? heapBudget : TSnapshotInstallBudget::DefaultProcessBudget();
+            auto stagedSource = std::make_shared<TSnapshotCaptureFile>(std::string(stagingDirectory));
+            stagedSource->Append(std::span<const char>(data.data(), data.size()), stagingBudget);
+            snapshot.DataSource = std::move(stagedSource);
+            std::string().swap(data);
+            reservation.reset();
+        }
     }
     if (reservation && !heapBudget->TryResize(reservation, snapshot.DataSize()))
         throw std::runtime_error("Captured snapshot exceeds the available heap budget");

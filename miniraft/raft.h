@@ -497,8 +497,8 @@ public:
         // shared budget here to override the process-wide snapshot receive
         // heap cap, including decoding of completed staging files.
         std::shared_ptr<TSnapshotInstallBudget> SnapshotInstallBudget;
-        // On Linux, stage streamed application captures and full incoming
-        // snapshot images in anonymous files in this directory.
+        // On Linux, stage streamed captures, bounded legacy captures, and
+        // full incoming snapshot images in anonymous files in this directory.
         std::string SnapshotStagingDirectory;
         // Share this separately from SnapshotInstallBudget to limit staged
         // file bytes. Defaults to a separate 256 MiB process-wide budget.
