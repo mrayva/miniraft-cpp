@@ -250,6 +250,63 @@ TSnapshotDatabase CopyDatabaseToMemory(sqlite3* source, uint64_t pageSize) {
         throw TMessageError("Cannot complete SQL snapshot capture");
     return result;
 }
+
+class TSqlSnapshotSource final : public ISnapshotSource {
+public:
+    TSqlSnapshotSource(std::unique_ptr<unsigned char, decltype(&sqlite3_free)> bytes, uint64_t size)
+        : Bytes(std::move(bytes)), Length(size) { }
+
+    uint64_t Size() const override { return Length; }
+
+    size_t Read(uint64_t offset, std::span<char> destination) const override {
+        if (offset >= Length || destination.empty()) return 0;
+        const auto count = size_t(std::min<uint64_t>(destination.size(), Length - offset));
+        memcpy(destination.data(), Bytes.get() + size_t(offset), count);
+        return count;
+    }
+
+private:
+    std::unique_ptr<unsigned char, decltype(&sqlite3_free)> Bytes{nullptr, sqlite3_free};
+    uint64_t Length;
+};
+
+std::shared_ptr<const ISnapshotSource> CreateSqlSnapshotSource(sqlite3* db, uint64_t index) {
+    const auto pageSize = CheckSnapshotCapture(db, index);
+    CheckedSnapshotBytes(db, pageSize);
+    auto consistent = CopyDatabaseToMemory(db, pageSize);
+    auto* checkpoint = consistent.Db.get();
+    const auto storedIndex = ReadAppliedIndex(checkpoint).value_or(0);
+    if (storedIndex > index)
+        throw TMessageError("SQL database progress exceeds the snapshot boundary");
+    if (storedIndex < index) {
+        // Raft-only entries advance LastAppliedIndex without changing SQL data.
+        // Stamp the copy without allowing the internal update to fire triggers
+        // or foreign key actions on an existing schema.
+        if (sqlite3_db_config(checkpoint, SQLITE_DBCONFIG_ENABLE_TRIGGER, 0, static_cast<int*>(nullptr)) != SQLITE_OK ||
+            sqlite3_db_config(checkpoint, SQLITE_DBCONFIG_ENABLE_FKEY, 0, static_cast<int*>(nullptr)) != SQLITE_OK)
+            throw TMessageError("Cannot isolate SQL snapshot progress update");
+        const auto update = AppliedIndexUpdate(index);
+        if (sqlite3_exec(checkpoint, update.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK ||
+            ReadAppliedIndex(checkpoint) != index)
+            throw TMessageError("Cannot set SQL snapshot progress");
+        CheckedSnapshotBytes(checkpoint, pageSize);
+    }
+    sqlite3_int64 size = 0;
+    auto* bytes = sqlite3_serialize(checkpoint, "main", &size, 0);
+    std::unique_ptr<unsigned char, decltype(&sqlite3_free)> image(bytes, sqlite3_free);
+    if (!bytes || size <= 0 || uint64_t(size) > MaxSqlSnapshotBytes)
+        throw TMessageError("Cannot serialize SQL snapshot within the size limit");
+    if (size < 100 ||
+        !((static_cast<unsigned char>(bytes[18]) == 1 && static_cast<unsigned char>(bytes[19]) == 1) ||
+          (static_cast<unsigned char>(bytes[18]) == 2 && static_cast<unsigned char>(bytes[19]) == 2)))
+        throw TMessageError("Unsupported SQL snapshot database format");
+    // Backup copied all WAL-visible pages. The standalone image therefore uses
+    // rollback mode regardless of the source database's journal mode.
+    bytes[18] = 1;
+    bytes[19] = 1;
+    const auto imageSize = uint64_t(size);
+    return std::make_shared<TSqlSnapshotSource>(std::move(image), imageSize);
+}
 }
 
 std::string TSql::ExecuteRead(const std::string& q) {
@@ -421,42 +478,23 @@ std::optional<uint64_t> TSql::SnapshotSizeUpperBound() const {
 }
 
 std::string TSql::SaveSnapshot() const {
-    const auto pageSize = CheckSnapshotCapture(Db, LastAppliedIndex);
-    CheckedSnapshotBytes(Db, pageSize);
-    auto consistent = CopyDatabaseToMemory(Db, pageSize);
-    auto* checkpoint = consistent.Db.get();
-    const auto storedIndex = ReadAppliedIndex(checkpoint).value_or(0);
-    if (storedIndex > LastAppliedIndex)
-        throw TMessageError("SQL database progress exceeds the snapshot boundary");
-    if (storedIndex < LastAppliedIndex) {
-        // Raft-only entries advance LastAppliedIndex without changing SQL data.
-        // Stamp the copy without allowing the internal update to fire triggers
-        // or foreign key actions on an existing schema.
-        if (sqlite3_db_config(checkpoint, SQLITE_DBCONFIG_ENABLE_TRIGGER, 0, static_cast<int*>(nullptr)) != SQLITE_OK ||
-            sqlite3_db_config(checkpoint, SQLITE_DBCONFIG_ENABLE_FKEY, 0, static_cast<int*>(nullptr)) != SQLITE_OK)
-            throw TMessageError("Cannot isolate SQL snapshot progress update");
-        const auto update = AppliedIndexUpdate(LastAppliedIndex);
-        if (sqlite3_exec(checkpoint, update.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK ||
-            ReadAppliedIndex(checkpoint) != LastAppliedIndex)
-            throw TMessageError("Cannot set SQL snapshot progress");
-        CheckedSnapshotBytes(checkpoint, pageSize);
+    const auto source = CreateSqlSnapshotSource(Db, LastAppliedIndex);
+    std::string result(size_t(source->Size()), '\0');
+    size_t copied = 0;
+    while (copied < result.size()) {
+        const auto count = source->Read(copied,
+            std::span<char>(result.data() + copied, result.size() - copied));
+        if (!count || count > result.size() - copied)
+            throw TMessageError("Cannot read serialized SQL snapshot");
+        copied += count;
     }
-    sqlite3_int64 size = 0;
-    auto* bytes = sqlite3_serialize(checkpoint, "main", &size, 0);
-    std::unique_ptr<unsigned char, decltype(&sqlite3_free)> image(bytes, sqlite3_free);
-    if (!bytes || size <= 0 || uint64_t(size) > MaxSqlSnapshotBytes)
-        throw TMessageError("Cannot serialize SQL snapshot within the size limit");
-    std::string result(reinterpret_cast<const char*>(bytes), size_t(size));
-    if (result.size() < 100 ||
-        !((static_cast<unsigned char>(result[18]) == 1 && static_cast<unsigned char>(result[19]) == 1) ||
-          (static_cast<unsigned char>(result[18]) == 2 && static_cast<unsigned char>(result[19]) == 2)))
-        throw TMessageError("Unsupported SQL snapshot database format");
-    // SQLite documents this conversion for deserializing a complete database
-    // image. Backup copied all WAL-visible pages above, so rollback mode is now
-    // the correct self-contained representation.
-    result[18] = 1;
-    result[19] = 1;
     return result;
+}
+
+std::shared_ptr<const ISnapshotSource> TSql::OpenSnapshotSource(uint64_t index) const {
+    if (index != LastAppliedIndex)
+        throw TMessageError("SQL snapshot source does not match the requested applied index");
+    return CreateSqlSnapshotSource(Db, index);
 }
 
 void TSql::ValidateSnapshot(std::string_view bytes, uint64_t index) const {

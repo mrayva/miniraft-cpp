@@ -233,6 +233,33 @@ void test_sql_snapshot_roundtrip_and_rejection_are_atomic(void**) {
         assert_true(ReadText(restored, "SELECT count(*) FROM t") == "count(*)\n2\n");
     }
 }
+void test_sql_snapshot_source_is_stable_and_matches_requested_index(void**) {
+    TSql sql(":memory:", 1);
+    Seed(sql);
+    bool wrongIndexRejected = false;
+    try { (void)sql.OpenSnapshotSource(2); }
+    catch (const TMessageError&) { wrongIndexRejected = true; }
+    assert_true(wrongIndexRejected);
+    auto source = sql.OpenSnapshotSource(1);
+    assert_non_null(source.get());
+    const auto capturedSize = source->Size();
+    assert_true(capturedSize > 100);
+
+    Apply(sql, "INSERT INTO t VALUES ('later')", 2);
+    std::string streamed(size_t(capturedSize), '\0');
+    for (size_t offset = 0; offset < streamed.size();) {
+        const auto count = std::min<size_t>(37, streamed.size() - offset);
+        const auto copied = source->Read(offset,
+            std::span<char>(streamed.data() + offset, count));
+        assert_true(copied > 0 && copied <= count);
+        offset += copied;
+    }
+    sql.ValidateSnapshot(streamed, 1);
+    assert_true(IsRejected([&] { sql.ValidateSnapshot(streamed, 2); }));
+
+    const auto current = sql.SaveSnapshot();
+    assert_true(current != streamed);
+}
 void test_sql_snapshot_truncation_rejects_before_replacement(void**) {
     TDatabase sourceFile, targetFile;
     TSql source(sourceFile.Path, 1);
@@ -700,6 +727,7 @@ int main() {
         cmocka_unit_test(test_sql_automatic_rollback_is_consumed_without_partial_data),
         cmocka_unit_test(test_sql_metadata_failure_rolls_back_data_and_does_not_advance),
         cmocka_unit_test(test_sql_snapshot_roundtrip_and_rejection_are_atomic),
+        cmocka_unit_test(test_sql_snapshot_source_is_stable_and_matches_requested_index),
         cmocka_unit_test(test_sql_snapshot_truncation_rejects_before_replacement),
         cmocka_unit_test(test_sql_snapshot_installation_busy_failure_preserves_database),
         cmocka_unit_test(test_sql_snapshot_includes_committed_wal_pages),

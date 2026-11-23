@@ -26,12 +26,16 @@ migration or mixed-version support.
 ## Image and recovery contract
 
 The application image is captured with SQLite's backup API into an in-memory
-database and then serialized. This includes committed pages still present in a
-WAL file. Save requires a nonzero committed Raft applied index and no open
-transaction. Raft no-ops and configuration entries advance this index without
-changing SQL data. If the SQLite progress marker trails the Raft index or is
-absent, capture writes the exact boundary into the backup copy. The live
-database is unaffected. The SQL payload is capped below 64 MiB to leave room for
+database and then serialized into an immutable range-readable source. Raft
+copies that source into its final snapshot image in bounded reads. The backup
+database is released before Raft allocates that final image, avoiding the extra
+full-size `std::string` copy used by the legacy callback path. This includes
+committed pages still present in a WAL file. Save requires a nonzero committed
+Raft applied index and no open transaction. Raft no-ops and configuration
+entries advance this index without changing SQL data. If the SQLite progress
+marker trails the Raft index or is absent, capture writes the exact boundary
+into the backup copy. The live database is unaffected. The SQL payload is
+capped below 64 MiB to leave room for
 the Raft snapshot header and maximum voter metadata. Before allocating the padded image,
 SQL checks the format signature, rollback mode, page size, page alignment and
 the in-header page count when SQLite's header counters make it authoritative.
