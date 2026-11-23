@@ -2,8 +2,8 @@
 
 This design describes the staged work to remove the current 64 MiB
 complete-image limit. The application capture-source API and optional receive
-staging files are implemented. Durable generations and staged application
-activation remain open. The current
+staging files are implemented. Durable application generations and
+crash-recoverable activation remain open. The current
 snapshot format, storage behavior and transfer limits are described in
 [compaction and InstallSnapshot](compaction.md).
 
@@ -28,6 +28,13 @@ as the source and releases the in-memory backup database before Raft allocates
 the final image, reducing capture's peak full-image copies. The serialized
 source and final Raft image still coexist during capture; capture still
 materializes one complete image and remains capped at 64 MiB.
+
+`IStagedSnapshotRsm` lets an application validate and prepare an installation
+before Raft publishes the durable snapshot, then install that same prepared
+image after publication. The SQL example keeps the validated SQLite database
+open across those phases, avoiding a second full-image allocation and integrity
+scan during activation. This is an in-memory staging step; it does not provide
+durable application generations or change crash recovery ordering.
 
 Full in-memory InstallSnapshot assemblies reserve their declared image size
 against a shared 256 MiB process-wide heap budget by default. Raft instances can share a

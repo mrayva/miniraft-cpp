@@ -50,6 +50,21 @@ struct IStreamingSnapshotRsm {
     virtual std::shared_ptr<const ISnapshotSource> OpenSnapshotSource(uint64_t index) const = 0;
 };
 
+// Optional two-phase application snapshot installation. Preparation validates
+// and stages an image without changing application state. Install publishes
+// that same staged image after Raft has durably published its snapshot. The
+// installer must be installed or destroyed before its RSM is destroyed.
+struct IStagedSnapshotInstallation {
+    virtual ~IStagedSnapshotInstallation() = default;
+    virtual void Install() = 0;
+};
+
+struct IStagedSnapshotRsm {
+    virtual ~IStagedSnapshotRsm() = default;
+    virtual std::unique_ptr<IStagedSnapshotInstallation> PrepareSnapshotInstallation(
+        std::string_view bytes, uint64_t index) = 0;
+};
+
 // CommandRequest -> Write? -> LogEntry -> Append -> Committed As Index -> Applied As Index (Same) -> Index -> CommandResponse
 // CommandRequest -> Read? -> CurrentIndex (fixate) >= CommittedIndex -> CommandResponse
 struct IRsm {
@@ -75,6 +90,23 @@ struct IRsm {
     // TRequestProcessor. It must identify committed progress in the same Raft log.
     uint64_t LastAppliedIndex = 0;
 };
+
+inline std::unique_ptr<IStagedSnapshotInstallation> PrepareApplicationSnapshotInstallation(
+        IRsm& rsm, std::string_view bytes, uint64_t index) {
+    if (auto* staged = dynamic_cast<IStagedSnapshotRsm*>(&rsm)) {
+        auto installation = staged->PrepareSnapshotInstallation(bytes, index);
+        if (!installation) throw std::logic_error("Staged snapshot preparation returned no installation");
+        return installation;
+    }
+    rsm.ValidateSnapshot(bytes, index);
+    return {};
+}
+
+inline void InstallApplicationSnapshot(IRsm& rsm, std::string_view bytes, uint64_t index,
+        std::unique_ptr<IStagedSnapshotInstallation> installation) {
+    if (installation) installation->Install();
+    else rsm.LoadSnapshot(bytes, index);
+}
 
 struct TIdempotentWriteResult {
     uint64_t Index = 0;

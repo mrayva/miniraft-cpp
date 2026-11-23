@@ -25,7 +25,7 @@ struct TSqlReadLimits {
     size_t MaxResultBytes = TMessageLimits{}.MaxFrameBytes - sizeof(TCommandResponse);
 };
 
-class TSql: public IRsm, public IStreamingSnapshotRsm {
+class TSql: public IRsm, public IStreamingSnapshotRsm, public IStagedSnapshotRsm {
 public:
     void Validate(TMessageHolder<TCommandRequest> message) const override;
     TSql(const std::string& path, int serverId, TSqlReadLimits readLimits = {});
@@ -40,6 +40,8 @@ public:
     std::string SaveSnapshot() const override;
     std::optional<uint64_t> SnapshotSizeUpperBound() const override;
     std::shared_ptr<const ISnapshotSource> OpenSnapshotSource(uint64_t index) const override;
+    std::unique_ptr<IStagedSnapshotInstallation> PrepareSnapshotInstallation(
+        std::string_view bytes, uint64_t index) override;
     void ValidateSnapshot(std::string_view bytes, uint64_t index) const override;
     void LoadSnapshot(std::string_view bytes, uint64_t index) override;
 

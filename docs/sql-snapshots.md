@@ -43,8 +43,10 @@ It then copies the image into a buffer with 20 zeroed trailing guard bytes for
 SQLite's malformed-image checks. Before restore or installation,
 SQL checks that the image can be opened,
 passes `PRAGMA quick_check(1)`, and has exactly one valid progress marker equal
-to the Raft snapshot boundary. WAL-mode backup bytes are normalized to SQLite's
-standalone rollback-mode format before deserialization. The receiver also
+to the Raft snapshot boundary. Raft installation keeps this validated SQLite
+image staged until the durable snapshot is published, then installs that same
+image instead of deserializing and checking it again. WAL-mode backup bytes are
+normalized to SQLite's standalone rollback-mode format before deserialization. The receiver also
 requires the target database page size to match before Raft publishes the
 snapshot durably. Invalid or incompatible images do not replace the live
 database.

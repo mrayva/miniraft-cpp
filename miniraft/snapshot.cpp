@@ -698,8 +698,8 @@ void RestoreSnapshot(const TSnapshot& snapshot, const TRaft& raft, IRsm& rsm) {
     CheckLocalLog(snapshot, raft, configurationAtBoundary);
     if (rsm.LastAppliedIndex >= snapshot.Index)
         throw std::runtime_error("Application is not behind the snapshot");
-    rsm.ValidateSnapshot(snapshot.Data, snapshot.Index);
-    rsm.LoadSnapshot(snapshot.Data, snapshot.Index);
+    auto installation = PrepareApplicationSnapshotInstallation(rsm, snapshot.Data, snapshot.Index);
+    InstallApplicationSnapshot(rsm, snapshot.Data, snapshot.Index, std::move(installation));
     if (rsm.LastAppliedIndex != snapshot.Index) throw std::runtime_error("Application failed to restore snapshot progress");
 }
 

@@ -260,6 +260,22 @@ void test_sql_snapshot_source_is_stable_and_matches_requested_index(void**) {
     const auto current = sql.SaveSnapshot();
     assert_true(current != streamed);
 }
+void test_sql_staged_snapshot_install_reuses_validated_image(void**) {
+    TSql source(":memory:", 1), target(":memory:", 2);
+    Seed(source);
+    Seed(target);
+    Apply(source, "INSERT INTO t VALUES ('snapshot')", 2);
+    const auto image = source.SaveSnapshot();
+
+    auto installation = target.PrepareSnapshotInstallation(image, 2);
+    assert_int_equal(target.LastAppliedIndex, 1);
+    assert_true(ReadText(target, "SELECT value FROM t") == "value\noriginal\n");
+
+    installation->Install();
+    assert_int_equal(target.LastAppliedIndex, 2);
+    assert_true(ReadText(target, "SELECT value FROM t ORDER BY rowid") ==
+        "value\noriginal\nsnapshot\n");
+}
 void test_sql_snapshot_truncation_rejects_before_replacement(void**) {
     TDatabase sourceFile, targetFile;
     TSql source(sourceFile.Path, 1);
@@ -728,6 +744,7 @@ int main() {
         cmocka_unit_test(test_sql_metadata_failure_rolls_back_data_and_does_not_advance),
         cmocka_unit_test(test_sql_snapshot_roundtrip_and_rejection_are_atomic),
         cmocka_unit_test(test_sql_snapshot_source_is_stable_and_matches_requested_index),
+        cmocka_unit_test(test_sql_staged_snapshot_install_reuses_validated_image),
         cmocka_unit_test(test_sql_snapshot_truncation_rejects_before_replacement),
         cmocka_unit_test(test_sql_snapshot_installation_busy_failure_preserves_database),
         cmocka_unit_test(test_sql_snapshot_includes_committed_wal_pages),

@@ -270,6 +270,33 @@ private:
     uint64_t Length;
 };
 
+class TSqlSnapshotInstallation final : public IStagedSnapshotInstallation {
+public:
+    TSqlSnapshotInstallation(sqlite3* target, uint64_t* lastAppliedIndex,
+            uint64_t index, TSnapshotDatabase image)
+        : Target(target), LastAppliedIndex(lastAppliedIndex), Index(index), Image(std::move(image)) { }
+
+    void Install() override {
+        if (!sqlite3_get_autocommit(Target))
+            throw TMessageError("Cannot replace SQL state during a transaction");
+        if (ReadPragmaInteger(Image.Db.get(), "page_size") != ReadPragmaInteger(Target, "page_size"))
+            throw TMessageError("SQL snapshot page size does not match the target database");
+        sqlite3_backup* backup = sqlite3_backup_init(Target, "main", Image.Db.get(), "main");
+        if (!backup) throw TMessageError("Cannot begin SQL snapshot installation");
+        const int copied = sqlite3_backup_step(backup, -1);
+        const int finished = sqlite3_backup_finish(backup);
+        if (copied != SQLITE_DONE || finished != SQLITE_OK)
+            throw TMessageError("Cannot atomically install SQL snapshot");
+        *LastAppliedIndex = Index;
+    }
+
+private:
+    sqlite3* Target;
+    uint64_t* LastAppliedIndex;
+    uint64_t Index;
+    TSnapshotDatabase Image;
+};
+
 std::shared_ptr<const ISnapshotSource> CreateSqlSnapshotSource(sqlite3* db, uint64_t index) {
     const auto pageSize = CheckSnapshotCapture(db, index);
     CheckedSnapshotBytes(db, pageSize);
@@ -503,14 +530,15 @@ void TSql::ValidateSnapshot(std::string_view bytes, uint64_t index) const {
 }
 
 void TSql::LoadSnapshot(std::string_view bytes, uint64_t index) {
+    auto installation = PrepareSnapshotInstallation(bytes, index);
+    installation->Install();
+}
+
+std::unique_ptr<IStagedSnapshotInstallation> TSql::PrepareSnapshotInstallation(
+        std::string_view bytes, uint64_t index) {
     auto image = OpenSnapshotDatabase(bytes);
     ValidateSnapshotForTarget(image.Db.get(), Db, index);
-    sqlite3_backup* backup = sqlite3_backup_init(Db, "main", image.Db.get(), "main");
-    if (!backup) throw TMessageError("Cannot begin SQL snapshot installation");
-    const int copied = sqlite3_backup_step(backup, -1);
-    const int finished = sqlite3_backup_finish(backup);
-    if (copied != SQLITE_DONE || finished != SQLITE_OK)
-        throw TMessageError("Cannot atomically install SQL snapshot");
-    LastAppliedIndex = index;
+    return std::make_unique<TSqlSnapshotInstallation>(Db, &LastAppliedIndex, index,
+        std::move(image));
 }
 

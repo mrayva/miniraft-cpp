@@ -3408,6 +3408,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     // Keep the heap allocation charged through validation and publication.
     // A staged file retains its separate disk reservation until we close it.
     std::shared_ptr<void> installationReservation;
+    std::unique_ptr<IStagedSnapshotInstallation> stagedApplicationInstall;
     TSnapshot snapshot;
     try {
         installationReservation = incoming.File ? SnapshotInstallBudget->TryReserve(incoming.Total) :
@@ -3574,7 +3575,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         for (auto voter : snapshot.JointVoters)
             if (voter != Id && !Nodes.contains(voter))
                 throw TMessageError("Snapshot configuration is missing a voter peer target");
-        application->ValidateSnapshot(snapshot.Data, snapshot.Index);
+        stagedApplicationInstall = PrepareApplicationSnapshotInstallation(
+            *application, snapshot.Data, snapshot.Index);
     } catch (const std::exception&) {
         IncomingSnapshot.reset(); reply(false, false, 0); return;
     }
@@ -3583,7 +3585,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         installedSnapshot = std::make_shared<const TSnapshot>(std::move(snapshot));
         TRaftInstallSnapshotPermit permit;
         State->InstallRaftSnapshot(installedSnapshot, permit); // publish Raft state before app replacement or ACK
-        application->LoadSnapshot(installedSnapshot->Data, installedSnapshot->Index);
+        InstallApplicationSnapshot(*application, installedSnapshot->Data,
+            installedSnapshot->Index, std::move(stagedApplicationInstall));
         if (application->LastAppliedIndex != installedSnapshot->Index) std::terminate();
     } catch (...) { std::terminate(); }
     VolatileState->CommitIndex = State->CommitIndex;
