@@ -601,14 +601,17 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
     // before granting replication progress or accepting a higher term; payload
     // bytes and CRC are validated by the full install path when needed.
     const size_t fixedHeaderBytes = stableLineage ? 88 : stable ? 52 : jointLineage ? 92 : joint ? 56 : 36;
+    if (totalBytes < fixedHeaderBytes + 4) return {true, false, 0};
     if (prefix.size() < fixedHeaderBytes) return {false, false, fixedHeaderBytes};
     uint64_t embeddedIndex = 0, embeddedTerm = 0, voterCount = 0, dataBytes = 0;
     if (!ReadSnapshotInteger(prefix, 8, 8, embeddedIndex) ||
         !ReadSnapshotInteger(prefix, 16, 8, embeddedTerm) ||
         !ReadSnapshotInteger(prefix, 24, 4, voterCount) ||
         !ReadSnapshotInteger(prefix, 28, 8, dataBytes) ||
-        embeddedIndex != index || embeddedTerm != term || voterCount > TSnapshot::MaxVoters)
+        embeddedIndex != index || embeddedTerm != term || voterCount > TSnapshot::MaxVoters ||
+        dataBytes > totalBytes - fixedHeaderBytes - 4)
         return {true, false, 0};
+    const auto metadataBytes = totalBytes - dataBytes - 4; // Exclude payload and checksum.
     uint64_t configurationIndex = 0, configurationTerm = 0, newCount = 0;
     uint64_t previousConfigurationIndex = 0, previousConfigurationTerm = 0;
     uint64_t previousJointIndex = 0, previousJointTerm = 0, previousVoterCount = 0;
@@ -689,7 +692,10 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
     }
     const uint64_t voterBytes = voterCount * 4;
     uint64_t headerBytes = fixedHeaderBytes + voterBytes + newCount * 4 + previousVoterCount * 4;
-    if (headerBytes > totalBytes || totalBytes - headerBytes < 4)
+    constexpr uint64_t transitionHeaderBytes = 56;
+    constexpr uint64_t minTransitionBytes = transitionHeaderBytes + 8; // Two nonempty voter lists.
+    if (configurationHistory ? headerBytes + 4 + minTransitionBytes > metadataBytes :
+            headerBytes != metadataBytes)
         return {true, false, 0};
     if (headerBytes > prefix.size()) return {false, false, size_t(headerBytes)};
     std::vector<uint32_t> incomingOld, incomingNew, incomingPrevious;
@@ -736,21 +742,21 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
 
     std::vector<TSnapshotConfigurationTransition> transitions;
     if (configurationHistory) {
-        if (headerBytes + 4 > totalBytes - 4) return {true, false, 0};
         uint64_t transitionCount = 0;
         if (!ReadSnapshotInteger(prefix, size_t(headerBytes), 4, transitionCount))
             return {false, false, size_t(headerBytes + 4), false, termValidated};
         const auto transitionLimit = largeHistory ? TSnapshot::MaxConfigurationTransitions :
             extendedHistory ? TSnapshot::MaxExtendedConfigurationTransitions :
             TSnapshot::MaxLegacyConfigurationTransitions;
-        if (!transitionCount || transitionCount > transitionLimit)
+        if (!transitionCount || transitionCount > transitionLimit ||
+            transitionCount > (metadataBytes - headerBytes - 4) / minTransitionBytes)
             return {true, false, 0};
         transitions.reserve(size_t(transitionCount));
         headerBytes += 4;
         for (uint64_t i = 0; i < transitionCount; ++i) {
-            if (headerBytes + 56 > totalBytes - 4) return {true, false, 0};
-            if (headerBytes + 56 > prefix.size())
-                return {false, false, size_t(headerBytes + 56), false, termValidated};
+            if (headerBytes + transitionHeaderBytes > metadataBytes) return {true, false, 0};
+            if (headerBytes + transitionHeaderBytes > prefix.size())
+                return {false, false, size_t(headerBytes + transitionHeaderBytes), false, termValidated};
             TSnapshotConfigurationTransition transition;
             const size_t offset = size_t(headerBytes);
             uint64_t oldCount = 0, nextCount = 0;
@@ -764,8 +770,8 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
                 !ReadSnapshotInteger(prefix, offset + 52, 4, nextCount) ||
                 oldCount > TSnapshot::MaxVoters || nextCount > TSnapshot::MaxVoters)
                 return {true, false, 0};
-            const uint64_t transitionBytes = 56 + 4 * (oldCount + nextCount);
-            if (transitionBytes > totalBytes - 4 - headerBytes)
+            const uint64_t transitionBytes = transitionHeaderBytes + 4 * (oldCount + nextCount);
+            if (transitionBytes + (transitionCount - i - 1) * minTransitionBytes > metadataBytes - headerBytes)
                 return {true, false, 0};
             if (headerBytes + transitionBytes > prefix.size())
                 return {false, false, size_t(headerBytes + transitionBytes), false, termValidated};
@@ -783,8 +789,8 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
                 }
                 return true;
             };
-            if (!readTransitionVoters(offset + 56, oldCount, transition.OldVoters) ||
-                !readTransitionVoters(offset + 56 + oldCount * 4, nextCount, transition.NewVoters) ||
+            if (!readTransitionVoters(offset + transitionHeaderBytes, oldCount, transition.OldVoters) ||
+                !readTransitionVoters(offset + transitionHeaderBytes + oldCount * 4, nextCount, transition.NewVoters) ||
                 transition.OldVoters.empty() || transition.NewVoters.empty() ||
                 transition.OldVoters == transition.NewVoters || !transition.JointIndex || !transition.JointTerm ||
                 ((transition.PreviousConfigurationIndex == 0) != (transition.PreviousConfigurationTerm == 0)) ||
@@ -817,8 +823,7 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
                 tail.NewVoters != incomingNew)))
             return {true, false, 0};
     }
-    if (headerBytes + 4 > totalBytes || dataBytes != totalBytes - headerBytes - 4)
-        return {true, false, 0};
+    if (headerBytes != metadataBytes) return {true, false, 0};
     if (configurationHistory && !knownJointStableSuccessor && !staleStableLineageMetadata &&
         !staleJointHistoryMetadata) {
         const auto& trustedTransitions = pendingConfiguration

@@ -1335,6 +1335,50 @@ void test_valid_split_higher_term_covered_snapshot_accepts_leader_without_reload
     assert_true(Read(*app, "a") == "committed");
 }
 
+void test_truncated_snapshot_header_is_rejected_for_covered_and_new_boundaries(void**) {
+    TKv source;
+    const TSnapshot known{5, 1, {1, 2}, source.SaveSnapshot()};
+    const auto knownBytes = EncodeSnapshot(known);
+    TMessageHolder<TInstallSnapshotResponse> response;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) {
+        response = message.template Cast<TInstallSnapshotResponse>();
+    });
+    auto state = std::make_shared<TState>();
+    auto budget = std::make_shared<TSnapshotInstallBudget>();
+    auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}},
+        std::vector<uint32_t>{}, TRaft::TLogLimits{.SnapshotInstallBudget = budget});
+    auto app = std::make_shared<TApplication>();
+    TRequestProcessor processor(raft, app, {});
+    raft->Process({}, Chunk(known, knownBytes, 0, static_cast<uint32_t>(knownBytes.size())));
+    assert_true(response->Installed);
+
+    const auto term = state->CurrentTerm;
+    for (const auto index : {known.Index, known.Index + 1}) {
+        auto candidate = known;
+        candidate.Index = index;
+        auto bytes = EncodeSnapshot(candidate);
+        bytes.replace(0, 8, "MRFTS003");
+        bytes.resize(48); // The stable header alone needs 52 bytes.
+        auto chunk = Chunk(candidate, bytes, 0, static_cast<uint32_t>(bytes.size()));
+        chunk->Term = term;
+        raft->Process({}, chunk);
+        assert_true(bool(response));
+        assert_false(response->Success);
+        assert_false(response->Installed);
+        assert_int_equal(response->NextOffset, 0);
+        assert_int_equal(state->CurrentTerm, term);
+        assert_int_equal(budget->UsedBytes(), 0);
+
+        response = {};
+        chunk->Term = term + 1;
+        raft->Process({}, chunk);
+        assert_false(bool(response));
+        assert_int_equal(state->CurrentTerm, term);
+        assert_int_equal(budget->UsedBytes(), 0);
+    }
+    assert_int_equal(app->Loads, 1);
+}
+
 void test_unmatched_joint_snapshot_does_not_accept_leader_contact(void**) {
     TKv source; source.Write(source.Prepare(Command("a", "joint")), 5);
     TSnapshot joint{5, 2, {1, 2}, source.SaveSnapshot()};
@@ -1526,6 +1570,37 @@ void ExerciseStaleStableSnapshotHistoryRecovery(bool jointSuccessor) {
         raft->Process({}, request);
         return replies.back();
     };
+
+    auto truncated = EncodeSnapshot(incoming);
+    const size_t baseMetadataBytes = (jointSuccessor ? 92 : 88) +
+        4 * (incoming.Voters.size() + incoming.JointVoters.size() + incoming.PreviousVoters.size());
+    // The declared payload leaves room for only one transition, while the
+    // metadata count still advertises all three.
+    truncated.resize(baseMetadataBytes + 4 + 64 + incoming.Data.size() + 4);
+    auto truncatedRequest = Chunk(incoming, truncated, 0, static_cast<uint32_t>(baseMetadataBytes + 4));
+    truncatedRequest->Src = truncatedRequest->LeaderId = 3;
+    truncatedRequest->Term = state->CurrentTerm + 1;
+    const auto term = state->CurrentTerm;
+    raft->Process({}, truncatedRequest);
+    assert_true(replies.empty());
+    assert_int_equal(state->CurrentTerm, term);
+
+    const auto split = baseMetadataBytes - 4;
+    auto first = Chunk(incoming, truncated, 0, static_cast<uint32_t>(split));
+    auto second = Chunk(incoming, truncated, split, 8);
+    for (auto* chunk : {&first, &second}) {
+        (*chunk)->Src = (*chunk)->LeaderId = 3;
+        (*chunk)->Term = term + 1;
+    }
+    raft->Process({}, first);
+    assert_int_equal(replies.size(), 1);
+    assert_true(replies.back()->Success);
+    assert_int_equal(state->CurrentTerm, term);
+    raft->Process({}, second);
+    assert_int_equal(replies.size(), 2);
+    assert_false(replies.back()->Success);
+    assert_int_equal(replies.back()->NextOffset, 0);
+    assert_int_equal(state->CurrentTerm, term);
 
     auto conflictingHistory = incoming;
     // Keep the sender in the image's final voter set, but remove it from one
@@ -2567,6 +2642,7 @@ int main() {
         cmocka_unit_test(test_higher_term_snapshot_defers_term_change_until_split_metadata_is_validated),
         cmocka_unit_test(test_invalid_split_higher_term_snapshot_preserves_candidate_state),
         cmocka_unit_test(test_valid_split_higher_term_covered_snapshot_accepts_leader_without_reload),
+        cmocka_unit_test(test_truncated_snapshot_header_is_rejected_for_covered_and_new_boundaries),
         cmocka_unit_test(test_unmatched_joint_snapshot_does_not_accept_leader_contact),
         cmocka_unit_test(test_stable_snapshot_completes_known_joint_membership_only_from_new_voter),
         cmocka_unit_test(test_stale_stable_snapshot_recovers_multi_transition_stable_membership),
