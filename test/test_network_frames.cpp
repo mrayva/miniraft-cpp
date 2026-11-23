@@ -191,6 +191,23 @@ void test_inbound_frame_budget_is_held_until_all_message_copies_are_released(voi
     auto recoveredMessage = recoveredTask.await_resume();
     assert_int_equal(recoveredMessage.Cast<TRequestVoteRequest>()->CandidateId, 1);
 }
+void test_inbound_connection_budget_releases_admission_on_disconnect(void**) {
+    auto budget = std::make_shared<TInboundMessageBudget>(
+        TInboundMessageBudgetLimits{.MaxBytes = 1024, .MaxConnections = 1});
+    auto active = budget->TryReserveConnection();
+    assert_true(bool(active));
+    assert_false(bool(budget->TryReserveConnection()));
+
+    active.reset();
+    auto replacement = budget->TryReserveConnection();
+    assert_true(bool(replacement));
+
+    auto frame = budget->TryReserve(1024);
+    assert_true(bool(frame));
+    assert_false(bool(budget->TryReserve(1)));
+    replacement.reset();
+    assert_true(bool(budget->TryReserveConnection()));
+}
 void test_inbound_frame_budget_covers_append_entries_payload_arrays(void**) {
     auto append = NewHoldedMessage(TAppendEntriesRequest{.Nentries = 1});
     const auto payloadArrayBytes = sizeof(TMessageHolder<TMessage>);
@@ -342,6 +359,7 @@ int main() {
         cmocka_unit_test(test_count_and_minimum_batch_budget_are_checked_before_children),
         cmocka_unit_test(test_aggregate_budget_is_shared_between_entries),
         cmocka_unit_test(test_failed_reader_cannot_resume_at_another_frame),
+        cmocka_unit_test(test_inbound_connection_budget_releases_admission_on_disconnect),
         cmocka_unit_test(test_writer_validates_entire_batch_before_first_byte),
         cmocka_unit_test(test_fragmented_roundtrip_keeps_consecutive_frame_boundaries),
         cmocka_unit_test(test_fragmented_snapshot_request_and_response_roundtrip),

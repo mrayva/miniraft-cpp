@@ -42,6 +42,8 @@ notification; write outcomes may remain unknown.
 * Maximum frame size: 16 MiB, including its header.
 * Maximum complete AppendEntries batch: 64 MiB, including root and child headers.
 * Maximum AppendEntries child count: 4096.
+* Maximum accepted client connections per server: 1024 by default, configured
+  with `TInboundMessageBudgetLimits::MaxConnections`.
 
 Raft log proposals are checked against the frame cap before mutating the log or
 the proposed entry's term. Batch construction now observes the same aggregate
@@ -93,7 +95,10 @@ connection reset ordering. No independent reviewer approval is claimed.
 This is structural framing validation, not authentication or complete validation
 of consensus fields. Sender/destination membership, index/term semantics and
 application payload lengths (KV/SQL/custom commands) still need their own checks.
-Per-connection caps do not bound aggregate memory across unlimited connections;
-admission limits, deadlines and broader fuzzing remain open. Native wire encoding,
-TLS lifecycle stress, retry deduplication and generated history checking also
-remain separate work. No library-wide security or linearizability claim is made.
+The bundled server now rejects accepted client sockets when its shared inbound
+connection limit is full. Reservations last for the connection task lifetime,
+including idle clients, and release when the socket closes or frame processing
+fails. General connection deadlines and broader fuzzing remain open. Native
+wire encoding, TLS lifecycle stress, retry deduplication and generated history
+checking also remain separate work. No library-wide security or linearizability
+claim is made.

@@ -83,12 +83,22 @@ private:
 
 struct TInboundMessageBudgetLimits {
     uint64_t MaxBytes = 256ULL * 1024 * 1024;
+    size_t MaxConnections = 1024;
 };
 
 // Bounds serialized frame storage and AppendEntries payload-holder arrays while
 // the decoded messages remain alive. This is a network-buffer quota, not a
 // process-wide allocator limit.
 class TInboundMessageBudget : public std::enable_shared_from_this<TInboundMessageBudget> {
+    class TConnectionReservation {
+    public:
+        explicit TConnectionReservation(std::shared_ptr<TInboundMessageBudget> budget)
+            : Budget(std::move(budget)) { }
+        ~TConnectionReservation() { Budget->ReleaseConnection(); }
+    private:
+        std::shared_ptr<TInboundMessageBudget> Budget;
+    };
+
     class TReservation {
     public:
         TReservation(std::shared_ptr<TInboundMessageBudget> budget, uint64_t bytes)
@@ -102,6 +112,20 @@ class TInboundMessageBudget : public std::enable_shared_from_this<TInboundMessag
 public:
     explicit TInboundMessageBudget(TInboundMessageBudgetLimits limits = {})
         : Limits(limits) { }
+
+    std::shared_ptr<void> TryReserveConnection() {
+        {
+            std::lock_guard lock(Mutex);
+            if (ActiveConnections >= Limits.MaxConnections) return {};
+            ++ActiveConnections;
+        }
+        try {
+            return std::make_shared<TConnectionReservation>(shared_from_this());
+        } catch (...) {
+            ReleaseConnection();
+            throw;
+        }
+    }
 
     std::shared_ptr<void> TryReserve(uint64_t bytes) {
         if (!bytes) return {};
@@ -120,6 +144,12 @@ public:
     }
 
 private:
+    void ReleaseConnection() noexcept {
+        std::lock_guard lock(Mutex);
+        if (!ActiveConnections) std::terminate();
+        --ActiveConnections;
+    }
+
     void Release(uint64_t bytes) noexcept {
         std::lock_guard lock(Mutex);
         if (bytes > UsedBytes) std::terminate();
@@ -129,6 +159,7 @@ private:
     const TInboundMessageBudgetLimits Limits;
     std::mutex Mutex;
     uint64_t UsedBytes = 0;
+    size_t ActiveConnections = 0;
 };
 
 template<typename TSocket>
@@ -549,7 +580,7 @@ public:
 
 private:
     NNet::TVoidTask InboundServe();
-    NNet::TVoidTask InboundConnection(TSocket socket);
+    NNet::TVoidTask InboundConnection(TSocket socket, std::shared_ptr<void> connectionReservation);
     NNet::TVoidTask OutboundServe(std::shared_ptr<TNode<TSocket>>);
     NNet::TVoidTask Idle();
     void ReconcilePeerReaders();

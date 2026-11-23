@@ -10,7 +10,9 @@
 #include "server.h"
 
 template<typename TSocket>
-NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(TSocket socket) {
+NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(
+        TSocket socket, std::shared_ptr<void> connectionReservation) {
+    (void)connectionReservation;
     std::shared_ptr<TNode<TSocket>> client;
     try {
         client = std::make_shared<TNode<TSocket>>(
@@ -287,8 +289,10 @@ template<typename TSocket>
 NNet::TVoidTask TRaftServer<TSocket>::InboundServe() {
     while (true) {
         auto client = co_await Socket.Accept();
+        auto connectionReservation = InboundMessageBudget->TryReserveConnection();
+        if (!connectionReservation) continue;
         std::cout << "Accepted\n";
-        InboundConnection(std::move(client));
+        InboundConnection(std::move(client), std::move(connectionReservation));
     }
     co_return;
 }
