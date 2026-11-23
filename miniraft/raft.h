@@ -232,7 +232,8 @@ struct IIdempotentRsm : IRsm {
     virtual void RestoreIdempotencySnapshot(
         TIdempotencySnapshot, uint64_t index) = 0;
     bool SupportsApplicationSnapshotInstall() const final { return true; }
-    // Upper bound for the complete encoded wrapper returned by SaveSnapshot.
+    // Upper bound for the complete encoded wrapper returned by SaveSnapshot or
+    // emitted by the disk-staged writer path.
     virtual std::optional<uint64_t> IdempotencySnapshotSizeUpperBound() const {
         return std::nullopt;
     }
@@ -246,6 +247,18 @@ struct IIdempotentRsm : IRsm {
         if (bound && bytes.size() > *bound)
             throw std::logic_error("Idempotency snapshot exceeded its declared size bound");
         return bytes;
+    }
+    // Disk-staged capture can emit the wrapper directly without constructing a
+    // second full encoded string. This is deliberately non-virtual so the
+    // existing IIdempotentRsm vtable and application ABI remain unchanged.
+    void WriteSnapshot(uint64_t index, ISnapshotSink& sink) const {
+        auto snapshot = CaptureIdempotencySnapshot();
+        if (index != LastAppliedIndex || snapshot.LastAppliedIndex != LastAppliedIndex)
+            throw std::logic_error("Idempotency snapshot progress does not match the RSM");
+        const auto bytes = ::WriteIdempotencySnapshot(snapshot, SnapshotLimits, sink);
+        const auto bound = IdempotencySnapshotSizeUpperBound();
+        if (bound && bytes > *bound)
+            throw std::logic_error("Idempotency snapshot exceeded its declared size bound");
     }
     std::optional<uint64_t> SnapshotSizeUpperBound() const final {
         auto bound = IdempotencySnapshotSizeUpperBound();

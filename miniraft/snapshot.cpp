@@ -1036,6 +1036,8 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         std::exception_ptr Failure;
     };
     const auto streamingRsm = dynamic_cast<const IStreamingSnapshotRsm*>(&rsm);
+    const auto writerRsm = dynamic_cast<const IStreamingSnapshotWriterRsm*>(&rsm);
+    const auto idempotentRsm = dynamic_cast<const IIdempotentRsm*>(&rsm);
     if (auto source = streamingRsm ? streamingRsm->OpenSnapshotSource(index) : nullptr) {
         const auto dataBytes = source->Size();
         if (dataBytes > TSnapshot::MaxBytes - metadataBytes)
@@ -1070,12 +1072,13 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
             throw std::logic_error("Application snapshot source changed size during capture");
         if (stagedSource) snapshot.DataSource = std::move(stagedSource);
         else snapshot.DataSource = std::make_shared<TApplicationSnapshotSource>(std::move(source), dataBytes);
-    } else if (const auto writerRsm = dynamic_cast<const IStreamingSnapshotWriterRsm*>(&rsm)) {
+    } else if (writerRsm || (!stagingDirectory.empty() && idempotentRsm)) {
         if (!stagingDirectory.empty() && !stagingBudget)
             stagingBudget = heapBudget ? heapBudget : TSnapshotInstallBudget::DefaultProcessBudget();
         TCaptureSink sink(heapBudget, stagingBudget, stagingDirectory,
             TSnapshot::MaxBytes - metadataBytes, upperBound);
-        writerRsm->WriteSnapshot(index, sink);
+        if (writerRsm) writerRsm->WriteSnapshot(index, sink);
+        else idempotentRsm->WriteSnapshot(index, sink);
         sink.RethrowFailure();
         if (stagingDirectory.empty()) snapshot.Data = sink.TakeData();
         else snapshot.DataSource = sink.TakeSource();

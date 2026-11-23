@@ -5,6 +5,11 @@
 #include <string>
 #include <cstring>
 #include <cmocka.h>
+#include <cstdlib>
+#include <filesystem>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 namespace {
 template<class F> void Reject(F&& f) {
@@ -159,10 +164,84 @@ void test_idempotent_kv_rejects_aggregate_response_cache_overflow(void**) {
     assert_true(Read(rsm, "one", 1) == "abc");
 }
 
+void test_idempotent_snapshot_capture_uses_staging_budget(void**) {
+#ifdef __linux__
+    char directoryTemplate[] = "/tmp/miniraft-idempotent-capture-XXXXXX";
+    auto* createdDirectory = mkdtemp(directoryTemplate);
+    assert_non_null(createdDirectory);
+    struct TDirectoryCleanup {
+        std::filesystem::path Path;
+        ~TDirectoryCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(Path, ignored);
+        }
+    } cleanup{createdDirectory};
+
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 1;
+    auto entry = NewHoldedMessage<TLogEntry>();
+    entry->Term = 1;
+    state->Append(entry);
+    state->CommitIndex = 1;
+
+    auto application = std::make_shared<TIdempotentKvRsm>();
+    auto initial = application->CaptureIdempotencySnapshot();
+    initial.LastAppliedIndex = 1;
+    application->RestoreIdempotencySnapshot(std::move(initial), 1);
+    const auto expectedImage = application->SaveSnapshot();
+
+    auto heapBudget = std::make_shared<TSnapshotInstallBudget>(1);
+    auto stagingBudget = std::make_shared<TSnapshotInstallBudget>(1024);
+    TRaft::TLogLimits limits;
+    limits.SnapshotInstallBudget = heapBudget;
+    limits.SnapshotStagingBudget = stagingBudget;
+    limits.SnapshotStagingDirectory = createdDirectory;
+    std::shared_ptr<const TSnapshot> snapshot;
+    {
+        auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{},
+            std::vector<uint32_t>{}, limits);
+        TRequestProcessor processor(raft, application, {});
+        snapshot = raft->CompactShared();
+        assert_true(snapshot->Data.empty());
+        assert_true(bool(snapshot->DataSource));
+        assert_true(snapshot->MaterializeData() == expectedImage);
+        assert_true(DecodeIdempotencySnapshot(snapshot->MaterializeData()) ==
+            application->CaptureIdempotencySnapshot());
+        assert_int_equal(heapBudget->UsedBytes(), 0);
+        assert_int_equal(stagingBudget->UsedBytes(), expectedImage.size());
+    }
+    state.reset();
+    assert_int_equal(stagingBudget->UsedBytes(), expectedImage.size());
+    snapshot.reset();
+    assert_int_equal(stagingBudget->UsedBytes(), 0);
+
+    auto rejectedState = std::make_shared<TState>();
+    rejectedState->CurrentTerm = 1;
+    auto rejectedEntry = NewHoldedMessage<TLogEntry>();
+    rejectedEntry->Term = 1;
+    rejectedState->Append(rejectedEntry);
+    rejectedState->CommitIndex = 1;
+    auto rejectedHeapBudget = std::make_shared<TSnapshotInstallBudget>(1);
+    auto rejectedStagingBudget = std::make_shared<TSnapshotInstallBudget>(expectedImage.size() - 1);
+    limits.SnapshotInstallBudget = rejectedHeapBudget;
+    limits.SnapshotStagingBudget = rejectedStagingBudget;
+    {
+        auto raft = std::make_shared<TRaft>(rejectedState, 1, TNodeDict{},
+            std::vector<uint32_t>{}, limits);
+        TRequestProcessor processor(raft, application, {});
+        Reject([&] { raft->Compact(); });
+    }
+    assert_int_equal(rejectedState->SnapshotIndex, 0);
+    assert_int_equal(rejectedHeapBudget->UsedBytes(), 0);
+    assert_int_equal(rejectedStagingBudget->UsedBytes(), 0);
+#endif
+}
+
 int main() {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_idempotent_kv_application_snapshot_and_session_controls),
         cmocka_unit_test(test_idempotent_kv_rejects_aggregate_response_cache_overflow),
+        cmocka_unit_test(test_idempotent_snapshot_capture_uses_staging_budget),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }

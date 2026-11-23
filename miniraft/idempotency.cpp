@@ -1,4 +1,5 @@
 #include "idempotency.h"
+#include "raft.h"
 #include "snapshot_codec.h"
 
 #include <cstring>
@@ -349,6 +350,60 @@ void ValidateIdempotencySnapshot(const TIdempotencySnapshot& snapshot,
         Invalid("Idempotency session count exceeds limit");
     if (EncodedSize(snapshot) > limits.MaxEncodedBytes)
         Invalid("Idempotency snapshot exceeds encoded byte limit");
+}
+
+uint64_t WriteIdempotencySnapshot(const TIdempotencySnapshot& snapshot,
+        const TIdempotencySnapshotLimits& limits, ISnapshotSink& sink) {
+    ValidateIdempotencySnapshot(snapshot, limits);
+    const auto encodedBytes = EncodedSize(snapshot);
+    uint64_t written = 0;
+    NSnapshotCodec::TChecksum checksum;
+    auto writePayload = [&](std::string_view bytes) {
+        if (bytes.empty()) return;
+        if (written > encodedBytes || bytes.size() > encodedBytes - written)
+            throw std::logic_error("Idempotency snapshot size calculation mismatch");
+        sink.Write(std::span<const char>(bytes.data(), bytes.size()));
+        checksum.Update(bytes);
+        written += bytes.size();
+    };
+    auto writeInteger = [&](uint64_t value, unsigned width) {
+        std::array<char, 8> encoded{};
+        for (unsigned i = 0; i < width; ++i) encoded[i] = char(value >> (8 * i));
+        writePayload(std::string_view(encoded.data(), width));
+    };
+
+    writePayload(Magic);
+    writeInteger(EncodedVersion, 4);
+    writeInteger(snapshot.LastAppliedIndex, 8);
+    writeInteger(snapshot.Epoch, 8);
+    writeInteger(snapshot.ApplicationData.size(), 8);
+    writeInteger(snapshot.Sessions.size(), 4);
+    writePayload(snapshot.ApplicationData);
+    for (const auto& session : snapshot.Sessions) {
+        writeInteger(session.SessionIdHigh, 8);
+        writeInteger(session.SessionIdLow, 8);
+        writeInteger(session.HighestSequence, 8);
+        writePayload(std::string_view(
+            reinterpret_cast<const char*>(session.PayloadDigest.data()),
+            session.PayloadDigest.size()));
+        writeInteger(session.LogIndex, 8);
+        writeInteger(session.ErrorCode, 4);
+        writeInteger(session.Closed ? 1 : 0, 4);
+        writeInteger(session.ResponseData.size(), 8);
+        writePayload(session.ResponseData);
+    }
+
+    if (written != encodedBytes - ChecksumBytes)
+        throw std::logic_error("Idempotency snapshot size calculation mismatch");
+    const auto checksumBytes = checksum.Finish();
+    std::array<char, ChecksumBytes> encodedChecksum{};
+    for (unsigned i = 0; i < ChecksumBytes; ++i)
+        encodedChecksum[i] = char(checksumBytes >> (8 * i));
+    sink.Write(encodedChecksum);
+    written += encodedChecksum.size();
+    if (written != encodedBytes)
+        throw std::logic_error("Idempotency snapshot size calculation mismatch");
+    return written;
 }
 
 std::string EncodeIdempotencySnapshot(const TIdempotencySnapshot& snapshot,

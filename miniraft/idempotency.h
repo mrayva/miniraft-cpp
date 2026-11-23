@@ -10,6 +10,8 @@
 #include "messages.h"
 #include "snapshot.h"
 
+struct ISnapshotSink;
+
 struct TIdempotentOperationIdentity {
     uint64_t Epoch = 0;
     uint64_t SessionIdHigh = 0, SessionIdLow = 0;
@@ -96,5 +98,8 @@ void ValidateIdempotencySnapshot(const TIdempotencySnapshot& snapshot,
                                  const TIdempotencySnapshotLimits& limits = {});
 std::string EncodeIdempotencySnapshot(const TIdempotencySnapshot& snapshot,
                                       const TIdempotencySnapshotLimits& limits = {});
+uint64_t WriteIdempotencySnapshot(const TIdempotencySnapshot& snapshot,
+                                 const TIdempotencySnapshotLimits& limits,
+                                 ISnapshotSink& sink);
 TIdempotencySnapshot DecodeIdempotencySnapshot(std::string_view bytes,
                                                const TIdempotencySnapshotLimits& limits = {});
