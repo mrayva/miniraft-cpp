@@ -139,10 +139,15 @@ capacity changes before proposing.
   WAL/group-commit path; disk work blocks the event loop. Legacy TDiskState
   still lacks the same power-loss durability guarantees.
 - Transport validates claimed source IDs, but incoming connections are not
-  bound to authenticated Raft identities (`server.cpp:13-30`,
-  `raft.cpp:1364-1368`). A reachable untrusted client can claim a configured
-  peer ID. TLS configuration and peer authorization need a separate security
-  design; enabling encryption alone does not establish that binding.
+  bound to authenticated Raft identities by default (`server.cpp:13-30`,
+  `raft.cpp:1364-1368`). `TRaftServer` now accepts an optional
+  `TPeerIdentityResolver`; when configured, it rejects peer capability probes
+  without an authenticated identity and rejects ID-bearing messages whose
+  `Src` differs from the resolved identity. The resolver must use credentials
+  supplied by the transport, not the message's claimed ID. It remains opt-in
+  for compatibility, and the built-in TLS contexts do not yet configure
+  mutual certificate verification or identity mapping. Deployments without a
+  resolver retain the legacy unauthenticated peer behavior.
 - No replicated client deduplication/session protocol. Retrying a write after
   an uncertain outcome can execute it again. Correlation cookies do not provide
   durable operation identity. Forwarding uses negotiated sessionized

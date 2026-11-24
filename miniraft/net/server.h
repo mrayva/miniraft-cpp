@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <coroutine>
@@ -545,6 +546,11 @@ private:
 template<typename TSocket>
 class TRaftServer {
 public:
+    // Return the node ID authenticated by the transport for an accepted
+    // connection. Return nullopt for client connections. This resolver must
+    // derive identity from credentials, not from the message's claimed Src.
+    using TPeerIdentityResolver = std::function<std::optional<uint32_t>(const TSocket&)>;
+
     TRaftServer(
         typename TSocket::TPoller& poller,
         TSocket socket,
@@ -554,7 +560,8 @@ public:
         const std::shared_ptr<ITimeSource>& ts,
         TRequestProcessor::TAdmissionLimits admissionLimits = {},
         TOutboundQueueLimits outboundQueueLimits = {},
-        TInboundMessageBudgetLimits inboundMessageBudgetLimits = {})
+        TInboundMessageBudgetLimits inboundMessageBudgetLimits = {},
+        TPeerIdentityResolver peerIdentityResolver = {})
         : Poller(poller)
         , Socket(std::move(socket))
         , Raft(raft)
@@ -562,6 +569,7 @@ public:
         , InboundMessageBudget(std::make_shared<TInboundMessageBudget>(inboundMessageBudgetLimits))
         , RequestProcessor(std::make_shared<TRequestProcessor>(raft, rsm, nodes, admissionLimits, ts))
         , TimeSource(ts)
+        , ResolvePeerIdentity(std::move(peerIdentityResolver))
     {
         try {
             for (const auto& [id, node] : nodes) {
@@ -674,6 +682,7 @@ private:
     std::unordered_set<std::shared_ptr<TNode<TSocket>>> RetiredPeerNodes;
     std::unordered_map<std::shared_ptr<TNode<TSocket>>, ITimeSource::Time> InboundLastActivity;
     std::shared_ptr<ITimeSource> TimeSource;
+    TPeerIdentityResolver ResolvePeerIdentity;
     bool Serving = false;
     bool Stopping = false;
     size_t ActiveTasks = 0;

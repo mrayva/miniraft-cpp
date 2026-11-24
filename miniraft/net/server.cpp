@@ -26,9 +26,23 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(
         } readerGuard{client};
         Nodes.insert(client);
         InboundLastActivity.emplace(client, TimeSource->Now());
+        bool peerIdentityResolved = false;
+        std::optional<uint32_t> authenticatedPeerId;
         while (true) {
             auto mes = co_await TMessageReader(client->Sock(), {}, InboundMessageBudget).Read();
             InboundLastActivity[client] = TimeSource->Now();
+            if (ResolvePeerIdentity && !peerIdentityResolved) {
+                authenticatedPeerId = ResolvePeerIdentity(client->Sock());
+                peerIdentityResolved = true;
+            }
+            if (ResolvePeerIdentity) {
+                const auto messageType = EMessageType(mes->Type);
+                if (messageType == EMessageType::PEER_CAPABILITIES_REQUEST && !authenticatedPeerId)
+                    throw TMessageError("Unauthenticated peer capability request");
+                if (mes.IsEx() && (!authenticatedPeerId ||
+                        mes.template Cast<TMessageEx>()->Src != *authenticatedPeerId))
+                    throw TMessageError("Peer message source does not match authenticated identity");
+            }
             // client request
             if (auto maybeCapabilities = mes.template Maybe<TPeerCapabilitiesRequest>()) {
                 auto request = maybeCapabilities.Cast();
