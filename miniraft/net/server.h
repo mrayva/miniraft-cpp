@@ -581,6 +581,19 @@ public:
     }
 
     void Serve();
+    // Stop accepting requests, retire live peers and clients, then wait until
+    // every server coroutine and retired node operation has unwound. The caller
+    // must keep the poller running until this task completes.
+    NNet::TValueTask<void> Stop() {
+        RequestStop();
+        while (ActiveTasks || HasPendingRetirement()) {
+            DrainNodes();
+            co_await Poller.Sleep(std::chrono::milliseconds(10));
+        }
+        DrainNodes();
+        co_return;
+    }
+    bool IsStopped() const { return Stopping && ActiveTasks == 0 && !HasPendingRetirement(); }
 
     // Register local endpoints on any role so every replica can validate and
     // communicate with future voters. This does not change quorum membership.
@@ -625,10 +638,22 @@ public:
 
 private:
     static constexpr auto CapabilityNegotiationTimeout = std::chrono::seconds(5);
+    static constexpr auto AcceptPollInterval = std::chrono::milliseconds(100);
+    struct TTaskGuard {
+        explicit TTaskGuard(TRaftServer& server) : Server(&server) { ++Server->ActiveTasks; }
+        ~TTaskGuard() {
+            if (!Server->ActiveTasks) std::terminate();
+            --Server->ActiveTasks;
+        }
+        TRaftServer* Server;
+    };
     NNet::TVoidTask InboundServe();
     NNet::TVoidTask InboundConnection(TSocket socket, std::shared_ptr<void> connectionReservation);
     NNet::TVoidTask OutboundServe(std::shared_ptr<TNode<TSocket>>);
     NNet::TVoidTask Idle();
+    NNet::TValueTask<TSocket> AcceptWithDeadline();
+    void RequestStop();
+    bool HasPendingRetirement() const;
     void ReconcilePeerReaders();
     void DrainNodes();
     void DebugPrint();
@@ -650,6 +675,8 @@ private:
     std::unordered_map<std::shared_ptr<TNode<TSocket>>, ITimeSource::Time> InboundLastActivity;
     std::shared_ptr<ITimeSource> TimeSource;
     bool Serving = false;
+    bool Stopping = false;
+    size_t ActiveTasks = 0;
 
     // for debug
     TStateFields PersistentFields;

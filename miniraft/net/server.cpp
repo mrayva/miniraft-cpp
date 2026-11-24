@@ -12,12 +12,18 @@
 template<typename TSocket>
 NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(
         TSocket socket, std::shared_ptr<void> connectionReservation) {
+    TTaskGuard taskGuard(*this);
     (void)connectionReservation;
     std::shared_ptr<TNode<TSocket>> client;
     try {
         client = std::make_shared<TNode<TSocket>>(
             "client", std::move(socket), TimeSource
         );
+        client->MarkResponseReaderStarted();
+        struct TReaderGuard {
+            std::shared_ptr<TNode<TSocket>> Node;
+            ~TReaderGuard() { Node->MarkResponseReaderStopped(); }
+        } readerGuard{client};
         Nodes.insert(client);
         InboundLastActivity.emplace(client, TimeSource->Now());
         while (true) {
@@ -72,12 +78,17 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(
     InboundLastActivity.erase(client);
     Nodes.erase(client);
     RequestProcessor->CleanUp(client);
+    if (client && client->IsRetired()) {
+        client->Drain();
+        if (!client->RetirementComplete()) RetiredPeerNodes.insert(client);
+    }
     co_return;
 }
 
 template<typename TSocket>
 void TRaftServer<TSocket>::Serve() {
     if (Serving) throw std::logic_error("Raft server is already serving");
+    if (Stopping) throw std::logic_error("A stopped Raft server cannot be restarted");
     Serving = true;
     ReconcilePeerReaders();
     Idle();
@@ -85,8 +96,63 @@ void TRaftServer<TSocket>::Serve() {
 }
 
 template<typename TSocket>
+void TRaftServer<TSocket>::RequestStop() {
+    if (Stopping) return;
+    if (!Serving) {
+        Stopping = true;
+        return;
+    }
+    if constexpr (requires(TSocket& socket, NNet::TTime deadline) {
+            socket.Accept(deadline);
+            socket.Close();
+        }) {
+        const auto validateRetirement = [](const auto& nodes) {
+            for (const auto& node : nodes) {
+                if (auto realNode = std::dynamic_pointer_cast<TNode<TSocket>>(node)) {
+                    if (!realNode->IsRetired() && !realNode->SupportsRetirement())
+                        throw std::logic_error("A live server connection cannot be safely retired");
+                }
+            }
+        };
+        validateRetirement(Nodes);
+        validateRetirement(RetiredPeerNodes);
+
+        Stopping = true;
+        Socket.Close();
+        for (const auto& node : Nodes)
+            if (auto realNode = std::dynamic_pointer_cast<TNode<TSocket>>(node))
+                realNode->Retire();
+        for (const auto& node : RetiredPeerNodes)
+            if (!node->IsRetired()) node->Retire();
+    } else {
+        throw std::logic_error("Server listener does not support cancellable accept and close");
+    }
+}
+
+template<typename TSocket>
+bool TRaftServer<TSocket>::HasPendingRetirement() const {
+    for (const auto& node : Nodes) {
+        if (auto realNode = std::dynamic_pointer_cast<TNode<TSocket>>(node))
+            if (realNode->IsRetired() && !realNode->RetirementComplete()) return true;
+    }
+    for (const auto& node : RetiredPeerNodes)
+        if (!node->RetirementComplete()) return true;
+    return false;
+}
+
+template<typename TSocket>
+NNet::TValueTask<TSocket> TRaftServer<TSocket>::AcceptWithDeadline() {
+    if constexpr (requires(TSocket& socket, NNet::TTime deadline) { socket.Accept(deadline); }) {
+        co_return co_await Socket.Accept(NNet::TClock::now() + AcceptPollInterval);
+    } else {
+        co_return co_await Socket.Accept();
+    }
+}
+
+template<typename TSocket>
 void TRaftServer<TSocket>::RegisterPeerTargetImpl(
         uint32_t id, std::shared_ptr<TNode<TSocket>> node, bool stageLearner) {
+    if (Stopping) throw std::logic_error("Cannot register peers on a stopped Raft server");
     if (!node || node->IsRetired()) throw std::invalid_argument("Invalid peer target endpoint");
     auto [peer, insertedPeer] = PeerNodes.emplace(id, node);
     if (!insertedPeer) throw std::invalid_argument("Duplicate network peer ID");
@@ -210,7 +276,7 @@ std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::RemoveLearnerTarget(uint32
 
 template<typename TSocket>
 void TRaftServer<TSocket>::ReconcilePeerReaders() {
-    if (!Serving) return;
+    if (!Serving || Stopping) return;
     NNet::TDetail::ReconcilePeerResponseReaders(PeerNodes, PeerResponseReaders,
         [this](uint32_t, const auto& node) {
             // Learners need replies to prove catch-up before promotion.
@@ -233,6 +299,7 @@ void TRaftServer<TSocket>::DrainNodes() {
 
 template<typename TSocket>
 NNet::TVoidTask TRaftServer<TSocket>::OutboundServe(std::shared_ptr<TNode<TSocket>> node) {
+    TTaskGuard taskGuard(*this);
     struct TReaderGuard {
         std::shared_ptr<TNode<TSocket>> Node;
         ~TReaderGuard() { Node->MarkResponseReaderStopped(); }
@@ -290,12 +357,20 @@ NNet::TVoidTask TRaftServer<TSocket>::OutboundServe(std::shared_ptr<TNode<TSocke
 
 template<typename TSocket>
 NNet::TVoidTask TRaftServer<TSocket>::InboundServe() {
-    while (true) {
-        auto client = co_await Socket.Accept();
-        auto connectionReservation = InboundMessageBudget->TryReserveConnection();
-        if (!connectionReservation) continue;
-        std::cout << "Accepted\n";
-        InboundConnection(std::move(client), std::move(connectionReservation));
+    TTaskGuard taskGuard(*this);
+    while (!Stopping) {
+        try {
+            auto client = co_await AcceptWithDeadline();
+            if (Stopping) break;
+            auto connectionReservation = InboundMessageBudget->TryReserveConnection();
+            if (!connectionReservation) continue;
+            std::cout << "Accepted\n";
+            InboundConnection(std::move(client), std::move(connectionReservation));
+        } catch (const std::system_error& ex) {
+            if (Stopping) break;
+            if (ex.code() == std::make_error_code(std::errc::timed_out)) continue;
+            throw;
+        }
     }
     co_return;
 }
@@ -344,10 +419,11 @@ void TRaftServer<TSocket>::DebugPrint() {
 
 template<typename TSocket>
 NNet::TVoidTask TRaftServer<TSocket>::Idle() {
+    TTaskGuard taskGuard(*this);
     auto t0 = TimeSource->Now();
     auto dt = std::chrono::milliseconds(2000);
     auto sleep = std::chrono::milliseconds(100);
-    while (true) {
+    while (!Stopping) {
         try {
             const auto now = TimeSource->Now();
             NNet::TDetail::ExpireIdleConnections(

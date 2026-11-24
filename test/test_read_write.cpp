@@ -41,6 +41,19 @@ TMessageHolder<TLogEntry> MakeEntry(const char* text) {
     return mes;
 }
 
+NNet::TVoidTask StopServerAndMark(TRaftServer<NNet::TSocket>& server, bool& stopped) {
+    co_await server.Stop();
+    stopped = true;
+}
+
+NNet::TVoidTask ConnectSocketAndMark(NNet::TSocket& socket, bool& connected) {
+    try {
+        co_await socket.Connect();
+        connected = true;
+    } catch (const std::exception&) {
+    }
+}
+
 } // namespace
 
 void test_host_endpoint_parser_validates_all_fields(void**) {
@@ -428,6 +441,39 @@ void test_server_stages_and_removes_runtime_learner(void**) {
     assert_true(raft->GetLearnerIds() == std::vector<uint32_t>({3}));
     assert_true(server.RemoveLearnerTarget(3) == retryEndpoint);
     assert_true(raft->GetLearnerIds().empty());
+}
+
+void test_server_stop_joins_accept_and_timer_tasks(void**) {
+    NNet::TLoop<NNet::TPoll> loop;
+    auto timeSource = std::make_shared<TTimeSource>();
+    auto raft = std::make_shared<TRaft>(std::make_shared<TState>(), 1, TNodeDict{});
+    NNet::TSocket listener(NNet::TAddress{"127.0.0.1", 0}, loop.Poller());
+    listener.Bind();
+    listener.Listen();
+    sockaddr_in bound{};
+    socklen_t boundSize = sizeof(bound);
+    assert_int_equal(::getsockname(listener.Fd(), reinterpret_cast<sockaddr*>(&bound), &boundSize), 0);
+    const NNet::TAddress address(reinterpret_cast<sockaddr*>(&bound), boundSize);
+    TRaftServer<NNet::TSocket> server(
+        loop.Poller(), std::move(listener), raft, std::make_shared<TDummyRsm>(), TNodeDict{}, timeSource);
+
+    server.Serve();
+    assert_false(server.IsStopped());
+    NNet::TSocket client(address, loop.Poller());
+    bool connected = false;
+    ConnectSocketAndMark(client, connected);
+    for (size_t step = 0; step < 1000 && !connected; ++step)
+        loop.Step();
+    assert_true(connected);
+    loop.Step(); // Let the accepted connection enter its pending message read.
+
+    bool stopped = false;
+    StopServerAndMark(server, stopped);
+    assert_false(stopped);
+    for (size_t step = 0; step < 1000 && !stopped; ++step)
+        loop.Step();
+    assert_true(stopped);
+    assert_true(server.IsStopped());
 }
 
 void test_server_forwards_successful_membership_operations(void**) {
@@ -1122,6 +1168,7 @@ int main() {
         cmocka_unit_test(test_read_write),
         cmocka_unit_test(test_read_write_payload),
         cmocka_unit_test(test_server_stages_and_removes_runtime_learner),
+        cmocka_unit_test(test_server_stop_joins_accept_and_timer_tasks),
         cmocka_unit_test(test_server_forwards_successful_membership_operations),
 #ifdef __linux__
         cmocka_unit_test(test_idempotent_client_times_out_and_retries_same_operation),

@@ -165,6 +165,12 @@ capacity changes before proposing.
   The optional built-in network server is not part of this package. Several
   milestone documents describe historical limits that later work superseded;
   a single current capability/recovery matrix would help.
+- Follow-up: `TRaftServer::Stop()` now closes the listener, retires active
+  peer and client sockets, and awaits the accept, timer, reader, connector and
+  writer work associated with those nodes. The caller must await it while the
+  poller remains active. This path requires a deadline-capable, closable
+  listener and safely retireable peer transports; arbitrary custom socket
+  adapters still need their own cancellation contract.
 
 ## Comparison with NuRaft
 
