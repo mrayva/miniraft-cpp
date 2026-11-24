@@ -1,5 +1,6 @@
 #include <miniraft/net/server.h>
 #include <cerrno>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -154,6 +155,7 @@ struct TTlsHandshakeDeadlineSocket {
     TPoller* Owner;
     std::shared_ptr<TTlsHandshakeDeadlineState> State;
 
+    NNet::TValueTask<TTlsHandshakeDeadlineSocket> Accept();
     std::suspend_never Connect(NNet::TTime) { return {}; }
     TReadAwaiter ReadSome(void*, size_t, NNet::TTime deadline) {
         State->ReadDeadline = deadline;
@@ -168,6 +170,9 @@ struct TTlsHandshakeDeadlineSocket {
         co_return ssize_t(size);
     }
 };
+NNet::TValueTask<TTlsHandshakeDeadlineSocket> TTlsHandshakeDeadlineSocket::Accept() {
+    co_return TTlsHandshakeDeadlineSocket{Owner, State};
+}
 struct TTlsHandshakeDeadlineResult {
     bool Completed = false;
     bool TimedOut = false;
@@ -176,6 +181,24 @@ NNet::TVoidTask ConnectTlsWithDeadline(NNet::TSslSocket<TTlsHandshakeDeadlineSoc
         NNet::TTime deadline, TTlsHandshakeDeadlineResult& result) {
     try {
         co_await socket.Connect(deadline);
+    } catch (const std::system_error& ex) {
+        result.TimedOut = ex.code() == std::make_error_code(std::errc::timed_out);
+    }
+    result.Completed = true;
+}
+using TTestTlsSocket = NNet::TSslSocket<TTlsHandshakeDeadlineSocket>;
+NNet::TVoidTask AcceptFakeTlsSocket(TTestTlsSocket& listener,
+        std::optional<TTestTlsSocket>& accepted) {
+    accepted.emplace(co_await listener.Accept());
+}
+struct TTlsReadResult {
+    bool Completed = false;
+    bool TimedOut = false;
+};
+NNet::TVoidTask ReadFromTlsSocket(TTestTlsSocket& socket, TTlsReadResult& result) {
+    char byte;
+    try {
+        co_await socket.ReadSome(&byte, 1);
     } catch (const std::system_error& ex) {
         result.TimedOut = ex.code() == std::make_error_code(std::errc::timed_out);
     }
@@ -577,6 +600,34 @@ void test_tls_move_assignment_releases_replaced_ssl_session(void**) {
     }
     assert_true(contextFreeCalls == 1);
 }
+void test_failed_background_tls_handshake_wakes_all_readers(void**) {
+    TPoller poller;
+    auto serverContext = NNet::TSslContext::ServerFromMem(testMemCert, testMemKey);
+    auto state = std::make_shared<TTlsHandshakeDeadlineState>();
+    TTestTlsSocket listener(TTlsHandshakeDeadlineSocket{&poller, state}, serverContext);
+    std::optional<TTestTlsSocket> accepted;
+    auto accept = AcceptFakeTlsSocket(listener, accepted);
+    assert_true(accepted.has_value());
+
+    TTlsReadResult firstResult;
+    TTlsReadResult secondResult;
+    auto first = ReadFromTlsSocket(*accepted, firstResult);
+    auto second = ReadFromTlsSocket(*accepted, secondResult);
+    assert_false(firstResult.Completed);
+    assert_false(secondResult.Completed);
+    assert_int_equal(state->TimedReadCalls, 1);
+
+    poller.TickOne();
+    assert_true(firstResult.Completed);
+    assert_true(firstResult.TimedOut);
+    assert_true(secondResult.Completed);
+    assert_true(secondResult.TimedOut);
+
+    TTlsReadResult lateResult;
+    auto late = ReadFromTlsSocket(*accepted, lateResult);
+    assert_true(lateResult.Completed);
+    assert_true(lateResult.TimedOut);
+}
 void test_socket_read_and_write_deadlines_cancel_waits(void**) {
     for (const bool write : {false, true}) {
         int sockets[2]{};
@@ -677,6 +728,7 @@ int main() {
         cmocka_unit_test(test_tls_handshake_obeys_connect_deadline),
         cmocka_unit_test(test_tls_handshake_write_obeys_connect_deadline),
         cmocka_unit_test(test_tls_move_assignment_releases_replaced_ssl_session),
+        cmocka_unit_test(test_failed_background_tls_handshake_wakes_all_readers),
         cmocka_unit_test(test_socket_read_and_write_deadlines_cancel_waits),
         cmocka_unit_test(test_tls_shutdown_wakes_retired_peer_reader),
 #endif
