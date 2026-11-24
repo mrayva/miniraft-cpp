@@ -702,7 +702,8 @@ NNet::TVoidTask ReadTlsRecord(NNet::TSslSocket<NNet::TSocket>& socket,
     }
     result.Completed = true;
 }
-NNet::TVoidTask ReadTlsUntilShutdown(std::shared_ptr<TNode<TRetirableTlsSocket>> node, bool& stopped) {
+template<typename TSocket>
+NNet::TVoidTask ReadTlsUntilShutdown(std::shared_ptr<TNode<TSocket>> node, bool& stopped) {
     char byte = 0;
     try {
         co_await node->Sock().ReadSome(&byte, 1);
@@ -712,6 +713,7 @@ NNet::TVoidTask ReadTlsUntilShutdown(std::shared_ptr<TNode<TRetirableTlsSocket>>
     stopped = true;
 }
 void test_tls_shutdown_wakes_retired_peer_reader(void**) {
+    using TTlsSocket = NNet::TSslSocket<NNet::TSocket>;
     NNet::TLoop<NNet::TPoll> loop;
     NNet::TSocket rawListener(NNet::TAddress{"127.0.0.1", 0}, loop.Poller());
     rawListener.Bind(); rawListener.Listen();
@@ -722,18 +724,18 @@ void test_tls_shutdown_wakes_retired_peer_reader(void**) {
 
     auto clientContext = NNet::TSslContext::Client();
     auto serverContext = NNet::TSslContext::ServerFromMem(testMemCert, testMemKey);
-    TRetirableTlsSocket listener(std::move(rawListener), serverContext);
-    TTlsAcceptState accepted;
-    AcceptTlsPeer(listener, serverContext, accepted);
-    auto node = std::make_shared<TNode<TRetirableTlsSocket>>(
+    TTlsRecordPeerState accepted;
+    AcceptTlsRecordPeer(rawListener, serverContext, accepted);
+    auto node = std::make_shared<TNode<TTlsSocket>>(
         [&](const NNet::TAddress& address) {
-            return TRetirableTlsSocket(NNet::TSocket(address, loop.Poller()), clientContext);
+            return TTlsSocket(NNet::TSocket(address, loop.Poller()), clientContext);
         }, "tls-peer", peerAddress, std::make_shared<TTimeSource>());
     node->Drain();
     for (size_t step = 0; step < 10000 && (!node->IsConnected() || !accepted.HandshakeComplete); ++step)
         loop.Step();
     assert_true(node->IsConnected());
     assert_true(accepted.HandshakeComplete);
+    assert_true(node->Sock().Fd() >= 0);
     assert_true(node->SupportsRetirement());
 
     node->MarkResponseReaderStarted();

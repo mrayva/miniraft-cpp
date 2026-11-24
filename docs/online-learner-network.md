@@ -51,13 +51,13 @@ voter, `UnregisterPeerTarget` (or leader-only `RemoveLearnerTarget`) can remove
 it after a stable configuration demotes it. The server shuts down the socket
 and retains the endpoint until its reader and writer coroutines unwind. The
 returned node is retired; use a fresh endpoint if that ID is registered again.
-The raw coroio TLS wrapper does not expose the shutdown hook needed for live
-removal after a response reader starts. Use
+`TSslSocket<THandle>` exposes its live native descriptor, so the server can
+shut it down and wake a pending TLS read during peer retirement. Custom socket
+wrappers that hide the descriptor need to expose `Shutdown() noexcept` or use
 `NNet::TRetirableSslSocket<THandle>` from
-`miniraft/net/retirable_ssl_socket.h` for both the server listener and peer
-endpoints when live TLS peer retirement is needed. The deterministic TLS
-lifecycle test verifies that shutdown wakes a pending TLS read and lets the
-retired node clean up.
+`miniraft/net/retirable_ssl_socket.h`. The deterministic TLS lifecycle test
+verifies retirement of the raw TLS socket and confirms that the pending read
+unwinds before the endpoint is reclaimed.
 
 The KV CLI still discovers peers at startup. Endpoint registrations are
 instance-local and are lost on restart; the application must provision them on

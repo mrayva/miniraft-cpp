@@ -58,13 +58,13 @@ the vote through the current term.
 These are `TRaft` APIs. `TRaftServer` reconciles outbound client-response readers
 after Raft messages and on its timer loop, so a promoted voter can receive
 forwarded command replies without restarting. After the stable successor commits
-a demotion, a peer endpoint can be unregistered. `TRaftServer` retires native
-TCP endpoints by shutting down their socket and retaining them until reader and
-writer coroutines unwind. Socket types without a safe shutdown hook, including
-the raw coroio TLS wrapper, must remain registered until server shutdown. For
-TLS servers, use `NNet::TRetirableSslSocket<THandle>` from
-`miniraft/net/retirable_ssl_socket.h`; it exposes the native shutdown hook used
-to wake pending TLS I/O during peer retirement.
+a demotion, a peer endpoint can be unregistered. `TRaftServer` retires socket
+types that expose `Shutdown() noexcept` or a live native `Fd()`, then retains the
+endpoint until reader and writer coroutines unwind. This includes
+`TSslSocket<THandle>`, whose native descriptor is shut down to wake pending TLS
+I/O. Custom wrappers that hide the descriptor need to expose a shutdown hook or
+use `NNet::TRetirableSslSocket<THandle>` from
+`miniraft/net/retirable_ssl_socket.h`.
 
 Incoming AppendEntries configuration records are decoded and the complete
 candidate suffix is scanned before a higher RPC term is persisted. The scan
