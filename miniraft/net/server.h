@@ -89,11 +89,17 @@ private:
 // are observed by poller coroutines; the worker never resumes a coroutine or
 // calls the poller's non-thread-safe wakeup APIs.
 class TSerializedRaftWorker {
+    static size_t ValidateQueueLimit(size_t maxQueuedJobs) {
+        if (!maxQueuedJobs)
+            throw std::invalid_argument("Serialized Raft worker queue limit must be positive");
+        return maxQueuedJobs;
+    }
+
 public:
     explicit TSerializedRaftWorker(std::recursive_mutex& accessMutex,
             size_t maxQueuedJobs = 1024)
         : AccessMutex(accessMutex)
-        , MaxQueuedJobs(maxQueuedJobs)
+        , MaxQueuedJobs(ValidateQueueLimit(maxQueuedJobs))
         , Thread([this] { Run(); }) { }
 
     TSerializedRaftWorker(const TSerializedRaftWorker&) = delete;

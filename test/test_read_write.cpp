@@ -6,6 +6,8 @@
 #include <iostream>
 #include <memory>
 #include <functional>
+#include <future>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -79,6 +81,95 @@ void test_host_endpoint_parser_validates_all_fields(void**) {
         catch (const std::invalid_argument&) { rejected = true; }
         assert_true(rejected);
     }
+}
+
+void test_serialized_raft_worker_bounds_queue_and_recovers_after_saturation(void**) {
+    using namespace std::chrono_literals;
+    std::recursive_mutex accessMutex;
+
+    bool rejectedZeroCapacity = false;
+    try {
+        TSerializedRaftWorker worker(accessMutex, 0);
+    } catch (const std::invalid_argument&) {
+        rejectedZeroCapacity = true;
+    }
+
+    TSerializedRaftWorker worker(accessMutex, 1);
+    std::mutex gateMutex;
+    std::condition_variable gateCondition;
+    bool callbackEntered = false;
+    bool releaseCallback = false;
+    std::vector<int> completionOrder;
+    auto first = worker.Submit([&] {
+        {
+            std::unique_lock lock(gateMutex);
+            callbackEntered = true;
+            gateCondition.notify_all();
+            gateCondition.wait(lock, [&] { return releaseCallback; });
+        }
+        completionOrder.push_back(1);
+        return 1;
+    });
+
+    bool sawCallbackEnter = false;
+    {
+        std::unique_lock lock(gateMutex);
+        sawCallbackEnter = gateCondition.wait_for(lock, 3s, [&] { return callbackEntered; });
+    }
+    const auto pendingWhileRunning = worker.Pending();
+    std::future<int> second;
+    bool queuedSecond = false;
+    bool rejectedThird = false;
+    size_t pendingWhileRunningAndQueued = 0;
+    if (sawCallbackEnter) {
+        second = worker.Submit([&] {
+            completionOrder.push_back(2);
+            return 2;
+        });
+        queuedSecond = true;
+        pendingWhileRunningAndQueued = worker.Pending();
+        try {
+            (void)worker.Submit([&] {
+                completionOrder.push_back(3);
+                return 3;
+            });
+        } catch (const TRaftWorkerQueueFull&) {
+            rejectedThird = true;
+        }
+    }
+
+    {
+        std::lock_guard lock(gateMutex);
+        releaseCallback = true;
+    }
+    gateCondition.notify_all();
+
+    const bool firstReady = first.wait_for(3s) == std::future_status::ready;
+    const bool secondReady = queuedSecond && second.wait_for(3s) == std::future_status::ready;
+    worker.Stop();
+    const auto pendingAfterStop = worker.Pending();
+    bool rejectedAfterStop = false;
+    try {
+        (void)worker.Submit([] { return 4; });
+    } catch (const std::logic_error&) {
+        rejectedAfterStop = true;
+    }
+
+    assert_true(rejectedZeroCapacity);
+    assert_true(sawCallbackEnter);
+    assert_true(pendingWhileRunning == 1);
+    assert_true(queuedSecond);
+    assert_true(pendingWhileRunningAndQueued == 2);
+    assert_true(rejectedThird);
+    assert_true(firstReady);
+    assert_true(secondReady);
+    assert_true(pendingAfterStop == 0);
+    assert_true(rejectedAfterStop);
+    assert_int_equal(first.get(), 1);
+    assert_int_equal(second.get(), 2);
+    assert_int_equal(completionOrder.size(), 2);
+    assert_int_equal(completionOrder[0], 1);
+    assert_int_equal(completionOrder[1], 2);
 }
 
 #ifdef __linux__
@@ -1347,6 +1438,7 @@ void test_serving_server_retires_demoted_joint_voter_reader(void**) {
 int main() {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_host_endpoint_parser_validates_all_fields),
+        cmocka_unit_test(test_serialized_raft_worker_bounds_queue_and_recovers_after_saturation),
         cmocka_unit_test(test_node_send_queue_bounds_data_and_coalesces_raft_retries),
         cmocka_unit_test(test_message_send_recv),
         cmocka_unit_test(test_read_write),
