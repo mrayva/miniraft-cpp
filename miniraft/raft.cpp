@@ -2501,8 +2501,23 @@ uint64_t TRaft::Append(TMessageHolder<TLogEntry> entry) {
     EnsureProposalLogCapacity(entry->Len, 1);
     entry->Term = State->CurrentTerm;
     const auto bytes = entry->Len;
-    State->Append(std::move(entry));
-    RecordUncommittedLogEntry(State->LastLogIndex, bytes);
+    const bool singleVoterConfiguration = Configuration &&
+        !Configuration->HasUncommittedConfiguration() &&
+        !Configuration->Committed.IsJoint() &&
+        Configuration->Committed.OldVoters().size() == 1 &&
+        Configuration->Committed.OldVoters().front() == Id;
+    if (singleVoterConfiguration) {
+        // A stable one-voter quorum is satisfied locally. Publish the entry and
+        // its commit boundary together so durable backends need only one update.
+        const auto index = State->LastLogIndex + 1;
+        std::vector<TMessageHolder<TLogEntry>> entries;
+        entries.push_back(std::move(entry));
+        State->AppendBatchAndCommit(entries, index);
+        AdvanceCommitIndex(index);
+    } else {
+        State->Append(std::move(entry));
+        RecordUncommittedLogEntry(State->LastLogIndex, bytes);
+    }
     return State->LastLogIndex;
 }
 

@@ -71,6 +71,22 @@ std::shared_ptr<TRaft> MakeRaft(
     return std::make_shared<TRaft>(std::move(state), 1, nodes);
 }
 
+struct TCountingAppendState: TState {
+    size_t AppendCalls = 0;
+    size_t AppendBatchAndCommitCalls = 0;
+
+    void Append(TMessageHolder<TLogEntry> entry) override {
+        ++AppendCalls;
+        TState::Append(std::move(entry));
+    }
+
+    void AppendBatchAndCommit(
+            const std::vector<TMessageHolder<TLogEntry>>& entries, uint64_t commitIndex) override {
+        ++AppendBatchAndCommitCalls;
+        TState::AppendBatchAndCommit(entries, commitIndex);
+    }
+};
+
 template<typename T=TMessage>
 std::vector<TMessageHolder<T>> MakeLog(const std::vector<uint64_t>& terms) {
     std::vector<TMessageHolder<T>> entries;
@@ -692,6 +708,26 @@ void test_commit_advance_wrong_term(void**) {
     assert_int_equal(s1.CommitIndex, 0);
 }
 
+void test_single_voter_proposal_publishes_append_and_commit_together(void**) {
+    auto singleState = std::make_shared<TCountingAppendState>();
+    auto singleRaft = std::make_shared<TRaft>(singleState, 1, TNodeDict{});
+    singleRaft->Become(EState::LEADER);
+    assert_int_equal(singleRaft->Append(NewHoldedMessage<TLogEntry>()), 1);
+    assert_int_equal(singleState->AppendBatchAndCommitCalls, 1);
+    assert_int_equal(singleState->CommitIndex, 1);
+    assert_int_equal(singleRaft->GetVolatileState()->CommitIndex, 1);
+
+    auto multiState = std::make_shared<TCountingAppendState>();
+    TNodeDict peers {{2, std::make_shared<TFakeNode>()}};
+    auto multiRaft = std::make_shared<TRaft>(multiState, 1, peers);
+    multiRaft->Become(EState::LEADER);
+    assert_int_equal(multiRaft->Append(NewHoldedMessage<TLogEntry>()), 1);
+    assert_int_equal(multiState->AppendBatchAndCommitCalls, 0);
+    assert_int_equal(multiState->AppendCalls, 1);
+    assert_int_equal(multiState->CommitIndex, 0);
+    assert_int_equal(multiRaft->GetVolatileState()->CommitIndex, 0);
+}
+
 void test_leader_heartbeat(void**) {
     std::vector<TMessageHolder<TMessage>> messages;
     auto onSend = [&](auto message) {
@@ -834,6 +870,7 @@ int main() {
         cmocka_unit_test(test_election_5_nodes),
         cmocka_unit_test(test_commit_advance),
         cmocka_unit_test(test_commit_advance_wrong_term),
+        cmocka_unit_test(test_single_voter_proposal_publishes_append_and_commit_together),
         cmocka_unit_test(test_leader_heartbeat),
         cmocka_unit_test(test_disk_state),
         cmocka_unit_test(test_disk_state_restore1),

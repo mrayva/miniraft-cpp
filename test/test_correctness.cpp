@@ -727,11 +727,11 @@ void test_invalid_leadership_expiration_is_rejected(void**) {
 }
 
 void test_uncommitted_log_budget_survives_disconnect_and_releases_after_commit(void**) {
-    auto state = std::make_shared<TState>();
-    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{}, std::vector<uint32_t>{},
-        TRaft::TLogLimits{.MaxUncommittedBytes = 1024, .MaxUncommittedEntries = 2});
-    raft->ProcessTimeout({});
-    assert_int_equal(raft->CurrentStateName(), EState::LEADER);
+    TCluster cluster(3, TRaft::TLogLimits{
+        .MaxUncommittedBytes = 1024, .MaxUncommittedEntries = 2});
+    cluster.Elect(1);
+    auto raft = cluster.Nodes[0];
+    auto state = raft->GetState();
 
     TWriteClient client(raft);
     client.Write(31, "survives disconnect");
@@ -743,7 +743,7 @@ void test_uncommitted_log_budget_survives_disconnect_and_releases_after_commit(v
     assert_int_equal(client.Replies[0].Cookie, 32);
     assert_int_equal(client.Replies[0].Error, TCommandResponse::Overloaded);
 
-    raft->ProcessTimeout({});
+    cluster.Replicate(1);
     assert_true(state->CommitIndex >= acceptedIndex);
     client.Write(33, "capacity released");
     assert_int_equal(raft->GetLastIndex(), acceptedIndex + 1);
