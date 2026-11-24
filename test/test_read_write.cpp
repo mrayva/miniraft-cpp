@@ -202,10 +202,13 @@ void test_server_poller_progresses_while_worker_callback_is_blocked(void**) {
 
     bool timerFired = false;
     if (gateEntered()) {
-        auto timer = [&]() -> NNet::TVoidTask {
+        // Keep the coroutine lambda closure alive until its suspended task
+        // completes; the coroutine frame retains a pointer to that closure.
+        auto timerTask = [&]() -> NNet::TVoidTask {
             co_await loop.Poller().Sleep(10ms);
             timerFired = true;
-        }();
+        };
+        auto timer = timerTask();
         (void)timer;
         const auto timerDeadline = NNet::TClock::now() + 1s;
         while (!timerFired && NNet::TClock::now() < timerDeadline) loop.Step();
