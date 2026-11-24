@@ -39,10 +39,11 @@ class TRetirableSslSocket final : public TSslSocket<THandle> {
         , Fd_(init.Fd)
     { }
 
-    // Accepted sockets are inbound clients, not Raft peer targets. Their
-    // reader lifetime remains managed by the accepted connection coroutine.
-    TRetirableSslSocket(TBase&& socket, TAcceptedTag)
+    // Accepted sockets also retain their native handle so server shutdown can
+    // interrupt a TLS reader blocked on that client connection.
+    TRetirableSslSocket(TBase&& socket, TAcceptedTag, int fd)
         : TBase(std::move(socket))
+        , Fd_(fd)
     { }
 
 public:
@@ -77,9 +78,24 @@ public:
 #endif
     }
 
+    void Close() {
+        if (Fd_ < 0) return;
+        TBase::Close();
+        Fd_ = -1;
+    }
+
     TValueTask<TRetirableSslSocket> Accept() {
         auto socket = co_await TBase::Accept();
-        co_return TRetirableSslSocket(std::move(socket), TAcceptedTag{});
+        const auto fd = socket.Fd();
+        co_return TRetirableSslSocket(std::move(socket), TAcceptedTag{}, fd);
+    }
+
+    TValueTask<TRetirableSslSocket> Accept(TTime deadline)
+        requires requires(TBase& socket, TTime until) { socket.Accept(until); }
+    {
+        auto socket = co_await TBase::Accept(deadline);
+        const auto fd = socket.Fd();
+        co_return TRetirableSslSocket(std::move(socket), TAcceptedTag{}, fd);
     }
 
 private:

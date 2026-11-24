@@ -170,7 +170,9 @@ capacity changes before proposing.
   writer work associated with those nodes. The caller must await it while the
   poller remains active. This path requires a deadline-capable, closable
   listener and safely retireable peer transports; arbitrary custom socket
-  adapters still need their own cancellation contract.
+  adapters still need their own cancellation contract. The built-in retirable
+  TLS adapter now forwards deadline accept and close, and retains the accepted
+  socket handle so shutdown can interrupt client TLS reads.
 
 ## Comparison with NuRaft
 
