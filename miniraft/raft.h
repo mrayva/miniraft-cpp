@@ -785,6 +785,9 @@ private:
         size_t CoveredPrefixCapacity = 0;
         std::shared_ptr<TIncomingSnapshotFile> File;
         std::optional<TMetadataContext> ValidatedMetadata;
+        // Retain the first chunk's wire fence so later chunks cannot reveal a
+        // joint snapshot after its magic was split across transport messages.
+        bool JointElectionFenceLeader = false;
     };
     std::optional<TIncomingSnapshot> IncomingSnapshot;
     std::shared_ptr<const TSnapshotEncoding> EncodedSnapshot;

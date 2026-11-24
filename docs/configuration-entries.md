@@ -42,8 +42,10 @@ majority. The leader advances the joint entry's commit index only after a strict
 old-side majority of fence-capable voters has acknowledged that entry. A
 configuration-bearing AppendEntries and a snapshot that carries joint
 membership metadata use a reserved leader marker; current receivers reject an
-unmarked transition from an older leader. Older binaries leave these reserved
-response and request bits zero.
+unmarked transition from an older leader. Receivers retain that marker across
+snapshot chunks and reject a joint image as soon as its complete magic is
+available, even when a sender splits the magic across the first chunks. Older
+binaries leave these reserved response and request bits zero.
 Every voter in the proposed stable set must separately advertise application
 snapshot restore support; newly added voters must advertise storage and
 application snapshot installation support. This lets an operator remove a

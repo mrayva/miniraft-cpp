@@ -3400,6 +3400,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
                 .Success = uint32_t(success), .Installed = uint32_t(installed)}));
     };
     if (request->Term < State->CurrentTerm) { reply(false, false, 0); return; }
+    const bool jointElectionFenceLeader = request->Done &
+        TInstallSnapshotRequest::JointElectionFenceLeader;
     // Partial or unsupported image headers are not evidence of leader contact.
     // In particular, do not demote a candidate or refresh its election timer
     // until the complete bounded metadata prefix is supported.
@@ -3433,6 +3435,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             IncomingSnapshot.reset(); // Release the superseded assembly before reserving its replacement.
             IncomingSnapshot = TIncomingSnapshot{request->Term, request->SnapshotIndex, request->SnapshotTerm,
                 request->TotalBytes, request->LeaderId, now, {}};
+            IncomingSnapshot->JointElectionFenceLeader = jointElectionFenceLeader;
         }
         auto& incoming = *IncomingSnapshot;
         const char* prefix = incoming.File ? incoming.File->Data() :
@@ -3519,6 +3522,10 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         if (!IsSupportedSnapshotMagicPrefix(receivedPrefix)) {
             IncomingSnapshot.reset(); reply(false, false, 0); return;
         }
+        if (SnapshotNeedsJointElectionFence(receivedPrefix) &&
+            !incoming.JointElectionFenceLeader) {
+            IncomingSnapshot.reset(); reply(false, false, 0); return;
+        }
         if (!probe.Complete) {
             // Once the base voter lists authenticate this sender, record its
             // term even if configuration-history metadata spans later chunks.
@@ -3570,6 +3577,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         IncomingSnapshot = TIncomingSnapshot{request->Term, request->SnapshotIndex, request->SnapshotTerm,
             request->TotalBytes, request->LeaderId, now, std::move(image), 0, true,
             std::move(reservation), {}, 0, std::move(file)};
+        IncomingSnapshot->JointElectionFenceLeader = jointElectionFenceLeader;
     }
     auto& incoming = *IncomingSnapshot;
     const char* bytes = incoming.File ? incoming.File->Data() : incoming.Bytes.data();
@@ -3595,6 +3603,10 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     if (advanced) IncomingSnapshot->LastProgress = now;
     const std::string_view receivedImage(bytes, size_t(receivedBytes));
     if (!IsSupportedSnapshotMagicPrefix(receivedImage)) {
+        IncomingSnapshot.reset(); reply(false, false, 0); return;
+    }
+    if (SnapshotNeedsJointElectionFence(receivedImage) &&
+        !incoming.JointElectionFenceLeader) {
         IncomingSnapshot.reset(); reply(false, false, 0); return;
     }
     const auto knownSnapshot = State->GetSnapshot();

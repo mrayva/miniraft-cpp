@@ -266,7 +266,7 @@ void test_fresh_learner_bootstraps_stable_and_joint_membership_snapshots(void**)
     TKv image;
     const auto data = image.SaveSnapshot();
     auto deliver = [&](TSnapshot snapshot, const std::vector<uint32_t>& bootstrapVoters,
-            bool expectedInstall, bool priorLog = false) {
+            bool expectedInstall, bool priorLog = false, bool jointElectionFenceLeader = true) {
         constexpr uint32_t learnerId = 10;
         std::vector<TMessageHolder<TMessage>> replies;
         TNodeDict peers;
@@ -289,7 +289,7 @@ void test_fresh_learner_bootstraps_stable_and_joint_membership_snapshots(void**)
         request->SnapshotIndex = snapshot.Index; request->SnapshotTerm = snapshot.Term;
         request->Offset = 0; request->TotalBytes = encoded.size();
         request->Done = TInstallSnapshotRequest::DoneFlag |
-            TInstallSnapshotRequest::JointElectionFenceLeader;
+            (jointElectionFenceLeader ? TInstallSnapshotRequest::JointElectionFenceLeader : 0u);
         request->LeaderId = bootstrapVoters.front();
         memcpy(request->Data, encoded.data(), encoded.size());
         raft->Process({}, request);
@@ -325,12 +325,57 @@ void test_fresh_learner_bootstraps_stable_and_joint_membership_snapshots(void**)
     TSnapshot stable{5, 2, {1, 2, 3}, data};
     stable.StableConfiguration = true;
     stable.ConfigurationIndex = 2; stable.ConfigurationTerm = 2;
-    deliver(stable, {1, 2, 3}, true);
+    deliver(stable, {1, 2, 3}, true, false, false);
 
     TSnapshot joint{5, 2, {1, 2, 3}, data};
     joint.JointVoters = {3, 4, 5};
     joint.ConfigurationIndex = 3; joint.ConfigurationTerm = 2;
     deliver(joint, {1, 2, 3, 4, 5}, true);
+
+    // An unmarked sender cannot hide joint membership behind a short first
+    // chunk. The first four bytes are accepted only as an untrusted prefix;
+    // once the complete magic identifies a joint image, the transfer is
+    // rejected before term, snapshot, or application state changes.
+    {
+        constexpr uint32_t learnerId = 10;
+        std::vector<TMessageHolder<TMessage>> replies;
+        TNodeDict peers;
+        for (auto id : {1u, 2u, 3u, 4u, 5u})
+            peers[id] = std::make_shared<TEndpoint>([&](auto message) { replies.push_back(std::move(message)); });
+        auto state = std::make_shared<TState>();
+        auto raft = std::make_shared<TRaft>(state, learnerId, peers, std::vector<uint32_t>{learnerId});
+        auto application = std::make_shared<TApp>();
+        TRequestProcessor processor(raft, application, peers);
+        auto splitJoint = joint;
+        splitJoint.Term = 1;
+        splitJoint.ConfigurationTerm = 1;
+        const auto encoded = EncodeSnapshot(splitJoint);
+        auto sendChunk = [&](uint64_t offset, uint32_t count, bool done) {
+            auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
+            request->Seqno = offset + 1;
+            request->Src = 1; request->Dst = learnerId; request->Term = state->CurrentTerm;
+            request->SnapshotIndex = splitJoint.Index; request->SnapshotTerm = splitJoint.Term;
+            request->Offset = offset; request->TotalBytes = encoded.size();
+            request->Done = done ? TInstallSnapshotRequest::DoneFlag : 0u;
+            request->LeaderId = 1;
+            memcpy(request->Data, encoded.data() + offset, count);
+            raft->Process({}, request);
+        };
+        sendChunk(0, 4, false);
+        assert_int_equal(replies.size(), 1);
+        auto prefixReply = replies.back().Cast<TInstallSnapshotResponse>();
+        assert_true(prefixReply->Success); assert_false(prefixReply->Installed);
+        assert_int_equal(prefixReply->NextOffset, 4);
+        sendChunk(4, static_cast<uint32_t>(encoded.size() - 4), true);
+        assert_int_equal(replies.size(), 2);
+        auto rejectedReply = replies.back().Cast<TInstallSnapshotResponse>();
+        assert_false(rejectedReply->Success); assert_false(rejectedReply->Installed);
+        assert_int_equal(rejectedReply->NextOffset, 0);
+        assert_int_equal(state->CurrentTerm, 1);
+        assert_int_equal(state->SnapshotIndex, 0);
+        assert_int_equal(state->CommitIndex, 0);
+        assert_int_equal(application->LastAppliedIndex, 0);
+    }
 
     TSnapshot wrongSet{5, 2, {1, 2, 4}, data};
     wrongSet.StableConfiguration = true;
