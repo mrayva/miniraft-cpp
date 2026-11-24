@@ -137,6 +137,7 @@ void test_learner_messages_cannot_change_voter_term_or_leadership(void**) {
     messages.push_back(NewHoldedMessage(header, TAppendEntriesRequest{.LeaderId = 4}));
     messages.push_back(NewHoldedMessage(header, TAppendEntriesResponse{.MatchIndex = 0, .Success = 0}));
     auto install = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + 1);
+    install->Seqno = 1;
     install->Src = 4; install->Dst = 1; install->Term = 99; install->SnapshotIndex = 1; install->SnapshotTerm = 1;
     install->TotalBytes = 44; install->LeaderId = 4; install->Data[0] = 'x'; messages.push_back(install);
     messages.push_back(NewHoldedMessage(header, TInstallSnapshotResponse{.SnapshotIndex = 1}));
@@ -283,6 +284,7 @@ void test_fresh_learner_bootstraps_stable_and_joint_membership_snapshots(void**)
         TRequestProcessor processor(raft, application, peers);
         const auto encoded = EncodeSnapshot(snapshot);
         auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + encoded.size());
+        request->Seqno = 1;
         request->Src = bootstrapVoters.front(); request->Dst = learnerId; request->Term = 3;
         request->SnapshotIndex = snapshot.Index; request->SnapshotTerm = snapshot.Term;
         request->Offset = 0; request->TotalBytes = encoded.size(); request->Done = 1;

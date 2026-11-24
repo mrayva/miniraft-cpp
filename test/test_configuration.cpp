@@ -298,6 +298,7 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
         for (size_t offset = 0; offset < image.size();) {
             const auto count = std::min<size_t>(TInstallSnapshotRequest::MaxChunkBytes, image.size() - offset);
             auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
+            request->Seqno = offset + 1;
             request->Src = 4; request->Dst = 1; request->Term = stableImage.Term + 1;
             request->SnapshotIndex = stableImage.Index; request->SnapshotTerm = stableImage.Term;
             request->Offset = offset; request->TotalBytes = image.size();
@@ -324,6 +325,7 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
     for (size_t offset = 0; offset < bytes.size();) {
         const auto count = std::min<size_t>(TInstallSnapshotRequest::MaxChunkBytes, bytes.size() - offset);
         auto retainedRequest = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
+        retainedRequest->Seqno = offset + 1;
         retainedRequest->Src = 2; retainedRequest->Dst = 4; retainedRequest->Term = stableImage.Term + 1;
         retainedRequest->SnapshotIndex = stableImage.Index; retainedRequest->SnapshotTerm = stableImage.Term;
         retainedRequest->Offset = offset; retainedRequest->TotalBytes = bytes.size();
@@ -429,6 +431,7 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
         const auto count = std::min<size_t>(TInstallSnapshotRequest::MaxChunkBytes,
             encodedJointImage.size() - offset);
         auto install = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
+        install->Seqno = offset + 1;
         install->Src = leaderId; install->Dst = learnerId; install->Term = jointImage.Term + 1;
         install->SnapshotIndex = jointImage.Index; install->SnapshotTerm = jointImage.Term;
         install->Offset = offset; install->TotalBytes = encodedJointImage.size();
@@ -1684,6 +1687,7 @@ void test_removed_member_rejoins_from_fresh_snapshot_after_compaction(void**) {
             const TSnapshot& image, uint32_t senderId) {
         const auto bytes = EncodeSnapshot(image);
         auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + bytes.size());
+        request->Seqno = 1;
         request->Src = senderId; request->Dst = receiverId; request->Term = term;
         request->SnapshotIndex = image.Index; request->SnapshotTerm = image.Term;
         request->Offset = 0; request->TotalBytes = bytes.size(); request->Done = 1;
@@ -1944,6 +1948,7 @@ void test_removed_member_rejoins_through_fresh_joint_snapshot_bootstrap(void**) 
         const auto jointBytes = EncodeSnapshot(jointSnapshot);
         auto makeInstallRequest = [&](uint32_t receiverId) {
             auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + jointBytes.size());
+            request->Seqno = 1;
             request->Src = 1; request->Dst = receiverId; request->Term = 3;
             request->SnapshotIndex = jointSnapshot.Index; request->SnapshotTerm = jointSnapshot.Term;
             request->Offset = 0; request->TotalBytes = jointBytes.size(); request->Done = 1;
@@ -3521,6 +3526,7 @@ void test_snapshot_transfer_before_uncommitted_configuration_preserves_suffix(vo
     auto sendSnapshot = [&](const TSnapshot& image, uint64_t rpcTerm, uint32_t leaderId = 1) {
         const auto bytes = EncodeSnapshot(image);
         auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + bytes.size());
+        request->Seqno = 1;
         request->Src = leaderId; request->Dst = 2; request->Term = rpcTerm;
         request->SnapshotIndex = image.Index; request->SnapshotTerm = image.Term;
         request->Offset = 0; request->TotalBytes = bytes.size(); request->Done = 1; request->LeaderId = leaderId;
@@ -4592,6 +4598,7 @@ void test_verified_multihop_disjoint_snapshot_recovers_and_readds_stale_voter(vo
         const auto beforeApplicationInstall = staleApplication->LastAppliedIndex;
         const auto encoded = EncodeSnapshot(verified);
         auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + encoded.size());
+        request->Seqno = 1;
         request->Src = 7; request->Dst = 2; request->Term = 5;
         request->SnapshotIndex = verified.Index; request->SnapshotTerm = verified.Term;
         request->Offset = 0; request->TotalBytes = encoded.size(); request->Done = 1;
@@ -4728,6 +4735,7 @@ void test_stale_snapshot_missing_new_voter_target_is_rejected_before_install(voi
     auto install = [&](uint64_t term) {
         auto request = NewHoldedMessage<TInstallSnapshotRequest>(
             sizeof(TInstallSnapshotRequest) + encoded.size());
+        request->Seqno = 1;
         request->Src = 2;
         request->Dst = 3;
         request->Term = term;
@@ -4809,6 +4817,7 @@ void test_high_term_snapshot_metadata_spanning_chunks_progresses(void**) {
 
     auto sendChunk = [&](size_t offset, size_t count) {
         auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
+        request->Seqno = offset + 1;
         request->Src = 2;
         request->Dst = 1;
         request->Term = 3;
@@ -4899,6 +4908,7 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
     auto sendSnapshot = [&](const TSnapshot& snapshot, uint32_t leaderId, uint64_t rpcTerm = 5) {
         const auto encoded = EncodeSnapshot(snapshot);
         auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + encoded.size());
+        request->Seqno = 1;
         request->Src = leaderId; request->Dst = 3; request->Term = rpcTerm;
         request->SnapshotIndex = snapshot.Index; request->SnapshotTerm = snapshot.Term;
         request->Offset = 0; request->TotalBytes = encoded.size(); request->Done = 1;
@@ -4944,6 +4954,7 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
     const auto middleBytes = EncodeSnapshot(image);
     auto middleRequest = NewHoldedMessage<TInstallSnapshotRequest>(
         sizeof(TInstallSnapshotRequest) + middleBytes.size());
+    middleRequest->Seqno = 1;
     middleRequest->Src = 2; middleRequest->Dst = 3; middleRequest->Term = 5;
     middleRequest->SnapshotIndex = image.Index; middleRequest->SnapshotTerm = image.Term;
     middleRequest->Offset = 0; middleRequest->TotalBytes = middleBytes.size(); middleRequest->Done = 1;
@@ -4966,6 +4977,7 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
     const auto shorterHistoryBytes = EncodeSnapshot(shorterHistoryImage);
     auto shorterHistoryRequest = NewHoldedMessage<TInstallSnapshotRequest>(
         sizeof(TInstallSnapshotRequest) + shorterHistoryBytes.size());
+    shorterHistoryRequest->Seqno = 1;
     shorterHistoryRequest->Src = 2; shorterHistoryRequest->Dst = 3; shorterHistoryRequest->Term = 5;
     shorterHistoryRequest->SnapshotIndex = shorterHistoryImage.Index;
     shorterHistoryRequest->SnapshotTerm = shorterHistoryImage.Term;
@@ -4999,6 +5011,7 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
         TRequestProcessor lineageProcessor(lineageRaft, lineageApplication, lineagePeers);
         auto request = NewHoldedMessage<TInstallSnapshotRequest>(
             sizeof(TInstallSnapshotRequest) + forgedHistoryBytes.size());
+        request->Seqno = 1;
         request->Src = 2; request->Dst = 1; request->Term = 4;
         request->SnapshotIndex = forgedHistoryImage.Index; request->SnapshotTerm = forgedHistoryImage.Term;
         request->Offset = 0; request->TotalBytes = forgedHistoryBytes.size(); request->Done = 1;
@@ -5058,6 +5071,7 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
         const auto encoded = EncodeSnapshot(jointImage);
         auto request = NewHoldedMessage<TInstallSnapshotRequest>(
             sizeof(TInstallSnapshotRequest) + encoded.size());
+        request->Seqno = 1;
         request->Src = leaderId; request->Dst = 3; request->Term = 6;
         request->SnapshotIndex = jointImage.Index; request->SnapshotTerm = jointImage.Term;
         request->Offset = 0; request->TotalBytes = encoded.size(); request->Done = 1;
@@ -5096,6 +5110,7 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
     const auto shorterSuccessorBytes = EncodeSnapshot(shorterSuccessorImage);
     auto stableSuccessorRequest = NewHoldedMessage<TInstallSnapshotRequest>(
         sizeof(TInstallSnapshotRequest) + shorterSuccessorBytes.size());
+    stableSuccessorRequest->Seqno = 1;
     stableSuccessorRequest->Src = 4; stableSuccessorRequest->Dst = 3; stableSuccessorRequest->Term = 7;
     stableSuccessorRequest->SnapshotIndex = shorterSuccessorImage.Index;
     stableSuccessorRequest->SnapshotTerm = shorterSuccessorImage.Term;
@@ -5131,6 +5146,7 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
         TRequestProcessor staleLineageProcessor(staleLineageRaft, staleLineageApplication, staleLineagePeers);
         auto request = NewHoldedMessage<TInstallSnapshotRequest>(
             sizeof(TInstallSnapshotRequest) + forgedStaleBytes.size());
+        request->Seqno = 1;
         request->Src = 4; request->Dst = 3; request->Term = 6;
         request->SnapshotIndex = forgedStaleImage.Index; request->SnapshotTerm = forgedStaleImage.Term;
         request->Offset = 0; request->TotalBytes = forgedStaleBytes.size(); request->Done = 1;
@@ -5166,6 +5182,7 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
             staleJointLineageApplication, staleJointLineagePeers);
         auto request = NewHoldedMessage<TInstallSnapshotRequest>(
             sizeof(TInstallSnapshotRequest) + forgedJointStaleBytes.size());
+        request->Seqno = 1;
         request->Src = 2; request->Dst = 3; request->Term = 6;
         request->SnapshotIndex = forgedJointStaleImage.Index; request->SnapshotTerm = forgedJointStaleImage.Term;
         request->Offset = 0; request->TotalBytes = forgedJointStaleBytes.size(); request->Done = 1;
@@ -5207,6 +5224,7 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
         TRequestProcessor sparseJointProcessor(sparseJointRaft, sparseJointApplication, sparseJointPeers);
         auto request = NewHoldedMessage<TInstallSnapshotRequest>(
             sizeof(TInstallSnapshotRequest) + forgedSuccessorBytes.size());
+        request->Seqno = 1;
         request->Src = 4; request->Dst = 3; request->Term = 7;
         request->SnapshotIndex = forgedSuccessorImage.Index; request->SnapshotTerm = forgedSuccessorImage.Term;
         request->Offset = 0; request->TotalBytes = forgedSuccessorBytes.size(); request->Done = 1;
