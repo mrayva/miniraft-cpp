@@ -148,6 +148,86 @@ void test_idempotent_client_times_out_and_retries_same_operation(void**) {
     assert_memory_equal(first.Mes, retried.Mes, first->Len);
     assert_false(store->Saved->HasPending);
 }
+
+void test_server_poller_progresses_while_worker_callback_is_blocked(void**) {
+    using namespace std::chrono_literals;
+    struct TGate {
+        std::mutex Mutex;
+        std::condition_variable Condition;
+        bool Entered = false;
+        bool Released = false;
+    };
+    struct TBlockingRsm final : TDummyRsm {
+        std::shared_ptr<TGate> Gate;
+        void Validate(TMessageHolder<TCommandRequest>) const override {
+            std::unique_lock lock(Gate->Mutex);
+            Gate->Entered = true;
+            Gate->Condition.notify_all();
+            Gate->Condition.wait(lock, [&] { return Gate->Released; });
+        }
+    };
+
+    NNet::TLoop<NNet::TPoll> loop;
+    loop.Poller().SetMaxDuration(1ms);
+    auto timeSource = std::make_shared<TTimeSource>();
+    NNet::TSocket listener(NNet::TAddress{"127.0.0.1", 0}, loop.Poller());
+    listener.Bind();
+    listener.Listen();
+    sockaddr_in bound{};
+    socklen_t boundSize = sizeof(bound);
+    assert_int_equal(::getsockname(listener.Fd(), reinterpret_cast<sockaddr*>(&bound), &boundSize), 0);
+    const NNet::TAddress address(reinterpret_cast<sockaddr*>(&bound), boundSize);
+
+    auto gate = std::make_shared<TGate>();
+    auto rsm = std::make_shared<TBlockingRsm>();
+    rsm->Gate = gate;
+    auto raft = std::make_shared<TRaft>(std::make_shared<TState>(), 1, TNodeDict{});
+    TRaftServer<NNet::TSocket> server(
+        loop.Poller(), std::move(listener), raft, rsm, TNodeDict{}, timeSource);
+    server.Serve();
+
+    NNet::TSocket client(address, loop.Poller());
+    auto sendRequest = [](NNet::TSocket& socket) -> NNet::TVoidTask {
+        co_await socket.Connect();
+        co_await TMessageWriter(socket).Write(NewHoldedMessage<TCommandRequest>());
+    }(client);
+    (void)sendRequest;
+
+    const auto gateEntered = [&] {
+        std::lock_guard lock(gate->Mutex);
+        return gate->Entered;
+    };
+    const auto deadline = NNet::TClock::now() + 3s;
+    while (!gateEntered() && NNet::TClock::now() < deadline) loop.Step();
+
+    bool timerFired = false;
+    if (gateEntered()) {
+        auto timer = [&]() -> NNet::TVoidTask {
+            co_await loop.Poller().Sleep(10ms);
+            timerFired = true;
+        }();
+        (void)timer;
+        const auto timerDeadline = NNet::TClock::now() + 1s;
+        while (!timerFired && NNet::TClock::now() < timerDeadline) loop.Step();
+    }
+    const bool callbackStillBlocked = [&] {
+        std::lock_guard lock(gate->Mutex);
+        return gate->Entered && !gate->Released;
+    }();
+    {
+        std::lock_guard lock(gate->Mutex);
+        gate->Released = true;
+    }
+    gate->Condition.notify_all();
+
+    bool stopped = false;
+    StopServerAndMark(server, stopped);
+    const auto stopDeadline = NNet::TClock::now() + 3s;
+    while (!stopped && NNet::TClock::now() < stopDeadline) loop.Step();
+    assert_true(stopped);
+    assert_true(timerFired);
+    assert_true(callbackStillBlocked);
+}
 #endif
 
 void test_node_send_queue_bounds_data_and_coalesces_raft_retries(void**) {
@@ -1124,6 +1204,7 @@ int RunServingServerMembershipReaderTest(const std::filesystem::path& dir) {
     auto joiningPeer = makePeer("joining-voter");
     server.RegisterPeerTarget(3, joiningPeer);
     server.Serve(); // Starts readers for voters 1/2 and staged target 3.
+    return server.WithSerializedRaft([&](TRaft&) -> int {
     if (!joiningPeer->HasResponseReader()) return 8;
 
     auto* volatileState = const_cast<TVolatileState*>(raft->GetVolatileState());
@@ -1240,6 +1321,7 @@ int RunServingServerMembershipReaderTest(const std::filesystem::path& dir) {
     if (removedReplacement != replacementPeer || !removedReplacement->IsRetired() ||
         raft->GetLearnerIds() != std::vector<uint32_t>({4, 5, 6})) return 7;
     return 0;
+    });
 }
 
 void test_serving_server_retires_demoted_joint_voter_reader(void**) {
@@ -1271,6 +1353,7 @@ int main() {
         cmocka_unit_test(test_server_forwards_successful_membership_operations),
 #ifdef __linux__
         cmocka_unit_test(test_idempotent_client_times_out_and_retries_same_operation),
+        cmocka_unit_test(test_server_poller_progresses_while_worker_callback_is_blocked),
         cmocka_unit_test(test_server_transitions_membership_and_installs_joint_snapshot_over_socket_transport),
         cmocka_unit_test(test_serving_server_retires_demoted_joint_voter_reader),
 #endif

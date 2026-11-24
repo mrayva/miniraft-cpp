@@ -25,12 +25,12 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(
             ~TReaderGuard() { Node->MarkResponseReaderStopped(); }
         } readerGuard{client};
         Nodes.insert(client);
-        InboundLastActivity.emplace(client, TimeSource->Now());
+        InboundLastActivity.emplace(client, CurrentTime());
         bool peerIdentityResolved = false;
         std::optional<uint32_t> authenticatedPeerId;
         while (true) {
             auto mes = co_await TMessageReader(client->Sock(), {}, InboundMessageBudget).Read();
-            InboundLastActivity[client] = TimeSource->Now();
+            InboundLastActivity[client] = CurrentTime();
             if (ResolvePeerIdentity && !peerIdentityResolved) {
                 authenticatedPeerId = ResolvePeerIdentity(client->Sock());
                 peerIdentityResolved = true;
@@ -43,7 +43,10 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(
                         mes.template Cast<TMessageEx>()->Src != *authenticatedPeerId))
                     throw TMessageError("Peer message source does not match authenticated identity");
             }
-            // client request
+            const auto now = CurrentTime();
+            bool handledCapabilities = false;
+            // Capability negotiation changes transport state and stays on the
+            // poller. Raft and application callbacks below run on the worker.
             if (auto maybeCapabilities = mes.template Maybe<TPeerCapabilitiesRequest>()) {
                 auto request = maybeCapabilities.Cast();
                 if (!request->ConnectionId || !request->MinVersion ||
@@ -58,32 +61,44 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(
                         TPeerCapabilitiesRequest::SessionizedForwarding) : 0;
                 response->ConnectionId = request->ConnectionId;
                 client->Send(std::move(response));
-            } else if (auto maybeSessionForwardedRequest = mes.template Maybe<TSessionForwardedCommandRequest>()) {
-                RequestProcessor->OnSessionForwardedCommandRequest(
-                    std::move(maybeSessionForwardedRequest.Cast()), client);
-            } else if (auto maybeSessionForwardedResponse = mes.template Maybe<TSessionForwardedCommandResponse>()) {
-                RequestProcessor->OnSessionForwardedCommandResponse(
-                    std::move(maybeSessionForwardedResponse.Cast()), client);
-            } else if (auto maybeForwardedRequest = mes.template Maybe<TForwardedCommandRequest>()) {
-                RequestProcessor->OnForwardedCommandRequest(std::move(maybeForwardedRequest.Cast()), client);
-            } else if (auto maybeForwardedResponse = mes.template Maybe<TForwardedCommandResponse>()) {
-                RequestProcessor->OnForwardedCommandResponse(std::move(maybeForwardedResponse.Cast()), client);
-            } else if (auto maybeIdempotentRequest = mes.template Maybe<TIdempotentCommandRequest>()) {
-                RequestProcessor->OnIdempotentCommandRequest(
-                    std::move(maybeIdempotentRequest.Cast()), client);
-            } else if (auto maybeCommandRequest = mes.template Maybe<TCommandRequest>()) {
-                RequestProcessor->OnCommandRequest(std::move(maybeCommandRequest.Cast()), client);
-            } else if (auto maybeCommandResponse = mes.template Maybe<TCommandResponse>()) {
-                RequestProcessor->OnCommandResponse(std::move(maybeCommandResponse.Cast()), client);
-            } else {
-                Raft->Process(TimeSource->Now(), std::move(mes), client);
-                ReconcilePeerReaders();
+                handledCapabilities = true;
             }
-            Raft->ProcessTimeout(TimeSource->Now());
+
+            auto processTick = [this, now] {
+                Raft->ProcessTimeout(now);
+                RequestProcessor->CheckStateChange();
+                RequestProcessor->ProcessCommitted();
+                RequestProcessor->ProcessWaiting();
+            };
+            if (handledCapabilities) {
+                co_await RunOnRaftWorker(processTick);
+            } else {
+                co_await RunOnRaftWorker([this, request = std::move(mes), client,
+                        now, processTick = std::move(processTick)]() mutable {
+                    if (auto maybe = request.template Maybe<TSessionForwardedCommandRequest>()) {
+                        RequestProcessor->OnSessionForwardedCommandRequest(
+                            std::move(maybe.Cast()), client);
+                    } else if (auto maybe = request.template Maybe<TSessionForwardedCommandResponse>()) {
+                        RequestProcessor->OnSessionForwardedCommandResponse(
+                            std::move(maybe.Cast()), client);
+                    } else if (auto maybe = request.template Maybe<TForwardedCommandRequest>()) {
+                        RequestProcessor->OnForwardedCommandRequest(std::move(maybe.Cast()), client);
+                    } else if (auto maybe = request.template Maybe<TForwardedCommandResponse>()) {
+                        RequestProcessor->OnForwardedCommandResponse(std::move(maybe.Cast()), client);
+                    } else if (auto maybe = request.template Maybe<TIdempotentCommandRequest>()) {
+                        RequestProcessor->OnIdempotentCommandRequest(
+                            std::move(maybe.Cast()), client);
+                    } else if (auto maybe = request.template Maybe<TCommandRequest>()) {
+                        RequestProcessor->OnCommandRequest(std::move(maybe.Cast()), client);
+                    } else if (auto maybe = request.template Maybe<TCommandResponse>()) {
+                        RequestProcessor->OnCommandResponse(std::move(maybe.Cast()), client);
+                    } else {
+                        Raft->Process(now, std::move(request), client);
+                    }
+                    processTick();
+                });
+            }
             ReconcilePeerReaders();
-            RequestProcessor->CheckStateChange();
-            RequestProcessor->ProcessCommitted();
-            RequestProcessor->ProcessWaiting();
             DrainNodes();
         }
     } catch (const std::exception & ex) {
@@ -91,7 +106,11 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(
     }
     InboundLastActivity.erase(client);
     Nodes.erase(client);
-    RequestProcessor->CleanUp(client);
+    try {
+        co_await RunOnRaftWorker([this, client] { RequestProcessor->CleanUp(client); });
+    } catch (const std::exception& ex) {
+        std::cerr << "Request cleanup exception: " << ex.what() << "\n";
+    }
     if (client && client->IsRetired()) {
         client->Drain();
         if (!client->RetirementComplete()) RetiredPeerNodes.insert(client);
@@ -166,6 +185,8 @@ NNet::TValueTask<TSocket> TRaftServer<TSocket>::AcceptWithDeadline() {
 template<typename TSocket>
 void TRaftServer<TSocket>::RegisterPeerTargetImpl(
         uint32_t id, std::shared_ptr<TNode<TSocket>> node, bool stageLearner) {
+    WaitForPriorRaftWork();
+    typename TRaftServer<TSocket>::TSerializedAccessGuard lock(*this);
     if (Stopping) throw std::logic_error("Cannot register peers on a stopped Raft server");
     if (!node || node->IsRetired()) throw std::invalid_argument("Invalid peer target endpoint");
     auto [peer, insertedPeer] = PeerNodes.emplace(id, node);
@@ -200,6 +221,8 @@ void TRaftServer<TSocket>::RegisterPeerTarget(uint32_t id, std::shared_ptr<TNode
 template<typename TSocket>
 std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::ReplacePeerTarget(
         uint32_t id, std::shared_ptr<TNode<TSocket>> node) {
+    WaitForPriorRaftWork();
+    typename TRaftServer<TSocket>::TSerializedAccessGuard lock(*this);
     if (!node || node->IsRetired()) throw std::invalid_argument("Invalid replacement peer endpoint");
     auto peer = PeerNodes.find(id);
     if (peer == PeerNodes.end()) throw std::invalid_argument("Unknown network peer target");
@@ -253,6 +276,8 @@ void TRaftServer<TSocket>::AddLearnerTarget(uint32_t id, std::shared_ptr<TNode<T
 template<typename TSocket>
 std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::UnregisterPeerTargetImpl(
         uint32_t id, bool requireLeader) {
+    WaitForPriorRaftWork();
+    typename TRaftServer<TSocket>::TSerializedAccessGuard lock(*this);
     auto peer = PeerNodes.find(id);
     if (peer == PeerNodes.end()) throw std::invalid_argument("Unknown network peer target");
     auto endpoint = peer->second;
@@ -334,14 +359,22 @@ NNet::TVoidTask TRaftServer<TSocket>::OutboundServe(std::shared_ptr<TNode<TSocke
                     throw TMessageError("Invalid peer capability response");
                 DrainNodes();
             } else if (auto maybeSessionForwardedResponse = mes.template Maybe<TSessionForwardedCommandResponse>()) {
-                RequestProcessor->OnSessionForwardedCommandResponse(
-                    std::move(maybeSessionForwardedResponse.Cast()), node);
+                co_await RunOnRaftWorker([this, response = std::move(maybeSessionForwardedResponse.Cast()),
+                        node]() mutable {
+                    RequestProcessor->OnSessionForwardedCommandResponse(std::move(response), node);
+                });
                 DrainNodes();
             } else if (auto maybeForwardedResponse = mes.template Maybe<TForwardedCommandResponse>()) {
-                RequestProcessor->OnForwardedCommandResponse(std::move(maybeForwardedResponse.Cast()), node);
+                co_await RunOnRaftWorker([this, response = std::move(maybeForwardedResponse.Cast()),
+                        node]() mutable {
+                    RequestProcessor->OnForwardedCommandResponse(std::move(response), node);
+                });
                 DrainNodes();
             } else if (auto maybeCommandResponse = mes.template Maybe<TCommandResponse>()) {
-                RequestProcessor->OnCommandResponse(std::move(maybeCommandResponse.Cast()), node);
+                co_await RunOnRaftWorker([this, response = std::move(maybeCommandResponse.Cast()),
+                        node]() mutable {
+                    RequestProcessor->OnCommandResponse(std::move(response), node);
+                });
                 DrainNodes();
             } else {
                 std::cerr << "Wrong message type: " << mes->Type << std::endl;
@@ -355,7 +388,7 @@ NNet::TVoidTask TRaftServer<TSocket>::OutboundServe(std::shared_ptr<TNode<TSocke
             if (node->IsRetired()) break;
             if (wasConnected && node->IsCapabilityNegotiating())
                 node->FailCapabilityNegotiation(generation);
-            RequestProcessor->OnPeerDisconnected(node);
+            co_await RunOnRaftWorker([this, node] { RequestProcessor->OnPeerDisconnected(node); });
             if (wasConnected) node->Disconnect(generation);
             DrainNodes();
             co_await Poller.Sleep(std::chrono::milliseconds(1000));
@@ -363,7 +396,7 @@ NNet::TVoidTask TRaftServer<TSocket>::OutboundServe(std::shared_ptr<TNode<TSocke
         }
     }
     if (node->IsRetired()) {
-        RequestProcessor->OnPeerDisconnected(node);
+        co_await RunOnRaftWorker([this, node] { RequestProcessor->OnPeerDisconnected(node); });
         DrainNodes();
     }
     co_return;
@@ -434,12 +467,12 @@ void TRaftServer<TSocket>::DebugPrint() {
 template<typename TSocket>
 NNet::TVoidTask TRaftServer<TSocket>::Idle() {
     TTaskGuard taskGuard(*this);
-    auto t0 = TimeSource->Now();
+    auto t0 = CurrentTime();
     auto dt = std::chrono::milliseconds(2000);
     auto sleep = std::chrono::milliseconds(100);
     while (!Stopping) {
         try {
-            const auto now = TimeSource->Now();
+            const auto now = CurrentTime();
             NNet::TDetail::ExpireIdleConnections(
                 InboundLastActivity, now, InboundMessageBudget->ConnectionIdleTimeout(),
                 [](const auto& client) {
@@ -447,24 +480,29 @@ NNet::TVoidTask TRaftServer<TSocket>::Idle() {
                     client->Retire();
                     return true;
                 });
+            std::vector<std::shared_ptr<INode>> disconnectedPeers;
             for (const auto& [_, node] : PeerNodes) {
                 if (node->ExpireCapabilityNegotiation(now, CapabilityNegotiationTimeout))
-                    RequestProcessor->OnPeerDisconnected(node);
+                    disconnectedPeers.push_back(node);
             }
-            Raft->ProcessTimeout(now);
+            co_await RunOnRaftWorker([this, now, disconnectedPeers = std::move(disconnectedPeers)] {
+                for (const auto& peer : disconnectedPeers)
+                    RequestProcessor->OnPeerDisconnected(peer);
+                Raft->ProcessTimeout(now);
+                RequestProcessor->CheckStateChange();
+                RequestProcessor->ProcessCommitted();
+                RequestProcessor->ProcessWaiting();
+            });
             ReconcilePeerReaders();
-            RequestProcessor->CheckStateChange();
-            RequestProcessor->ProcessCommitted();
-            RequestProcessor->ProcessWaiting();
             DrainNodes();
         } catch (const TNodeQueueFull& ex) {
             // Periodic Raft requests are regenerated by their retry timers.
             // An outbound overload must not terminate this server task.
             std::cerr << "Raft tick: " << ex.what() << "\n";
         }
-        auto t1 = TimeSource->Now();
+        auto t1 = CurrentTime();
         if (t1 > t0 + dt) {
-            DebugPrint();
+            co_await RunOnRaftWorker([this] { DebugPrint(); });
             t0 = t1;
         }
         co_await Poller.Sleep(t1 + sleep);

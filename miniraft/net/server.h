@@ -1,11 +1,15 @@
 #pragma once
 
+#include <algorithm>
 #include <exception>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <coroutine>
@@ -14,8 +18,12 @@
 #include <string_view>
 #include <charconv>
 #include <optional>
+#include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include <coroio/all.hpp>
 #include <miniraft/net/retirable_ssl_socket.h>
@@ -50,6 +58,114 @@ void ExpireIdleConnections(TConnections& connections, ITimeSource::Time now,
 class TNodeQueueFull : public std::runtime_error {
 public:
     TNodeQueueFull() : std::runtime_error("Outbound node queue limit exceeded") {}
+};
+
+class TRaftWorkerQueueFull : public std::runtime_error {
+public:
+    TRaftWorkerQueueFull() : std::runtime_error("Serialized Raft worker queue is full") { }
+};
+
+// The poller publishes its latest time into this view. RequestProcessor can
+// then read time from its worker thread without calling a caller-supplied
+// ITimeSource concurrently with the poller.
+class TCachedTimeSource final : public ITimeSource {
+public:
+    explicit TCachedTimeSource(const std::shared_ptr<ITimeSource>& source)
+        : Ticks(source->Now().time_since_epoch().count()) { }
+
+    Time Now() override {
+        return Time(Time::duration(Ticks.load(std::memory_order_acquire)));
+    }
+
+    void Publish(Time time) {
+        Ticks.store(time.time_since_epoch().count(), std::memory_order_release);
+    }
+
+private:
+    std::atomic<Time::duration::rep> Ticks;
+};
+
+// Executes stateful Raft work in FIFO order on one background thread. Futures
+// are observed by poller coroutines; the worker never resumes a coroutine or
+// calls the poller's non-thread-safe wakeup APIs.
+class TSerializedRaftWorker {
+public:
+    explicit TSerializedRaftWorker(std::recursive_mutex& accessMutex,
+            size_t maxQueuedJobs = 1024)
+        : AccessMutex(accessMutex)
+        , MaxQueuedJobs(maxQueuedJobs)
+        , Thread([this] { Run(); }) { }
+
+    TSerializedRaftWorker(const TSerializedRaftWorker&) = delete;
+    TSerializedRaftWorker& operator=(const TSerializedRaftWorker&) = delete;
+
+    ~TSerializedRaftWorker() { Stop(); }
+
+    template<typename TFunction>
+    auto Submit(TFunction&& function) {
+        using TResult = std::invoke_result_t<std::decay_t<TFunction>&>;
+        std::lock_guard lock(Mutex);
+        if (Stopping) throw std::logic_error("Serialized Raft worker is stopping");
+        if (Jobs.size() >= MaxQueuedJobs) throw TRaftWorkerQueueFull{};
+        auto task = std::make_shared<std::packaged_task<TResult()>>(
+            std::forward<TFunction>(function));
+        auto future = task->get_future();
+        Jobs.emplace_back([task] { (*task)(); });
+        PendingJobs.fetch_add(1, std::memory_order_release);
+        Condition.notify_one();
+        return future;
+    }
+
+    size_t Pending() const { return PendingJobs.load(std::memory_order_acquire); }
+
+    void WaitUntilIdle() const {
+        if (Thread.get_id() == std::this_thread::get_id()) return;
+        std::unique_lock lock(Mutex);
+        Condition.wait(lock, [this] { return PendingJobs.load(std::memory_order_acquire) == 0; });
+    }
+
+    void Stop() noexcept {
+        {
+            std::lock_guard lock(Mutex);
+            Stopping = true;
+        }
+        Condition.notify_all();
+        std::lock_guard joinLock(JoinMutex);
+        if (Thread.joinable()) Thread.join();
+    }
+
+private:
+    void Run() noexcept {
+        while (true) {
+            std::function<void()> job;
+            {
+                std::unique_lock lock(Mutex);
+                Condition.wait(lock, [this] { return Stopping || !Jobs.empty(); });
+                if (Jobs.empty()) return;
+                job = std::move(Jobs.front());
+                Jobs.pop_front();
+            }
+            try {
+                std::lock_guard lock(AccessMutex);
+                job();
+            } catch (...) {
+                // packaged_task stores user exceptions in its future. This
+                // catch protects the worker loop from infrastructure errors.
+            }
+            PendingJobs.fetch_sub(1, std::memory_order_release);
+            Condition.notify_all();
+        }
+    }
+
+    std::recursive_mutex& AccessMutex;
+    const size_t MaxQueuedJobs;
+    mutable std::mutex Mutex;
+    std::mutex JoinMutex;
+    mutable std::condition_variable Condition;
+    std::deque<std::function<void()>> Jobs;
+    std::atomic<size_t> PendingJobs{0};
+    bool Stopping = false;
+    std::thread Thread;
 };
 
 struct TOutboundQueueLimits {
@@ -458,9 +574,9 @@ public:
     }
     void FailCapabilityNegotiation(uint64_t generation) {
         if (!CapabilityNegotiating || generation != ConnectionGeneration) return;
+        PeerFeatures = 0;
         CapabilityNegotiating = false;
         CapabilityNegotiationStarted = {};
-        PeerFeatures = 0;
         SkipNextCapabilityProbe = true;
         DiscardForwardedCommands();
     }
@@ -529,13 +645,13 @@ private:
     std::shared_ptr<ITimeSource> TimeSource;
     std::function<TSocket(const NNet::TAddress&)> SocketFactory;
     TSocket Socket;
-    bool Connected = false;
+    std::atomic<bool> Connected = false;
     std::atomic<bool> Retired = false;
-    bool CapabilityNegotiating = false;
+    std::atomic<bool> CapabilityNegotiating = false;
     bool SkipNextCapabilityProbe = false;
     ITimeSource::Time CapabilityNegotiationStarted{};
     uint64_t TimedOutCapabilityGeneration = 0;
-    uint64_t PeerFeatures = 0;
+    std::atomic<uint64_t> PeerFeatures = 0;
     bool ResponseReaderActive = false;
     bool RetiredCleaned = false;
     uint64_t ConnectionGeneration = 0;
@@ -576,11 +692,14 @@ public:
         : Poller(poller)
         , Socket(std::move(socket))
         , Raft(raft)
+        , TimeSource(ts ? ts : std::make_shared<TTimeSource>())
+        , WorkerTimeSource(std::make_shared<TCachedTimeSource>(TimeSource))
         , OutboundQueueBudget(std::make_shared<TOutboundQueueBudget>(outboundQueueLimits))
         , InboundMessageBudget(std::make_shared<TInboundMessageBudget>(inboundMessageBudgetLimits))
-        , RequestProcessor(std::make_shared<TRequestProcessor>(raft, rsm, nodes, admissionLimits, ts))
-        , TimeSource(ts)
+        , RequestProcessor(std::make_shared<TRequestProcessor>(raft, rsm, nodes,
+            admissionLimits, WorkerTimeSource))
         , ResolvePeerIdentity(std::move(peerIdentityResolver))
+        , RaftWorker(RaftAccessMutex)
     {
         try {
             for (const auto& [id, node] : nodes) {
@@ -610,9 +729,69 @@ public:
             co_await Poller.Sleep(std::chrono::milliseconds(10));
         }
         DrainNodes();
+        while (RaftWorker.Pending())
+            co_await Poller.Sleep(std::chrono::milliseconds(1));
+        RaftWorker.Stop();
         co_return;
     }
     bool IsStopped() const { return Stopping && ActiveTasks == 0 && !HasPendingRetirement(); }
+
+    class TSerializedAccessGuard {
+    public:
+        explicit TSerializedAccessGuard(const TRaftServer& server) : Server(&server) {
+            Server->RaftAccessMutex.lock();
+            try {
+                HeldServers().push_back(Server);
+            } catch (...) {
+                Server->RaftAccessMutex.unlock();
+                throw;
+            }
+        }
+        TSerializedAccessGuard(const TSerializedAccessGuard&) = delete;
+        TSerializedAccessGuard& operator=(const TSerializedAccessGuard&) = delete;
+        ~TSerializedAccessGuard() {
+            auto& held = HeldServers();
+            if (held.empty() || held.back() != Server) std::terminate();
+            held.pop_back();
+            Server->RaftAccessMutex.unlock();
+        }
+
+        static bool IsHeldByCurrentThread(const TRaftServer& server) {
+            const auto& held = HeldServers();
+            return std::find(held.begin(), held.end(), &server) != held.end();
+        }
+
+    private:
+        static std::vector<const TRaftServer*>& HeldServers() {
+            static thread_local std::vector<const TRaftServer*> held;
+            return held;
+        }
+        const TRaftServer* Server;
+    };
+
+    void WaitForPriorRaftWork() const {
+        if (!TSerializedAccessGuard::IsHeldByCurrentThread(*this))
+            RaftWorker.WaitUntilIdle();
+    }
+
+    // Run a short external Raft operation after earlier worker jobs drain, under
+    // the same serialization gate. Do not retain references into Raft state
+    // after the callback returns. Call on the poller thread while serving.
+    // Long or blocking work belongs on the worker.
+    template<typename TFunction>
+    auto WithSerializedRaft(TFunction&& function) const
+            -> std::invoke_result_t<std::decay_t<TFunction>&, TRaft&> {
+        using TResult = std::invoke_result_t<std::decay_t<TFunction>&, TRaft&>;
+        static_assert(!std::is_reference_v<TResult>,
+            "Serialized Raft callbacks must not return references");
+        WaitForPriorRaftWork();
+        TSerializedAccessGuard lock(*this);
+        if constexpr (std::is_void_v<TResult>) {
+            std::invoke(function, *Raft);
+        } else {
+            return std::invoke(function, *Raft);
+        }
+    }
 
     // Register local endpoints on any role so every replica can validate and
     // communicate with future voters. This does not change quorum membership.
@@ -630,6 +809,8 @@ public:
     // the poller loop and Raft work, like endpoint registration.
     TJointConfigurationReadiness CheckJointConfigurationReadiness(
         const std::vector<uint32_t>& newVoters) const {
+        WaitForPriorRaftWork();
+        TSerializedAccessGuard lock(*this);
         return Raft->CheckJointConfigurationReadiness(newVoters);
     }
     // Start a joint-consensus voter transition after staging added peers with
@@ -637,21 +818,28 @@ public:
     // appends the stable successor after the joint entry commits.
     // Calls must be serialized with the poller loop and Raft work.
     uint64_t ProposeJointConfiguration(std::vector<uint32_t> newVoters) {
+        WaitForPriorRaftWork();
+        TSerializedAccessGuard lock(*this);
         return Raft->ProposeJointConfiguration(std::move(newVoters));
     }
     // Append the stable successor after the joint configuration commits and
     // leadership has transferred to a voter on its new side.
     uint64_t FinalizeConfiguration() {
+        WaitForPriorRaftWork();
+        TSerializedAccessGuard lock(*this);
         return Raft->FinalizeConfiguration();
     }
     // Transfer leadership to a voter on the new side of a committed joint
     // configuration. Calls must be serialized with the poller loop and Raft work.
     void TransferLeadership(uint32_t target) {
-        if (!TimeSource) throw std::logic_error("Leadership transfer requires a time source");
-        Raft->TransferLeadership(target, TimeSource->Now());
+        WaitForPriorRaftWork();
+        TSerializedAccessGuard lock(*this);
+        Raft->TransferLeadership(target, WorkerTimeSource->Now());
     }
     // Calls must be serialized with the poller loop and Raft work.
     TCompactionMembershipReadiness CheckCompactionMembershipReadiness() const {
+        WaitForPriorRaftWork();
+        TSerializedAccessGuard lock(*this);
         return Raft->CheckCompactionMembershipReadiness();
     }
 
@@ -670,6 +858,40 @@ private:
     NNet::TVoidTask InboundConnection(TSocket socket, std::shared_ptr<void> connectionReservation);
     NNet::TVoidTask OutboundServe(std::shared_ptr<TNode<TSocket>>);
     NNet::TVoidTask Idle();
+    ITimeSource::Time CurrentTime() {
+        std::lock_guard lock(TimeSourceMutex);
+        const auto now = TimeSource->Now();
+        WorkerTimeSource->Publish(now);
+        return now;
+    }
+    template<typename TFunction>
+    auto RunOnRaftWorker(TFunction&& function)
+            -> NNet::TValueTask<std::invoke_result_t<std::decay_t<TFunction>&>> {
+        using TResult = std::invoke_result_t<std::decay_t<TFunction>&>;
+        auto callable = std::make_shared<std::decay_t<TFunction>>(
+            std::forward<TFunction>(function));
+        std::future<TResult> future;
+        while (true) {
+            bool queueFull = false;
+            try {
+                future = RaftWorker.Submit([callable]() mutable -> TResult {
+                    return (*callable)();
+                });
+            } catch (const TRaftWorkerQueueFull&) {
+                queueFull = true;
+            }
+            if (!queueFull) break;
+            co_await Poller.Sleep(std::chrono::milliseconds(1));
+        }
+        while (future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+            co_await Poller.Sleep(std::chrono::milliseconds(1));
+        if constexpr (std::is_void_v<TResult>) {
+            future.get();
+            co_return;
+        } else {
+            co_return future.get();
+        }
+    }
     NNet::TValueTask<TSocket> AcceptWithDeadline();
     void RequestStop();
     bool HasPendingRetirement() const;
@@ -682,6 +904,9 @@ private:
     typename TSocket::TPoller& Poller;
     TSocket Socket;
     std::shared_ptr<TRaft> Raft;
+    std::shared_ptr<ITimeSource> TimeSource;
+    std::shared_ptr<TCachedTimeSource> WorkerTimeSource;
+    mutable std::mutex TimeSourceMutex;
     std::shared_ptr<TOutboundQueueBudget> OutboundQueueBudget;
     std::shared_ptr<TInboundMessageBudget> InboundMessageBudget;
     std::shared_ptr<TRequestProcessor> RequestProcessor;
@@ -692,7 +917,6 @@ private:
     std::unordered_set<uint32_t> PeerResponseReaders;
     std::unordered_set<std::shared_ptr<TNode<TSocket>>> RetiredPeerNodes;
     std::unordered_map<std::shared_ptr<TNode<TSocket>>, ITimeSource::Time> InboundLastActivity;
-    std::shared_ptr<ITimeSource> TimeSource;
     TPeerIdentityResolver ResolvePeerIdentity;
     bool Serving = false;
     bool Stopping = false;
@@ -701,6 +925,8 @@ private:
     // for debug
     TStateFields PersistentFields;
     TVolatileState VolatileFields;
+    mutable std::recursive_mutex RaftAccessMutex;
+    TSerializedRaftWorker RaftWorker;
 };
 
 #include "node_impl.h"
