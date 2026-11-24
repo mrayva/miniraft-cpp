@@ -83,6 +83,7 @@ static_assert(sizeof(TMessageEx) == sizeof(TMessage)+24);
 
 struct TRequestVoteRequest: public TMessageEx {
     static constexpr EMessageType MessageType = EMessageType::REQUEST_VOTE_REQUEST;
+    static constexpr uint32_t JointConsensusCapable = 1u << 0;
     uint64_t LastLogIndex;
     uint64_t LastLogTerm;
     uint32_t CandidateId;
@@ -101,6 +102,7 @@ static_assert(sizeof(TRequestVoteResponse) == sizeof(TMessageEx)+8);
 
 struct TPreVoteRequest: public TMessageEx {
     static constexpr EMessageType MessageType = EMessageType::PRE_VOTE_REQUEST;
+    static constexpr uint32_t JointConsensusCapable = 1u << 0;
     uint64_t ProspectiveTerm;
     uint64_t LastLogIndex;
     uint64_t LastLogTerm;
@@ -121,6 +123,9 @@ static_assert(sizeof(TPreVoteResponse) == sizeof(TMessageEx)+16);
 
 struct TAppendEntriesRequest: public TMessageEx {
     static constexpr EMessageType MessageType = EMessageType::APPEND_ENTRIES_REQUEST;
+    // Set in LeaderCommit on configuration-bearing AppendEntries. Receivers
+    // that predate the joint election fence reject the reserved out-of-range bit.
+    static constexpr uint64_t JointElectionFenceLeader = uint64_t(1) << 63;
     uint64_t PrevLogIndex = 0;
     uint64_t PrevLogTerm = 0;
     uint64_t LeaderCommit = 0;
@@ -146,6 +151,10 @@ struct TAppendEntriesResponse: public TMessageEx {
     // Padding's upper bits carry the receiver's maximum snapshot image size in
     // 64 KiB units. A missing bit identifies a legacy peer with the 64 MiB cap.
     static constexpr uint32_t SupportsSnapshotSizeNegotiation = 1u << 9;
+    // Marks peers that reject old-format vote requests while a joint
+    // configuration is active. Old readers may decode it as a larger limit,
+    // still capped by their local snapshot maximum.
+    static constexpr uint32_t SupportsJointElectionFence = 1u << 30;
     // Application snapshot restore is a separate requirement from the storage
     // backend's ability to adopt the Raft snapshot. This high bit was outside
     // the range emitted by the uint32_t size encoder and is ignored by older
@@ -159,8 +168,8 @@ struct TAppendEntriesResponse: public TMessageEx {
             ((bytes / SnapshotSizeUnitBytes) << SnapshotSizeShift);
     }
     static constexpr uint64_t DecodeSnapshotMaxBytes(uint32_t padding) {
-        return uint64_t((padding & ~SupportsApplicationSnapshotInstall) >> SnapshotSizeShift) *
-            SnapshotSizeUnitBytes;
+        return uint64_t((padding & ~(SupportsApplicationSnapshotInstall |
+            SupportsJointElectionFence)) >> SnapshotSizeShift) * SnapshotSizeUnitBytes;
     }
     static constexpr uint64_t DecodeSnapshotMaxBytesOrLegacy(
             uint32_t padding, uint64_t legacyMaxBytes) {
@@ -192,6 +201,8 @@ static_assert(sizeof(TAppendEntriesResponse) == sizeof(TMessageEx) + 16);
 struct TInstallSnapshotRequest: public TMessageEx {
     static constexpr EMessageType MessageType = EMessageType::INSTALL_SNAPSHOT_REQUEST;
     static constexpr uint32_t MaxChunkBytes = 64 * 1024;
+    static constexpr uint32_t JointElectionFenceLeader = 1u << 31;
+    static constexpr uint32_t DoneFlag = 1u;
     uint64_t SnapshotIndex = 0, SnapshotTerm = 0, TotalBytes = 0, Offset = 0;
     uint32_t LeaderId = 0, Done = 0;
     char Data[0];

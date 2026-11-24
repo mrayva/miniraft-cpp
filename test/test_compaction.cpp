@@ -940,6 +940,8 @@ void test_snapshot_size_negotiation_keeps_legacy_fallback_and_certifies_voter_li
         emptyNegotiatedPadding, legacyLimit), legacyLimit);
     assert_int_equal(TAppendEntriesResponse::DecodeSnapshotMaxBytesOrLegacy(currentPadding, legacyLimit),
         currentLimit);
+    assert_int_equal(TAppendEntriesResponse::DecodeSnapshotMaxBytesOrLegacy(
+        currentPadding | TAppendEntriesResponse::SupportsJointElectionFence, legacyLimit), currentLimit);
     assert_int_equal(TAppendEntriesResponse::EncodeConfigurationBarrierSnapshotLimit(
         legacyLimit, legacyLimit), 0);
     assert_int_equal(TAppendEntriesResponse::EncodeConfigurationBarrierSnapshotLimit(
@@ -1600,11 +1602,14 @@ void test_compacted_follower_hint_requires_boundary_probe_before_match(void**) {
     cluster.Pump(1); assert_int_equal(progress->MatchIndex[2], cluster.Nodes[0]->GetLastIndex());
 }
 
-TMessageHolder<TInstallSnapshotRequest> Chunk(const TSnapshot& snapshot, std::string_view bytes, uint64_t offset, uint32_t count) {
+TMessageHolder<TInstallSnapshotRequest> Chunk(const TSnapshot& snapshot, std::string_view bytes,
+        uint64_t offset, uint32_t count, bool jointElectionFenceLeader = false) {
     auto message = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
     message->Src = 1; message->Dst = 2; message->Term = 3; message->Seqno = offset + 1;
     message->SnapshotIndex = snapshot.Index; message->SnapshotTerm = snapshot.Term;
-    message->Offset = offset; message->TotalBytes = bytes.size(); message->Done = offset + count == bytes.size();
+    message->Offset = offset; message->TotalBytes = bytes.size();
+    message->Done = (offset + count == bytes.size() ? TInstallSnapshotRequest::DoneFlag : 0u) |
+        (jointElectionFenceLeader ? TInstallSnapshotRequest::JointElectionFenceLeader : 0u);
     message->LeaderId = 1; memcpy(message->Data, bytes.data() + offset, count); return message;
 }
 void test_idle_snapshot_transfer_discards_partial_image_and_restarts(void**) {
@@ -2370,6 +2375,7 @@ void test_stable_snapshot_completes_known_joint_membership_only_from_new_voter(v
     auto install = [&](const TSnapshot& candidate, uint32_t leader) {
         const auto bytes = EncodeSnapshot(candidate);
         auto request = Chunk(candidate, bytes, 0, static_cast<uint32_t>(bytes.size()));
+        request->Done |= TInstallSnapshotRequest::JointElectionFenceLeader;
         request->Src = leader;
         request->LeaderId = leader;
         raft->Process({}, request);
@@ -2470,6 +2476,7 @@ void ExerciseStaleStableSnapshotHistoryRecovery(bool jointSuccessor) {
     auto install = [&](const TSnapshot& candidate) {
         const auto bytes = EncodeSnapshot(candidate);
         auto request = Chunk(candidate, bytes, 0, static_cast<uint32_t>(bytes.size()));
+        request->Done |= TInstallSnapshotRequest::JointElectionFenceLeader;
         request->Src = 3;
         request->LeaderId = 3;
         raft->Process({}, request);
@@ -2483,6 +2490,7 @@ void ExerciseStaleStableSnapshotHistoryRecovery(bool jointSuccessor) {
     // metadata count still advertises all three.
     truncated.resize(baseMetadataBytes + 4 + 64 + incoming.Data.size() + 4);
     auto truncatedRequest = Chunk(incoming, truncated, 0, static_cast<uint32_t>(baseMetadataBytes + 4));
+    truncatedRequest->Done |= TInstallSnapshotRequest::JointElectionFenceLeader;
     truncatedRequest->Src = truncatedRequest->LeaderId = 3;
     truncatedRequest->Term = state->CurrentTerm + 1;
     const auto term = state->CurrentTerm;
@@ -2494,6 +2502,7 @@ void ExerciseStaleStableSnapshotHistoryRecovery(bool jointSuccessor) {
     auto first = Chunk(incoming, truncated, 0, static_cast<uint32_t>(split));
     auto second = Chunk(incoming, truncated, split, 8);
     for (auto* chunk : {&first, &second}) {
+        (*chunk)->Done |= TInstallSnapshotRequest::JointElectionFenceLeader;
         (*chunk)->Src = (*chunk)->LeaderId = 3;
         (*chunk)->Term = term + 1;
     }
@@ -2651,7 +2660,7 @@ void test_idle_partial_snapshot_expires_on_learner_despite_heartbeats(void**) {
     const auto bytes = EncodeSnapshot(snapshot);
     const size_t metadataBytes = 36 + 4 * snapshot.Voters.size();
 
-    raft->Process({}, Chunk(snapshot, bytes, 0, metadataBytes));
+    raft->Process({}, Chunk(snapshot, bytes, 0, metadataBytes, true));
     assert_true(replies.back()->Success); assert_false(replies.back()->Installed);
     assert_int_equal(replies.back()->NextOffset, metadataBytes); assert_int_equal(app->Loads, 0);
 
@@ -2844,11 +2853,12 @@ void test_partial_snapshot_rechecks_membership_after_joint_append(void**) {
     raft->Process({}, Chunk(snapshot, bytes, 0, metadataBytes));
     assert_true(reply.Cast<TInstallSnapshotResponse>()->Success);
     assert_int_equal(raft->GetLeaderId(), 1);
-    raft->Process({}, Chunk(snapshot, bytes, metadataBytes, 1));
+    raft->Process({}, Chunk(snapshot, bytes, metadataBytes, 1, true));
     assert_true(reply.Cast<TInstallSnapshotResponse>()->Success);
 
     auto append = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 2, .Term = 3},
-        TAppendEntriesRequest{.LeaderId = 1, .Nentries = 1});
+        TAppendEntriesRequest{.LeaderCommit = TAppendEntriesRequest::JointElectionFenceLeader,
+            .LeaderId = 1, .Nentries = 1});
     append.InitPayload(1);
     append.Payload[0] = EncodeConfigurationEntry({
         EConfigurationPhase::Joint, 3, 0, 0, {1, 2}, {1, 2, 3}});
@@ -2857,7 +2867,7 @@ void test_partial_snapshot_rechecks_membership_after_joint_append(void**) {
     assert_true(raft->GetConfigurationState().HasUncommittedConfiguration());
     assert_int_equal(state->CommitIndex, 0);
 
-    raft->Process({}, Chunk(snapshot, bytes, metadataBytes + 1, 1));
+    raft->Process({}, Chunk(snapshot, bytes, metadataBytes + 1, 1, true));
     const auto rejected = reply.Cast<TInstallSnapshotResponse>();
     assert_false(rejected->Success);
     assert_int_equal(rejected->NextOffset, 0);
@@ -3260,6 +3270,7 @@ void test_durable_stale_snapshot_membership_recovery_survives_restart(void**) {
         auto install = [&](const std::shared_ptr<TRaft>& raft, const TSnapshot& candidate) {
             const auto bytes = EncodeSnapshot(candidate);
             auto request = Chunk(candidate, bytes, 0, static_cast<uint32_t>(bytes.size()));
+            request->Done |= TInstallSnapshotRequest::JointElectionFenceLeader;
             request->Src = 3;
             request->LeaderId = 3;
             raft->Process({}, request);
@@ -3365,6 +3376,7 @@ void test_durable_membership_snapshot_install_is_atomic_across_restart(void**) {
         }
         const auto bytes = EncodeSnapshot(incoming);
         auto request = Chunk(incoming, bytes, 0, static_cast<uint32_t>(bytes.size()));
+        request->Done |= TInstallSnapshotRequest::JointElectionFenceLeader;
         request->Src = 3;
         request->LeaderId = 3;
 

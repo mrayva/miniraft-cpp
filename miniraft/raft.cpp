@@ -35,10 +35,29 @@ uint32_t LocalAppendCapabilityBits(const IState& state, bool idempotentLogSuppor
         TAppendEntriesResponse::SupportsSnapshotHistory32 |
         TAppendEntriesResponse::SupportsSnapshotLineage |
         TAppendEntriesResponse::SupportsJointConsensus |
+        TAppendEntriesResponse::SupportsJointElectionFence |
         (idempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotentLogEntries : 0u) |
         (idempotentLogSupport ? TAppendEntriesResponse::SupportsIdempotencyControlEntries : 0u) |
         (applicationSnapshotInstallSupport
             ? TAppendEntriesResponse::SupportsApplicationSnapshotInstall : 0u);
+}
+
+bool JointConsensusActive(const TConfigurationScan* configuration) {
+    return configuration &&
+        (configuration->Committed.IsJoint() || configuration->Latest.IsJoint() ||
+            configuration->HasUncommittedConfiguration());
+}
+
+uint64_t AppendLeaderCommitIndex(uint64_t leaderCommit) {
+    return leaderCommit & ~TAppendEntriesRequest::JointElectionFenceLeader;
+}
+
+bool SnapshotNeedsJointElectionFence(std::string_view prefix) {
+    if (prefix.size() < 8) return false;
+    const auto magic = prefix.substr(0, 8);
+    return magic == "MRFTS002" || magic == "MRFTS004" || magic == "MRFTS005" ||
+        magic == "MRFTS006" || magic == "MRFTS007" || magic == "MRFTS008" ||
+        magic == "MRFTS009" || magic == "MRFTS010" || magic == "MRFTS011";
 }
 
 uint64_t AllocateForwardingSession() {
@@ -1509,7 +1528,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
 
         const auto requestLastIndex = message->PrevLogIndex + message.PayloadSize;
         const auto commitFloor = std::max(State->CommitIndex, VolatileState->CommitIndex);
-        const auto batchCommitIndex = std::max(commitFloor, std::min(message->LeaderCommit, requestLastIndex));
+        const auto batchCommitIndex = std::max(commitFloor,
+            std::min(AppendLeaderCommitIndex(message->LeaderCommit), requestLastIndex));
         bool fits = supportsIncomingEntries;
         if (conflictIndex) {
             // Refuse a conflicting leader suffix at or below a commit boundary
@@ -1577,7 +1597,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             }
 
             matchIndex = index;
-            commitIndex = std::max(commitIndex, std::min(message->LeaderCommit, matchIndex));
+            commitIndex = std::max(commitIndex,
+                std::min(AppendLeaderCommitIndex(message->LeaderCommit), matchIndex));
         }
     }
 
@@ -1643,6 +1664,8 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             message->Padding & TAppendEntriesResponse::SupportsApplicationSnapshotInstall;
         capabilities.JointConsensus =
             message->Padding & TAppendEntriesResponse::SupportsJointConsensus;
+        capabilities.JointElectionFence =
+            message->Padding & TAppendEntriesResponse::SupportsJointElectionFence;
         capabilities.IdempotentLogEntries =
             message->Padding & TAppendEntriesResponse::SupportsIdempotentLogEntries;
         capabilities.IdempotencyControlEntries =
@@ -1694,6 +1717,8 @@ TMessageHolder<TRequestVoteRequest> TRaft::CreateVote(uint32_t nodeId) {
             .LastLogIndex = State->LastLogIndex,
             .LastLogTerm = State->LastLogTerm,
             .CandidateId = Id,
+            .Padding = JointConsensusActive(Configuration ? &*Configuration : nullptr)
+                ? TRequestVoteRequest::JointConsensusCapable : 0u,
         });
     return mes;
 }
@@ -1706,6 +1731,8 @@ TMessageHolder<TPreVoteRequest> TRaft::CreatePreVote(uint32_t nodeId) {
             .LastLogIndex = State->LastLogIndex,
             .LastLogTerm = State->LastLogTerm,
             .CandidateId = Id,
+            .Padding = JointConsensusActive(Configuration ? &*Configuration : nullptr)
+                ? TPreVoteRequest::JointConsensusCapable : 0u,
         });
 }
 
@@ -1733,12 +1760,17 @@ TMessageHolder<TAppendEntriesRequest> TRaft::CreateAppendEntries(uint32_t nodeId
     lastIndex = prevIndex + entries.size();
 
     const auto leaderCommit = std::min(VolatileState->CommitIndex, lastIndex);
+    const bool carriesConfigurationEntry = std::any_of(entries.begin(), entries.end(), [](const auto& entry) {
+        return entry->Flags == TLogEntry::EConfiguration;
+    });
+    const auto wireLeaderCommit = leaderCommit | (carriesConfigurationEntry
+        ? TAppendEntriesRequest::JointElectionFenceLeader : uint64_t(0));
     auto mes = NewHoldedMessage(
         TMessageEx {.Src = Id, .Dst = nodeId, .Term = State->CurrentTerm, .Seqno = NextSeqno()},
         TAppendEntriesRequest {
             .PrevLogIndex = prevIndex,
             .PrevLogTerm = State->LogTerm(prevIndex),
-            .LeaderCommit = leaderCommit,
+            .LeaderCommit = wireLeaderCommit,
             .LeaderId = Id,
             .Nentries = static_cast<uint32_t>(lastIndex - prevIndex),
         });
@@ -1894,7 +1926,9 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
     switch (EMessageType(message->Type)) {
     case EMessageType::REQUEST_VOTE_REQUEST: {
         auto vote = message.Cast<TRequestVoteRequest>();
-        return vote->CandidateId == header->Src && vote->LastLogIndex <= maxIndex &&
+        const bool jointElectionCapable = !JointConsensusActive(Configuration ? &*Configuration : nullptr) ||
+            (vote->Padding & TRequestVoteRequest::JointConsensusCapable);
+        return jointElectionCapable && vote->CandidateId == header->Src && vote->LastLogIndex <= maxIndex &&
             vote->LastLogTerm <= header->Term &&
             ((vote->LastLogIndex == 0) == (vote->LastLogTerm == 0));
     }
@@ -1902,7 +1936,9 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
         return message.Cast<TRequestVoteResponse>()->VoteGranted <= 1;
     case EMessageType::PRE_VOTE_REQUEST: {
         auto vote = message.Cast<TPreVoteRequest>();
-        return header->Term != UINT64_MAX && header->Seqno != 0 &&
+        const bool jointElectionCapable = !JointConsensusActive(Configuration ? &*Configuration : nullptr) ||
+            (vote->Padding & TPreVoteRequest::JointConsensusCapable);
+        return jointElectionCapable && header->Term != UINT64_MAX && header->Seqno != 0 &&
             vote->ProspectiveTerm == header->Term + 1 &&
             vote->CandidateId == header->Src && vote->LastLogIndex <= maxIndex &&
             vote->LastLogTerm <= header->Term &&
@@ -1920,6 +1956,14 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
     case EMessageType::INSTALL_SNAPSHOT_REQUEST: {
         auto request = message.Cast<TInstallSnapshotRequest>();
         const auto length = request->Len - sizeof(TInstallSnapshotRequest);
+        const auto done = request->Done & TInstallSnapshotRequest::DoneFlag;
+        const bool jointElectionFenceLeader = request->Done &
+            TInstallSnapshotRequest::JointElectionFenceLeader;
+        const bool incomingJointImage = request->Offset == 0 &&
+            SnapshotNeedsJointElectionFence(std::string_view(request->Data, length));
+        if ((JointConsensusActive(Configuration ? &*Configuration : nullptr) || incomingJointImage) &&
+            !jointElectionFenceLeader)
+            return false;
         const bool matchingIncomingSnapshot = IncomingSnapshot &&
             IncomingSnapshot->Term == header->Term && IncomingSnapshot->Leader == request->LeaderId &&
             IncomingSnapshot->Index == request->SnapshotIndex &&
@@ -1931,7 +1975,9 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
         // an older compacted boundary cannot have a newer term than the snapshot.
         const bool valid = header->Seqno != 0 && request->LeaderId == header->Src &&
             request->SnapshotIndex > 0 && request->SnapshotIndex <= maxIndex &&
-            request->SnapshotTerm > 0 && request->SnapshotTerm <= header->Term && request->Done <= 1 &&
+            request->SnapshotTerm > 0 && request->SnapshotTerm <= header->Term &&
+            !(request->Done & ~(TInstallSnapshotRequest::DoneFlag |
+                TInstallSnapshotRequest::JointElectionFenceLeader)) &&
             (request->SnapshotIndex <= VolatileState->CommitIndex ||
                 request->SnapshotTerm >= State->LogTerm(VolatileState->CommitIndex)) &&
             (request->SnapshotIndex > VolatileState->CommitIndex || request->SnapshotIndex < State->SnapshotIndex ||
@@ -1940,7 +1986,7 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
             request->TotalBytes >= 44 && request->TotalBytes <= TSnapshot::MaxBytes &&
             request->Offset <= request->TotalBytes && length > 0 && length <= TInstallSnapshotRequest::MaxChunkBytes &&
             length <= request->TotalBytes - request->Offset &&
-            bool(request->Done) == (request->Offset + length == request->TotalBytes);
+            bool(done) == (request->Offset + length == request->TotalBytes);
         if (!valid) return false;
         const auto application = SnapshotApplication.lock();
         if (!application || !application->SupportsApplicationSnapshotInstall()) return false;
@@ -2036,7 +2082,8 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
     case EMessageType::APPEND_ENTRIES_REQUEST: {
         auto append = message.Cast<TAppendEntriesRequest>();
         if (append->LeaderId != header->Src || append->PrevLogIndex > maxIndex ||
-            append->LeaderCommit > maxIndex || append->Nentries > maxIndex - append->PrevLogIndex ||
+            AppendLeaderCommitIndex(append->LeaderCommit) > maxIndex ||
+            append->Nentries > maxIndex - append->PrevLogIndex ||
             append->PrevLogTerm > header->Term ||
             ((append->PrevLogIndex == 0) != (append->PrevLogTerm == 0))) return false;
         auto previousTerm = append->PrevLogTerm;
@@ -2097,6 +2144,10 @@ bool TRaft::ValidateAppendConfiguration(TMessageHolder<TAppendEntriesRequest> me
         }
         hasConfigurationEntry = true;
     }
+    const bool jointElectionFenceLeader =
+        message->LeaderCommit & TAppendEntriesRequest::JointElectionFenceLeader;
+    if (hasConfigurationEntry != jointElectionFenceLeader)
+        return false;
     if (hasConfigurationEntry && (!ConfigurationBaseline || !State->SupportsVoterBinding() ||
         !State->SupportsCommitIndexPersistence() || State->GetBoundVoters() != InitialVoters))
         return false;
@@ -2153,7 +2204,7 @@ bool TRaft::ValidateAppendConfiguration(TMessageHolder<TAppendEntriesRequest> me
             shadow.Append(std::move(entry));
         }
         const auto commitIndex = std::max(VolatileState->CommitIndex,
-            std::min(message->LeaderCommit, index));
+            std::min(AppendLeaderCommitIndex(message->LeaderCommit), index));
         const auto scan = ScanConfigurationHistory(shadow, *ConfigurationBaseline, commitIndex);
         const auto* active = scan.Committed.IsJoint() ? &scan.Committed :
             scan.Latest.IsJoint() ? &scan.Latest : &scan.Committed;
@@ -2623,9 +2674,30 @@ TJointConfigurationReadiness TRaft::CheckJointConfigurationReadiness(
         if (id != Id) {
             const auto capability = VolatileState->PeerCapabilities.find(id);
             if (capability == VolatileState->PeerCapabilities.end() ||
-                capability->second.Term != State->CurrentTerm || !capability->second.JointConsensus)
+                capability->second.Term != State->CurrentTerm || !capability->second.JointConsensus ||
+                !capability->second.JointElectionFence)
                 readiness.VotersWithoutJointConsensusSupport.push_back(id);
         }
+    if (readiness.HasStableConfiguration && readiness.ChangesVoterSet) {
+        const auto& oldVoters = Configuration->Committed.OldVoters();
+        size_t fenceCapableOldVoters = 0;
+        for (auto id : oldVoters) {
+            bool supportsFence = id == Id;
+            if (id != Id) {
+                const auto capability = VolatileState->PeerCapabilities.find(id);
+                supportsFence = capability != VolatileState->PeerCapabilities.end() &&
+                    capability->second.Term == State->CurrentTerm && capability->second.JointConsensus &&
+                    capability->second.JointElectionFence;
+            }
+            if (supportsFence) {
+                ++fenceCapableOldVoters;
+            } else {
+                readiness.OldVotersWithoutJointElectionFence.push_back(id);
+            }
+        }
+        readiness.HasOldSideJointElectionFenceQuorum =
+            fenceCapableOldVoters > oldVoters.size() / 2;
+    }
     for (auto id : newVoters) {
         if (id == Id) {
             if (!LocalApplicationSnapshotInstallSupport)
@@ -2683,7 +2755,9 @@ uint64_t TRaft::ProposeJointConfiguration(std::vector<uint32_t> newVoters) {
     if (!readiness.ProposedVotersWithoutApplicationSnapshotInstallSupport.empty())
         throw std::logic_error("Every proposed voter must support application snapshot installation");
     if (!readiness.VotersWithoutJointConsensusSupport.empty())
-        throw std::logic_error("Every retained and proposed voter must advertise joint-consensus support in this term");
+        throw std::logic_error("Every proposed voter must advertise joint-consensus and election-fence support in this term");
+    if (!readiness.HasOldSideJointElectionFenceQuorum)
+        throw std::logic_error("A strict majority of old voters must advertise joint-election fence support in this term");
     if (!readiness.MembersWithoutIdempotentLogSupport.empty())
         throw std::logic_error("Every retained voter and learner must support idempotent log entries before membership can change");
     if (!readiness.MembersWithoutIdempotencyControlSupport.empty())
@@ -3267,7 +3341,12 @@ TMessageHolder<TMessage> TRaft::CreateInstallSnapshot(uint32_t nodeId) {
     request->SnapshotIndex = snapshot->Index; request->SnapshotTerm = snapshot->Term;
     request->Offset = rpc.Offset; request->TotalBytes = totalBytes;
     rpc.SentEnd = rpc.Offset + count;
-    request->Done = rpc.SentEnd == totalBytes; request->LeaderId = Id;
+    const bool jointElectionFenceLeader = JointConsensusActive(Configuration ? &*Configuration : nullptr) ||
+        snapshot->IsJoint() || snapshot->HasConfigurationLineage() ||
+        !snapshot->ConfigurationTransitions.empty();
+    request->Done = (rpc.SentEnd == totalBytes ? TInstallSnapshotRequest::DoneFlag : 0u) |
+        (jointElectionFenceLeader ? TInstallSnapshotRequest::JointElectionFenceLeader : 0u);
+    request->LeaderId = Id;
     CopySnapshotEncodingRange(*snapshot, *rpc.Encoding, rpc.Offset, request->Data, size_t(count));
     return request;
 }
@@ -3866,7 +3945,23 @@ void TRaft::AdvanceCommitIndex(uint64_t index) {
 void TRaft::AdvanceLeaderCommit() {
     const auto previous = VolatileState->CommitIndex;
     VolatileState->CommitAdvance(*VotingQuorum, Id, *State);
-    const auto updated = VolatileState->CommitIndex;
+    auto updated = VolatileState->CommitIndex;
+    if (Configuration && Configuration->Latest.IsJoint() && !Configuration->Committed.IsJoint()) {
+        const auto jointIndex = Configuration->Latest.ConfigurationIndex();
+        const TQuorum oldVoters(Configuration->Latest.OldVoters());
+        const auto fenceAcknowledgementIndex = oldVoters.Value([&](uint32_t id) {
+            if (id == Id) return State->LastLogIndex;
+            const auto capability = VolatileState->PeerCapabilities.find(id);
+            if (capability == VolatileState->PeerCapabilities.end() ||
+                capability->second.Term != State->CurrentTerm || !capability->second.JointConsensus ||
+                !capability->second.JointElectionFence)
+                return uint64_t(0);
+            const auto match = VolatileState->MatchIndex.find(id);
+            return match == VolatileState->MatchIndex.end() ? uint64_t(0) : match->second;
+        });
+        if (updated >= jointIndex && fenceAcknowledgementIndex < jointIndex)
+            updated = jointIndex - 1;
+    }
     VolatileState->CommitIndex = previous;
     AdvanceCommitIndex(updated);
 }

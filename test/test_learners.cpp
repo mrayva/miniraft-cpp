@@ -287,7 +287,9 @@ void test_fresh_learner_bootstraps_stable_and_joint_membership_snapshots(void**)
         request->Seqno = 1;
         request->Src = bootstrapVoters.front(); request->Dst = learnerId; request->Term = 3;
         request->SnapshotIndex = snapshot.Index; request->SnapshotTerm = snapshot.Term;
-        request->Offset = 0; request->TotalBytes = encoded.size(); request->Done = 1;
+        request->Offset = 0; request->TotalBytes = encoded.size();
+        request->Done = TInstallSnapshotRequest::DoneFlag |
+            TInstallSnapshotRequest::JointElectionFenceLeader;
         request->LeaderId = bootstrapVoters.front();
         memcpy(request->Data, encoded.data(), encoded.size());
         raft->Process({}, request);

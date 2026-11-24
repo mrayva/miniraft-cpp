@@ -29,12 +29,21 @@ transition. The embedding application can provision them locally with
 joint entry; this endpoint registration does not itself change quorum
 membership. Endpoint discovery and configuration distribution remain
 responsibilities of the embedding application.
-The leader advertises joint-consensus support in AppendEntries responses.
-`CheckJointConfigurationReadiness()` and `ProposeJointConfiguration()` require
-a current-term capability response from every existing and proposed remote
-voter. Older binaries leave the reserved response bits zero and therefore block
-the change. This catches incomplete rolling upgrades before a joint entry can
-reach a voter that would apply fixed-membership quorum rules.
+The leader advertises joint-consensus and joint-election-fence support in
+AppendEntries responses. `CheckJointConfigurationReadiness()` and
+`ProposeJointConfiguration()` require current-term support from every voter in
+the proposed stable set. They also require fence-capable voters to form a strict
+majority of the old set. Every old-side election quorum then intersects a
+voter that rejects legacy vote and pre-vote requests while either the committed
+or latest configuration is joint. This permits removal of an offline old voter
+when the remaining fence-capable old voters still form a majority, while
+preventing an old-format candidate from winning with an unsupported old-side
+majority. The leader advances the joint entry's commit index only after a strict
+old-side majority of fence-capable voters has acknowledged that entry. A
+configuration-bearing AppendEntries and a snapshot that carries joint
+membership metadata use a reserved leader marker; current receivers reject an
+unmarked transition from an older leader. Older binaries leave these reserved
+response and request bits zero.
 Every voter in the proposed stable set must separately advertise application
 snapshot restore support; newly added voters must advertise storage and
 application snapshot installation support. This lets an operator remove a
@@ -99,14 +108,16 @@ each], and CRC32[4] over the preceding payload. The outer entry term must match
 the encoded term and its flags must equal `EConfiguration`. CRC checks accidental
 corruption; it is not authentication. Every voter in the proposed stable set
 must run a compatible binary because older versions reject this entry type.
-Readiness checks the joint-consensus capability bit on a current-term
-AppendEntries response from each remote voter that remains in that set,
-including newly added voters. A removed old voter may be offline or on an older
-binary; its endpoint remains configured during the transition, and the old-set
-majority must still replicate and commit the joint entry. A removed voter that
-returns before finalization may reject the entry and cannot help satisfy that
-majority; after finalization it is no longer an active member and must be
-upgraded and staged as a learner before being added again.
+Readiness checks both capability bits on a current-term AppendEntries response
+from each remote voter in the proposed stable set, including newly added
+voters. For the old set, it checks that fence-capable voters exceed half of the
+set; each old-side election quorum must intersect that group. A removed old
+voter may be offline or on an older binary if that condition holds. Its
+endpoint remains configured during the transition, and the old-set majority
+must still replicate and commit the joint entry. A removed voter that returns
+before finalization may reject the entry and cannot help satisfy that majority;
+after finalization it is no longer an active member and must be upgraded and
+staged as a learner before being added again.
 
 After the stable successor commits, local compaction records the active voter
 set and stable configuration identity while preserving the original durable

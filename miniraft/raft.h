@@ -355,10 +355,16 @@ struct TJointConfigurationReadiness {
     // Every voter in the proposed stable set must be able to restore application
     // data from an installed Raft snapshot.
     std::vector<uint32_t> ProposedVotersWithoutApplicationSnapshotInstallSupport;
-    // Every voter in the proposed stable set must understand joint-consensus
-    // entries. A removed voter is still counted in the old quorum but need not
-    // advertise capabilities to start its removal while it is offline.
+    // Every voter in the proposed stable set must understand joint consensus
+    // and fence vote requests from older binaries. Removed voters need not be
+    // reachable when fence-capable voters still form a strict old-side majority.
     std::vector<uint32_t> VotersWithoutJointConsensusSupport;
+    // Fence-capable voters must form a strict majority of the old set, so every
+    // old-side election quorum intersects a voter that rejects legacy requests.
+    bool HasOldSideJointElectionFenceQuorum = false;
+    // Diagnostic only: an individual old voter may lack the fence if the
+    // remaining capable old voters still form a strict majority.
+    std::vector<uint32_t> OldVotersWithoutJointElectionFence;
     // When this RSM enables idempotent writes, continuing voters and learners
     // must understand tagged idempotent log records before membership changes.
     std::vector<uint32_t> MembersWithoutIdempotentLogSupport;
@@ -371,7 +377,8 @@ struct TJointConfigurationReadiness {
             HasCommittedCurrentTermEntry && ChangesVoterSet && HasLogCapacity && MissingPeerTargets.empty() &&
             AddedVotersWithoutCommitAck.empty() && AddedVotersWithoutSnapshotInstallSupport.empty() &&
             ProposedVotersWithoutApplicationSnapshotInstallSupport.empty() &&
-            VotersWithoutJointConsensusSupport.empty() && MembersWithoutIdempotentLogSupport.empty() &&
+            VotersWithoutJointConsensusSupport.empty() && HasOldSideJointElectionFenceQuorum &&
+            MembersWithoutIdempotentLogSupport.empty() &&
             MembersWithoutIdempotencyControlSupport.empty();
     }
 };
@@ -447,7 +454,7 @@ struct TVolatileState {
         bool SnapshotHistory1024 = false;
         bool InstallSnapshot = false;
         bool ApplicationSnapshotInstall = false;
-        bool JointConsensus = false;
+        bool JointConsensus = false, JointElectionFence = false;
         bool IdempotentLogEntries = false;
         bool IdempotencyControlEntries = false;
     };

@@ -302,7 +302,8 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
             request->Src = 4; request->Dst = 1; request->Term = stableImage.Term + 1;
             request->SnapshotIndex = stableImage.Index; request->SnapshotTerm = stableImage.Term;
             request->Offset = offset; request->TotalBytes = image.size();
-            request->Done = uint32_t(offset + count == image.size());
+            request->Done = uint32_t(offset + count == image.size()) |
+                TInstallSnapshotRequest::JointElectionFenceLeader;
             request->LeaderId = 4;
             memcpy(request->Data, image.data() + offset, count);
             stale->Process({}, request);
@@ -329,7 +330,8 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
         retainedRequest->Src = 2; retainedRequest->Dst = 4; retainedRequest->Term = stableImage.Term + 1;
         retainedRequest->SnapshotIndex = stableImage.Index; retainedRequest->SnapshotTerm = stableImage.Term;
         retainedRequest->Offset = offset; retainedRequest->TotalBytes = bytes.size();
-        retainedRequest->Done = uint32_t(offset + count == bytes.size());
+        retainedRequest->Done = uint32_t(offset + count == bytes.size()) |
+            TInstallSnapshotRequest::JointElectionFenceLeader;
         retainedRequest->LeaderId = 2;
         memcpy(retainedRequest->Data, bytes.data() + offset, count);
         retainedRaft->Process({}, retainedRequest);
@@ -435,7 +437,8 @@ void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void
         install->Src = leaderId; install->Dst = learnerId; install->Term = jointImage.Term + 1;
         install->SnapshotIndex = jointImage.Index; install->SnapshotTerm = jointImage.Term;
         install->Offset = offset; install->TotalBytes = encodedJointImage.size();
-        install->Done = uint32_t(offset + count == encodedJointImage.size());
+        install->Done = uint32_t(offset + count == encodedJointImage.size()) |
+            TInstallSnapshotRequest::JointElectionFenceLeader;
         install->LeaderId = leaderId;
         memcpy(install->Data, encodedJointImage.data() + offset, count);
         learnerRaft->Process({}, install);
@@ -767,7 +770,8 @@ void test_follower_can_register_future_voter_endpoint_before_joint_entry(void**)
         TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0, {1, 2}, {1, 2, 3}};
         auto makeRequest = [&] {
             auto request = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 2, .Term = 2},
-                TAppendEntriesRequest{.LeaderId = 1, .Nentries = 1});
+                TAppendEntriesRequest{.LeaderCommit = TAppendEntriesRequest::JointElectionFenceLeader,
+                    .LeaderId = 1, .Nentries = 1});
             request.InitPayload(1);
             request.Payload[0] = EncodeConfigurationEntry(joint);
             return request;
@@ -1071,6 +1075,10 @@ void test_new_voter_requires_snapshot_install_capability(void**) {
 
         volatileState->PeerCapabilities[2].Term = state->CurrentTerm;
         readiness = raft.CheckJointConfigurationReadiness({1, 2});
+        assert_true(readiness.VotersWithoutJointConsensusSupport == (std::vector<uint32_t>{2}));
+        assert_false(readiness.Ready());
+        volatileState->PeerCapabilities[2].JointElectionFence = true;
+        readiness = raft.CheckJointConfigurationReadiness({1, 2});
         assert_true(readiness.VotersWithoutJointConsensusSupport.empty());
         assert_true(readiness.ProposedVotersWithoutApplicationSnapshotInstallSupport == (std::vector<uint32_t>{2}));
         assert_false(readiness.Ready());
@@ -1136,7 +1144,7 @@ void test_joint_configuration_requires_every_member_capability(void**) {
         };
 
         auto readiness = raft.CheckJointConfigurationReadiness({1, 2, 3});
-        assert_true(readiness.VotersWithoutJointConsensusSupport == (std::vector<uint32_t>{3}));
+        assert_true(readiness.VotersWithoutJointConsensusSupport == (std::vector<uint32_t>{2, 3}));
         assert_false(readiness.Ready());
         const auto before = static_cast<TStateFields>(*state);
         Reject([&] { raft.ProposeJointConfiguration({1, 2, 3}); });
@@ -1147,6 +1155,12 @@ void test_joint_configuration_requires_every_member_capability(void**) {
             .Term = state->CurrentTerm,
             .JointConsensus = true,
         };
+        readiness = raft.CheckJointConfigurationReadiness({1, 2, 3});
+        assert_true(readiness.VotersWithoutJointConsensusSupport == (std::vector<uint32_t>{2, 3}));
+        volatileState->PeerCapabilities[2].JointElectionFence = true;
+        readiness = raft.CheckJointConfigurationReadiness({1, 2, 3});
+        assert_true(readiness.VotersWithoutJointConsensusSupport == (std::vector<uint32_t>{3}));
+        volatileState->PeerCapabilities[3].JointElectionFence = true;
         readiness = raft.CheckJointConfigurationReadiness({1, 2, 3});
         assert_true(readiness.VotersWithoutJointConsensusSupport.empty());
         assert_true(readiness.MembersWithoutIdempotentLogSupport == (std::vector<uint32_t>{3}));
@@ -1199,14 +1213,29 @@ void test_joint_removal_can_progress_without_removed_voter_capability(void**) {
             .Term = state->CurrentTerm,
             .ApplicationSnapshotInstall = true,
             .JointConsensus = true,
+            .JointElectionFence = true,
         };
         volatileState->MatchIndex[2] = 1;
         volatileState->NextIndex[2] = 2;
         volatileState->CommitAckIndex[2] = 1;
 
+        volatileState->PeerCapabilities[2].JointElectionFence = false;
+        const auto insufficientFenceQuorum = raft.CheckJointConfigurationReadiness({1});
+        assert_false(insufficientFenceQuorum.HasOldSideJointElectionFenceQuorum);
+        assert_true(insufficientFenceQuorum.OldVotersWithoutJointElectionFence ==
+            (std::vector<uint32_t>{2, 3}));
+        assert_false(insufficientFenceQuorum.Ready());
+        const auto beforeInsufficientFenceProposal = static_cast<TStateFields>(*state);
+        Reject([&] { raft.ProposeJointConfiguration({1}); });
+        assert_true(static_cast<TStateFields>(*state) == beforeInsufficientFenceProposal);
+
+        volatileState->PeerCapabilities[2].JointElectionFence = true;
+
         const auto readiness = raft.CheckJointConfigurationReadiness({1, 2});
         assert_true(readiness.MissingPeerTargets.empty());
         assert_true(readiness.VotersWithoutJointConsensusSupport.empty());
+        assert_true(readiness.HasOldSideJointElectionFenceQuorum);
+        assert_true(readiness.OldVotersWithoutJointElectionFence == (std::vector<uint32_t>{3}));
         assert_true(readiness.Ready());
 
         const auto jointIndex = raft.ProposeJointConfiguration({1, 2});
@@ -1216,11 +1245,29 @@ void test_joint_removal_can_progress_without_removed_voter_capability(void**) {
         auto request = retainedPeer->Messages.back().Cast<TAppendEntriesRequest>();
         const auto matchIndex = request->PrevLogIndex + request->Nentries;
         assert_int_equal(matchIndex, jointIndex);
+        assert_true(request->LeaderCommit & TAppendEntriesRequest::JointElectionFenceLeader);
         raft.Process(ITimeSource::Time{} + std::chrono::milliseconds(1), NewHoldedMessage(
             TMessageEx{.Src = 2, .Dst = 1, .Term = state->CurrentTerm, .Seqno = request->Seqno},
             TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1,
                 .Padding = TAppendEntriesResponse::SupportsJointConsensus |
                     TAppendEntriesResponse::SupportsApplicationSnapshotInstall}));
+        assert_int_equal(raft.GetVolatileState()->CommitIndex, 1);
+        assert_int_equal(state->CommitIndex, 1);
+
+        const auto firstAckSeqno = request->Seqno;
+        const auto fenceAckTime = ITimeSource::Time{} + std::chrono::seconds(3);
+        raft.ProcessTimeout(fenceAckTime);
+        request = retainedPeer->Messages.back().Cast<TAppendEntriesRequest>();
+        assert_int_equal(request->PrevLogIndex + request->Nentries, jointIndex);
+        assert_true(request->Seqno > firstAckSeqno);
+        raft.Process(fenceAckTime + std::chrono::milliseconds(1), NewHoldedMessage(
+            TMessageEx{.Src = 2, .Dst = 1, .Term = state->CurrentTerm, .Seqno = request->Seqno},
+            TAppendEntriesResponse{.MatchIndex = jointIndex, .Success = 1,
+                .Padding = TAppendEntriesResponse::SupportsJointConsensus |
+                    TAppendEntriesResponse::SupportsJointElectionFence |
+                    TAppendEntriesResponse::SupportsApplicationSnapshotInstall}));
+        assert_int_equal(raft.GetVolatileState()->MatchIndex.at(2), jointIndex);
+        assert_true(raft.GetVolatileState()->PeerCapabilities.at(2).JointElectionFence);
         assert_int_equal(raft.GetVolatileState()->CommitIndex, jointIndex);
         assert_int_equal(state->CommitIndex, jointIndex);
         assert_false(removedPeer->Messages.empty()); // The peer gets the entry but never acknowledges it.
@@ -1237,6 +1284,7 @@ void test_joint_removal_can_progress_without_removed_voter_capability(void**) {
             TMessageEx{.Src = 2, .Dst = 1, .Term = state->CurrentTerm, .Seqno = request->Seqno},
             TAppendEntriesResponse{.MatchIndex = stableMatchIndex, .Success = 1,
                 .Padding = TAppendEntriesResponse::SupportsJointConsensus |
+                    TAppendEntriesResponse::SupportsJointElectionFence |
                     TAppendEntriesResponse::SupportsApplicationSnapshotInstall}));
         assert_int_equal(raft.GetVolatileState()->CommitIndex, stableIndex);
         assert_int_equal(state->CommitIndex, stableIndex);
@@ -1247,6 +1295,92 @@ void test_joint_removal_can_progress_without_removed_voter_capability(void**) {
     std::filesystem::remove_all(dir, ignored);
 #endif
 }
+void test_joint_configuration_rejects_legacy_election_requests(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-vote-fence-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    {
+        auto state = std::make_shared<TDurableState>((dir / "raft").string(), 4);
+        state->BindVoters({1, 2, 3});
+        auto joint = Joint();
+        joint.Term = 1;
+        joint.PreviousIndex = joint.PreviousTerm = 0;
+        state->Append(EncodeConfigurationEntry(joint));
+        state->CommitIndex = 1;
+        state->Commit();
+
+        auto oldCandidate = std::make_shared<TEndpoint>();
+        TNodeDict peers{{1, oldCandidate}, {2, std::make_shared<TEndpoint>()},
+            {3, std::make_shared<TEndpoint>()}, {5, std::make_shared<TEndpoint>()}};
+        TRaft raft(state, 4, peers, {4});
+        assert_true(raft.GetConfigurationState().Committed.IsJoint());
+
+        // A voter from the old side may campaign during joint consensus only
+        // if it understands that elections need both majorities. Old binaries
+        // send zero in the reserved padding word.
+        auto legacyPreVote = NewHoldedMessage(TMessageEx{
+            .Src = 1, .Dst = 4, .Term = 1, .Seqno = 1},
+            TPreVoteRequest{.ProspectiveTerm = 2, .LastLogIndex = 1,
+                .LastLogTerm = 1, .CandidateId = 1});
+        raft.Process({}, legacyPreVote);
+        auto legacyVote = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 4, .Term = 2},
+            TRequestVoteRequest{.LastLogIndex = 1, .LastLogTerm = 1, .CandidateId = 1});
+        raft.Process({}, legacyVote);
+        assert_int_equal(state->CurrentTerm, 1);
+        assert_int_equal(state->VotedFor, 0);
+        assert_true(oldCandidate->Messages.empty());
+
+        auto capableVote = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 4, .Term = 2},
+            TRequestVoteRequest{.LastLogIndex = 1, .LastLogTerm = 1, .CandidateId = 1,
+                .Padding = TRequestVoteRequest::JointConsensusCapable});
+        raft.Process({}, capableVote);
+        assert_int_equal(state->CurrentTerm, 2);
+        assert_int_equal(state->VotedFor, 1);
+        assert_false(oldCandidate->Messages.empty());
+        assert_true(oldCandidate->Messages.back().Cast<TRequestVoteResponse>()->VoteGranted);
+
+        auto legacyStable = TConfigurationRecord{EConfigurationPhase::Stable, 2, 1, 1,
+            {1, 2, 3}, {3, 4, 5}};
+        auto legacyStableEntry = EncodeConfigurationEntry(legacyStable);
+        auto legacyAppend = NewHoldedMessage(
+            TMessageEx{.Src = 3, .Dst = 4, .Term = 2, .Seqno = 1},
+            TAppendEntriesRequest{.PrevLogIndex = 1, .PrevLogTerm = 1, .LeaderCommit = 1,
+                .LeaderId = 3, .Nentries = 1});
+        legacyAppend.InitPayload(1);
+        legacyAppend.Payload[0] = legacyStableEntry;
+        raft.Process({}, legacyAppend);
+        assert_int_equal(state->LastLogIndex, 1);
+
+        auto capableAppend = NewHoldedMessage(
+            TMessageEx{.Src = 3, .Dst = 4, .Term = 2, .Seqno = 2},
+            TAppendEntriesRequest{.PrevLogIndex = 1, .PrevLogTerm = 1,
+                .LeaderCommit = 1 | TAppendEntriesRequest::JointElectionFenceLeader,
+                .LeaderId = 3, .Nentries = 1});
+        capableAppend.InitPayload(1);
+        capableAppend.Payload[0] = legacyStableEntry;
+        raft.Process({}, capableAppend);
+        assert_int_equal(state->LastLogIndex, 2);
+
+        auto legacySnapshot = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + 1);
+        legacySnapshot->Src = 3;
+        legacySnapshot->Dst = 4;
+        legacySnapshot->Term = 3;
+        legacySnapshot->Seqno = 3;
+        legacySnapshot->SnapshotIndex = 1;
+        legacySnapshot->SnapshotTerm = 1;
+        legacySnapshot->TotalBytes = 44;
+        legacySnapshot->LeaderId = 3;
+        legacySnapshot->Done = TInstallSnapshotRequest::DoneFlag;
+        legacySnapshot->Data[0] = 'x';
+        raft.Process({}, legacySnapshot);
+        assert_int_equal(state->CurrentTerm, 2);
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
+
 void test_versioned_disk_state_can_start_voter_removal(void**) {
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-disk-membership-removal-" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -1269,10 +1403,12 @@ void test_versioned_disk_state_can_start_voter_removal(void**) {
             .Term = state->CurrentTerm,
             .ApplicationSnapshotInstall = true,
             .JointConsensus = true,
+            .JointElectionFence = true,
         };
         volatileState->PeerCapabilities[3] = {
             .Term = state->CurrentTerm,
             .JointConsensus = true,
+            .JointElectionFence = true,
         };
 
         const auto readiness = raft.CheckJointConfigurationReadiness({1, 2});
@@ -1308,7 +1444,8 @@ void test_new_voter_leader_can_forward_prior_term_joint_entry(void**) {
         {1, 2, 3}, {3, 4, 5}};
     auto makeRequest = [&](uint64_t term) {
         auto request = NewHoldedMessage(TMessageEx{.Src = 4, .Dst = 2, .Term = term},
-            TAppendEntriesRequest{.LeaderCommit = 1, .LeaderId = 4, .Nentries = 1});
+            TAppendEntriesRequest{.LeaderCommit = 1 | TAppendEntriesRequest::JointElectionFenceLeader,
+                .LeaderId = 4, .Nentries = 1});
         request.InitPayload(1);
         request.Payload[0] = EncodeConfigurationEntry(joint);
         return request;
@@ -1321,7 +1458,8 @@ void test_new_voter_leader_can_forward_prior_term_joint_entry(void**) {
     assert_int_equal(newLeader->Sent, 0);
 
     auto outsiderRequest = NewHoldedMessage(TMessageEx{.Src = 6, .Dst = 2, .Term = 4},
-        TAppendEntriesRequest{.LeaderCommit = 1, .LeaderId = 6, .Nentries = 1});
+        TAppendEntriesRequest{.LeaderCommit = 1 | TAppendEntriesRequest::JointElectionFenceLeader,
+            .LeaderId = 6, .Nentries = 1});
     outsiderRequest.InitPayload(1);
     outsiderRequest.Payload[0] = EncodeConfigurationEntry(joint);
     follower.Process({}, std::move(outsiderRequest));
@@ -1333,7 +1471,8 @@ void test_new_voter_leader_can_forward_prior_term_joint_entry(void**) {
     const TConfigurationRecord unrelatedJoint{EConfigurationPhase::Joint, 2, 1, 1,
         {1, 2, 3}, {3, 6, 7}};
     auto unrelatedRequest = NewHoldedMessage(TMessageEx{.Src = 6, .Dst = 2, .Term = 4},
-        TAppendEntriesRequest{.PrevLogIndex = 99, .PrevLogTerm = 2, .LeaderCommit = 99,
+        TAppendEntriesRequest{.PrevLogIndex = 99, .PrevLogTerm = 2,
+            .LeaderCommit = 99 | TAppendEntriesRequest::JointElectionFenceLeader,
             .LeaderId = 6, .Nentries = 1});
     unrelatedRequest.InitPayload(1);
     unrelatedRequest.Payload[0] = EncodeConfigurationEntry(unrelatedJoint);
@@ -1358,7 +1497,8 @@ void test_new_voter_leader_can_forward_prior_term_joint_entry(void**) {
     const TConfigurationRecord replacementJoint{EConfigurationPhase::Joint, 3, 0, 0,
         {1, 2, 3}, replacementNewVoters};
     auto replacementRequest = NewHoldedMessage(TMessageEx{.Src = 6, .Dst = 2, .Term = 4},
-        TAppendEntriesRequest{.LeaderCommit = 0, .LeaderId = 6, .Nentries = 1});
+        TAppendEntriesRequest{.LeaderCommit = TAppendEntriesRequest::JointElectionFenceLeader,
+            .LeaderId = 6, .Nentries = 1});
     replacementRequest.InitPayload(1);
     replacementRequest.Payload[0] = EncodeConfigurationEntry(replacementJoint);
     pendingFollower.Process({}, replacementRequest);
@@ -1382,7 +1522,8 @@ void test_new_voter_leader_can_forward_prior_term_joint_entry(void**) {
     const TConfigurationRecord stable{EConfigurationPhase::Stable, 2, 1, 2,
         {1, 2, 3}, {3, 4, 5}};
     auto stableForward = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 2, .Term = 3},
-        TAppendEntriesRequest{.PrevLogIndex = 1, .PrevLogTerm = 2, .LeaderCommit = 1,
+        TAppendEntriesRequest{.PrevLogIndex = 1, .PrevLogTerm = 2,
+            .LeaderCommit = 1 | TAppendEntriesRequest::JointElectionFenceLeader,
             .LeaderId = 1, .Nentries = 1});
     stableForward.InitPayload(1);
     stableForward.Payload[0] = EncodeConfigurationEntry(stable);
@@ -1396,7 +1537,8 @@ void test_new_voter_leader_can_forward_prior_term_joint_entry(void**) {
     auto sameTermStable = stable;
     sameTermStable.Term = 3;
     auto invalidStable = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 2, .Term = 3},
-        TAppendEntriesRequest{.PrevLogIndex = 1, .PrevLogTerm = 2, .LeaderCommit = 1,
+        TAppendEntriesRequest{.PrevLogIndex = 1, .PrevLogTerm = 2,
+            .LeaderCommit = 1 | TAppendEntriesRequest::JointElectionFenceLeader,
             .LeaderId = 1, .Nentries = 1});
     invalidStable.InitPayload(1);
     invalidStable.Payload[0] = EncodeConfigurationEntry(sameTermStable);
@@ -1521,7 +1663,8 @@ void test_new_side_election_replays_joint_entry_to_old_peer(void**) {
     assert_int_equal(appendPrevIndex, 0);
     assert_int_equal(appendTerm, 3);
     assert_int_equal(appendPayloadSize, appendEntryCount);
-    assert_int_equal(appendLeaderCommit, 1);
+    assert_int_equal(appendLeaderCommit & ~TAppendEntriesRequest::JointElectionFenceLeader, 1);
+    assert_true(appendLeaderCommit & TAppendEntriesRequest::JointElectionFenceLeader);
     assert_int_equal(appendLeaderId, 4);
     assert_int_equal(forwardedConfigurationTerm, 2);
     assert_true(appendEntryCount >= 1);
@@ -1761,7 +1904,9 @@ void test_removed_member_rejoins_from_fresh_snapshot_after_compaction(void**) {
         request->Seqno = 1;
         request->Src = senderId; request->Dst = receiverId; request->Term = term;
         request->SnapshotIndex = image.Index; request->SnapshotTerm = image.Term;
-        request->Offset = 0; request->TotalBytes = bytes.size(); request->Done = 1;
+        request->Offset = 0; request->TotalBytes = bytes.size();
+        request->Done = TInstallSnapshotRequest::DoneFlag |
+            TInstallSnapshotRequest::JointElectionFenceLeader;
         request->LeaderId = senderId;
         memcpy(request->Data, bytes.data(), bytes.size());
         receiver.Process(now, request);
@@ -2022,7 +2167,9 @@ void test_removed_member_rejoins_through_fresh_joint_snapshot_bootstrap(void**) 
             request->Seqno = 1;
             request->Src = 1; request->Dst = receiverId; request->Term = 3;
             request->SnapshotIndex = jointSnapshot.Index; request->SnapshotTerm = jointSnapshot.Term;
-            request->Offset = 0; request->TotalBytes = jointBytes.size(); request->Done = 1;
+            request->Offset = 0; request->TotalBytes = jointBytes.size();
+            request->Done = TInstallSnapshotRequest::DoneFlag |
+                TInstallSnapshotRequest::JointElectionFenceLeader;
             request->LeaderId = 1;
             memcpy(request->Data, jointBytes.data(), jointBytes.size());
             return request;
@@ -2438,7 +2585,8 @@ void test_live_joint_transition_waits_for_both_nontrivial_majorities(void**) {
                         TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1,
                             .Padding = TAppendEntriesResponse::SupportsInstallSnapshot |
                                 TAppendEntriesResponse::SupportsApplicationSnapshotInstall |
-                                TAppendEntriesResponse::SupportsJointConsensus}));
+                                TAppendEntriesResponse::SupportsJointConsensus |
+                                TAppendEntriesResponse::SupportsJointElectionFence}));
                 return matchIndex;
             };
             auto latestAppendMatchIndex = [&](uint32_t source) {
@@ -2663,7 +2811,7 @@ void test_disjoint_membership_change_transfers_finalizes_and_restarts(void**) {
     assert_false(heldSnapshotChunks.empty());
     auto partialChunk = std::move(heldSnapshotChunks.front());
     heldSnapshotChunks.erase(heldSnapshotChunks.begin());
-    assert_false(partialChunk.Cast<TInstallSnapshotRequest>()->Done);
+    assert_false(partialChunk.Cast<TInstallSnapshotRequest>()->Done & TInstallSnapshotRequest::DoneFlag);
     rafts[6]->Process(now, std::move(partialChunk));
     processors[6]->ProcessCommitted();
     assert_int_equal(states[6]->SnapshotIndex, 0);
@@ -3086,6 +3234,7 @@ void test_old_side_leader_can_transfer_after_joint_snapshot_with_pending_stable_
         });
         assert_true(request != endpoint->Messages.rend());
         const auto preVote = request->Cast<TPreVoteRequest>();
+        assert_true(preVote->Padding & TPreVoteRequest::JointConsensusCapable);
         leader->Process(start + std::chrono::milliseconds(1),
             NewHoldedMessage(TMessageEx{.Src = voter, .Dst = 3, .Term = preVote->Term,
                     .Seqno = preVote->Seqno},
@@ -3101,6 +3250,7 @@ void test_old_side_leader_can_transfer_after_joint_snapshot_with_pending_stable_
         });
         assert_true(request != endpoint->Messages.rend());
         const auto vote = request->Cast<TRequestVoteRequest>();
+        assert_true(vote->Padding & TRequestVoteRequest::JointConsensusCapable);
         leader->Process(start + std::chrono::milliseconds(3),
             NewHoldedMessage(TMessageEx{.Src = voter, .Dst = 3, .Term = vote->Term,
                 .Seqno = request->Cast<TMessageEx>()->Seqno},
@@ -3419,7 +3569,10 @@ void test_snapshot_install_validates_and_advances_committed_membership_history(v
             auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + bytes.size());
             request->Src = 1; request->Dst = 2; request->Term = rpcTerm; request->Seqno = replies.size() + 1;
             request->SnapshotIndex = snapshot.Index; request->SnapshotTerm = snapshot.Term;
-            request->Offset = 0; request->TotalBytes = bytes.size(); request->Done = 1; request->LeaderId = 1;
+            request->Offset = 0; request->TotalBytes = bytes.size();
+            request->Done = TInstallSnapshotRequest::DoneFlag |
+                TInstallSnapshotRequest::JointElectionFenceLeader;
+            request->LeaderId = 1;
             memcpy(request->Data, bytes.data(), bytes.size());
             raft->Process(ITimeSource::Time{}, request);
         };
@@ -3434,6 +3587,7 @@ void test_snapshot_install_validates_and_advances_committed_membership_history(v
         assert_true(static_cast<TStateFields>(*state) == before);
         assert_true(replies.empty());
         sendSnapshot(wrongIdentity, 3);
+        assert_int_equal(replies.size(), 1);
         assert_false(replies.back().Cast<TInstallSnapshotResponse>()->Success);
         assert_int_equal(state->SnapshotIndex, 0); assert_int_equal(app->LastAppliedIndex, 0);
 
@@ -3443,6 +3597,7 @@ void test_snapshot_install_validates_and_advances_committed_membership_history(v
         valid.StableConfiguration = true;
         valid.ConfigurationIndex = 3; valid.ConfigurationTerm = 2;
         sendSnapshot(valid, 3);
+        assert_int_equal(replies.size(), 2);
         assert_true(replies.back().Cast<TInstallSnapshotResponse>()->Installed);
         assert_int_equal(state->SnapshotIndex, 4); assert_int_equal(state->CommitIndex, 4);
         auto validWithLineage = valid;
@@ -3457,6 +3612,7 @@ void test_snapshot_install_validates_and_advances_committed_membership_history(v
         // from the receiver's proven stable history.
         TSnapshot legacy{5, 3, {1, 2}, "5"};
         sendSnapshot(legacy, 3);
+        assert_int_equal(replies.size(), 3);
         assert_true(replies.back().Cast<TInstallSnapshotResponse>()->Installed);
         assert_true(state->GetSnapshot()->StableConfiguration);
         assert_int_equal(state->GetSnapshot()->ConfigurationIndex, 3);
@@ -3467,10 +3623,12 @@ void test_snapshot_install_validates_and_advances_committed_membership_history(v
         // is rejected if snapshot installation left the old baseline at index 0.
         auto next = TConfigurationRecord{EConfigurationPhase::Joint, 3, 3, 2, {1, 2}, {1}};
         auto append = NewHoldedMessage(TMessageEx{.Src = 1, .Dst = 2, .Term = 3, .Seqno = 20},
-            TAppendEntriesRequest{.PrevLogIndex = 5, .PrevLogTerm = 3, .LeaderCommit = 6,
+            TAppendEntriesRequest{.PrevLogIndex = 5, .PrevLogTerm = 3,
+                .LeaderCommit = 6 | TAppendEntriesRequest::JointElectionFenceLeader,
                 .LeaderId = 1, .Nentries = 1});
         append.InitPayload(1); append.Payload[0] = EncodeConfigurationEntry(next);
         raft->Process(ITimeSource::Time{}, append);
+        assert_int_equal(replies.size(), 4);
         assert_true(replies.back().Cast<TAppendEntriesResponse>()->Success);
         assert_int_equal(state->LastLogIndex, 6); assert_int_equal(state->CommitIndex, 6);
         assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
@@ -3526,7 +3684,8 @@ void test_snapshot_install_validates_and_advances_committed_membership_history(v
             request->SnapshotTerm = incoming.Term;
             request->Offset = 0;
             request->TotalBytes = bytes.size();
-            request->Done = 1;
+            request->Done = TInstallSnapshotRequest::DoneFlag |
+                TInstallSnapshotRequest::JointElectionFenceLeader;
             request->LeaderId = 1;
             memcpy(request->Data, bytes.data(), bytes.size());
             raft->Process(ITimeSource::Time{}, std::move(request));
@@ -3600,7 +3759,10 @@ void test_snapshot_transfer_before_uncommitted_configuration_preserves_suffix(vo
         request->Seqno = 1;
         request->Src = leaderId; request->Dst = 2; request->Term = rpcTerm;
         request->SnapshotIndex = image.Index; request->SnapshotTerm = image.Term;
-        request->Offset = 0; request->TotalBytes = bytes.size(); request->Done = 1; request->LeaderId = leaderId;
+        request->Offset = 0; request->TotalBytes = bytes.size();
+        request->Done = TInstallSnapshotRequest::DoneFlag |
+            TInstallSnapshotRequest::JointElectionFenceLeader;
+        request->LeaderId = leaderId;
         memcpy(request->Data, bytes.data(), bytes.size());
         raft->Process(ITimeSource::Time{}, request);
     };
@@ -3775,7 +3937,10 @@ void test_joint_snapshot_install_requires_matching_joint_history_and_recovers(vo
             request->Src = 1; request->Dst = 2; request->Term = rpcTerm;
             request->Seqno = replies.size() + 1;
             request->SnapshotIndex = image.Index; request->SnapshotTerm = image.Term;
-            request->Offset = 0; request->TotalBytes = bytes.size(); request->Done = 1; request->LeaderId = 1;
+            request->Offset = 0; request->TotalBytes = bytes.size();
+            request->Done = TInstallSnapshotRequest::DoneFlag |
+                TInstallSnapshotRequest::JointElectionFenceLeader;
+            request->LeaderId = 1;
             memcpy(request->Data, bytes.data(), bytes.size());
             raft->Process(ITimeSource::Time{}, request);
         };
@@ -3866,7 +4031,10 @@ void test_committed_joint_snapshot_can_install_its_stable_successor(void**) {
         request->Src = leaderId; request->Dst = 2; request->Term = 4;
         request->Seqno = replies.size() + 1;
         request->SnapshotIndex = image.Index; request->SnapshotTerm = image.Term;
-        request->Offset = 0; request->TotalBytes = bytes.size(); request->Done = 1; request->LeaderId = leaderId;
+        request->Offset = 0; request->TotalBytes = bytes.size();
+        request->Done = TInstallSnapshotRequest::DoneFlag |
+            TInstallSnapshotRequest::JointElectionFenceLeader;
+        request->LeaderId = leaderId;
         memcpy(request->Data, bytes.data(), bytes.size());
         raft->Process(ITimeSource::Time{}, request);
     };
@@ -3945,7 +4113,10 @@ void test_stable_snapshot_successor_rejects_conflicting_earlier_transition_histo
         request->Src = 1; request->Dst = 2; request->Term = 3;
         request->Seqno = replies.size() + 1;
         request->SnapshotIndex = image.Index; request->SnapshotTerm = image.Term;
-        request->Offset = 0; request->TotalBytes = bytes.size(); request->Done = 1; request->LeaderId = 1;
+        request->Offset = 0; request->TotalBytes = bytes.size();
+        request->Done = TInstallSnapshotRequest::DoneFlag |
+            TInstallSnapshotRequest::JointElectionFenceLeader;
+        request->LeaderId = 1;
         memcpy(request->Data, bytes.data(), bytes.size());
         raft->Process(ITimeSource::Time{}, request);
     };
@@ -4317,7 +4488,9 @@ void test_raft_recovers_joint_quorum_for_candidate_election(void**) {
                 NewHoldedMessage(TMessageEx{.Src = source, .Dst = 4, .Term = 3, .Seqno = request->Seqno},
                     TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1,
                         .Padding = TAppendEntriesResponse::SupportsInstallSnapshot |
-                            TAppendEntriesResponse::SupportsApplicationSnapshotInstall}));
+                            TAppendEntriesResponse::SupportsApplicationSnapshotInstall |
+                            TAppendEntriesResponse::SupportsJointConsensus |
+                            TAppendEntriesResponse::SupportsJointElectionFence}));
         };
         ack(3, 1, 3);
         ack(5, 1, 3);
@@ -4814,7 +4987,8 @@ void test_stale_snapshot_missing_new_voter_target_is_rejected_before_install(voi
         request->SnapshotTerm = snapshot.Term;
         request->Offset = 0;
         request->TotalBytes = encoded.size();
-        request->Done = 1;
+        request->Done = TInstallSnapshotRequest::DoneFlag |
+            TInstallSnapshotRequest::JointElectionFenceLeader;
         request->LeaderId = 2;
         memcpy(request->Data, encoded.data(), encoded.size());
         raft->Process({}, std::move(request));
@@ -4896,7 +5070,8 @@ void test_high_term_snapshot_metadata_spanning_chunks_progresses(void**) {
         request->SnapshotTerm = snapshot.Term;
         request->Offset = offset;
         request->TotalBytes = encoded.size();
-        request->Done = uint32_t(offset + count == encoded.size());
+        request->Done = uint32_t(offset + count == encoded.size()) |
+            TInstallSnapshotRequest::JointElectionFenceLeader;
         request->LeaderId = 2;
         memcpy(request->Data, encoded.data() + offset, count);
         raft->Process({}, std::move(request));
@@ -4982,7 +5157,9 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
         request->Seqno = 1;
         request->Src = leaderId; request->Dst = 3; request->Term = rpcTerm;
         request->SnapshotIndex = snapshot.Index; request->SnapshotTerm = snapshot.Term;
-        request->Offset = 0; request->TotalBytes = encoded.size(); request->Done = 1;
+        request->Offset = 0; request->TotalBytes = encoded.size();
+        request->Done = TInstallSnapshotRequest::DoneFlag |
+            TInstallSnapshotRequest::JointElectionFenceLeader;
         request->LeaderId = leaderId;
         memcpy(request->Data, encoded.data(), encoded.size());
         stale->Process({}, request);
@@ -5028,7 +5205,9 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
     middleRequest->Seqno = 1;
     middleRequest->Src = 2; middleRequest->Dst = 3; middleRequest->Term = 5;
     middleRequest->SnapshotIndex = image.Index; middleRequest->SnapshotTerm = image.Term;
-    middleRequest->Offset = 0; middleRequest->TotalBytes = middleBytes.size(); middleRequest->Done = 1;
+    middleRequest->Offset = 0; middleRequest->TotalBytes = middleBytes.size();
+    middleRequest->Done = TInstallSnapshotRequest::DoneFlag |
+        TInstallSnapshotRequest::JointElectionFenceLeader;
     middleRequest->LeaderId = 2;
     memcpy(middleRequest->Data, middleBytes.data(), middleBytes.size());
     middleRaft->Process({}, middleRequest);
@@ -5053,7 +5232,9 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
     shorterHistoryRequest->SnapshotIndex = shorterHistoryImage.Index;
     shorterHistoryRequest->SnapshotTerm = shorterHistoryImage.Term;
     shorterHistoryRequest->Offset = 0; shorterHistoryRequest->TotalBytes = shorterHistoryBytes.size();
-    shorterHistoryRequest->Done = 1; shorterHistoryRequest->LeaderId = 2;
+    shorterHistoryRequest->Done = TInstallSnapshotRequest::DoneFlag |
+        TInstallSnapshotRequest::JointElectionFenceLeader;
+    shorterHistoryRequest->LeaderId = 2;
     memcpy(shorterHistoryRequest->Data, shorterHistoryBytes.data(), shorterHistoryBytes.size());
     middleRaft->Process({}, shorterHistoryRequest);
     assert_true(middleState->GetSnapshot()->ConfigurationTransitions == image.ConfigurationTransitions);
@@ -5085,7 +5266,9 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
         request->Seqno = 1;
         request->Src = 2; request->Dst = 1; request->Term = 4;
         request->SnapshotIndex = forgedHistoryImage.Index; request->SnapshotTerm = forgedHistoryImage.Term;
-        request->Offset = 0; request->TotalBytes = forgedHistoryBytes.size(); request->Done = 1;
+        request->Offset = 0; request->TotalBytes = forgedHistoryBytes.size();
+        request->Done = TInstallSnapshotRequest::DoneFlag |
+            TInstallSnapshotRequest::JointElectionFenceLeader;
         request->LeaderId = 2;
         memcpy(request->Data, forgedHistoryBytes.data(), forgedHistoryBytes.size());
         lineageRaft->Process({}, request);
@@ -5145,7 +5328,9 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
         request->Seqno = 1;
         request->Src = leaderId; request->Dst = 3; request->Term = 6;
         request->SnapshotIndex = jointImage.Index; request->SnapshotTerm = jointImage.Term;
-        request->Offset = 0; request->TotalBytes = encoded.size(); request->Done = 1;
+        request->Offset = 0; request->TotalBytes = encoded.size();
+        request->Done = TInstallSnapshotRequest::DoneFlag |
+            TInstallSnapshotRequest::JointElectionFenceLeader;
         request->LeaderId = leaderId;
         memcpy(request->Data, encoded.data(), encoded.size());
         jointStale->Process({}, request);
@@ -5186,7 +5371,9 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
     stableSuccessorRequest->SnapshotIndex = shorterSuccessorImage.Index;
     stableSuccessorRequest->SnapshotTerm = shorterSuccessorImage.Term;
     stableSuccessorRequest->Offset = 0; stableSuccessorRequest->TotalBytes = shorterSuccessorBytes.size();
-    stableSuccessorRequest->Done = 1; stableSuccessorRequest->LeaderId = 4;
+    stableSuccessorRequest->Done = TInstallSnapshotRequest::DoneFlag |
+        TInstallSnapshotRequest::JointElectionFenceLeader;
+    stableSuccessorRequest->LeaderId = 4;
     memcpy(stableSuccessorRequest->Data, shorterSuccessorBytes.data(), shorterSuccessorBytes.size());
     jointStale->Process({}, stableSuccessorRequest);
     assert_int_equal(jointStaleState->CurrentTerm, 7);
@@ -5220,7 +5407,9 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
         request->Seqno = 1;
         request->Src = 4; request->Dst = 3; request->Term = 6;
         request->SnapshotIndex = forgedStaleImage.Index; request->SnapshotTerm = forgedStaleImage.Term;
-        request->Offset = 0; request->TotalBytes = forgedStaleBytes.size(); request->Done = 1;
+        request->Offset = 0; request->TotalBytes = forgedStaleBytes.size();
+        request->Done = TInstallSnapshotRequest::DoneFlag |
+            TInstallSnapshotRequest::JointElectionFenceLeader;
         request->LeaderId = 4;
         memcpy(request->Data, forgedStaleBytes.data(), forgedStaleBytes.size());
         staleLineageRaft->Process({}, request);
@@ -5256,7 +5445,9 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
         request->Seqno = 1;
         request->Src = 2; request->Dst = 3; request->Term = 6;
         request->SnapshotIndex = forgedJointStaleImage.Index; request->SnapshotTerm = forgedJointStaleImage.Term;
-        request->Offset = 0; request->TotalBytes = forgedJointStaleBytes.size(); request->Done = 1;
+        request->Offset = 0; request->TotalBytes = forgedJointStaleBytes.size();
+        request->Done = TInstallSnapshotRequest::DoneFlag |
+            TInstallSnapshotRequest::JointElectionFenceLeader;
         request->LeaderId = 2;
         memcpy(request->Data, forgedJointStaleBytes.data(), forgedJointStaleBytes.size());
         staleJointLineageRaft->Process({}, request);
@@ -5298,7 +5489,9 @@ void test_overlapping_multihop_snapshot_recovers_stale_store_online(void**) {
         request->Seqno = 1;
         request->Src = 4; request->Dst = 3; request->Term = 7;
         request->SnapshotIndex = forgedSuccessorImage.Index; request->SnapshotTerm = forgedSuccessorImage.Term;
-        request->Offset = 0; request->TotalBytes = forgedSuccessorBytes.size(); request->Done = 1;
+        request->Offset = 0; request->TotalBytes = forgedSuccessorBytes.size();
+        request->Done = TInstallSnapshotRequest::DoneFlag |
+            TInstallSnapshotRequest::JointElectionFenceLeader;
         request->LeaderId = 4;
         memcpy(request->Data, forgedSuccessorBytes.data(), forgedSuccessorBytes.size());
         sparseJointRaft->Process({}, request);
@@ -5339,6 +5532,7 @@ int main() {
         cmocka_unit_test(test_new_voter_requires_snapshot_install_capability),
         cmocka_unit_test(test_joint_configuration_requires_every_member_capability),
         cmocka_unit_test(test_joint_removal_can_progress_without_removed_voter_capability),
+        cmocka_unit_test(test_joint_configuration_rejects_legacy_election_requests),
         cmocka_unit_test(test_versioned_disk_state_can_start_voter_removal),
         cmocka_unit_test(test_new_voter_leader_can_forward_prior_term_joint_entry),
         cmocka_unit_test(test_new_side_election_replays_joint_entry_to_old_peer),

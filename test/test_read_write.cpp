@@ -1349,7 +1349,8 @@ int RunServingServerMembershipReaderTest(const std::filesystem::path& dir) {
     TConfigurationRecord addJoint{EConfigurationPhase::Joint, 2, 0, 0, {1, 2}, {1, 2, 3}};
     auto addRequest = NewHoldedMessage(
         TMessageEx{.Src = 2, .Dst = 1, .Term = 2},
-        TAppendEntriesRequest{.LeaderCommit = 1, .LeaderId = 2, .Nentries = 1});
+        TAppendEntriesRequest{.LeaderCommit = 1 | TAppendEntriesRequest::JointElectionFenceLeader,
+            .LeaderId = 2, .Nentries = 1});
     addRequest.InitPayload(1);
     addRequest.Payload[0] = EncodeConfigurationEntry(addJoint);
     raft->Process({}, std::move(addRequest));
@@ -1366,7 +1367,8 @@ int RunServingServerMembershipReaderTest(const std::filesystem::path& dir) {
     TConfigurationRecord removeStable{EConfigurationPhase::Stable, 2, 3, 2, {1, 2, 3}, {1, 2}};
     auto removeRequest = NewHoldedMessage(
         TMessageEx{.Src = 2, .Dst = 1, .Term = 2},
-        TAppendEntriesRequest{.PrevLogIndex = 1, .PrevLogTerm = 2, .LeaderCommit = 4,
+        TAppendEntriesRequest{.PrevLogIndex = 1, .PrevLogTerm = 2,
+            .LeaderCommit = 4 | TAppendEntriesRequest::JointElectionFenceLeader,
             .LeaderId = 2, .Nentries = 3});
     removeRequest.InitPayload(3);
     removeRequest.Payload[0] = EncodeConfigurationEntry(addStable);
@@ -1388,7 +1390,8 @@ int RunServingServerMembershipReaderTest(const std::filesystem::path& dir) {
     TConfigurationRecord readdJoint{EConfigurationPhase::Joint, 2, 4, 2, {1, 2}, {1, 2, 3}};
     auto readdRequest = NewHoldedMessage(
         TMessageEx{.Src = 2, .Dst = 1, .Term = 2},
-        TAppendEntriesRequest{.PrevLogIndex = 4, .PrevLogTerm = 2, .LeaderCommit = 5,
+        TAppendEntriesRequest{.PrevLogIndex = 4, .PrevLogTerm = 2,
+            .LeaderCommit = 5 | TAppendEntriesRequest::JointElectionFenceLeader,
             .LeaderId = 2, .Nentries = 1});
     readdRequest.InitPayload(1);
     readdRequest.Payload[0] = EncodeConfigurationEntry(readdJoint);
@@ -1402,7 +1405,8 @@ int RunServingServerMembershipReaderTest(const std::filesystem::path& dir) {
     TConfigurationRecord removeAgainStable{EConfigurationPhase::Stable, 2, 7, 2, {1, 2, 3}, {1, 2}};
     auto reuseRequest = NewHoldedMessage(
         TMessageEx{.Src = 2, .Dst = 1, .Term = 2},
-        TAppendEntriesRequest{.PrevLogIndex = 5, .PrevLogTerm = 2, .LeaderCommit = 8,
+        TAppendEntriesRequest{.PrevLogIndex = 5, .PrevLogTerm = 2,
+            .LeaderCommit = 8 | TAppendEntriesRequest::JointElectionFenceLeader,
             .LeaderId = 2, .Nentries = 3});
     reuseRequest.InitPayload(3);
     reuseRequest.Payload[0] = EncodeConfigurationEntry(readdStable);
