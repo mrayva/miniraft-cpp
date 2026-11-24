@@ -1,6 +1,7 @@
 #pragma once
 
 #include <exception>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
@@ -356,8 +357,9 @@ public:
         // be destroyed after their final drain without another poller turn.
         if (Drainer && Drainer.done()) { Drainer.destroy(); Drainer = {}; }
         if (Connector && Connector.done()) { Connector.destroy(); Connector = {}; }
+        std::lock_guard lock(QueueMutex);
         if (auto budget = QueueBudget.lock())
-            budget->Release(PendingMessageCount(), PendingMessageBytes());
+            budget->Release(PendingMessageCountLocked(), PendingMessageBytesLocked());
     }
 
     void Send(TMessageHolder<TMessage> message) override;
@@ -372,18 +374,20 @@ public:
     // same budget is harmless; switching budgets requires a prior detach.
     bool AttachQueueBudget(const std::shared_ptr<TOutboundQueueBudget>& budget) {
         if (!budget) throw std::invalid_argument("Outbound queue budget is null");
+        std::lock_guard lock(QueueMutex);
         const auto attachedBudget = QueueBudget.lock();
         if (attachedBudget == budget) return false;
         if (attachedBudget) throw std::logic_error("Node already has an outbound queue budget");
-        if (!budget->TryReplace(0, 0, PendingMessageCount(), PendingMessageBytes()))
+        if (!budget->TryReplace(0, 0, PendingMessageCountLocked(), PendingMessageBytesLocked()))
             throw TNodeQueueFull{};
         QueueBudget = budget;
         return true;
     }
     void DetachQueueBudget(const std::shared_ptr<TOutboundQueueBudget>& budget) noexcept {
+        std::lock_guard lock(QueueMutex);
         const auto attachedBudget = QueueBudget.lock();
         if (!budget || attachedBudget != budget) return;
-        attachedBudget->Release(PendingMessageCount(), PendingMessageBytes());
+        attachedBudget->Release(PendingMessageCountLocked(), PendingMessageBytesLocked());
         QueueBudget.reset();
     }
     bool SupportsRetirement() const {
@@ -468,14 +472,16 @@ private:
     enum class EQueueClass : uint8_t { Client, Vote, Replication, TimeoutNow, ConfigurationBarrier };
     static EQueueClass QueueClassFor(uint32_t type);
     static bool TryGetMessageTreeBytes(const TMessageHolder<TMessage>& message, uint64_t& bytes);
-    size_t PendingMessageCount() const { return PendingDataMessages + PendingRaftMessages; }
-    uint64_t PendingMessageBytes() const { return PendingDataBytes + PendingRaftBytes; }
+    size_t PendingMessageCountLocked() const { return PendingDataMessages + PendingRaftMessages; }
+    uint64_t PendingMessageBytesLocked() const { return PendingDataBytes + PendingRaftBytes; }
     void RecountPendingMessages();
+    void RecountPendingMessagesLocked();
     void CompletePendingMessage(EQueueClass queueClass, uint64_t bytes);
 
     void Connect();
     void ShutdownSocket() noexcept;
     void DropUnsupportedForwardingMessages() {
+        std::lock_guard lock(QueueMutex);
         bool removed = false;
         for (auto it = Messages.begin(); it != Messages.end();) {
             const auto type = EMessageType((*it)->Type);
@@ -494,9 +500,10 @@ private:
                 ++it;
             }
         }
-        if (removed) RecountPendingMessages();
+        if (removed) RecountPendingMessagesLocked();
     }
     void DiscardForwardedCommands() {
+        std::lock_guard lock(QueueMutex);
         bool removed = false;
         for (auto it = Messages.begin(); it != Messages.end();) {
             const auto type = EMessageType((*it)->Type);
@@ -511,7 +518,7 @@ private:
                 ++it;
             }
         }
-        if (removed) RecountPendingMessages();
+        if (removed) RecountPendingMessagesLocked();
     }
 
     NNet::TVoidSuspendedTask DoDrain();
@@ -523,7 +530,7 @@ private:
     std::function<TSocket(const NNet::TAddress&)> SocketFactory;
     TSocket Socket;
     bool Connected = false;
-    bool Retired = false;
+    std::atomic<bool> Retired = false;
     bool CapabilityNegotiating = false;
     bool SkipNextCapabilityProbe = false;
     ITimeSource::Time CapabilityNegotiationStarted{};
@@ -537,6 +544,10 @@ private:
     std::coroutine_handle<> Connector;
 
     std::vector<TMessageHolder<TMessage>> Messages;
+    // Raft may enqueue replies from a worker while the poller drains sockets.
+    // Queue accounting and its shared budget are changed under this lock; it is
+    // never held across socket I/O.
+    mutable std::mutex QueueMutex;
     // Includes messages in Messages and in the active writer batch.
     size_t PendingDataMessages = 0, PendingRaftMessages = 0;
     uint64_t PendingDataBytes = 0, PendingRaftBytes = 0;

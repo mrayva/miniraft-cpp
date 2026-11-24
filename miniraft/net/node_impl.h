@@ -27,6 +27,12 @@ bool TNode<TSocket>::TryGetMessageTreeBytes(const TMessageHolder<TMessage>& mess
 
 template<typename TSocket>
 void TNode<TSocket>::RecountPendingMessages() {
+    std::lock_guard lock(QueueMutex);
+    RecountPendingMessagesLocked();
+}
+
+template<typename TSocket>
+void TNode<TSocket>::RecountPendingMessagesLocked() {
     size_t dataMessages = 0, raftMessages = 0;
     uint64_t dataBytes = 0, raftBytes = 0;
     for (const auto& message : Messages) {
@@ -44,8 +50,8 @@ void TNode<TSocket>::RecountPendingMessages() {
             raftBytes += bytes;
         }
     }
-    const auto oldMessages = PendingMessageCount();
-    const auto oldBytes = PendingMessageBytes();
+    const auto oldMessages = PendingMessageCountLocked();
+    const auto oldBytes = PendingMessageBytesLocked();
     const auto budget = QueueBudget.lock();
     if (budget && !budget->TryReplace(oldMessages, oldBytes,
             dataMessages + raftMessages, dataBytes + raftBytes))
@@ -58,12 +64,17 @@ void TNode<TSocket>::RecountPendingMessages() {
 
 template<typename TSocket>
 void TNode<TSocket>::CompletePendingMessage(EQueueClass queueClass, uint64_t bytes) {
+    std::lock_guard lock(QueueMutex);
+    // Retire() releases all pending reservations atomically while holding this
+    // same mutex. An in-flight writer can finish after retirement and must not
+    // release that reservation a second time.
+    if (Retired) return;
     auto& count = queueClass == EQueueClass::Client ? PendingDataMessages : PendingRaftMessages;
     auto& totalBytes = queueClass == EQueueClass::Client ? PendingDataBytes : PendingRaftBytes;
     if (!count || totalBytes < bytes) throw std::logic_error("Outbound queue accounting underflow");
     const auto budget = QueueBudget.lock();
-    if (budget && !budget->TryReplace(PendingMessageCount(), PendingMessageBytes(),
-            PendingMessageCount() - 1, PendingMessageBytes() - bytes))
+    if (budget && !budget->TryReplace(PendingMessageCountLocked(), PendingMessageBytesLocked(),
+            PendingMessageCountLocked() - 1, PendingMessageBytesLocked() - bytes))
         throw std::logic_error("Completion exceeds aggregate outbound queue budget");
     --count;
     totalBytes -= bytes;
@@ -77,6 +88,7 @@ void TNode<TSocket>::Send(TMessageHolder<TMessage> message) {
 
 template<typename TSocket>
 bool TNode<TSocket>::TrySend(TMessageHolder<TMessage> message) {
+    std::lock_guard lock(QueueMutex);
     if (Retired) return false;
     ValidateMessageTree(message);
 
@@ -108,8 +120,8 @@ bool TNode<TSocket>::TrySend(TMessageHolder<TMessage> message) {
             return false;
     }
 
-    const auto oldTotalMessages = PendingMessageCount();
-    const auto oldTotalBytes = PendingMessageBytes();
+    const auto oldTotalMessages = PendingMessageCountLocked();
+    const auto oldTotalBytes = PendingMessageBytesLocked();
     if (replacedMessages > oldTotalMessages || replacedBytes > oldTotalBytes ||
         oldTotalMessages - replacedMessages == SIZE_MAX ||
         bytes > UINT64_MAX - (oldTotalBytes - replacedBytes))
@@ -176,8 +188,10 @@ void TNode<TSocket>::Retire() {
     if (Retired) return;
     if (!SupportsRetirement())
         throw std::logic_error("Socket type does not support safe peer retirement");
+    std::lock_guard lock(QueueMutex);
+    if (Retired) return;
     if (const auto budget = QueueBudget.lock())
-        if (!budget->TryReplace(PendingMessageCount(), PendingMessageBytes(), 0, 0))
+        if (!budget->TryReplace(PendingMessageCountLocked(), PendingMessageBytesLocked(), 0, 0))
             throw std::logic_error("Failed to release retired node's aggregate outbound queue usage");
     Retired = true;
     Messages.clear();
@@ -205,14 +219,20 @@ void TNode<TSocket>::ShutdownSocket() noexcept {
 template<typename TSocket>
 NNet::TVoidSuspendedTask TNode<TSocket>::DoDrain() {
     try {
-        while (!Messages.empty()) {
-            auto tosend = std::move(Messages); Messages.clear();
+        while (true) {
+            std::vector<TMessageHolder<TMessage>> tosend;
+            {
+                std::lock_guard lock(QueueMutex);
+                if (Messages.empty()) break;
+                tosend = std::move(Messages);
+                Messages.clear();
+            }
             for (auto&& m : tosend) {
                 const auto queueClass = QueueClassFor(m->Type);
                 uint64_t bytes = 0;
                 if (!TryGetMessageTreeBytes(m, bytes)) throw std::logic_error("Outbound message size overflow");
                 co_await TMessageWriter(Socket).Write(std::move(m));
-                if (!Retired) CompletePendingMessage(queueClass, bytes);
+                CompletePendingMessage(queueClass, bytes);
             }
         }
     } catch (const std::exception& ex) {

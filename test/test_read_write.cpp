@@ -1,10 +1,13 @@
 #include <chrono>
+#include <atomic>
+#include <condition_variable>
 #include <coroutine>
 #include <cstdint>
 #include <iostream>
 #include <memory>
 #include <functional>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 #include <filesystem>
 
@@ -227,6 +230,28 @@ void test_node_send_queue_bounds_data_and_coalesces_raft_retries(void**) {
             co_return static_cast<std::ptrdiff_t>(size);
         }
     };
+    struct TWriteGate {
+        std::mutex Mutex;
+        std::condition_variable Condition;
+        bool Entered = false;
+        bool Released = false;
+        std::atomic<bool> BlockFirstWrite{false};
+    };
+    struct TBlockingSocket {
+        using TPoller = TImmediatePoller;
+        std::shared_ptr<TWriteGate> Gate;
+        TPoller* Poller() { return nullptr; }
+        NNet::TValueTask<void> Connect() { co_return; }
+        NNet::TValueTask<std::ptrdiff_t> WriteSome(const void*, size_t size) {
+            if (!Gate->BlockFirstWrite.exchange(true)) {
+                std::unique_lock lock(Gate->Mutex);
+                Gate->Entered = true;
+                Gate->Condition.notify_all();
+                Gate->Condition.wait(lock, [&] { return Gate->Released; });
+            }
+            co_return static_cast<std::ptrdiff_t>(size);
+        }
+    };
     auto drainBudget = std::make_shared<TOutboundQueueBudget>(TOutboundQueueLimits{1, 1024});
     TNode<TImmediateSocket> drainFirst("drain-first", TImmediateSocket{}, timeSource);
     TNode<TImmediateSocket> drainSecond("drain-second", TImmediateSocket{}, timeSource);
@@ -236,6 +261,80 @@ void test_node_send_queue_bounds_data_and_coalesces_raft_retries(void**) {
     assert_false(drainSecond.TrySend(NewHoldedMessage<TCommandResponse>()));
     drainFirst.Drain(); // Successful completion returns its aggregate reservation.
     assert_true(drainSecond.TrySend(NewHoldedMessage<TCommandResponse>()));
+
+    // A worker may produce Raft replies while the poller owns the node's
+    // writer. Concurrent retries of the same traffic classes must coalesce
+    // without corrupting the queue or its shared reservation.
+    auto concurrentBudget = std::make_shared<TOutboundQueueBudget>(TOutboundQueueLimits{4, 1024});
+    auto writeGate = std::make_shared<TWriteGate>();
+    TNode<TBlockingSocket> concurrent("concurrent", TBlockingSocket{writeGate}, timeSource);
+    TNode<TImmediateSocket> concurrentContender("concurrent-contender", TImmediateSocket{}, timeSource);
+    assert_true(concurrent.AttachQueueBudget(concurrentBudget));
+    assert_true(concurrentContender.AttachQueueBudget(concurrentBudget));
+    assert_true(concurrent.TrySend(NewHoldedMessage<TAppendEntriesRequest>()));
+    std::thread drainThread([&] { concurrent.Drain(); });
+    std::unique_lock writerLock(writeGate->Mutex);
+    const bool writerSuspended = writeGate->Condition.wait_for(
+        writerLock, std::chrono::seconds(5), [&] { return writeGate->Entered; });
+    writerLock.unlock();
+    if (!writerSuspended) {
+        {
+            std::lock_guard lock(writeGate->Mutex);
+            writeGate->Released = true;
+        }
+        writeGate->Condition.notify_all();
+        drainThread.join();
+        assert_true(writerSuspended);
+        return;
+    }
+
+    std::atomic<bool> startProducers{false};
+    std::atomic<size_t> accepted{0};
+    std::mutex producerMutex;
+    std::condition_variable producerCondition;
+    size_t producersDone = 0;
+    std::vector<std::thread> producers;
+    for (size_t threadIndex = 0; threadIndex < 4; ++threadIndex) {
+        producers.emplace_back([&, threadIndex] {
+            while (!startProducers.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (size_t i = 0; i < 1000; ++i) {
+                const auto trafficClass = (i + threadIndex) % 3;
+                bool sent = false;
+                if (trafficClass == 0)
+                    sent = concurrent.TrySend(NewHoldedMessage<TAppendEntriesRequest>());
+                else if (trafficClass == 1)
+                    sent = concurrent.TrySend(NewHoldedMessage<TRequestVoteRequest>());
+                else
+                    sent = concurrent.TrySend(NewHoldedMessage<TConfigurationBarrierRequest>());
+                if (sent) accepted.fetch_add(1, std::memory_order_relaxed);
+            }
+            {
+                std::lock_guard lock(producerMutex);
+                ++producersDone;
+            }
+            producerCondition.notify_one();
+        });
+    }
+    startProducers.store(true, std::memory_order_release);
+    std::unique_lock producerLock(producerMutex);
+    const bool producersCompletedWhileWriterBlocked = producerCondition.wait_for(
+        producerLock, std::chrono::seconds(5), [&] { return producersDone == producers.size(); });
+    producerLock.unlock();
+    const bool contenderWasRejectedWhileWriterBlocked =
+        !concurrentContender.TrySend(NewHoldedMessage<TCommandResponse>());
+    {
+        std::lock_guard lock(writeGate->Mutex);
+        writeGate->Released = true;
+    }
+    writeGate->Condition.notify_all();
+    for (auto& producer : producers) producer.join();
+    drainThread.join();
+    assert_true(producersCompletedWhileWriterBlocked);
+    assert_true(accepted.load(std::memory_order_relaxed) == 4000);
+    // The in-flight request and one retry per class consume all four
+    // aggregate slots until the writer completes both batches.
+    assert_true(contenderWasRejectedWhileWriterBlocked);
+    assert_true(concurrentContender.TrySend(NewHoldedMessage<TCommandResponse>()));
 }
 
 void test_message_send_recv(void**) {
