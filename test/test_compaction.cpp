@@ -3450,7 +3450,9 @@ void test_snapshot_and_suffix_are_atomic_at_every_publication_stage(void**) {
     using TStage = TDurableState::EStage;
     for (bool priorSnapshot : {false, true}) for (bool retain : {false, true}) for (auto stage : {TStage::TempCreated, TStage::Written, TStage::FileSynced,
          TStage::Renamed, TStage::DirectorySynced, TStage::SnapshotTempCreated, TStage::SnapshotWritten,
-         TStage::SnapshotFileSynced, TStage::SnapshotRenamed, TStage::SnapshotDirectorySynced}) {
+         TStage::SnapshotFileSynced, TStage::SnapshotRenamed, TStage::SnapshotDirectorySynced,
+         TStage::LogTempCreated, TStage::LogWritten, TStage::LogFileSynced, TStage::LogRenamed,
+         TStage::LogDirectorySynced}) {
         TFiles files;
         { TDurableState state(files.Name, 1); state.CurrentTerm = 3; state.VotedFor = 2;
           for (uint64_t term : {1, 2, 3}) { auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = term; state.Append(entry); }
@@ -3464,7 +3466,7 @@ void test_snapshot_and_suffix_are_atomic_at_every_publication_stage(void**) {
         int status = 0; assert_int_equal(waitpid(child, &status, 0), child);
         assert_true(WIFEXITED(status)); assert_int_equal(WEXITSTATUS(status), 90);
         TDurableState state(files.Name, 1);
-        const bool updated = stage <= TStage::DirectorySynced && stage >= TStage::Renamed;
+        const bool updated = stage == TStage::Renamed || stage == TStage::DirectorySynced;
         assert_int_equal(state.CurrentTerm, 3); assert_int_equal(state.VotedFor, 2);
         assert_int_equal(state.SnapshotIndex, updated ? retain ? 2 : 4 : priorSnapshot ? 1 : 0);
         assert_int_equal(state.LastLogIndex, updated && !retain ? 4 : 3);

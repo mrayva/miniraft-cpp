@@ -605,6 +605,8 @@ void TDurableState::Publish()
         ? SnapshotImageName(Impl->File, SnapshotIndex, SnapshotTerm) : std::string{};
     uint64_t imageBytes = Impl->PublishedSnapshotBytes;
     auto imageDigest = Impl->PublishedSnapshotDigest;
+    bool snapshotDirectoryChanged = false;
+    bool logDirectoryChanged = false;
     if (Impl->Snapshot && snapshotFile != previousSnapshotFile) {
         const auto snapshotEncoding = PrepareSnapshotEncoding(*Impl->Snapshot);
         imageBytes = SnapshotEncodingSize(*snapshotEncoding);
@@ -637,8 +639,7 @@ void TDurableState::Publish()
         Require(renameat(Impl->Directory.Value, snapshotTemp.c_str(),
             Impl->Directory.Value, snapshotFile.c_str()) == 0, "publish durable snapshot image");
         Impl->Stage(EStage::SnapshotRenamed);
-        Sync(Impl->Directory.Value);
-        Impl->Stage(EStage::SnapshotDirectorySynced);
+        snapshotDirectoryChanged = true;
     }
 
     const auto previousLogGeneration = Impl->LogGeneration;
@@ -682,8 +683,7 @@ void TDurableState::Publish()
         Require(renameat(Impl->Directory.Value, logTemp.c_str(),
             Impl->Directory.Value, logFile.c_str()) == 0, "publish durable log generation");
         Impl->Stage(EStage::LogRenamed);
-        Sync(Impl->Directory.Value);
-        Impl->Stage(EStage::LogDirectorySynced);
+        logDirectoryChanged = true;
     } else if (Impl->Log.size() > Impl->PublishedLogCount) {
         const auto logFile = LogImageName(Impl->File, logGeneration);
         TFd log(openat(Impl->Directory.Value, logFile.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW));
@@ -711,6 +711,13 @@ void TDurableState::Publish()
         Impl->Stage(EStage::LogAppendFileSynced);
     } else if (Impl->Log.size() != Impl->PublishedLogCount) {
         throw std::logic_error("Durable log changed without a replacement generation");
+    }
+    // Persist all renamed sidecars together, before the manifest can refer to
+    // them. This needs one directory sync even when both were replaced.
+    if (snapshotDirectoryChanged || logDirectoryChanged) {
+        Sync(Impl->Directory.Value);
+        if (snapshotDirectoryChanged) Impl->Stage(EStage::SnapshotDirectorySynced);
+        if (logDirectoryChanged) Impl->Stage(EStage::LogDirectorySynced);
     }
     const auto logChecksumValue = ~logChecksumState;
 
