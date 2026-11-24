@@ -1176,6 +1176,77 @@ void test_joint_configuration_requires_every_member_capability(void**) {
     std::filesystem::remove_all(dir, ignored);
 #endif
 }
+void test_joint_removal_can_progress_without_removed_voter_capability(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-remove-offline-voter-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    {
+        auto state = std::make_shared<TDurableState>((dir / "raft").string(), 1);
+        state->BindVoters({1, 2, 3});
+        state->CurrentTerm = 2;
+        state->Append(Ordinary(2));
+        state->CommitIndex = 1;
+        state->Commit();
+
+        auto retainedPeer = std::make_shared<TEndpoint>();
+        auto removedPeer = std::make_shared<TEndpoint>();
+        TRaft raft(state, 1, {{2, retainedPeer}, {3, removedPeer}});
+        raft.Become(EState::LEADER);
+        raft.SetLocalApplicationSnapshotInstallSupport(true);
+        auto* volatileState = const_cast<TVolatileState*>(raft.GetVolatileState());
+        volatileState->PeerCapabilities[2] = {
+            .Term = state->CurrentTerm,
+            .ApplicationSnapshotInstall = true,
+            .JointConsensus = true,
+        };
+        volatileState->MatchIndex[2] = 1;
+        volatileState->NextIndex[2] = 2;
+        volatileState->CommitAckIndex[2] = 1;
+
+        const auto readiness = raft.CheckJointConfigurationReadiness({1, 2});
+        assert_true(readiness.MissingPeerTargets.empty());
+        assert_true(readiness.VotersWithoutJointConsensusSupport.empty());
+        assert_true(readiness.Ready());
+
+        const auto jointIndex = raft.ProposeJointConfiguration({1, 2});
+        assert_int_equal(jointIndex, 2);
+        raft.ProcessTimeout(ITimeSource::Time{});
+        assert_false(retainedPeer->Messages.empty());
+        auto request = retainedPeer->Messages.back().Cast<TAppendEntriesRequest>();
+        const auto matchIndex = request->PrevLogIndex + request->Nentries;
+        assert_int_equal(matchIndex, jointIndex);
+        raft.Process(ITimeSource::Time{} + std::chrono::milliseconds(1), NewHoldedMessage(
+            TMessageEx{.Src = 2, .Dst = 1, .Term = state->CurrentTerm, .Seqno = request->Seqno},
+            TAppendEntriesResponse{.MatchIndex = matchIndex, .Success = 1,
+                .Padding = TAppendEntriesResponse::SupportsJointConsensus |
+                    TAppendEntriesResponse::SupportsApplicationSnapshotInstall}));
+        assert_int_equal(raft.GetVolatileState()->CommitIndex, jointIndex);
+        assert_int_equal(state->CommitIndex, jointIndex);
+        assert_false(removedPeer->Messages.empty()); // The peer gets the entry but never acknowledges it.
+        assert_int_equal(removedPeer->Messages.back().Cast<TAppendEntriesRequest>()->Dst, 3);
+
+        const auto stableIndex = raft.FinalizeConfiguration();
+        assert_int_equal(stableIndex, 3);
+        const auto later = ITimeSource::Time{} + std::chrono::seconds(10);
+        raft.ProcessTimeout(later);
+        request = retainedPeer->Messages.back().Cast<TAppendEntriesRequest>();
+        const auto stableMatchIndex = request->PrevLogIndex + request->Nentries;
+        assert_int_equal(stableMatchIndex, stableIndex);
+        raft.Process(later + std::chrono::milliseconds(1), NewHoldedMessage(
+            TMessageEx{.Src = 2, .Dst = 1, .Term = state->CurrentTerm, .Seqno = request->Seqno},
+            TAppendEntriesResponse{.MatchIndex = stableMatchIndex, .Success = 1,
+                .Padding = TAppendEntriesResponse::SupportsJointConsensus |
+                    TAppendEntriesResponse::SupportsApplicationSnapshotInstall}));
+        assert_int_equal(raft.GetVolatileState()->CommitIndex, stableIndex);
+        assert_int_equal(state->CommitIndex, stableIndex);
+        assert_false(raft.IsVoter(3));
+        assert_true(raft.GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+#endif
+}
 void test_versioned_disk_state_can_start_voter_removal(void**) {
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-disk-membership-removal-" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -5267,6 +5338,7 @@ int main() {
         cmocka_unit_test(test_compaction_membership_readiness_reports_acknowledgement_blockers),
         cmocka_unit_test(test_new_voter_requires_snapshot_install_capability),
         cmocka_unit_test(test_joint_configuration_requires_every_member_capability),
+        cmocka_unit_test(test_joint_removal_can_progress_without_removed_voter_capability),
         cmocka_unit_test(test_versioned_disk_state_can_start_voter_removal),
         cmocka_unit_test(test_new_voter_leader_can_forward_prior_term_joint_entry),
         cmocka_unit_test(test_new_side_election_replays_joint_entry_to_old_peer),

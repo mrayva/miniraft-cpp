@@ -346,6 +346,8 @@ struct TJointConfigurationReadiness {
     bool ChangesVoterSet = false;
     // The joint entry, its stable successor and reserved control entries fit.
     bool HasLogCapacity = false;
+    // Replication targets for both the old and proposed quorum sets are needed
+    // until the stable successor commits.
     std::vector<uint32_t> MissingPeerTargets;
     std::vector<uint32_t> AddedVotersWithoutCommitAck;
     // Missing/unknown peer capability advertisements fail closed before promotion.
@@ -353,10 +355,12 @@ struct TJointConfigurationReadiness {
     // Every voter in the proposed stable set must be able to restore application
     // data from an installed Raft snapshot.
     std::vector<uint32_t> ProposedVotersWithoutApplicationSnapshotInstallSupport;
-    // Every current and proposed voter must understand joint-consensus entries.
+    // Every voter in the proposed stable set must understand joint-consensus
+    // entries. A removed voter is still counted in the old quorum but need not
+    // advertise capabilities to start its removal while it is offline.
     std::vector<uint32_t> VotersWithoutJointConsensusSupport;
-    // When this RSM enables idempotent writes, every replication target must
-    // understand tagged idempotent log records before membership can change.
+    // When this RSM enables idempotent writes, continuing voters and learners
+    // must understand tagged idempotent log records before membership changes.
     std::vector<uint32_t> MembersWithoutIdempotentLogSupport;
     // Session controls have a separate capability bit for safe mixed-version
     // operation, even when the peer supports idempotent command records.

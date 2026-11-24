@@ -41,9 +41,12 @@ include the complete bounded metadata prefix and match the RPC boundary and
 known configuration history before hard state advances.
 
 Older binaries do not understand MRFTS002 and may acknowledge an already-covered
-image without checking its version. Upgrade every voter before using joint
-snapshot transfer. A standalone export is not proof that a configuration is
-committed and is not an authoritative Raft checkpoint.
+image without checking its version. Every voter in the proposed stable set must
+be upgraded before it participates in a joint transition. A removed voter may
+remain offline or on an older binary while its old-set majority is satisfied by
+other voters; if it returns before finalization, it may reject joint snapshot
+transfer and cannot help that majority. A standalone export is not proof that a
+configuration is committed and is not an authoritative Raft checkpoint.
 
 Tests cover a golden v1 image, joint round-trip, every-byte corruption and
 truncation, semantic corruption with valid CRC, bounds and ordering, standalone

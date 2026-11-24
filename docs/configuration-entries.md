@@ -97,10 +97,16 @@ entry term[8], previous configuration index[8], previous configuration
 term[8], old count[4], new count[4], old voter IDs[4 each], new voter IDs[4
 each], and CRC32[4] over the preceding payload. The outer entry term must match
 the encoded term and its flags must equal `EConfiguration`. CRC checks accidental
-corruption; it is not authentication. All voters must run a compatible binary
-before a transition because older versions reject this entry type. Readiness
-also checks the new joint-consensus capability bit on a current-term
-AppendEntries response from every remote voter in the old and proposed sets.
+corruption; it is not authentication. Every voter in the proposed stable set
+must run a compatible binary because older versions reject this entry type.
+Readiness checks the joint-consensus capability bit on a current-term
+AppendEntries response from each remote voter that remains in that set,
+including newly added voters. A removed old voter may be offline or on an older
+binary; its endpoint remains configured during the transition, and the old-set
+majority must still replicate and commit the joint entry. A removed voter that
+returns before finalization may reject the entry and cannot help satisfy that
+majority; after finalization it is no longer an active member and must be
+upgraded and staged as a learner before being added again.
 
 After the stable successor commits, local compaction records the active voter
 set and stable configuration identity while preserving the original durable

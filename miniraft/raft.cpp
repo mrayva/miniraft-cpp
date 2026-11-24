@@ -2607,13 +2607,20 @@ TJointConfigurationReadiness TRaft::CheckJointConfigurationReadiness(
         }
     }
 
+    // Keep targets for both quorum sets: the old-set majority still governs
+    // joint commitment. Capability gates apply to voters that remain after the
+    // transition. A removed voter may be offline or on an older binary; its
+    // missing ACK can affect quorum availability, but cannot waive either
+    // majority.
     std::vector<uint32_t> requiredVoters = Voters;
     requiredVoters.insert(requiredVoters.end(), newVoters.begin(), newVoters.end());
     std::sort(requiredVoters.begin(), requiredVoters.end());
     requiredVoters.erase(std::unique(requiredVoters.begin(), requiredVoters.end()), requiredVoters.end());
     for (auto id : requiredVoters)
+        if (id != Id && !Nodes.contains(id)) readiness.MissingPeerTargets.push_back(id);
+
+    for (auto id : newVoters)
         if (id != Id) {
-            if (!Nodes.contains(id)) readiness.MissingPeerTargets.push_back(id);
             const auto capability = VolatileState->PeerCapabilities.find(id);
             if (capability == VolatileState->PeerCapabilities.end() ||
                 capability->second.Term != State->CurrentTerm || !capability->second.JointConsensus)
@@ -2632,7 +2639,7 @@ TJointConfigurationReadiness TRaft::CheckJointConfigurationReadiness(
             readiness.ProposedVotersWithoutApplicationSnapshotInstallSupport.push_back(id);
     }
     if (LocalIdempotentLogSupport) {
-        std::vector<uint32_t> requiredMembers = requiredVoters;
+        std::vector<uint32_t> requiredMembers = newVoters;
         requiredMembers.insert(requiredMembers.end(), Learners.begin(), Learners.end());
         std::sort(requiredMembers.begin(), requiredMembers.end());
         requiredMembers.erase(std::unique(requiredMembers.begin(), requiredMembers.end()), requiredMembers.end());
@@ -2676,11 +2683,11 @@ uint64_t TRaft::ProposeJointConfiguration(std::vector<uint32_t> newVoters) {
     if (!readiness.ProposedVotersWithoutApplicationSnapshotInstallSupport.empty())
         throw std::logic_error("Every proposed voter must support application snapshot installation");
     if (!readiness.VotersWithoutJointConsensusSupport.empty())
-        throw std::logic_error("Every current and proposed voter must advertise joint-consensus support in this term");
+        throw std::logic_error("Every retained and proposed voter must advertise joint-consensus support in this term");
     if (!readiness.MembersWithoutIdempotentLogSupport.empty())
-        throw std::logic_error("Every replication target must support idempotent log entries before membership can change");
+        throw std::logic_error("Every retained voter and learner must support idempotent log entries before membership can change");
     if (!readiness.MembersWithoutIdempotencyControlSupport.empty())
-        throw std::logic_error("Every replication target must support idempotency control entries before membership can change");
+        throw std::logic_error("Every retained voter and learner must support idempotency control entries before membership can change");
 
     const auto& latest = Configuration->Latest;
     TConfigurationRecord record{EConfigurationPhase::Joint, State->CurrentTerm,
