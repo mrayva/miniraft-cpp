@@ -2,6 +2,7 @@
 #include "raft.h"
 #include "snapshot_codec.h"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -165,36 +166,67 @@ private:
 };
 }
 
-std::array<uint8_t, 32> ComputeIdempotentPayloadDigest(std::string_view payload) {
-    if (payload.size() > UINT64_MAX / 8)
-        throw std::length_error("Idempotent payload is too large to hash");
-    std::array<uint32_t, 8> hash{
+TSha256DigestBuilder::TSha256DigestBuilder()
+    : Hash{
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
         0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-    };
+    } { }
+
+void TSha256DigestBuilder::Update(std::span<const uint8_t> bytes) {
+    if (Finalized) throw std::logic_error("SHA-256 digest builder is finalized");
+    if (bytes.size() > UINT64_MAX / 8 - TotalBytes)
+        throw std::length_error("SHA-256 input is too large to hash");
+
     size_t offset = 0;
-    while (payload.size() - offset >= 64) {
-        ProcessSha256Block(reinterpret_cast<const uint8_t*>(payload.data() + offset), hash);
-        offset += 64;
+    if (PendingBytes) {
+        const auto count = std::min(Pending.size() - PendingBytes, bytes.size());
+        if (count) memcpy(Pending.data() + PendingBytes, bytes.data(), count);
+        PendingBytes += count;
+        offset += count;
+        if (PendingBytes < Pending.size()) {
+            TotalBytes += bytes.size();
+            return;
+        }
+        ProcessSha256Block(Pending.data(), Hash);
+        PendingBytes = 0;
     }
 
-    const auto remaining = payload.size() - offset;
+    while (bytes.size() - offset >= Pending.size()) {
+        ProcessSha256Block(bytes.data() + offset, Hash);
+        offset += Pending.size();
+    }
+    PendingBytes = bytes.size() - offset;
+    if (PendingBytes) memcpy(Pending.data(), bytes.data() + offset, PendingBytes);
+    TotalBytes += bytes.size();
+}
+
+std::array<uint8_t, 32> TSha256DigestBuilder::Finish() {
+    if (Finalized) throw std::logic_error("SHA-256 digest builder is finalized");
+    Finalized = true;
+
     std::array<uint8_t, 128> tail{};
-    if (remaining) memcpy(tail.data(), payload.data() + offset, remaining);
-    tail[remaining] = 0x80;
-    const size_t tailBytes = remaining < 56 ? 64 : 128;
-    const uint64_t bitLength = uint64_t(payload.size()) * 8;
+    if (PendingBytes) memcpy(tail.data(), Pending.data(), PendingBytes);
+    tail[PendingBytes] = 0x80;
+    const size_t tailBytes = PendingBytes < 56 ? 64 : 128;
+    const uint64_t bitLength = TotalBytes * 8;
     for (unsigned i = 0; i < 8; ++i)
         tail[tailBytes - 1 - i] = uint8_t(bitLength >> (8 * i));
-    ProcessSha256Block(tail.data(), hash);
-    if (tailBytes == 128) ProcessSha256Block(tail.data() + 64, hash);
+    ProcessSha256Block(tail.data(), Hash);
+    if (tailBytes == 128) ProcessSha256Block(tail.data() + 64, Hash);
 
     std::array<uint8_t, 32> digest{};
-    for (size_t i = 0; i < hash.size(); ++i) {
+    for (size_t i = 0; i < Hash.size(); ++i) {
         for (unsigned j = 0; j < 4; ++j)
-            digest[4 * i + j] = uint8_t(hash[i] >> (24 - 8 * j));
+            digest[4 * i + j] = uint8_t(Hash[i] >> (24 - 8 * j));
     }
     return digest;
+}
+
+std::array<uint8_t, 32> ComputeIdempotentPayloadDigest(std::string_view payload) {
+    TSha256DigestBuilder digest;
+    digest.Update(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(payload.data()), payload.size()));
+    return digest.Finish();
 }
 
 TMessageHolder<TLogEntry> EncodeIdempotentLogEntry(

@@ -406,6 +406,27 @@ void test_idempotent_payload_digest_matches_sha256_vectors(void**) {
         "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1");
     assert_true(ComputeIdempotentPayloadDigest(std::string_view("a\0b", 3)) !=
         ComputeIdempotentPayloadDigest("a"));
+
+    for (const size_t size : {size_t(0), size_t(1), size_t(55), size_t(56), size_t(63),
+             size_t(64), size_t(65), size_t(127), size_t(128), size_t(129), size_t(4097)}) {
+        const std::string payload(size, 'x');
+        TSha256DigestBuilder builder;
+        for (size_t offset = 0; offset < payload.size();) {
+            const auto count = std::min(payload.size() - offset, offset % 67 + 1);
+            builder.Update(std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(payload.data() + offset), count));
+            offset += count;
+        }
+        assert_true(builder.Finish() == ComputeIdempotentPayloadDigest(payload));
+        bool updateRejected = false;
+        try { builder.Update({}); }
+        catch (const std::logic_error&) { updateRejected = true; }
+        assert_true(updateRejected);
+        bool finishRejected = false;
+        try { (void)builder.Finish(); }
+        catch (const std::logic_error&) { finishRejected = true; }
+        assert_true(finishRejected);
+    }
 }
 
 void test_idempotent_log_record_roundtrip_and_rejects_corruption(void**) {

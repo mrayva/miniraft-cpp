@@ -605,30 +605,28 @@ void TDurableState::Publish()
         imageBytes = SnapshotEncodingSize(*snapshotEncoding);
         const auto snapshotTemp = snapshotFile + ".tmp";
         TFd snapshot(openat(Impl->Directory.Value, snapshotTemp.c_str(),
-            O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600));
+            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600));
         Require(snapshot.Value >= 0, "create durable snapshot image");
         struct stat snapshotInfo;
         Require(fstat(snapshot.Value, &snapshotInfo) == 0, "stat durable snapshot image");
         if (!S_ISREG(snapshotInfo.st_mode)) throw std::runtime_error("Invalid durable snapshot image type");
         Impl->Stage(EStage::SnapshotTempCreated);
         std::array<char, 64 * 1024> chunk{};
+        TSha256DigestBuilder snapshotDigest;
         for (uint64_t offset = 0; offset < imageBytes;) {
             const auto count = size_t(std::min<uint64_t>(chunk.size(), imageBytes - offset));
             CopySnapshotEncodingRange(*Impl->Snapshot, *snapshotEncoding, offset, chunk.data(), count);
+            snapshotDigest.Update(std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(chunk.data()), count));
             WriteAll(snapshot.Value, chunk.data(), count);
             offset += count;
         }
+        Require(fstat(snapshot.Value, &snapshotInfo) == 0, "stat completed durable snapshot image");
+        if (!S_ISREG(snapshotInfo.st_mode) || snapshotInfo.st_size < 0 ||
+            uint64_t(snapshotInfo.st_size) != imageBytes)
+            throw std::runtime_error("Unexpected durable snapshot length after write");
         Impl->Stage(EStage::SnapshotWritten);
-        {
-            // Hash the exact encoded file once per generation without copying
-            // the whole image into a second application buffer.
-            TReadOnlyMap mapped(snapshot.Value);
-            const auto bytes = mapped.Bytes();
-            if (bytes.size() != imageBytes)
-                throw std::runtime_error("Unexpected durable snapshot length after write");
-            imageDigest = ComputeIdempotentPayloadDigest(std::string_view(
-                reinterpret_cast<const char*>(bytes.data()), bytes.size()));
-        }
+        imageDigest = snapshotDigest.Finish();
         Sync(snapshot.Value);
         Impl->Stage(EStage::SnapshotFileSynced);
         Require(renameat(Impl->Directory.Value, snapshotTemp.c_str(),

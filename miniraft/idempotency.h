@@ -1,8 +1,10 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,6 +25,22 @@ struct TIdempotentOperationIdentity {
 // Stable SHA-256 of the exact application command bytes. Raft computes this
 // digest so a client cannot make two different payloads look like one retry.
 std::array<uint8_t, 32> ComputeIdempotentPayloadDigest(std::string_view payload);
+
+// Incremental SHA-256 for callers that already process large payloads in
+// ranges. Finish is single-use; updating or finishing again is an error.
+class TSha256DigestBuilder {
+public:
+    TSha256DigestBuilder();
+    void Update(std::span<const uint8_t> bytes);
+    std::array<uint8_t, 32> Finish();
+
+private:
+    std::array<uint32_t, 8> Hash;
+    std::array<uint8_t, 64> Pending{};
+    uint64_t TotalBytes = 0;
+    size_t PendingBytes = 0;
+    bool Finalized = false;
+};
 
 enum class EIdempotencyControlKind : uint32_t {
     CloseSession = 1,
