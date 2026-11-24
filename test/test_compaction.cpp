@@ -3532,20 +3532,21 @@ void test_compaction_reclaims_durable_prefix_bytes(void**) {
         auto entry = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 4096);
         memset(entry->Data, 0, 4096); state.Append(entry);
     }
-    const auto before = std::filesystem::file_size(files.Name + ".durable.1");
+    const auto before = std::filesystem::file_size(files.Name + ".durable.1.log.1");
     state.InstallSnapshot({29, 1, {1}, "small current application"});
-    const auto after = std::filesystem::file_size(files.Name + ".durable.1");
+    const auto after = std::filesystem::file_size(files.Name + ".durable.1.log.2");
     assert_true(after < before / 10); assert_int_equal(state.LastLogIndex, 30);
+    assert_false(std::filesystem::exists(files.Name + ".durable.1.log.1"));
     assert_true(bool(state.Get(30))); assert_false(state.Get(29));
 }
-void test_durable_v6_semantic_corruption_rejects_without_rewriting(void**) {
+void test_durable_v7_semantic_corruption_rejects_without_rewriting(void**) {
     for (int invalid = 0; invalid < 3; ++invalid) {
         TFiles files;
         { TDurableState state(files.Name, 1); ExerciseBoundary(state); }
         const auto path = files.Name + ".durable.1";
         std::ifstream input(path, std::ios::binary);
         std::string bytes(std::istreambuf_iterator<char>(input), {}); input.close();
-        assert_true(bytes.substr(0, 8) == "MRFTD006");
+        assert_true(bytes.substr(0, 8) == "MRFTD007");
         const auto snapshotPath = path + ".snapshot.3.2";
         if (invalid < 2) {
             const auto offset = invalid == 0 ? 52 : 32; // snapshot index reference or retained entry count
@@ -3645,7 +3646,7 @@ int main() {
         cmocka_unit_test(test_durable_stale_snapshot_membership_recovery_survives_restart),
         cmocka_unit_test(test_durable_membership_snapshot_install_is_atomic_across_restart),
         cmocka_unit_test(test_compaction_reclaims_durable_prefix_bytes),
-        cmocka_unit_test(test_durable_v6_semantic_corruption_rejects_without_rewriting),
+        cmocka_unit_test(test_durable_v7_semantic_corruption_rejects_without_rewriting),
 #endif
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);

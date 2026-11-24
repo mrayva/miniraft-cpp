@@ -1,6 +1,6 @@
 # Linux durable state: v0.1.0-alpha.3
 
-## Commit recovery: MRFTD006
+## Commit recovery: MRFTD007
 
 The current durable store persists `CommitIndex` alongside the current term,
 vote, voter binding, snapshot and retained log. Recovery requires
@@ -11,31 +11,43 @@ entries even when the application checkpoint trails them. Installed snapshots
 advance the persisted commit floor to at least their included index, and storage
 rejects truncation of committed entries.
 
-MRFTD006 keeps the 20-byte file header: magic[8], payload length[8] and CRC[4].
+MRFTD007 keeps the 20-byte file header: magic[8], payload length[8] and CRC[4].
 Its payload is CurrentTerm[8], VotedFor[4], retained-log count[8],
 CommitIndex[8], voter count[4], sorted voter IDs[4 each], SnapshotIndex[8],
-SnapshotTerm[8], encoded snapshot length[8], SHA-256 digest[32], then retained
-log records. Stores without a snapshot write zero length and digest fields.
-The CRC covers the v6 magic and payload. Snapshot bytes live in an immutable sidecar named
+SnapshotTerm[8], encoded snapshot length[8], SHA-256 digest[32], log
+generation[8], log image length[8], and log CRC[4]. The manifest CRC covers
+the v7 magic and payload. Stores without a snapshot write zero length and
+digest fields. Retained log records live in `NAME.durable.ID.log.GENERATION`.
+Each log image has a 20-byte header containing its magic, generation and header
+CRC, followed by term/flags/length/data records; the manifest's log CRC covers
+all records.
+
+Snapshot bytes live in an immutable sidecar named
 `NAME.durable.ID.snapshot.INDEX.TERM`; ordinary log, term, vote and commit
 updates do not rewrite it. A changed snapshot is written and synced to a
 temporary sidecar, renamed and directory-synced before the manifest references
-it. The manifest remains the atomic commit point. After it is durable, storage
-removes the previous sidecar. A crash can leave an unreferenced sidecar or an
-incomplete sidecar temp file; recovery ignores unreferenced images and removes
-matching orphan sidecars and temps after validating and syncing the selected
-manifest. If the manifest is absent but a published sidecar remains, fresh
-initialization fails closed so an interrupted migration cannot be mistaken for
-an empty store. Recovery verifies the length and digest of the exact encoded
-sidecar before decoding it. A sidecar from another store with the same snapshot
-index, term, and voters is rejected if its bytes differ.
+it. Tail appends extend and fsync the selected log generation before publishing
+the small manifest. Suffix replacement, `RemoveLast`, and snapshot compaction
+write a complete replacement log generation and sync its name before the
+manifest switches to it. The manifest remains the atomic commit point. After it
+is durable, storage removes superseded snapshot and log generations. A crash
+can leave unreferenced sidecars or incomplete temp files; recovery follows only
+the selected manifest and removes matching regular orphan files after
+validating and syncing the selected images. If the manifest is absent but a
+published sidecar remains, fresh initialization fails closed so an interrupted
+migration cannot be mistaken for an empty store. Recovery verifies the length
+and digest of the exact encoded snapshot sidecar before decoding it. A sidecar
+from another store with the same snapshot index, term, and voters is rejected
+if its bytes differ.
 
-MRFTD005 remains readable. It has no recorded digest, so the next successful
-publication binds the sidecar that passed legacy recovery checks without
-rewriting it. MRFTD004 remains readable with its snapshot inline. MRFTD001
-through MRFTD003 also remain readable and initialize their commit floor to
-SnapshotIndex because those formats did not record commit progress. All new
-publications write MRFTD006, which older binaries cannot open.
+MRFTD006 remains readable with inline log records; its next successful
+publication migrates them into an external log generation. MRFTD005 remains
+readable. It has no recorded digest, so the next successful publication binds
+the sidecar that passed legacy recovery checks without rewriting it. MRFTD004
+remains readable with its snapshot inline. MRFTD001 through MRFTD003 also
+remain readable and initialize their commit floor to SnapshotIndex because
+those formats did not record commit progress. All new publications write
+MRFTD007, which older binaries cannot open.
 Recovered unbound MRFTD002 snapshots with configuration metadata remain offline
 until explicitly bound. `BindVotersFromTrustedHistory` accepts them only when
 their complete retained membership chain starts from the independently trusted
@@ -73,12 +85,14 @@ suffix replacement, and a commit advance carried in that request. A commit
 advance learned by a later matching request is a separate publication. Other
 backends retain their existing truncation behavior:
 
-When the snapshot reference changes, storage first publishes its sidecar using
-the write/fsync/rename/directory-fsync sequence above. It then publishes the
-manifest:
+Before publishing the manifest, an ordinary tail append is appended and fsynced
+in the selected log generation. If the retained suffix changes, storage first
+writes a replacement log generation using write/fsync/rename/directory-fsync.
+When the snapshot reference changes, it also publishes the snapshot sidecar
+using the same sequence. It then publishes the manifest:
 
-1. Serialize hard state, snapshot reference and retained log into a temporary
-   file in the same directory.
+1. Serialize hard state, snapshot reference and log-generation reference into
+   a temporary manifest in the same directory.
 2. fsync the temporary file and check the result.
 3. Rename the temporary file over the published image atomically.
 4. fsync the containing directory and check the result.
@@ -100,14 +114,16 @@ Startup errors are exceptions and do not fall back to older/temp images.
 ## Format and ownership
 
 The manifest has version magic, payload length and CRC32. Recovery checks the
-checksum before decoding entries and validates bounds, commit metadata, snapshot
-identity, sidecar contents and term ordering. CRC32 detects accidental
-corruption but does not protect against malicious modification or all
-collisions.
+checksum before decoding metadata and validates bounds, commit metadata,
+snapshot identity, sidecar contents, log-generation identity, log checksum and
+term ordering. CRC32 detects accidental corruption but does not protect against
+malicious modification or all collisions.
 
-The files are NAME.durable.ID, its temporary image, NAME.durable.ID.lock, and
-the referenced snapshot sidecar. A sidecar is identified by included index and
-term and is never modified by ordinary manifest updates.
+The files are NAME.durable.ID, its temporary image, NAME.durable.ID.lock, the
+referenced snapshot sidecar, and the selected log generation. Snapshot
+sidecars are identified by included index and term; log generations are
+identified by a monotonically increasing generation number. Ordinary append
+and manifest updates do not rewrite prior log records.
 A nonblocking advisory flock holds the lock for the object's lifetime. Use one
 object/thread to mutate a store, and do not delete/replace its lock while running.
 Returned/appended entries are copied so external mutation cannot change the

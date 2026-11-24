@@ -88,7 +88,7 @@ store to `TDurableState`.
 
 Tests cover MRFTD001, MRFTD002 and MRFTD003 recovery, rejection of inconsistent
 vote/snapshot baselines and unanchored configuration history without rewriting
-the source file, and the current MRFTD006 binding after publication and restart.
+the source file, and the current MRFTD007 binding after publication and restart.
 Dry-run tests verify both successful and rejected checks preserve the source
 bytes, and that diagnostics are cleared on success. Legacy formats recover
 their commit floor at the snapshot boundary; the explicit history API accepts a

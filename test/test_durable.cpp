@@ -253,7 +253,7 @@ void test_v1_v2_v3_images_recover_conservatively_and_upgrade_on_publish(void**) 
         }
         std::ifstream upgraded(files.Image(), std::ios::binary);
         std::string published(8, '\0'); upgraded.read(published.data(), published.size());
-        assert_true(published == "MRFTD006");
+        assert_true(published == "MRFTD007");
     }
 }
 void test_v4_inline_snapshot_recovers_and_upgrades_to_sidecar(void**) {
@@ -287,7 +287,7 @@ void test_v4_inline_snapshot_recovers_and_upgrades_to_sidecar(void**) {
     {
         std::ifstream manifest(files.Image(), std::ios::binary);
         std::string magic(8, '\0'); manifest.read(magic.data(), magic.size());
-        assert_true(magic == "MRFTD006");
+        assert_true(magic == "MRFTD007");
         std::ifstream sidecar(sidecarPath, std::ios::binary);
         assert_true(bool(sidecar));
         TDurableState recovered(files.Name, 1);
@@ -323,7 +323,7 @@ void test_v5_sidecar_is_bound_on_next_manifest_publication(void**) {
     }
     std::ifstream manifest(files.Image(), std::ios::binary);
     std::string magic(8, '\0'); manifest.read(magic.data(), magic.size());
-    assert_true(magic == "MRFTD006");
+    assert_true(magic == "MRFTD007");
     TDurableState recovered(files.Name, 1);
     assert_true(recovered.GetSnapshot() && *recovered.GetSnapshot() == snapshot);
 }
@@ -531,6 +531,54 @@ void test_crash_at_every_publication_boundary(void**) {
             TDurableState recovered(files.Name, 1);
             Check(recovered, operation, stage >= TStage::Renamed);
         }
+    }
+}
+
+void test_crash_before_manifest_publication_discards_unpublished_log_changes(void**) {
+    const auto generationStages = {TStage::LogTempCreated, TStage::LogWritten, TStage::LogFileSynced,
+        TStage::LogRenamed, TStage::LogDirectorySynced};
+    for (auto stage : generationStages) {
+        TFiles files;
+        files.Seed();
+        const auto child = fork();
+        assert_true(child >= 0);
+        if (child == 0) {
+            try {
+                bool armed = false;
+                TDurableState state(files.Name, 1, [&](auto point) {
+                    if (armed && point == stage) _exit(90);
+                });
+                armed = true;
+                state.RemoveLast();
+            } catch (...) { _exit(2); }
+            _exit(3);
+        }
+        Wait(child, 90);
+        TDurableState recovered(files.Name, 1);
+        Check(recovered, EOperation::Truncate, false);
+        assert_false(fs::exists(files.Name + ".durable.1.log.2"));
+        assert_false(fs::exists(files.Name + ".durable.1.log.2.tmp"));
+    }
+
+    for (auto stage : {TStage::LogAppendStarted, TStage::LogAppendWritten, TStage::LogAppendFileSynced}) {
+        TFiles files;
+        files.Seed();
+        const auto child = fork();
+        assert_true(child >= 0);
+        if (child == 0) {
+            try {
+                bool armed = false;
+                TDurableState state(files.Name, 1, [&](auto point) {
+                    if (armed && point == stage) _exit(90);
+                });
+                armed = true;
+                state.Append(Entry(3, "unpublished"));
+            } catch (...) { _exit(2); }
+            _exit(3);
+        }
+        Wait(child, 90);
+        TDurableState recovered(files.Name, 1);
+        Check(recovered, EOperation::Append, false);
     }
 }
 
@@ -1281,6 +1329,35 @@ void test_fresh_durable_state_refuses_snapshot_sidecar_without_manifest(void**) 
     assert_true(fs::exists(sidecarPath));
     assert_false(fs::exists(files.Image()));
 }
+void test_fresh_durable_state_refuses_log_sidecar_without_manifest(void**) {
+    TFiles files;
+    const auto sidecarPath = files.Image().string() + ".log.1";
+    { std::ofstream sidecar(sidecarPath, std::ios::binary); sidecar << "possibly migrated log"; }
+    bool rejected = false;
+    try { TDurableState fresh(files.Name, 1); }
+    catch (const std::exception&) { rejected = true; }
+    assert_true(rejected);
+    assert_true(fs::exists(sidecarPath));
+    assert_false(fs::exists(files.Image()));
+}
+void test_durable_log_corruption_is_rejected_without_rewriting(void**) {
+    TFiles files;
+    files.Seed();
+    const auto logPath = files.Image().string() + ".log.1";
+    std::ifstream input(logPath, std::ios::binary);
+    std::string corrupted(std::istreambuf_iterator<char>(input), {});
+    input.close();
+    assert_true(corrupted.size() > 20);
+    corrupted.back() ^= 1;
+    { std::ofstream output(logPath, std::ios::binary); output.write(corrupted.data(), corrupted.size()); }
+
+    bool rejected = false;
+    try { TDurableState invalid(files.Name, 1); }
+    catch (const std::exception&) { rejected = true; }
+    assert_true(rejected);
+    std::ifstream after(logPath, std::ios::binary);
+    assert_true(std::string(std::istreambuf_iterator<char>(after), {}) == corrupted);
+}
 void test_get_and_append_do_not_share_mutable_entries(void**) {
     TFiles files;
     {
@@ -1844,6 +1921,7 @@ void test_reference_kv_idempotency_replays_from_durable_snapshot_and_log(void**)
 int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_crash_at_every_publication_boundary),
+        cmocka_unit_test(test_crash_before_manifest_publication_discards_unpublished_log_changes),
         cmocka_unit_test(test_acknowledged_updates_survive_immediate_exit),
         cmocka_unit_test(test_follower_persists_commit_before_ack_and_recovers_it),
         cmocka_unit_test(test_follower_batches_durable_append_before_ack),
@@ -1870,6 +1948,8 @@ int main() {
         cmocka_unit_test(test_durable_snapshot_sidecar_is_not_rewritten_with_log_updates),
         cmocka_unit_test(test_durable_recovery_reclaims_unreferenced_snapshot_files),
         cmocka_unit_test(test_fresh_durable_state_refuses_snapshot_sidecar_without_manifest),
+        cmocka_unit_test(test_fresh_durable_state_refuses_log_sidecar_without_manifest),
+        cmocka_unit_test(test_durable_log_corruption_is_rejected_without_rewriting),
         cmocka_unit_test(test_get_and_append_do_not_share_mutable_entries),
         cmocka_unit_test(test_raft_election_and_application_replay_after_restart),
         cmocka_unit_test(test_idempotency_control_survives_durable_restart_and_replays_atomically),

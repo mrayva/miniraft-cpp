@@ -1,7 +1,7 @@
 # Compaction and InstallSnapshot: v0.1.0-alpha.16
 
 The [learner follow-up](learners.md) adds non-voting replication and durable
-voter binding. Current MRFTD006 images persist commit progress and keep snapshot
+voter binding. Current MRFTD007 images persist commit progress and keep snapshot
 bytes in immutable sidecars; readers continue to accept MRFTD001 through
 MRFTD005 images.
 
@@ -91,19 +91,22 @@ does not install an image at or below known commitment, so stale snapshots canno
 rewind application state. Retained suffix entries are applied only after a leader
 establishes their commitment.
 
-MRFTD006 publishes hard state, the persisted commit boundary, voter binding,
-snapshot reference and suffix in one atomic manifest. Snapshot bytes are
-published to a separate immutable sidecar before the manifest can reference
-them; ordinary appends and commit updates do not rewrite snapshot bytes. Its
-header remains magic[8], payload length[8], CRC[4]. The payload is CurrentTerm[8],
-VotedFor[4], retained count[8], CommitIndex[8], voter count[4], voter IDs,
-SnapshotIndex[8], SnapshotTerm[8], sidecar length[8], SHA-256 digest[32], then
-term/flags/length/data records. The CRC covers the v6 magic plus payload. Recovery checks
-`SnapshotIndex <= CommitIndex <= LastLogIndex`, bounds the retained count, checks
-the referenced sidecar's encoded size, identity and checksum, and validates
-nondecreasing terms beginning at SnapshotTerm. MRFTD001 through MRFTD005 remain
-readable. V1 through v3 recover their commit floor as SnapshotIndex, and a successful
-later publication writes v6. A crash can leave an unreferenced sidecar or temp;
+MRFTD007 publishes hard state, the persisted commit boundary, voter binding,
+snapshot reference and log-generation reference in one atomic manifest. Snapshot
+bytes are published to a separate immutable sidecar before the manifest can
+reference them. Tail appends extend and sync the selected log generation;
+suffix replacement and compaction publish a new generation before the manifest
+switch. The header remains magic[8], payload length[8], CRC[4]. The payload is
+CurrentTerm[8], VotedFor[4], retained count[8], CommitIndex[8], voter count[4],
+voter IDs, SnapshotIndex[8], SnapshotTerm[8], sidecar length[8], SHA-256
+digest[32], log generation[8], log image length[8], and log CRC[4]. Log records
+are stored in the referenced generation file. The CRC covers the v7 magic plus
+payload. Recovery checks `SnapshotIndex <= CommitIndex <= LastLogIndex`, bounds
+the retained count, checks the referenced sidecar's encoded size, identity and
+checksum, and validates nondecreasing terms beginning at SnapshotTerm. MRFTD001
+through MRFTD006 remain readable. V1 through v3 recover their commit floor as
+SnapshotIndex, and a successful later publication writes v7. A crash can leave
+an unreferenced sidecar, log generation or temp;
 recovery ignores those files and removes matching orphans after validating the
 selected manifest. Malformed recovery does not rewrite the manifest. Live
 publication failure is fatal.

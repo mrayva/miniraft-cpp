@@ -134,10 +134,13 @@ capacity changes before proposing.
   that defaults to 20 seconds. This is not a lease and does not guarantee there
   is no overlap with a newly elected leader. Default leader reads are weaker
   than consistent reads.
-- TDurableState synchronously serializes and republishes the snapshot and
-  retained log on every update (`durable.cpp:245-298`). There is no efficient
-  WAL/group-commit path; disk work blocks the event loop. Legacy TDiskState
-  still lacks the same power-loss durability guarantees.
+- MRFTD007 now stores TDurableState log records in a checksummed external
+  generation. Tail appends sync only new records before publishing the small
+  manifest; suffix replacement and compaction use copy-on-write generations.
+  This removes the repeated full-log rewrite on ordinary appends. Each update
+  still synchronously fsyncs and blocks the event loop; group commit and
+  background disk I/O remain open. Legacy TDiskState still lacks the same
+  power-loss durability guarantees.
 - Transport validates claimed source IDs, but incoming connections are not
   bound to authenticated Raft identities by default (`server.cpp:13-30`,
   `raft.cpp:1364-1368`). `TRaftServer` now accepts an optional

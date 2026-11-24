@@ -9,7 +9,7 @@
 // Tests that intentionally synthesize a recovered store need a consistent
 // manifest so recovery reaches the membership checks they exercise.
 inline void RebindDurableSnapshotFixture(std::string& manifest, std::string_view image) {
-    if (!manifest.starts_with("MRFTD006") || manifest.size() < 108)
+    if ((!manifest.starts_with("MRFTD006") && !manifest.starts_with("MRFTD007")) || manifest.size() < 108)
         throw std::runtime_error("Unexpected durable fixture format");
     uint32_t voters = 0;
     for (unsigned i = 0; i < 4; ++i)

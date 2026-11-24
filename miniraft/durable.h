@@ -29,13 +29,15 @@ TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(
 
 // Linux: atomic hard-state + snapshot + suffix replacement, with file/directory
 // fsync. Snapshot sidecars are immutable between snapshots, so ordinary
-// updates write only the retained log and manifest.
+// updates append to the selected log generation and publish a small manifest.
 class TDurableState : public IState {
 public:
     enum class EStage {
         TempCreated, PayloadStarted, Written, FileSynced, Renamed, DirectorySynced,
         SnapshotTempCreated, SnapshotWritten, SnapshotFileSynced, SnapshotRenamed,
-        SnapshotDirectorySynced
+        SnapshotDirectorySynced,
+        LogTempCreated, LogWritten, LogFileSynced, LogRenamed, LogDirectorySynced,
+        LogAppendStarted, LogAppendWritten, LogAppendFileSynced
     };
     // Diagnostics/fault injection. Throwing from this hook during a live
     // operation is fatal, just like an I/O failure.

@@ -30,9 +30,31 @@ constexpr std::array<uint8_t, 8> ConfigurationMagic{'M','R','F','T','D','0','0',
 constexpr std::array<uint8_t, 8> CommitMagic{'M','R','F','T','D','0','0','4'};
 constexpr std::array<uint8_t, 8> ExternalSnapshotMagic{'M','R','F','T','D','0','0','5'};
 constexpr std::array<uint8_t, 8> BoundSnapshotMagic{'M','R','F','T','D','0','0','6'};
+constexpr std::array<uint8_t, 8> ExternalLogMagic{'M','R','F','T','D','0','0','7'};
+constexpr std::array<uint8_t, 8> DurableLogMagic{'M','R','F','T','L','0','0','1'};
+constexpr size_t DurableLogHeaderSize = 20;
 using TSnapshotDigest = std::array<uint8_t, 32>;
 std::string SnapshotImageName(const std::string& stateFile, uint64_t index, uint64_t term) {
     return stateFile + ".snapshot." + std::to_string(index) + "." + std::to_string(term);
+}
+std::string LogImageName(const std::string& stateFile, uint64_t generation) {
+    return stateFile + ".log." + std::to_string(generation);
+}
+std::string LogTempName(const std::string& stateFile, uint64_t generation) {
+    return LogImageName(stateFile, generation) + ".tmp";
+}
+void AppendInteger(std::string& bytes, uint64_t value, unsigned width) {
+    for (unsigned i = 0; i < width; ++i) bytes.push_back(char(value >> (8 * i)));
+}
+std::string EncodeDurableLogRecord(const TLogEntry& entry) {
+    const auto dataBytes = entry.Len - sizeof(TLogEntry);
+    std::string record;
+    record.reserve(20 + dataBytes);
+    AppendInteger(record, entry.Term, 8);
+    AppendInteger(record, entry.Flags, 8);
+    AppendInteger(record, dataBytes, 4);
+    record.append(entry.Data, dataBytes);
+    return record;
 }
 uint64_t Take(std::span<const uint8_t> bytes, size_t& position, unsigned width) {
     if (position > bytes.size() || width > bytes.size() - position)
@@ -47,6 +69,14 @@ uint32_t Checksum(std::span<const uint8_t> bytes, size_t start,
     if (version) checksum.Update(version->data(), version->size());
     if (start < bytes.size()) checksum.Update(bytes.data() + start, bytes.size() - start);
     return checksum.Finish();
+}
+std::array<uint8_t, DurableLogHeaderSize> MakeDurableLogHeader(uint64_t generation) {
+    std::array<uint8_t, DurableLogHeaderSize> header{};
+    std::copy(DurableLogMagic.begin(), DurableLogMagic.end(), header.begin());
+    for (unsigned i = 0; i < 8; ++i) header[8 + i] = uint8_t(generation >> (8 * i));
+    const auto checksum = Checksum(std::span<const uint8_t>(header.data(), 16), 0);
+    for (unsigned i = 0; i < 4; ++i) header[16 + i] = uint8_t(checksum >> (8 * i));
+    return header;
 }
 TMessageHolder<TLogEntry> Clone(TMessageHolder<TLogEntry> entry) {
     if (!entry.HasValidExtent() || entry->Len < sizeof(TLogEntry) || entry->Type != uint32_t(EMessageType::LOG_ENTRY))
@@ -120,6 +150,12 @@ bool IsSnapshotSidecarOrTemp(std::string_view name, std::string_view prefix) {
         IsPositiveDecimal(identity.substr(0, separator), uint64_t(INT64_MAX)) &&
         IsPositiveDecimal(identity.substr(separator + 1), UINT64_MAX);
 }
+bool IsLogGenerationOrTemp(std::string_view name, std::string_view prefix) {
+    if (!name.starts_with(prefix)) return false;
+    auto generation = name.substr(prefix.size());
+    if (generation.ends_with(".tmp")) generation.remove_suffix(4);
+    return IsPositiveDecimal(generation, UINT64_MAX);
+}
 bool HasSnapshotSidecarWithoutManifest(int directory, const std::string& stateFile) {
     TFd scanFd(openat(directory, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     Require(scanFd.Value >= 0, "open durable directory for snapshot check");
@@ -141,6 +177,28 @@ bool HasSnapshotSidecarWithoutManifest(int directory, const std::string& stateFi
         struct stat info;
         if (fstatat(directory, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) == 0) return true;
         if (errno != ENOENT) Require(false, "inspect snapshot without durable manifest");
+    }
+}
+bool HasLogSidecarWithoutManifest(int directory, const std::string& stateFile) {
+    TFd scanFd(openat(directory, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    Require(scanFd.Value >= 0, "open durable directory for log check");
+    auto* rawStream = fdopendir(scanFd.Value);
+    Require(rawStream != nullptr, "read durable directory for log check");
+    scanFd.Value = -1;
+    TDir stream(rawStream);
+    const auto prefix = stateFile + ".log.";
+    for (;;) {
+        errno = 0;
+        const auto* entry = readdir(stream.Value);
+        if (!entry) {
+            if (errno) Require(false, "read durable directory for log check");
+            return false;
+        }
+        const std::string name(entry->d_name);
+        if (!IsLogGenerationOrTemp(name, prefix) || std::string_view(name).ends_with(".tmp")) continue;
+        struct stat info;
+        if (fstatat(directory, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) == 0) return true;
+        if (errno != ENOENT) Require(false, "inspect log without durable manifest");
     }
 }
 void RemoveOrphanedSnapshotFiles(int directory, const std::string& stateFile,
@@ -171,6 +229,39 @@ void RemoveOrphanedSnapshotFiles(int directory, const std::string& stateFile,
         if (unlinkat(directory, name.c_str(), 0) < 0) {
             if (errno == ENOENT) continue;
             Require(false, "remove orphaned durable snapshot");
+        }
+        removed = true;
+    }
+    if (removed) Sync(directory);
+}
+void RemoveOrphanedLogFiles(int directory, const std::string& stateFile,
+        const std::string& referencedLogFile) {
+    TFd scanFd(openat(directory, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    Require(scanFd.Value >= 0, "open durable directory for log cleanup");
+    auto* rawStream = fdopendir(scanFd.Value);
+    Require(rawStream != nullptr, "read durable directory for log cleanup");
+    scanFd.Value = -1;
+    TDir stream(rawStream);
+    const auto prefix = stateFile + ".log.";
+    bool removed = false;
+    for (;;) {
+        errno = 0;
+        const auto* entry = readdir(stream.Value);
+        if (!entry) {
+            if (errno) Require(false, "read durable directory for log cleanup");
+            break;
+        }
+        const std::string name(entry->d_name);
+        if (name == referencedLogFile || !IsLogGenerationOrTemp(name, prefix)) continue;
+        struct stat info;
+        if (fstatat(directory, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) < 0) {
+            if (errno == ENOENT) continue;
+            Require(false, "inspect orphaned durable log");
+        }
+        if (!S_ISREG(info.st_mode)) continue;
+        if (unlinkat(directory, name.c_str(), 0) < 0) {
+            if (errno == ENOENT) continue;
+            Require(false, "remove orphaned durable log");
         }
         removed = true;
     }
@@ -214,6 +305,12 @@ private:
 
 struct TDurableState::TImpl {
     std::vector<TMessageHolder<TLogEntry>> Log;
+    uint64_t LogGeneration = 0;
+    uint64_t LogBytes = 0;
+    uint32_t LogChecksum = 0;
+    uint32_t LogChecksumState = UINT32_MAX;
+    size_t PublishedLogCount = 0;
+    bool ForceLogGeneration = true;
     std::shared_ptr<const TSnapshot> Snapshot;
     uint64_t PublishedSnapshotBytes = 0;
     TSnapshotDigest PublishedSnapshotDigest{};
@@ -264,18 +361,23 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
         if (!newLock) throw std::runtime_error("Published durable state is missing");
         if (HasSnapshotSidecarWithoutManifest(Impl->Directory.Value, Impl->File))
             throw std::runtime_error("Snapshot sidecar exists without a durable manifest");
+        if (HasLogSidecarWithoutManifest(Impl->Directory.Value, Impl->File))
+            throw std::runtime_error("Log sidecar exists without a durable manifest");
         Publish();
         return;
     }
     TReadOnlyMap mapped(file.Value);
     const auto bytes = mapped.Bytes();
-    const bool boundSnapshot = std::equal(BoundSnapshotMagic.begin(), BoundSnapshotMagic.end(), bytes.begin());
+    if (bytes.size() < Magic.size()) throw std::runtime_error("Truncated durable state magic");
+    const bool externalLog = std::equal(ExternalLogMagic.begin(), ExternalLogMagic.end(), bytes.begin());
+    const bool boundSnapshot = externalLog ||
+        std::equal(BoundSnapshotMagic.begin(), BoundSnapshotMagic.end(), bytes.begin());
     const bool externalSnapshot = boundSnapshot ||
         std::equal(ExternalSnapshotMagic.begin(), ExternalSnapshotMagic.end(), bytes.begin());
     const bool commitAware = externalSnapshot || std::equal(CommitMagic.begin(), CommitMagic.end(), bytes.begin());
     const bool configured = std::equal(ConfigurationMagic.begin(), ConfigurationMagic.end(), bytes.begin());
     const bool compacted = std::equal(SnapshotMagic.begin(), SnapshotMagic.end(), bytes.begin());
-    const auto* version = boundSnapshot ? &BoundSnapshotMagic : externalSnapshot ? &ExternalSnapshotMagic :
+    const auto* version = externalLog ? &ExternalLogMagic : boundSnapshot ? &BoundSnapshotMagic : externalSnapshot ? &ExternalSnapshotMagic :
         commitAware ? &CommitMagic : configured ? &ConfigurationMagic : compacted ? &SnapshotMagic : nullptr;
     if (!version && !std::equal(Magic.begin(), Magic.end(), bytes.begin()))
         throw std::runtime_error("Unknown durable state format");
@@ -311,6 +413,13 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
             if ((!SnapshotIndex && (expectedBytes || expectedDigest != TSnapshotDigest{})) ||
                 (SnapshotIndex && (!expectedBytes || expectedBytes > TSnapshot::MaxBytes)))
                 throw std::runtime_error("Invalid durable snapshot identity");
+        }
+        if (externalLog) {
+            Impl->LogGeneration = Take(bytes, position, 8);
+            Impl->LogBytes = Take(bytes, position, 8);
+            Impl->LogChecksum = static_cast<uint32_t>(Take(bytes, position, 4));
+            if (!Impl->LogGeneration || Impl->LogBytes < DurableLogHeaderSize)
+                throw std::runtime_error("Invalid durable log identity");
         }
         if (SnapshotIndex) {
             const auto snapshotFileName = SnapshotImageName(Impl->File, SnapshotIndex, SnapshotTerm);
@@ -377,22 +486,69 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
         }
     }
     if (!commitAware) CommitIndex = SnapshotIndex;
-    if (!CurrentTerm || count > uint64_t(INT64_MAX) - SnapshotIndex || count > (bytes.size() - position) / 20)
+    if (!CurrentTerm || count > uint64_t(INT64_MAX) - SnapshotIndex)
         throw std::runtime_error("Invalid durable state metadata");
-    for (uint64_t i = 0; i < count; ++i) {
-        const auto term = Take(bytes, position, 8);
-        const auto flags = Take(bytes, position, 8);
-        const auto length = Take(bytes, position, 4);
-        if (length > bytes.size() - position || length > UINT32_MAX - sizeof(TLogEntry) ||
-            !term || term < LastLogTerm || term > CurrentTerm)
-            throw std::runtime_error("Invalid durable log entry");
-        auto entry = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + length);
-        entry->Term = term;
-        entry->Flags = flags;
-        memcpy(entry->Data, bytes.data() + position, length);
-        position += length;
-        Impl->Log.push_back(entry);
-        LastLogTerm = term;
+    auto parseLogRecords = [&](std::span<const uint8_t> logBytes, size_t& logPosition,
+            NSnapshotCodec::TChecksum* checksum) {
+        for (uint64_t i = 0; i < count; ++i) {
+            const auto recordStart = logPosition;
+            const auto term = Take(logBytes, logPosition, 8);
+            const auto flags = Take(logBytes, logPosition, 8);
+            const auto length = Take(logBytes, logPosition, 4);
+            if (length > logBytes.size() - logPosition || length > UINT32_MAX - sizeof(TLogEntry) ||
+                !term || term < LastLogTerm || term > CurrentTerm)
+                throw std::runtime_error("Invalid durable log entry");
+            auto entry = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + length);
+            entry->Term = term;
+            entry->Flags = flags;
+            memcpy(entry->Data, logBytes.data() + logPosition, length);
+            logPosition += size_t(length);
+            if (checksum) checksum->Update(logBytes.data() + recordStart, logPosition - recordStart);
+            Impl->Log.push_back(entry);
+            LastLogTerm = term;
+        }
+    };
+    bool truncateLogTail = false;
+    TFd externalLogFile;
+    if (externalLog) {
+        if (position != bytes.size() || Impl->LogBytes > uint64_t(INT64_MAX))
+            throw std::runtime_error("Invalid external durable log metadata");
+        const auto logFileName = LogImageName(Impl->File, Impl->LogGeneration);
+        externalLogFile.Value = openat(Impl->Directory.Value, logFileName.c_str(),
+            O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+        Require(externalLogFile.Value >= 0, "open external durable log");
+        struct stat logInfo;
+        Require(fstat(externalLogFile.Value, &logInfo) == 0, "stat external durable log");
+        if (!S_ISREG(logInfo.st_mode) || logInfo.st_size < 0 ||
+            uint64_t(logInfo.st_size) < Impl->LogBytes)
+            throw std::runtime_error("External durable log size does not match its manifest");
+        truncateLogTail = uint64_t(logInfo.st_size) > Impl->LogBytes;
+        {
+            TReadOnlyMap logMap(externalLogFile.Value);
+            const auto image = logMap.Bytes();
+            if (Impl->LogBytes > image.size() || image.size() < DurableLogHeaderSize)
+                throw std::runtime_error("Truncated external durable log");
+            const auto logImage = image.first(size_t(Impl->LogBytes));
+            if (!std::equal(DurableLogMagic.begin(), DurableLogMagic.end(), logImage.begin()))
+                throw std::runtime_error("Unknown external durable log format");
+            size_t headerPosition = DurableLogMagic.size();
+            if (Take(logImage, headerPosition, 8) != Impl->LogGeneration ||
+                Take(logImage, headerPosition, 4) != Checksum(logImage.first(16), 0))
+                throw std::runtime_error("External durable log header mismatch");
+            NSnapshotCodec::TChecksum logChecksum;
+            size_t logPosition = DurableLogHeaderSize;
+            parseLogRecords(logImage, logPosition, &logChecksum);
+            if (logPosition != logImage.size() || logChecksum.Finish() != Impl->LogChecksum)
+                throw std::runtime_error("External durable log length/checksum mismatch");
+            Impl->LogChecksumState = logChecksum.State;
+            Impl->PublishedLogCount = Impl->Log.size();
+            Impl->ForceLogGeneration = false;
+        }
+    } else {
+        if (count > (bytes.size() - position) / 20)
+            throw std::runtime_error("Invalid durable state metadata");
+        parseLogRecords(bytes, position, nullptr);
+        Impl->ForceLogGeneration = true;
     }
     if (position != bytes.size()) throw std::runtime_error("Trailing durable state data");
     LastLogIndex = SnapshotIndex + count;
@@ -402,7 +558,14 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
     // image. Stabilize the selected image and its name before serving requests.
     Sync(file.Value);
     Sync(Impl->Directory.Value);
+    if (truncateLogTail) {
+        Require(ftruncate(externalLogFile.Value, off_t(Impl->LogBytes)) == 0,
+            "truncate uncommitted durable log tail");
+        Sync(externalLogFile.Value);
+    }
     RemoveOrphanedSnapshotFiles(Impl->Directory.Value, Impl->File, Impl->PublishedSnapshotFile);
+    RemoveOrphanedLogFiles(Impl->Directory.Value, Impl->File,
+        externalLog ? LogImageName(Impl->File, Impl->LogGeneration) : std::string{});
     Impl->Recovered = true;
     // A leftover manifest temp is never a recovery candidate, even if checksummed.
 #endif
@@ -474,20 +637,92 @@ void TDurableState::Publish()
         Sync(Impl->Directory.Value);
         Impl->Stage(EStage::SnapshotDirectorySynced);
     }
+
+    const auto previousLogGeneration = Impl->LogGeneration;
+    const auto previousLogFile = previousLogGeneration
+        ? LogImageName(Impl->File, previousLogGeneration) : std::string{};
+    auto logGeneration = Impl->LogGeneration;
+    auto logBytes = Impl->LogBytes;
+    auto logChecksumState = Impl->LogChecksumState;
+    const bool rewriteLog = Impl->ForceLogGeneration || !logGeneration;
+    if (rewriteLog) {
+        if (logGeneration == UINT64_MAX)
+            throw std::overflow_error("Durable log generation exhausted");
+        ++logGeneration;
+        const auto logTemp = LogTempName(Impl->File, logGeneration);
+        const auto logFile = LogImageName(Impl->File, logGeneration);
+        TFd log(openat(Impl->Directory.Value, logTemp.c_str(),
+            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600));
+        Require(log.Value >= 0, "create durable log generation");
+        struct stat logInfo;
+        Require(fstat(log.Value, &logInfo) == 0, "stat durable log generation");
+        if (!S_ISREG(logInfo.st_mode)) throw std::runtime_error("Invalid durable log generation type");
+        Impl->Stage(EStage::LogTempCreated);
+        const auto logHeader = MakeDurableLogHeader(logGeneration);
+        WriteAll(log.Value, logHeader.data(), logHeader.size());
+        logBytes = logHeader.size();
+        NSnapshotCodec::TChecksum logChecksum;
+        for (const auto& entry : Impl->Log) {
+            auto record = EncodeDurableLogRecord(*entry.Mes);
+            if (record.size() > UINT64_MAX - logBytes)
+                throw std::length_error("Durable log generation exceeds format size limit");
+            WriteAll(log.Value, record.data(), record.size());
+            logChecksum.Update(reinterpret_cast<const uint8_t*>(record.data()), record.size());
+            logBytes += record.size();
+            if (logBytes > uint64_t(INT64_MAX))
+                throw std::length_error("Durable log generation exceeds platform offset limit");
+        }
+        Impl->Stage(EStage::LogWritten);
+        logChecksumState = logChecksum.State;
+        Sync(log.Value);
+        Impl->Stage(EStage::LogFileSynced);
+        Require(renameat(Impl->Directory.Value, logTemp.c_str(),
+            Impl->Directory.Value, logFile.c_str()) == 0, "publish durable log generation");
+        Impl->Stage(EStage::LogRenamed);
+        Sync(Impl->Directory.Value);
+        Impl->Stage(EStage::LogDirectorySynced);
+    } else if (Impl->Log.size() > Impl->PublishedLogCount) {
+        const auto logFile = LogImageName(Impl->File, logGeneration);
+        TFd log(openat(Impl->Directory.Value, logFile.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW));
+        Require(log.Value >= 0, "open durable log for append");
+        struct stat logInfo;
+        Require(fstat(log.Value, &logInfo) == 0, "stat durable log for append");
+        if (!S_ISREG(logInfo.st_mode) || logInfo.st_size < 0 || uint64_t(logInfo.st_size) != logBytes)
+            throw std::runtime_error("Durable log length changed before append");
+        Impl->Stage(EStage::LogAppendStarted);
+        for (size_t i = Impl->PublishedLogCount; i < Impl->Log.size(); ++i) {
+            auto record = EncodeDurableLogRecord(*Impl->Log[i].Mes);
+            if (record.size() > UINT64_MAX - logBytes || logBytes + record.size() > uint64_t(INT64_MAX))
+                throw std::length_error("Durable log exceeds platform offset limit");
+            WriteAll(log.Value, record.data(), record.size());
+            NSnapshotCodec::TChecksum update;
+            update.State = logChecksumState;
+            update.Update(reinterpret_cast<const uint8_t*>(record.data()), record.size());
+            logChecksumState = update.State;
+            logBytes += record.size();
+        }
+        Impl->Stage(EStage::LogAppendWritten);
+        Sync(log.Value);
+        Impl->Stage(EStage::LogAppendFileSynced);
+    } else if (Impl->Log.size() != Impl->PublishedLogCount) {
+        throw std::logic_error("Durable log changed without a replacement generation");
+    }
+    const auto logChecksumValue = ~logChecksumState;
+
     TFd temp(openat(Impl->Directory.Value, Impl->Temp.c_str(),
                     O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600));
     Require(temp.Value >= 0, "create durable temporary image");
     Impl->Stage(EStage::TempCreated);
     constexpr size_t PayloadOffset = CommitMagic.size() + 8 + 4;
     std::array<uint8_t, PayloadOffset> header{};
-    std::copy(BoundSnapshotMagic.begin(), BoundSnapshotMagic.end(), header.begin());
+    std::copy(ExternalLogMagic.begin(), ExternalLogMagic.end(), header.begin());
     WriteAll(temp.Value, header.data(), header.size());
 
     NSnapshotCodec::TChecksum checksum;
     auto updateChecksum = [&](const uint8_t* data, size_t size) {
         checksum.Update(data, size);
     };
-    updateChecksum(BoundSnapshotMagic.data(), BoundSnapshotMagic.size());
+    updateChecksum(ExternalLogMagic.data(), ExternalLogMagic.size());
     uint64_t payloadLength = 0;
     bool payloadStarted = false;
     auto writePayload = [&](const void* data, size_t size) {
@@ -517,19 +752,15 @@ void TDurableState::Publish()
     writeInteger(SnapshotTerm, 8);
     writeInteger(imageBytes, 8);
     writePayload(imageDigest.data(), imageDigest.size());
-    for (const auto& entry : Impl->Log) {
-        const auto dataBytes = entry->Len - sizeof(TLogEntry);
-        writeInteger(entry->Term, 8);
-        writeInteger(entry->Flags, 8);
-        writeInteger(dataBytes, 4);
-        writePayload(entry->Data, dataBytes);
-    }
+    writeInteger(logGeneration, 8);
+    writeInteger(logBytes, 8);
+    writeInteger(logChecksumValue, 4);
 
     std::array<uint8_t, 12> encodedHeader{};
     for (unsigned i = 0; i < 8; ++i) encodedHeader[i] = uint8_t(payloadLength >> (8 * i));
     const auto checksumValue = checksum.Finish();
     for (unsigned i = 0; i < 4; ++i) encodedHeader[8 + i] = uint8_t(checksumValue >> (8 * i));
-    WriteAtAll(temp.Value, encodedHeader.data(), encodedHeader.size(), off_t(BoundSnapshotMagic.size()));
+    WriteAtAll(temp.Value, encodedHeader.data(), encodedHeader.size(), off_t(ExternalLogMagic.size()));
     Impl->Stage(EStage::Written);
     Sync(temp.Value);
     Impl->Stage(EStage::FileSynced);
@@ -541,8 +772,17 @@ void TDurableState::Publish()
     Impl->PublishedSnapshotFile = snapshotFile;
     Impl->PublishedSnapshotBytes = imageBytes;
     Impl->PublishedSnapshotDigest = imageDigest;
+    Impl->LogGeneration = logGeneration;
+    Impl->LogBytes = logBytes;
+    Impl->LogChecksum = logChecksumValue;
+    Impl->LogChecksumState = logChecksumState;
+    Impl->PublishedLogCount = Impl->Log.size();
+    Impl->ForceLogGeneration = false;
     if (!previousSnapshotFile.empty() && previousSnapshotFile != snapshotFile &&
         unlinkat(Impl->Directory.Value, previousSnapshotFile.c_str(), 0) == 0)
+        Sync(Impl->Directory.Value);
+    if (!previousLogFile.empty() && previousLogFile != LogImageName(Impl->File, logGeneration) &&
+        unlinkat(Impl->Directory.Value, previousLogFile.c_str(), 0) == 0)
         Sync(Impl->Directory.Value);
 #endif
 }
@@ -617,6 +857,7 @@ void TDurableState::ReplaceSuffixAndAppendBatch(uint64_t firstIndex,
     Impl->Log.resize(prefixSize);
     for (auto& entry : cloned) Impl->Log.push_back(std::move(entry));
 
+    if (firstIndex <= LastLogIndex) Impl->ForceLogGeneration = true;
     LastLogIndex = SnapshotIndex + Impl->Log.size();
     LastLogTerm = Impl->Log.empty() ? SnapshotTerm : Impl->Log.back()->Term;
     CommitIndex = commitIndex;
@@ -629,6 +870,7 @@ void TDurableState::RemoveLast()
     if (LastLogIndex <= CommitIndex)
         throw std::logic_error("Cannot remove a committed log entry");
     Impl->Log.pop_back();
+    Impl->ForceLogGeneration = true;
     LastLogIndex = SnapshotIndex + Impl->Log.size();
     LastLogTerm = Impl->Log.empty() ? SnapshotTerm : Impl->Log.back()->Term;
     Commit();
@@ -692,6 +934,7 @@ void TDurableState::InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> sa
     if (saved->Index <= LastLogIndex && LogTerm(saved->Index) == saved->Term)
         suffix.assign(Impl->Log.begin() + (saved->Index - SnapshotIndex), Impl->Log.end());
     Impl->Log.swap(suffix);
+    Impl->ForceLogGeneration = true;
     Impl->Snapshot = std::move(saved);
     SnapshotIndex = Impl->Snapshot->Index;
     SnapshotTerm = Impl->Snapshot->Term;
@@ -1034,6 +1277,7 @@ TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(const std::string& legacyBa
     const auto stagingFile = std::filesystem::path(stagingBase).filename().string() +
         ".durable." + std::to_string(nodeId);
 
+    uint64_t stagingLogGeneration = 0;
     {
         TDurableState destination(stagingBase, nodeId);
         if (destination.Impl->Recovered || !destination.Impl->Log.empty() ||
@@ -1052,6 +1296,7 @@ TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(const std::string& legacyBa
         destination.LastLogTerm = info.LastLogTerm;
         destination.CommitIndex = info.CommitIndex;
         destination.Publish();
+        stagingLogGeneration = destination.Impl->LogGeneration;
     }
     {
         TDurableState verified(stagingBase, nodeId);
@@ -1105,6 +1350,21 @@ TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(const std::string& legacyBa
         }
         Sync(directory.Value);
     }
+    const auto logFile = LogImageName(finalFile, stagingLogGeneration);
+    if (linkat(staging.Value, logFile.c_str(), directory.Value, logFile.c_str(), 0) < 0) {
+        Require(errno == EEXIST, "publish migrated durable log");
+        TFd stagedLog(openat(staging.Value, logFile.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+        Require(stagedLog.Value >= 0, "open staged migration log");
+        TFd existingLog(openat(directory.Value, logFile.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+        Require(existingLog.Value >= 0, "open existing migration log");
+        TReadOnlyMap stagedMap(stagedLog.Value), existingMap(existingLog.Value);
+        const auto stagedBytes = stagedMap.Bytes();
+        const auto existingBytes = existingMap.Bytes();
+        if (stagedBytes.size() != existingBytes.size() ||
+            !std::equal(stagedBytes.begin(), stagedBytes.end(), existingBytes.begin()))
+            throw std::runtime_error("Conflicting durable log exists at migration destination");
+    }
+    Sync(directory.Value);
     Require(linkat(staging.Value, stagingFile.c_str(), directory.Value, finalFile.c_str(), 0) == 0,
         "publish migrated durable image");
     Sync(directory.Value);
