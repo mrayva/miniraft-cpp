@@ -28,9 +28,14 @@ partition, learner, snapshot and read tests exercise the fixed-membership paths.
 This arithmetic now backs the bounded live transition API described in
 [configuration entries](configuration-entries.md). Recovered suffix transitions
 and live changes require a bound original voter set, a persisted commit index and
-endpoints for every active voter. Joint snapshot recovery requires the exact
-committed joint identity; transfer that would introduce an unknown transition
-or include a receiver's uncommitted configuration entry remains unsupported.
+endpoints for every active voter. At alpha.24, joint snapshot recovery required
+the exact committed joint identity, and receivers with an uncommitted
+configuration could not install snapshots. The later [joint snapshot
+runtime](joint-snapshot-runtime.md) follow-up permits a matching snapshot before
+that entry while retaining the suffix, or a snapshot covering it only when it
+exactly matches the receiver's validated pending configuration and its sender
+belongs to the governing quorum. Introducing an unknown transition remains
+unsupported.
 At alpha.24, leader removal and explicit leadership transfer were not yet
 implemented. The later [leadership transfer](leadership-transfer.md) follow-up
 adds a bounded `TimeoutNow` path for moving leadership to a caught-up voter in
