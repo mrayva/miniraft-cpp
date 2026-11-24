@@ -666,6 +666,42 @@ NNet::TVoidTask AcceptTlsPeer(TRetirableTlsSocket& listener, NNet::TSslContext& 
     co_await state.Connection->AcceptHandshake();
     state.HandshakeComplete = true;
 }
+struct TTlsRecordPeerState {
+    std::unique_ptr<NNet::TSslSocket<NNet::TSocket>> Connection;
+    int NativeFd = -1;
+    bool HandshakeComplete = false;
+};
+NNet::TVoidTask AcceptTlsRecordPeer(NNet::TSocket& listener, NNet::TSslContext& context,
+        TTlsRecordPeerState& state) {
+    auto socket = co_await listener.Accept();
+    state.NativeFd = socket.Fd();
+    state.Connection = std::make_unique<NNet::TSslSocket<NNet::TSocket>>(
+        std::move(socket), context);
+    co_await state.Connection->AcceptHandshake();
+    state.HandshakeComplete = true;
+}
+NNet::TVoidTask ConnectTlsRecordPeer(NNet::TSslSocket<NNet::TSocket>& socket, bool& connected) {
+    try {
+        co_await socket.Connect();
+        connected = true;
+    } catch (const std::exception&) {
+    }
+}
+struct TTlsRecordReadResult {
+    bool Completed = false;
+    bool Threw = false;
+    ssize_t Bytes = -1;
+};
+NNet::TVoidTask ReadTlsRecord(NNet::TSslSocket<NNet::TSocket>& socket,
+        TTlsRecordReadResult& result) {
+    char byte;
+    try {
+        result.Bytes = co_await socket.ReadSome(&byte, 1);
+    } catch (const std::exception&) {
+        result.Threw = true;
+    }
+    result.Completed = true;
+}
 NNet::TVoidTask ReadTlsUntilShutdown(std::shared_ptr<TNode<TRetirableTlsSocket>> node, bool& stopped) {
     char byte = 0;
     try {
@@ -710,6 +746,39 @@ void test_tls_shutdown_wakes_retired_peer_reader(void**) {
     node->Drain();
     assert_true(node->RetirementComplete());
 }
+void test_tls_read_throws_on_malformed_record(void**) {
+    NNet::TLoop<NNet::TPoll> loop;
+    NNet::TSocket listener(NNet::TAddress{"127.0.0.1", 0}, loop.Poller());
+    listener.Bind(); listener.Listen();
+    sockaddr_in bound{};
+    socklen_t boundSize = sizeof(bound);
+    assert_int_equal(::getsockname(listener.Fd(), reinterpret_cast<sockaddr*>(&bound), &boundSize), 0);
+    const NNet::TAddress peerAddress(reinterpret_cast<sockaddr*>(&bound), boundSize);
+
+    auto clientContext = NNet::TSslContext::Client();
+    auto serverContext = NNet::TSslContext::ServerFromMem(testMemCert, testMemKey);
+    TTlsRecordPeerState peer;
+    AcceptTlsRecordPeer(listener, serverContext, peer);
+    NNet::TSslSocket<NNet::TSocket> client(
+        NNet::TSocket(peerAddress, loop.Poller()), clientContext);
+    bool connected = false;
+    ConnectTlsRecordPeer(client, connected);
+    for (size_t step = 0; step < 10000 && (!connected || !peer.HandshakeComplete); ++step)
+        loop.Step();
+    assert_true(connected);
+    assert_true(peer.HandshakeComplete);
+
+    TTlsRecordReadResult result;
+    ReadTlsRecord(client, result);
+    assert_false(result.Completed);
+    const unsigned char malformedRecord[] = {0xff, 0x03, 0x03, 0x00, 0x00};
+    assert_int_equal(::send(peer.NativeFd, malformedRecord, sizeof(malformedRecord), MSG_NOSIGNAL),
+        sizeof(malformedRecord));
+    for (size_t step = 0; step < 100 && !result.Completed; ++step)
+        loop.Step();
+    assert_true(result.Completed);
+    assert_true(result.Threw);
+}
 #endif
 }
 int main() {
@@ -731,6 +800,7 @@ int main() {
         cmocka_unit_test(test_failed_background_tls_handshake_wakes_all_readers),
         cmocka_unit_test(test_socket_read_and_write_deadlines_cancel_waits),
         cmocka_unit_test(test_tls_shutdown_wakes_retired_peer_reader),
+        cmocka_unit_test(test_tls_read_throws_on_malformed_record),
 #endif
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
