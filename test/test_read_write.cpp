@@ -75,7 +75,9 @@ void test_host_endpoint_parser_validates_all_fields(void**) {
     for (const auto* endpoint : {"", "localhost", ":80:1", "localhost::1",
             "localhost:0:1", "localhost:65536:1", "localhost:80:0",
             "localhost:80:4294967296", "localhost:80:1:extra", "[]:80:1",
-            "[::1]80:1", "[::1]:80:1:extra"}) {
+            "[::1]80:1", "[::1]:80:1:extra", "[localhost]:80:1",
+            "[not-an-ipv6-literal]:80:1", "[2001:db8::gg]:80:1",
+            "[fe80::1%eth0]:80:1", "bad host:80:1"}) {
         bool rejected = false;
         try { (void)THost{endpoint}; }
         catch (const std::invalid_argument&) { rejected = true; }

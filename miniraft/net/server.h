@@ -404,8 +404,9 @@ struct THost {
         size_t portBegin = 0;
         size_t portEnd = 0;
         size_t idBegin = 0;
+        const bool bracketedAddress = !input.empty() && input.front() == '[';
 
-        if (!input.empty() && input.front() == '[') {
+        if (bracketedAddress) {
             const auto close = input.find(']');
             if (close == std::string_view::npos || close == 1 || close + 1 >= input.size() ||
                 input[close + 1] != ':')
@@ -438,6 +439,9 @@ struct THost {
             parsedPortResult.ptr != port.data() + port.size() || parsedPort == 0 || parsedPort > 65535 ||
             parsedIdResult.ec != std::errc{} || parsedIdResult.ptr != id.data() + id.size() || !Id)
             throw std::invalid_argument("Invalid node address, port, or ID");
+        if (bracketedAddress && address.find(':') == std::string_view::npos)
+            throw std::invalid_argument("Bracketed node address must be an IPv6 literal");
+        (void)NNet::THostPort(std::string(address), static_cast<int>(parsedPort));
         Address.assign(address);
         Port = static_cast<int>(parsedPort);
     }
