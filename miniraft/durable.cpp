@@ -109,6 +109,11 @@ void Sync(int fd) {
     do { result = fsync(fd); } while (result < 0 && errno == EINTR);
     Require(result == 0, "fsync durable state");
 }
+void SyncFileData(int fd) {
+    int result;
+    do { result = fdatasync(fd); } while (result < 0 && errno == EINTR);
+    Require(result == 0, "fdatasync durable log");
+}
 void WriteAll(int fd, const void* data, size_t size) {
     const auto* bytes = static_cast<const uint8_t*>(data);
     size_t done = 0;
@@ -700,7 +705,9 @@ void TDurableState::Publish()
             logBytes += record.size();
         }
         Impl->Stage(EStage::LogAppendWritten);
-        Sync(log.Value);
+        // The generation already exists and only its appended bytes and length
+        // changed. Keep full fsync for newly-created files and namespace changes.
+        SyncFileData(log.Value);
         Impl->Stage(EStage::LogAppendFileSynced);
     } else if (Impl->Log.size() != Impl->PublishedLogCount) {
         throw std::logic_error("Durable log changed without a replacement generation");
