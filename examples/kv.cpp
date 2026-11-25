@@ -252,14 +252,18 @@ NNet::TFuture<void> Client(TPoller& poller, std::unique_ptr<TSocket> socket,
     co_return;
 }
 
-template<typename TPoller>
-NNet::TVoidTask CheckpointLoop(TPoller& poller, std::shared_ptr<TRaft> raft,
+template<typename TPoller, typename TSocket>
+NNet::TVoidTask CheckpointLoop(TPoller& poller, TRaftServer<TSocket>& server,
     std::shared_ptr<IRsm> rsm, std::shared_ptr<TSnapshotStore> store, uint64_t interval, uint64_t saved) {
     while (true) {
         co_await poller.Sleep(std::chrono::seconds(1));
-        if (rsm->LastAppliedIndex <= saved || rsm->LastAppliedIndex - saved < interval) continue;
         try {
-            auto snapshot = raft->CompactShared();
+            auto snapshot = server.WithSerializedRaft([&](TRaft& raft) -> std::shared_ptr<const TSnapshot> {
+                if (rsm->LastAppliedIndex <= saved || rsm->LastAppliedIndex - saved < interval)
+                    return {};
+                return raft.CompactShared();
+            });
+            if (!snapshot) continue;
             store->Save(*snapshot);
             saved = snapshot->Index;
         } catch (const std::exception& error) {
@@ -588,7 +592,7 @@ int main(int argc, char** argv) {
         socket.Listen();
         TRaftServer server(loop.Poller(), std::move(socket), raft, rsm, nodes, timeSource);
         server.Serve();
-        if (snapshots) CheckpointLoop(loop.Poller(), raft, rsm, snapshots, snapshotInterval, savedSnapshot);
+        if (snapshots) CheckpointLoop(loop.Poller(), server, rsm, snapshots, snapshotInterval, savedSnapshot);
 #ifdef __linux__
         if (!peerConfig.empty()) {
             for (;;) {
