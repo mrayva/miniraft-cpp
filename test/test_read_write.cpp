@@ -1355,6 +1355,14 @@ int RunServingServerMembershipReaderTest(const std::filesystem::path& dir) {
     addRequest.Payload[0] = EncodeConfigurationEntry(addJoint);
     raft->Process({}, std::move(addRequest));
     if (!raft->IsVoter(3)) return 2;
+    bool jointVoterRetirementRejected = false;
+    try {
+        (void)server.UnregisterPeerTarget(3);
+    } catch (const std::invalid_argument&) {
+        jointVoterRetirementRejected = true;
+    }
+    if (!jointVoterRetirementRejected || joiningPeer->IsRetired() ||
+        !joiningPeer->HasResponseReader() || !raft->IsVoter(3)) return 15;
 
     // Registering another endpoint invokes the production reconciliation path
     // while the server is serving, without a timer wait or socket traffic.
@@ -1368,14 +1376,31 @@ int RunServingServerMembershipReaderTest(const std::filesystem::path& dir) {
     auto removeRequest = NewHoldedMessage(
         TMessageEx{.Src = 2, .Dst = 1, .Term = 2},
         TAppendEntriesRequest{.PrevLogIndex = 1, .PrevLogTerm = 2,
-            .LeaderCommit = 4 | TAppendEntriesRequest::JointElectionFenceLeader,
-            .LeaderId = 2, .Nentries = 3});
-    removeRequest.InitPayload(3);
+            .LeaderCommit = 3 | TAppendEntriesRequest::JointElectionFenceLeader,
+            .LeaderId = 2, .Nentries = 2});
+    removeRequest.InitPayload(2);
     removeRequest.Payload[0] = EncodeConfigurationEntry(addStable);
     removeRequest.Payload[1] = EncodeConfigurationEntry(removeJoint);
-    removeRequest.Payload[2] = EncodeConfigurationEntry(removeStable);
     raft->Process({}, std::move(removeRequest));
-    if (raft->IsVoter(3)) return 3;
+    if (!raft->IsVoter(3)) return 17;
+    bool pendingRemovalRejected = false;
+    try {
+        (void)server.UnregisterPeerTarget(3);
+    } catch (const std::invalid_argument&) {
+        pendingRemovalRejected = true;
+    }
+    if (!pendingRemovalRejected || joiningPeer->IsRetired() ||
+        !joiningPeer->HasResponseReader() || !raft->IsVoter(3)) return 16;
+
+    auto finalizeRemoval = NewHoldedMessage(
+        TMessageEx{.Src = 2, .Dst = 1, .Term = 2},
+        TAppendEntriesRequest{.PrevLogIndex = 3, .PrevLogTerm = 2,
+            .LeaderCommit = 4 | TAppendEntriesRequest::JointElectionFenceLeader,
+            .LeaderId = 2, .Nentries = 1});
+    finalizeRemoval.InitPayload(1);
+    finalizeRemoval.Payload[0] = EncodeConfigurationEntry(removeStable);
+    raft->Process({}, std::move(finalizeRemoval));
+    if (raft->IsVoter(3)) return 18;
 
     // Successful retirement proves the serving server started and tracked the
     // reader when peer 3 was promoted, then kept it until demotion completed.
