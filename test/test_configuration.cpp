@@ -2834,13 +2834,20 @@ void test_live_joint_transition_waits_for_both_nontrivial_majorities(void**) {
     run(true, true);
 #endif
 }
-void test_disjoint_membership_change_transfers_finalizes_and_restarts(void**) {
 #ifdef __linux__
-    auto dir = std::filesystem::temp_directory_path() / ("miniraft-disjoint-live-membership-" +
-        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+void run_live_membership_failure_scenario(uint32_t scenario,
+        const std::vector<uint32_t>& newVoters,
+        const std::vector<uint32_t>& blockedJointReplicas) {
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-live-membership-faults-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" +
+        std::to_string(scenario));
     assert_true(std::filesystem::create_directory(dir));
     const std::vector<uint32_t> oldVoters{1, 2, 3};
-    const std::vector<uint32_t> newVoters{4, 5, 6};
+    const std::vector<uint32_t> initialLearners{4, 5, 6};
+    std::vector<uint32_t> addedVoters;
+    for (auto voter : newVoters)
+        if (!std::binary_search(oldVoters.begin(), oldVoters.end(), voter))
+            addedVoters.push_back(voter);
     std::array<std::shared_ptr<TDurableState>, 7> states{};
     std::array<std::shared_ptr<TRaft>, 7> rafts{};
     std::array<std::shared_ptr<TSnapshotRsm>, 7> applications{};
@@ -2863,7 +2870,7 @@ void test_disjoint_membership_change_transfers_finalizes_and_restarts(void**) {
         TNodeDict peers;
         for (uint32_t peer = 1; peer <= 6; ++peer)
             if (peer != id) peers.emplace(peer, endpoints[id][peer]);
-        rafts[id] = std::make_shared<TRaft>(states[id], id, peers, newVoters);
+        rafts[id] = std::make_shared<TRaft>(states[id], id, peers, initialLearners);
         applications[id] = std::make_shared<TSnapshotRsm>();
         applications[id]->SnapshotPaddingBytes = 2 * TInstallSnapshotRequest::MaxChunkBytes + 17;
         processors[id] = std::make_shared<TRequestProcessor>(rafts[id], applications[id], peers);
@@ -2872,7 +2879,8 @@ void test_disjoint_membership_change_transfers_finalizes_and_restarts(void**) {
         for (uint32_t to = 1; to <= 6; ++to) {
             if (from == to) continue;
             endpoints[from][to]->Route = [&, from, to](auto message) {
-                if (isolateNewMajority && from == 1 && (to == 5 || to == 6)) return;
+                if (isolateNewMajority && from == 1 &&
+                    std::binary_search(blockedJointReplicas.begin(), blockedJointReplicas.end(), to)) return;
                 if (isolateSnapshotReceiver && (from == 6 || to == 6)) return;
                 if (holdSnapshotChunks && from == 4 && to == 6 &&
                     message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_REQUEST)) {
@@ -2898,11 +2906,11 @@ void test_disjoint_membership_change_transfers_finalizes_and_restarts(void**) {
     assert_int_equal(rafts[1]->GetVolatileState()->CommitIndex, 1);
     for (unsigned i = 0; i < 8; ++i) {
         bool ready = true;
-        for (auto id : newVoters) ready = ready && rafts[1]->IsLearnerCommitAcknowledged(id);
+        for (auto id : addedVoters) ready = ready && rafts[1]->IsLearnerCommitAcknowledged(id);
         if (ready) break;
         tick(1);
     }
-    for (auto id : newVoters) assert_true(rafts[1]->IsLearnerCommitAcknowledged(id));
+    for (auto id : addedVoters) assert_true(rafts[1]->IsLearnerCommitAcknowledged(id));
 
     isolateNewMajority = true;
     const auto jointIndex = rafts[1]->ProposeJointConfiguration(newVoters);
@@ -2910,12 +2918,11 @@ void test_disjoint_membership_change_transfers_finalizes_and_restarts(void**) {
     assert_true(rafts[1]->GetVolatileState()->CommitIndex < jointIndex);
     assert_int_equal(states[2]->CommitIndex, jointIndex - 1);
     assert_int_equal(states[4]->CommitIndex, jointIndex - 1);
-    assert_true(rafts[1]->GetVolatileState()->MatchIndex.at(2) >= jointIndex);
-    assert_true(rafts[1]->GetVolatileState()->MatchIndex.at(3) >= jointIndex);
-    assert_true(rafts[1]->GetVolatileState()->MatchIndex.at(4) >= jointIndex);
-    assert_true(rafts[1]->GetVolatileState()->MatchIndex.at(5) < jointIndex);
-    assert_true(rafts[1]->GetVolatileState()->MatchIndex.at(6) < jointIndex);
-    assert_true(states[4]->LastLogIndex >= jointIndex);
+    for (uint32_t id = 2; id <= 6; ++id)
+        assert_true((rafts[1]->GetVolatileState()->MatchIndex.at(id) >= jointIndex) ==
+            !std::binary_search(blockedJointReplicas.begin(), blockedJointReplicas.end(), id));
+    assert_true((states[4]->LastLogIndex >= jointIndex) ==
+        !std::binary_search(blockedJointReplicas.begin(), blockedJointReplicas.end(), 4));
     isolateNewMajority = false;
     for (unsigned i = 0; i < 8 && rafts[1]->GetVolatileState()->CommitIndex < jointIndex; ++i) tick(1);
     assert_int_equal(rafts[1]->GetVolatileState()->CommitIndex, jointIndex);
@@ -2925,9 +2932,14 @@ void test_disjoint_membership_change_transfers_finalizes_and_restarts(void**) {
         if (propagated) break;
         tick(1);
     }
+    auto jointVoters = oldVoters;
+    jointVoters.insert(jointVoters.end(), newVoters.begin(), newVoters.end());
+    std::sort(jointVoters.begin(), jointVoters.end());
+    jointVoters.erase(std::unique(jointVoters.begin(), jointVoters.end()), jointVoters.end());
     for (uint32_t id = 1; id <= 6; ++id) {
-        assert_true(rafts[id]->IsVoter(id));
-        assert_true(rafts[id]->GetVoterIds() == (std::vector<uint32_t>{1, 2, 3, 4, 5, 6}));
+        assert_true(rafts[id]->IsVoter(id) ==
+            std::binary_search(jointVoters.begin(), jointVoters.end(), id));
+        assert_true(rafts[id]->GetVoterIds() == jointVoters);
     }
 
     for (unsigned i = 0; i < 8 &&
@@ -2953,7 +2965,8 @@ void test_disjoint_membership_change_transfers_finalizes_and_restarts(void**) {
     }
     for (uint32_t id = 1; id <= 6; ++id) {
         assert_true(rafts[id]->GetVoterIds() == newVoters);
-        assert_true(rafts[id]->IsVoter(id) == (id >= 4));
+        assert_true(rafts[id]->IsVoter(id) ==
+            std::binary_search(newVoters.begin(), newVoters.end(), id));
         assert_true(states[id]->GetBoundVoters() == oldVoters);
     }
 
@@ -3058,18 +3071,26 @@ void test_disjoint_membership_change_transfers_finalizes_and_restarts(void**) {
             if (voter != id) peers.emplace(voter, std::make_shared<TEndpoint>());
         rafts[id] = std::make_shared<TRaft>(states[id], id, peers);
         assert_true(rafts[id]->GetVoterIds() == newVoters);
-        assert_true(rafts[id]->IsVoter(id) == (id >= 4));
+        assert_true(rafts[id]->IsVoter(id) ==
+            std::binary_search(newVoters.begin(), newVoters.end(), id));
         assert_true(rafts[id]->GetVolatileState()->CommitIndex >= stableIndex);
-        if (id >= 4) {
+        if (std::binary_search(newVoters.begin(), newVoters.end(), id))
+            assert_true(rafts[id]->GetVolatileState()->CommitIndex >= snapshotIndex);
+        if (states[id]->SnapshotIndex >= snapshotIndex) {
             const auto snapshot = states[id]->GetSnapshot();
             assert_true(snapshot && snapshot->StableConfiguration);
             assert_true(snapshot->Voters == newVoters);
             assert_int_equal(snapshot->ConfigurationIndex, stableIndex);
-            assert_true(rafts[id]->GetVolatileState()->CommitIndex >= snapshotIndex);
         }
     }
     std::error_code ignored;
     std::filesystem::remove_all(dir, ignored);
+}
+#endif
+void test_live_membership_fault_scenarios_transfer_finalize_and_restart(void**) {
+#ifdef __linux__
+    run_live_membership_failure_scenario(0, {4, 5, 6}, {5, 6});
+    run_live_membership_failure_scenario(1, {2, 4, 6}, {4, 6});
 #endif
 }
 void test_live_disjoint_joint_entry_waits_for_old_majority_over_network(void**) {
@@ -5807,7 +5828,7 @@ int main() {
         cmocka_unit_test(test_fresh_joint_snapshot_rejoin_recovers_voter_role_after_restart),
         cmocka_unit_test(test_joint_membership_addition_and_finalization_replicate_deterministically),
         cmocka_unit_test(test_live_joint_transition_waits_for_both_nontrivial_majorities),
-        cmocka_unit_test(test_disjoint_membership_change_transfers_finalizes_and_restarts),
+        cmocka_unit_test(test_live_membership_fault_scenarios_transfer_finalize_and_restart),
         cmocka_unit_test(test_live_disjoint_joint_entry_waits_for_old_majority_over_network),
         cmocka_unit_test(test_joint_strong_read_waits_for_both_disjoint_majorities),
         cmocka_unit_test(test_timeout_now_retries_and_falls_back_under_joint_quorum),
