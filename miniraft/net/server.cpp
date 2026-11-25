@@ -123,7 +123,14 @@ void TRaftServer<TSocket>::Serve() {
     if (Serving) throw std::logic_error("Raft server is already serving");
     if (Stopping) throw std::logic_error("A stopped Raft server cannot be restarted");
     Serving = true;
-    ReconcilePeerReaders();
+    try {
+        ReconcilePeerReaders();
+    } catch (...) {
+        // Allow the caller to retry startup if a response reader could not
+        // be launched. Reconciliation rolls back that reader's reservation.
+        Serving = false;
+        throw;
+    }
     Idle();
     InboundServe();
 }
@@ -320,7 +327,12 @@ void TRaftServer<TSocket>::ReconcilePeerReaders() {
         [this](uint32_t, const auto& node) {
             // Learners need replies to prove catch-up before promotion.
             node->MarkResponseReaderStarted();
-            OutboundServe(node);
+            try {
+                OutboundServe(node);
+            } catch (...) {
+                node->MarkResponseReaderStopped();
+                throw;
+            }
         });
 }
 

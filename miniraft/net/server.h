@@ -39,8 +39,18 @@ namespace NNet::TDetail {
 template<class TPeerMap, class TStarted, class TStartReader>
 void ReconcilePeerResponseReaders(const TPeerMap& peers,
         TStarted& started, TStartReader startReader) {
-    for (const auto& [id, peer] : peers)
-        if (started.insert(id).second) startReader(id, peer);
+    for (const auto& [id, peer] : peers) {
+        auto [entry, inserted] = started.insert(id);
+        if (!inserted) continue;
+        try {
+            startReader(id, peer);
+        } catch (...) {
+            // A failed launch did not create a reader. Leave this peer
+            // eligible for a later reconciliation attempt.
+            started.erase(entry);
+            throw;
+        }
+    }
 }
 
 template<class TConnections, class TClose>

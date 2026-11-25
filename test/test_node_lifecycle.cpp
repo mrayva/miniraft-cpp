@@ -436,6 +436,36 @@ void test_peer_response_readers_start_once_for_replication_targets(void**) {
     reconcile(); // Repeated processing must not launch a duplicate reader.
     assert_int_equal(startCount, 3);
 }
+void test_peer_response_reader_start_failure_can_retry(void**) {
+    std::unordered_map<uint32_t, std::string> peers{{1, "peer"}};
+    std::unordered_set<uint32_t> started;
+    unsigned startCount = 0;
+    bool failStart = true;
+    const auto reconcile = [&] {
+        NNet::TDetail::ReconcilePeerResponseReaders(peers, started,
+            [&](uint32_t, const std::string&) {
+                ++startCount;
+                if (failStart) throw std::runtime_error("reader launch failed");
+            });
+    };
+
+    bool threw = false;
+    try {
+        reconcile();
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    assert_true(threw);
+    assert_true(started.empty());
+    assert_int_equal(startCount, 1);
+
+    failStart = false;
+    reconcile();
+    assert_true(started == std::unordered_set<uint32_t>({1}));
+    assert_int_equal(startCount, 2);
+    reconcile();
+    assert_int_equal(startCount, 2);
+}
 NNet::TVoidTask WaitForRetiredResponseReader(
         std::shared_ptr<TNode<TAsyncSocket>> node, bool& stopped) {
     char byte = 0;
@@ -792,6 +822,7 @@ int main() {
         cmocka_unit_test(test_old_reader_failure_cannot_disconnect_writer_reconnect),
         cmocka_unit_test(test_connect_timeout_cancels_a_ready_event_before_retry),
         cmocka_unit_test(test_peer_response_readers_start_once_for_replication_targets),
+        cmocka_unit_test(test_peer_response_reader_start_failure_can_retry),
         cmocka_unit_test(test_retirement_wakes_reader_and_writer_before_socket_cleanup),
 #ifdef __linux__
         cmocka_unit_test(test_socket_shutdown_wakes_a_real_pending_read),
