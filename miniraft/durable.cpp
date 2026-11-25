@@ -583,7 +583,8 @@ void TDurableState::Publish()
 #ifndef __linux__
     throw std::runtime_error("TDurableState currently requires Linux");
 #else
-    if (!CurrentTerm || LastLogIndex > uint64_t(INT64_MAX) || LastLogIndex != SnapshotIndex + Impl->Log.size() ||
+    if (!CurrentTerm || LastLogTerm > CurrentTerm || LastLogIndex > uint64_t(INT64_MAX) ||
+        LastLogIndex != SnapshotIndex + Impl->Log.size() ||
         CommitIndex < SnapshotIndex || CommitIndex > LastLogIndex ||
         LastLogTerm != (Impl->Log.empty() ? SnapshotTerm : Impl->Log.back()->Term) ||
         (Impl->Snapshot ? (Impl->Snapshot->Index != SnapshotIndex || Impl->Snapshot->Term != SnapshotTerm ||
@@ -594,12 +595,12 @@ void TDurableState::Publish()
     if (!Impl->Voters.empty()) {
         ValidateFixedVoters(Impl->Voters);
     }
-    uint64_t previousTerm = SnapshotTerm;
-    for (const auto& entry : Impl->Log) {
-        if (!entry->Term || entry->Term < previousTerm || entry->Term > CurrentTerm)
-            throw std::runtime_error("Invalid durable log term");
-        previousTerm = entry->Term;
-    }
+    // Recovery and trusted migration validate the complete log. Online appends
+    // and suffix replacement validate new entries against the retained prefix;
+    // snapshot installation retains only a matching suffix, and RemoveLast only
+    // shortens it. Get() returns a clone, so callers cannot mutate stored entries.
+    // Rechecking the whole suffix here would make each normal append linear in
+    // the log length.
     const auto previousSnapshotFile = Impl->PublishedSnapshotFile;
     const auto snapshotFile = Impl->Snapshot
         ? SnapshotImageName(Impl->File, SnapshotIndex, SnapshotTerm) : std::string{};

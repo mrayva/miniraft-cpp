@@ -85,6 +85,13 @@ suffix replacement, and a commit advance carried in that request. A commit
 advance learned by a later matching request is a separate publication. Other
 backends retain their existing truncation behavior:
 
+Recovery and trusted migration validate the complete retained log. Online
+append and suffix replacement validate new entries against the retained prefix;
+snapshot installation keeps a suffix only when its boundary term matches, and
+truncation only shortens the validated suffix. Since reads return owned clones,
+publication checks the log boundary in constant time instead of rescanning all
+retained entries on every append.
+
 Before publishing the manifest, an ordinary tail append is appended and fsynced
 in the selected log generation. If the retained suffix changes, storage first
 writes a replacement log generation using write/fsync/rename/directory-fsync.
