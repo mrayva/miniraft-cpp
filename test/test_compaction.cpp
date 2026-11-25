@@ -3487,8 +3487,8 @@ void test_snapshot_and_suffix_are_atomic_at_every_publication_stage(void**) {
         if (retain || !updated) assert_int_equal(state.Get(3)->Term, 3);
     }
 }
-void test_remote_snapshot_install_crash_before_application_load_recovers_on_restart(void**) {
-    TFiles files;
+template<class TMakeApplication>
+void ExerciseRemoteSnapshotInstallCrashRecovery(TFiles& files, TMakeApplication makeApplication) {
     {
         TDurableState state(files.Name, 2);
         state.BindVoters({1, 2});
@@ -3508,14 +3508,11 @@ void test_remote_snapshot_install_crash_before_application_load_recovers_on_rest
     const auto child = fork();
     assert_true(child >= 0);
     if (child == 0) {
-        struct TCrashDuringLoad final : TKv {
-            void LoadSnapshot(std::string_view, uint64_t) override { _exit(87); }
-        };
         try {
             auto state = std::make_shared<TDurableState>(files.Name, 2);
             TNodeDict peers{{1, std::make_shared<TEndpoint>([](auto) {})}};
             auto raft = std::make_shared<TRaft>(state, 2, peers);
-            auto application = std::make_shared<TCrashDuringLoad>();
+            auto application = makeApplication();
             TRequestProcessor processor(raft, application, peers);
             raft->Process({}, request);
         } catch (...) { _exit(91); }
@@ -3539,6 +3536,32 @@ void test_remote_snapshot_install_crash_before_application_load_recovers_on_rest
         assert_int_equal(application->LastAppliedIndex, snapshot.Index);
         assert_true(Read(*application, "crash-window") == "durable image");
     }
+}
+void test_remote_snapshot_install_crash_before_application_load_recovers_on_restart(void**) {
+    TFiles files;
+    ExerciseRemoteSnapshotInstallCrashRecovery(files, [] {
+        struct TCrashDuringLoad final : TKv {
+            void LoadSnapshot(std::string_view, uint64_t) override { _exit(87); }
+        };
+        return std::make_shared<TCrashDuringLoad>();
+    });
+}
+void test_remote_snapshot_install_crash_during_staged_activation_recovers_on_restart(void**) {
+    TFiles files;
+    ExerciseRemoteSnapshotInstallCrashRecovery(files, [] {
+        struct TCrashDuringActivation final : TKv, IStagedSnapshotRsm {
+            struct TInstallation final : IStagedSnapshotInstallation {
+                void Install() override { _exit(87); }
+            };
+            std::unique_ptr<IStagedSnapshotInstallation> PrepareSnapshotInstallation(
+                    std::string_view bytes, uint64_t index) override {
+                ValidateSnapshot(bytes, index);
+                return std::make_unique<TInstallation>();
+            }
+            bool SupportsApplicationSnapshotInstall() const override { return true; }
+        };
+        return std::make_shared<TCrashDuringActivation>();
+    });
 }
 void test_compaction_reclaims_durable_prefix_bytes(void**) {
     TFiles files; TDurableState state(files.Name, 1);
@@ -3657,6 +3680,7 @@ int main() {
         cmocka_unit_test(test_durable_compacted_boundary_survives_restart),
         cmocka_unit_test(test_snapshot_and_suffix_are_atomic_at_every_publication_stage),
         cmocka_unit_test(test_remote_snapshot_install_crash_before_application_load_recovers_on_restart),
+        cmocka_unit_test(test_remote_snapshot_install_crash_during_staged_activation_recovers_on_restart),
         cmocka_unit_test(test_durable_stale_snapshot_membership_recovery_survives_restart),
         cmocka_unit_test(test_durable_membership_snapshot_install_is_atomic_across_restart),
         cmocka_unit_test(test_compaction_reclaims_durable_prefix_bytes),
