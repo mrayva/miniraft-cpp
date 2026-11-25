@@ -2,6 +2,7 @@
 #include <miniraft/configuration.h>
 #include <miniraft/raft.h>
 #include <miniraft/snapshot_codec.h>
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <fstream>
@@ -104,6 +105,20 @@ struct TFiles {
         output.write(bytes.data(), bytes.size());
         output.flush();
         assert_true(bool(output));
+    }
+    void ClearCurrentMetadataVoterBinding() {
+        std::ifstream input(Path("state"), std::ios::binary);
+        std::string bytes{std::istreambuf_iterator<char>(input), {}};
+        assert_true(bytes.size() >= 92);
+        assert_true(bytes.substr(0, 8) == "MRFTL005");
+        uint32_t voterCount = 0;
+        for (unsigned i = 0; i < 4; ++i)
+            voterCount |= uint32_t(uint8_t(bytes[40 + i])) << (8 * i);
+        assert_int_equal(bytes.size(), 92 + 4 * voterCount);
+        bytes.erase(88, 4 * voterCount);
+        std::fill(bytes.begin() + 40, bytes.begin() + 44, '\0');
+        Rewrite("state", bytes);
+        RepairMetadataChecksum();
     }
     void Rewrite(const std::string& kind, const std::string& bytes) {
         std::ofstream output(Path(kind), std::ios::binary | std::ios::trunc);
@@ -459,6 +474,64 @@ void test_disk_legacy_membership_history_can_be_bound_and_recovered(void**) {
         assert_true(scan.Committed.OldVoters() == active);
         assert_false(scan.Committed.IsJoint());
     }
+}
+void test_disk_truncated_snapshot_history_can_use_trusted_external_anchor(void**) {
+    const std::vector<uint32_t> original{1, 2, 3};
+    const std::vector<uint32_t> active{2, 3, 4};
+    auto trustedHistory = TConfigurationHistory::Stable(original, 0, 0, 0, 0);
+    trustedHistory = trustedHistory.Advance(1, EncodeConfigurationEntry({
+        EConfigurationPhase::Joint, 2, 0, 0, original, active}));
+    trustedHistory = trustedHistory.Advance(2, EncodeConfigurationEntry({
+        EConfigurationPhase::Stable, 3, 1, 2, original, active}));
+
+    TSnapshot truncated{2, 3, active, "truncated snapshot history"};
+    truncated.StableConfiguration = true;
+    truncated.ConfigurationIndex = 2;
+    truncated.ConfigurationTerm = 3;
+    TFiles files;
+    {
+        TDiskState state(files.Name, 1);
+        state.BindVoters(original);
+        state.CurrentTerm = 3;
+        state.VotedFor = 1;
+        state.Append(EncodeConfigurationEntry({EConfigurationPhase::Joint, 2, 0, 0,
+            original, active}));
+        state.Append(EncodeConfigurationEntry({EConfigurationPhase::Stable, 3, 1, 2,
+            original, active}));
+        state.CommitIndex = 2;
+        state.Commit();
+        state.InstallSnapshot(truncated);
+        auto tail = NewHoldedMessage<TLogEntry>();
+        tail->Term = 3;
+        state.Append(tail);
+        state.CommitIndex = 3;
+        state.Commit();
+    }
+    files.ClearCurrentMetadataVoterBinding();
+
+    {
+        TDiskState state(files.Name, 1);
+        assert_true(state.GetBoundVoters().empty());
+        std::string reason;
+        assert_false(state.CanBindVotersFromTrustedHistory(original, 3, &reason));
+        assert_true(!reason.empty());
+        assert_true(state.CanBindVotersFromTrustedHistory(original, 3, trustedHistory, &reason));
+        assert_true(reason.empty());
+        assert_true(state.GetBoundVoters().empty());
+
+        state.BindVotersFromTrustedHistory(original, 3, trustedHistory);
+        assert_true(state.GetBoundVoters() == original);
+        assert_true(state.GetSnapshot()->ConfigurationTransitions ==
+            trustedHistory.ConfigurationTransitions());
+    }
+
+    TDiskState recovered(files.Name, 1);
+    assert_true(recovered.GetBoundVoters() == original);
+    const auto baseline = TConfigurationHistory::FromStableSnapshot(*recovered.GetSnapshot());
+    const auto scan = ScanCommittedConfigurationHistory(recovered, baseline);
+    assert_true(scan.Committed.OldVoters() == active);
+    assert_false(scan.Committed.IsJoint());
+    assert_false(scan.HasUncommittedConfiguration());
 }
 void test_disk_vote_outside_original_binding_requires_committed_membership_proof(void**) {
     TFiles files;
@@ -1370,6 +1443,7 @@ int main() {
         cmocka_unit_test(test_checksums_detect_log_and_index_record_corruption),
         cmocka_unit_test(test_versioned_metadata_persists_commit_and_voter_baseline),
         cmocka_unit_test(test_disk_legacy_membership_history_can_be_bound_and_recovered),
+        cmocka_unit_test(test_disk_truncated_snapshot_history_can_use_trusted_external_anchor),
         cmocka_unit_test(test_disk_vote_outside_original_binding_requires_committed_membership_proof),
         cmocka_unit_test(test_disk_snapshot_generation_recovers_suffix_and_replaces_conflict),
         cmocka_unit_test(test_disk_suffix_replacement_publishes_one_generation),

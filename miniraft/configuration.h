@@ -68,6 +68,15 @@ private:
     std::vector<TSnapshotConfigurationTransition> Transitions;
 };
 
+// Validate an offline snapshot against a complete history supplied from a
+// trusted external record, then return the same image with that history
+// attached. The supplied history must start at the original voter baseline
+// and end exactly at the snapshot boundary.
+TSnapshot SnapshotWithTrustedConfigurationHistory(const TSnapshot& snapshot,
+    const std::vector<uint32_t>& originalVoters, const TConfigurationHistory& history);
+void ValidateSnapshotAgainstTrustedConfigurationHistory(const TSnapshot& snapshot,
+    const std::vector<uint32_t>& originalVoters, const TConfigurationHistory& history);
+
 struct IState;
 struct TConfigurationScan {
     TConfigurationHistory Committed;
@@ -91,6 +100,11 @@ struct TConfigurationScan {
 // baseline and commit boundary; neither is proven by this scan.
 TConfigurationScan ScanConfigurationHistory(const IState& state,
     TConfigurationHistory baseline, uint64_t commitIndex);
+// Offline migration-only scan. Callers must first validate the supplied
+// boundary snapshot against independently trusted history; the stored image's
+// metadata is then checked against this validated boundary instead.
+TConfigurationScan ScanConfigurationHistoryWithTrustedSnapshotBoundary(const IState& state,
+    TConfigurationHistory baseline, uint64_t commitIndex, const TSnapshot& trustedSnapshot);
 
 // Recover configuration identity at a particular committed index without
 // interpreting later retained entries as part of that boundary.

@@ -2,6 +2,7 @@
 #include "idempotency.h"
 #include "snapshot_codec.h"
 #include "state.h"
+#include <algorithm>
 #include <climits>
 #include <cstring>
 #include <stdexcept>
@@ -134,6 +135,68 @@ TConfigurationHistory TConfigurationHistory::FromStableSnapshot(const TSnapshot&
     return history;
 }
 
+void ValidateSnapshotAgainstTrustedConfigurationHistory(const TSnapshot& snapshot,
+        const std::vector<uint32_t>& originalVoters, const TConfigurationHistory& history) {
+    ValidateSnapshot(snapshot);
+    ValidateFixedVoters(originalVoters);
+    if (history.ThroughIndex() != snapshot.Index || history.ThroughTerm() != snapshot.Term)
+        throw std::invalid_argument("Trusted configuration history does not match the snapshot boundary");
+
+    const auto& transitions = history.ConfigurationTransitions();
+    if (transitions.empty()) {
+        if (history.IsJoint() || history.OldVoters() != originalVoters ||
+            history.ConfigurationIndex() || history.ConfigurationTerm())
+            throw std::invalid_argument("Trusted configuration history is not anchored to the original voter set");
+    } else if (transitions.front().PreviousConfigurationIndex ||
+        transitions.front().PreviousConfigurationTerm || transitions.front().OldVoters != originalVoters) {
+        throw std::invalid_argument("Trusted configuration history is not anchored to the original voter set");
+    }
+
+    if (!snapshot.HasConfigurationMetadata()) {
+        if (snapshot.Voters != originalVoters)
+            throw std::invalid_argument("Legacy snapshot does not match the trusted original voter set");
+    } else {
+        if (snapshot.Voters != history.OldVoters() || snapshot.JointVoters != history.NewVoters() ||
+            snapshot.IsJoint() != history.IsJoint() ||
+            snapshot.StableConfiguration != (!history.IsJoint()) ||
+            snapshot.ConfigurationIndex != history.ConfigurationIndex() ||
+            snapshot.ConfigurationTerm != history.ConfigurationTerm())
+            throw std::invalid_argument("Snapshot membership does not match the trusted configuration history");
+        if (snapshot.HasConfigurationLineage() &&
+            (snapshot.PreviousVoters != history.PreviousVoters() ||
+             snapshot.PreviousConfigurationIndex != history.PreviousConfigurationIndex() ||
+             snapshot.PreviousConfigurationTerm != history.PreviousConfigurationTerm() ||
+             snapshot.PreviousJointIndex != history.PreviousJointIndex() ||
+             snapshot.PreviousJointTerm != history.PreviousJointTerm()))
+            throw std::invalid_argument("Snapshot lineage does not match the trusted configuration history");
+        if (!snapshot.ConfigurationTransitions.empty()) {
+            if (snapshot.ConfigurationTransitions.size() > transitions.size() ||
+                !std::equal(snapshot.ConfigurationTransitions.rbegin(), snapshot.ConfigurationTransitions.rend(),
+                    transitions.rbegin()))
+                throw std::invalid_argument("Snapshot transitions do not match the trusted configuration history");
+        }
+    }
+}
+
+TSnapshot SnapshotWithTrustedConfigurationHistory(const TSnapshot& snapshot,
+        const std::vector<uint32_t>& originalVoters, const TConfigurationHistory& history) {
+    ValidateSnapshotAgainstTrustedConfigurationHistory(snapshot, originalVoters, history);
+    TSnapshot enriched = snapshot;
+    enriched.Voters = history.OldVoters();
+    enriched.JointVoters = history.NewVoters();
+    enriched.StableConfiguration = !history.IsJoint() && history.ConfigurationIndex() != 0;
+    enriched.ConfigurationIndex = history.ConfigurationIndex();
+    enriched.ConfigurationTerm = history.ConfigurationTerm();
+    enriched.PreviousVoters = history.PreviousVoters();
+    enriched.PreviousConfigurationIndex = history.PreviousConfigurationIndex();
+    enriched.PreviousConfigurationTerm = history.PreviousConfigurationTerm();
+    enriched.PreviousJointIndex = history.PreviousJointIndex();
+    enriched.PreviousJointTerm = history.PreviousJointTerm();
+    enriched.ConfigurationTransitions = history.ConfigurationTransitions();
+    ValidateSnapshot(enriched);
+    return enriched;
+}
+
 TSnapshot TConfigurationHistory::MakeSnapshot(std::string data) const {
     TSnapshot snapshot{Through, ThroughLogTerm, Old, std::move(data)};
     if (IsJoint()) {
@@ -220,7 +283,8 @@ TConfigurationHistory TConfigurationHistory::ObserveMetadata(uint64_t index, uin
 
 namespace {
 TConfigurationScan ScanConfigurationHistoryThrough(const IState& state,
-    TConfigurationHistory baseline, uint64_t commitIndex, uint64_t scanThrough) {
+    TConfigurationHistory baseline, uint64_t commitIndex, uint64_t scanThrough,
+    const TSnapshot* trustedSnapshot = nullptr) {
     if (!state.CurrentTerm || state.LastLogIndex > uint64_t(INT64_MAX) ||
         state.SnapshotIndex > state.LastLogIndex || state.SnapshotTerm > state.CurrentTerm ||
         state.LastLogTerm > state.CurrentTerm ||
@@ -228,7 +292,8 @@ TConfigurationScan ScanConfigurationHistoryThrough(const IState& state,
         commitIndex < state.SnapshotIndex || commitIndex > scanThrough || scanThrough > state.LastLogIndex)
         throw std::invalid_argument("Invalid configuration scan boundaries");
 
-    const auto snapshot = state.GetSnapshot();
+    const auto storedSnapshot = state.GetSnapshot();
+    const TSnapshot* snapshot = trustedSnapshot ? trustedSnapshot : storedSnapshot.get();
     if (state.SnapshotIndex) {
         if (!snapshot) throw std::invalid_argument("Missing configuration scan snapshot");
         ValidateSnapshot(*snapshot);
@@ -307,6 +372,12 @@ TConfigurationScan ScanConfigurationHistoryThrough(const IState& state,
 TConfigurationScan ScanConfigurationHistory(const IState& state,
     TConfigurationHistory baseline, uint64_t commitIndex) {
     return ScanConfigurationHistoryThrough(state, std::move(baseline), commitIndex, state.LastLogIndex);
+}
+
+TConfigurationScan ScanConfigurationHistoryWithTrustedSnapshotBoundary(const IState& state,
+    TConfigurationHistory baseline, uint64_t commitIndex, const TSnapshot& trustedSnapshot) {
+    return ScanConfigurationHistoryThrough(state, std::move(baseline), commitIndex,
+        state.LastLogIndex, &trustedSnapshot);
 }
 
 TConfigurationHistory ScanConfigurationHistoryPrefix(const IState& state,

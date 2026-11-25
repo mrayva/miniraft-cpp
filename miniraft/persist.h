@@ -6,6 +6,8 @@
 #include <functional>
 #include <string>
 
+class TConfigurationHistory;
+
 struct TDiskState : IState {
     enum class ECommitStage {
         EntriesPublished,
@@ -68,6 +70,14 @@ struct TDiskState : IState {
         uint64_t commitIndex, std::string* reason = nullptr) const;
     void BindVotersFromTrustedHistory(const std::vector<uint32_t>& voters,
         uint64_t commitIndex);
+    // Variant for a compacted snapshot whose bounded embedded history no longer
+    // reaches the original voter set. The caller supplies independently
+    // verified complete history through the snapshot boundary.
+    bool CanBindVotersFromTrustedHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex, const TConfigurationHistory& history,
+        std::string* reason = nullptr) const;
+    void BindVotersFromTrustedHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex, const TConfigurationHistory& history);
     void MarkRaftStarted() override { RaftStarted = true; }
 
 private:
@@ -75,6 +85,8 @@ private:
         uint64_t commitIndex) const;
     void ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t>& voters,
         uint64_t commitIndex) const;
+    void ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex, const TConfigurationHistory* history) const;
     void ValidateStoredVoteMembershipHistory() const;
     bool Recovering = true;
     bool RecoveredStore = false;
@@ -94,7 +106,8 @@ private:
     std::string SnapshotPath(uint64_t generation) const;
     void InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated);
     void InstallSnapshotImpl(std::shared_ptr<const TSnapshot> snapshot);
-    void InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snapshot);
+    void InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snapshot,
+        bool allowSameBoundary = false);
     void WriteSnapshotGenerationFile(const std::string& path, const TSnapshot& snapshot);
     uint64_t WriteCompactedLogGeneration(const std::string& entriesPath, const std::string& indexPath,
         uint64_t firstIndex, uint64_t lastIndex, uint64_t& lastTerm,

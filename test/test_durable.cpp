@@ -427,6 +427,52 @@ void test_legacy_configuration_snapshot_migration_requires_complete_trusted_hist
         assert_true(rejected);
         assert_true(state.HasUnboundRecoveredState());
     }
+
+    auto trustedStableHistory = TConfigurationHistory::Stable(originalVoters, 0, 0, 0, 0);
+    trustedStableHistory = trustedStableHistory.Advance(1, EncodeConfigurationEntry({
+        EConfigurationPhase::Joint, 2, 0, 0, originalVoters, newVoters}));
+    trustedStableHistory = trustedStableHistory.Advance(2, EncodeConfigurationEntry({
+        EConfigurationPhase::Stable, 3, 1, 2, originalVoters, newVoters}));
+    TSnapshot truncatedStable{2, 3, newVoters, "externally anchored snapshot"};
+    truncatedStable.StableConfiguration = true;
+    truncatedStable.ConfigurationIndex = 2;
+    truncatedStable.ConfigurationTerm = 3;
+    TFiles externallyAnchoredFiles;
+    const auto externallyAnchoredImage = LegacyImage(
+        "MRFTD002", true, false, &truncatedStable, 1);
+    { std::ofstream output(externallyAnchoredFiles.Image(), std::ios::binary);
+      output.write(externallyAnchoredImage.data(), externallyAnchoredImage.size()); }
+    {
+        TDurableState state(externallyAnchoredFiles.Name, 1);
+        std::string reason;
+        const std::vector<uint32_t> wrongOriginal{1, 2, 5};
+        auto wrongHistory = TConfigurationHistory::Stable(wrongOriginal, 0, 0, 0, 0);
+        wrongHistory = wrongHistory.Advance(1, EncodeConfigurationEntry({
+            EConfigurationPhase::Joint, 2, 0, 0, wrongOriginal, newVoters}));
+        wrongHistory = wrongHistory.Advance(2, EncodeConfigurationEntry({
+            EConfigurationPhase::Stable, 3, 1, 2, wrongOriginal, newVoters}));
+        assert_false(state.CanBindVotersFromTrustedHistory(originalVoters, 3, &reason));
+        assert_false(state.CanBindVotersFromTrustedHistory(
+            originalVoters, 3, wrongHistory, &reason));
+        assert_true(!reason.empty());
+        assert_true(state.GetBoundVoters().empty());
+        assert_true(state.CanBindVotersFromTrustedHistory(
+            originalVoters, 3, trustedStableHistory, &reason));
+        assert_true(reason.empty());
+        assert_true(state.GetBoundVoters().empty()); // Dry run leaves storage unbound.
+        state.BindVotersFromTrustedHistory(originalVoters, 3, trustedStableHistory);
+        assert_true(state.GetSnapshot()->ConfigurationTransitions ==
+            trustedStableHistory.ConfigurationTransitions());
+    }
+    {
+        TDurableState recovered(externallyAnchoredFiles.Name, 1);
+        assert_true(recovered.GetBoundVoters() == originalVoters);
+        const auto recoveredHistory = TConfigurationHistory::FromStableSnapshot(*recovered.GetSnapshot());
+        const auto scan = ScanCommittedConfigurationHistory(recovered, recoveredHistory);
+        assert_false(scan.Committed.IsJoint());
+        assert_true(scan.Committed.OldVoters() == newVoters);
+        assert_false(scan.HasUncommittedConfiguration());
+    }
 }
 void test_legacy_vote_cannot_be_justified_by_uncommitted_membership(void**) {
     const std::vector<uint32_t> originalVoters{1, 2, 3};

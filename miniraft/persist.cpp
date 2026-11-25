@@ -887,10 +887,14 @@ void TDiskState::InstallSnapshotImpl(std::shared_ptr<const TSnapshot> snapshot) 
     InstallValidatedSnapshot(std::move(snapshot));
 }
 
-void TDiskState::InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snapshot) {
+void TDiskState::InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snapshot,
+        bool allowSameBoundary) {
     if (!SnapshotCompatibleWithVoterBinding(*snapshot, Voters))
         throw std::invalid_argument("Snapshot is incompatible with the persisted voter binding");
-    if (snapshot->Index <= SnapshotIndex || snapshot->Term < SnapshotTerm || snapshot->Term > CurrentTerm)
+    const bool sameBoundary = allowSameBoundary && snapshot->Index == SnapshotIndex &&
+        snapshot->Term == SnapshotTerm;
+    if ((!sameBoundary && snapshot->Index <= SnapshotIndex) || snapshot->Term < SnapshotTerm ||
+        snapshot->Term > CurrentTerm)
         throw std::invalid_argument("Obsolete or future disk snapshot");
     if (snapshot->Index <= CommitIndex &&
         (snapshot->Index > LastLogIndex || LogTerm(snapshot->Index) != snapshot->Term))
@@ -1191,6 +1195,11 @@ void TDiskState::ValidateTrustedLegacyVoterBaseline(const std::vector<uint32_t>&
 
 void TDiskState::ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t>& voters,
         uint64_t commitIndex) const {
+    ValidateTrustedLegacyVoterHistory(voters, commitIndex, nullptr);
+}
+
+void TDiskState::ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex, const TConfigurationHistory* trustedHistory) const {
     ValidateFixedVoters(voters);
     if (RaftStarted)
         throw std::invalid_argument("Trusted legacy history migration must happen before Raft startup");
@@ -1206,15 +1215,26 @@ void TDiskState::ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t>& 
 
     auto baseline = TConfigurationHistory::Stable(voters, 0, 0, SnapshotIndex, SnapshotTerm);
     auto historicalVoters = voters;
+    TSnapshot trustedBoundary;
+    bool hasTrustedBoundary = false;
     if (Snapshot) {
         ValidateSnapshot(*Snapshot);
         if (Snapshot->Index != SnapshotIndex || Snapshot->Term != SnapshotTerm ||
             Snapshot->Term > CurrentTerm)
             throw std::invalid_argument("Legacy snapshot boundary mismatch");
-        baseline = TrustedDiskSnapshotHistory(*Snapshot, voters);
+        if (trustedHistory) {
+            ValidateSnapshotAgainstTrustedConfigurationHistory(*Snapshot, voters, *trustedHistory);
+            baseline = *trustedHistory;
+            trustedBoundary = trustedHistory->MakeSnapshot({});
+            hasTrustedBoundary = true;
+        } else {
+            baseline = TrustedDiskSnapshotHistory(*Snapshot, voters);
+        }
         AddDiskSnapshotVoters(baseline, historicalVoters);
     } else if (SnapshotIndex || SnapshotTerm) {
         throw std::invalid_argument("Legacy compacted state is missing its snapshot");
+    } else if (trustedHistory) {
+        throw std::invalid_argument("External trusted history requires a compacted snapshot boundary");
     }
 
     auto previousTerm = SnapshotTerm;
@@ -1237,7 +1257,9 @@ void TDiskState::ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t>& 
     if (LastLogTerm != previousTerm)
         throw std::invalid_argument("Legacy log last term mismatch");
 
-    const auto configuration = ScanConfigurationHistory(*this, baseline, commitIndex);
+    const auto configuration = hasTrustedBoundary
+        ? ScanConfigurationHistoryWithTrustedSnapshotBoundary(*this, baseline, commitIndex, trustedBoundary)
+        : ScanConfigurationHistory(*this, baseline, commitIndex);
     for (const auto& transition : configuration.Committed.ConfigurationTransitions()) {
         historicalVoters.insert(historicalVoters.end(), transition.OldVoters.begin(), transition.OldVoters.end());
         historicalVoters.insert(historicalVoters.end(), transition.NewVoters.begin(), transition.NewVoters.end());
@@ -1308,4 +1330,29 @@ void TDiskState::BindVotersFromTrustedHistory(const std::vector<uint32_t>& voter
     CommitIndex = commitIndex;
     CommitIndexTrusted = true;
     Commit();
+}
+
+bool TDiskState::CanBindVotersFromTrustedHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex, const TConfigurationHistory& history, std::string* reason) const {
+    if (reason) reason->clear();
+    try {
+        ValidateTrustedLegacyVoterHistory(voters, commitIndex, &history);
+        return true;
+    } catch (const std::exception& error) {
+        if (reason) *reason = error.what();
+        return false;
+    } catch (...) {
+        if (reason) *reason = "Unknown trusted history migration validation failure";
+        return false;
+    }
+}
+
+void TDiskState::BindVotersFromTrustedHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex, const TConfigurationHistory& history) {
+    ValidateTrustedLegacyVoterHistory(voters, commitIndex, &history);
+    auto enriched = SnapshotWithTrustedConfigurationHistory(*Snapshot, voters, history);
+    Voters = voters;
+    CommitIndex = commitIndex;
+    CommitIndexTrusted = true;
+    InstallValidatedSnapshot(std::make_shared<const TSnapshot>(std::move(enriched)), true);
 }

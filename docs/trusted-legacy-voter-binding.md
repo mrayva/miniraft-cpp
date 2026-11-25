@@ -68,6 +68,28 @@ publishes the binding before startup. Histories truncated before the original
 transition remain unprovable and are rejected. The commit boundary and the
 completeness of `voters` still require independent records.
 
+If the snapshot's embedded history is truncated but an independently verified
+history is available through its exact boundary, the C++ API also accepts that
+history explicitly:
+
+```cpp
+if (!state->CanBindVotersFromTrustedHistory(originalVoters, commitIndex,
+        verifiedHistory, &reason))
+    throw std::runtime_error("History migration refused: " + reason);
+state->BindVotersFromTrustedHistory(originalVoters, commitIndex, verifiedHistory);
+```
+
+`verifiedHistory` must start at the original voter baseline and end at the
+snapshot's exact index and term. The API checks the snapshot membership against
+that history, validates the retained log suffix and stored vote, then publishes
+the snapshot with the verified lineage attached before persisting the binding.
+The same overload is available on `TDiskState`. This is an offline recovery
+path: the caller remains responsible for verifying the history source, the
+application image at the snapshot boundary, the original voter set and commit
+index. The embedded and supplied transition histories are bounded to 1,024
+transitions, so a longer history still needs a separately established recovery
+baseline.
+
 New `TDiskState` metadata versions persist a CRC-protected commit boundary and
 original voter binding, so fresh split-format stores can use live membership.
 For a recovered old 20-byte metadata store, call

@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+class TConfigurationHistory;
+
 struct TLegacyDiskStateMigrationInfo {
     uint64_t CurrentTerm = 0;
     uint32_t VotedFor = 0;
@@ -88,6 +90,14 @@ public:
         uint64_t commitIndex, std::string* reason = nullptr) const;
     void BindVotersFromTrustedHistory(const std::vector<uint32_t>& voters,
         uint64_t commitIndex);
+    // Variant for a compacted snapshot whose bounded embedded history no longer
+    // reaches the original voter set. The caller supplies independently
+    // verified complete history through the snapshot boundary.
+    bool CanBindVotersFromTrustedHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex, const TConfigurationHistory& history,
+        std::string* reason = nullptr) const;
+    void BindVotersFromTrustedHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex, const TConfigurationHistory& history);
 private:
     friend TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(
         const std::string&, const std::string&, uint32_t,
@@ -95,6 +105,8 @@ private:
     void ValidateTrustedLegacyVoterBaseline(const std::vector<uint32_t>& voters) const;
     void ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t>& voters,
         uint64_t commitIndex) const;
+    void ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t>& voters,
+        uint64_t commitIndex, const TConfigurationHistory* history) const;
     void InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated);
     void InstallSnapshotImpl(std::shared_ptr<const TSnapshot> snapshot);
     void InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snapshot);
