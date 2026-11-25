@@ -112,6 +112,8 @@ def main():
                 wait_for(write, 30)
                 if key == b"a":
                     if learner_mode:
+                        reload(f"voter {endpoints[0]}\n",
+                               "Peer config reload cannot remove active voter")
                         invalid = (f"learner {endpoints[2]}\nlearner {endpoints[0]}\n"
                                    f"voter {endpoints[1]}\n")
                         reload(invalid, "Peer config reload cannot change bootstrap roles")
@@ -171,6 +173,7 @@ def main():
             if learner_mode:
                 wait_for(lambda: call(0, b"moved", b"new endpoint")[0] > last[0], 15)
                 wait_for(lambda: call(2, b"moved")[1] == b"new endpoint", 15)
+                reload(learner_catalog(False), "Reloaded peer config (1 endpoint changes)")
             for log in logs:
                 log.flush(); log.seek(0)
                 output = log.read()

@@ -319,6 +319,7 @@ static void ReloadPeerConfig(const std::string& path, uint32_t localId,
     LoadPeerConfig(path, requested, requestedLearners);
     const std::unordered_set<uint32_t> learnerIds(learners.begin(), learners.end());
     const std::unordered_set<uint32_t> newLearnerIds(requestedLearners.begin(), requestedLearners.end());
+    std::unordered_set<uint32_t> requestedIds;
     std::unordered_map<uint32_t, size_t> currentById;
     std::map<std::pair<std::string, int>, uint32_t> currentByAddress;
     for (size_t i = 0; i < hosts.size(); ++i) {
@@ -332,12 +333,12 @@ static void ReloadPeerConfig(const std::string& path, uint32_t localId,
         std::shared_ptr<TNode<TSocket>> Endpoint;
     };
     std::vector<TChange> changes;
-    size_t existing = 0;
+    requestedIds.reserve(requested.size());
     for (size_t i = 0; i < requested.size(); ++i) {
         const auto& host = requested[i];
+        requestedIds.insert(host.Id);
         std::optional<size_t> current;
         if (const auto it = currentById.find(host.Id); it != currentById.end()) {
-            ++existing;
             current = it->second;
             const auto& previous = hosts[*current];
             if (learnerIds.contains(host.Id) != newLearnerIds.contains(host.Id))
@@ -353,7 +354,21 @@ static void ReloadPeerConfig(const std::string& path, uint32_t localId,
             throw std::invalid_argument("Peer config reload cannot reassign an existing address to another node ID");
         changes.push_back({i, current, {}});
     }
-    if (existing != hosts.size()) throw std::invalid_argument("Peer config reload cannot remove endpoints");
+    if (!requestedIds.contains(localId))
+        throw std::invalid_argument("Peer config reload cannot remove the local listener");
+
+    std::vector<uint32_t> removals;
+    for (const auto& host : hosts)
+        if (!requestedIds.contains(host.Id) && host.Id != localId)
+            removals.push_back(host.Id);
+    // GetVoterIds includes both sides of an active joint configuration, so
+    // endpoint retirement stays blocked until the stable successor is active.
+    const auto activeVoters = server.WithSerializedRaft(
+        [](TRaft& raft) { return raft.GetVoterIds(); });
+    for (auto removed : removals)
+        if (std::binary_search(activeVoters.begin(), activeVoters.end(), removed))
+            throw std::invalid_argument("Peer config reload cannot remove active voter " +
+                std::to_string(removed));
 
     // Resolve and allocate every new endpoint before changing any live routes.
     for (auto& change : changes) change.Endpoint = makeEndpoint(requested[change.Requested]);
@@ -370,7 +385,16 @@ static void ReloadPeerConfig(const std::string& path, uint32_t localId,
             hosts.push_back(std::move(host));
         }
     }
-    std::cerr << "Reloaded peer config (" << changes.size() << " endpoint changes)\n";
+    for (auto removed : removals) {
+        server.UnregisterPeerTarget(removed);
+        const auto host = std::find_if(hosts.begin(), hosts.end(),
+            [removed](const THost& candidate) { return candidate.Id == removed; });
+        if (host == hosts.end()) throw std::logic_error("Removed peer is absent from local configuration");
+        hosts.erase(host);
+        learners.erase(std::remove(learners.begin(), learners.end(), removed), learners.end());
+    }
+    std::cerr << "Reloaded peer config (" << changes.size() + removals.size()
+              << " endpoint changes)\n";
 }
 #endif
 
