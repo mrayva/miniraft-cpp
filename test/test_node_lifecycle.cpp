@@ -449,18 +449,12 @@ void test_peer_response_reader_start_failure_can_retry(void**) {
             });
     };
 
-    bool threw = false;
-    try {
-        reconcile();
-    } catch (const std::runtime_error&) {
-        threw = true;
-    }
-    assert_true(threw);
+    assert_false(NNet::TDetail::TryPeerResponseReaderReconciliation(reconcile));
     assert_true(started.empty());
     assert_int_equal(startCount, 1);
 
     failStart = false;
-    reconcile();
+    assert_true(NNet::TDetail::TryPeerResponseReaderReconciliation(reconcile));
     assert_true(started == std::unordered_set<uint32_t>({1}));
     assert_int_equal(startCount, 2);
     reconcile();

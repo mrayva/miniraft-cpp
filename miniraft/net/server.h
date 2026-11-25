@@ -53,6 +53,16 @@ void ReconcilePeerResponseReaders(const TPeerMap& peers,
     }
 }
 
+template<class TReconcile>
+bool TryPeerResponseReaderReconciliation(TReconcile&& reconcile) noexcept {
+    try {
+        std::forward<TReconcile>(reconcile)();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 template<class TConnections, class TClose>
 void ExpireIdleConnections(TConnections& connections, ITimeSource::Time now,
         std::chrono::milliseconds idleTimeout, TClose close) {
@@ -920,6 +930,7 @@ private:
     NNet::TValueTask<TSocket> AcceptWithDeadline();
     void RequestStop();
     bool HasPendingRetirement() const;
+    void ReconcilePeerReadersBestEffort() noexcept;
     void ReconcilePeerReaders();
     void DrainNodes();
     void DebugPrint();
