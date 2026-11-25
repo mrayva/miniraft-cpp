@@ -4073,6 +4073,84 @@ void test_committed_joint_snapshot_can_install_its_stable_successor(void**) {
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 #endif
 }
+void test_committed_joint_log_can_anchor_stable_snapshot_successor(void**) {
+#ifdef __linux__
+    auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-log-stable-successor-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(dir));
+    const auto name = (dir / "raft").string();
+
+    auto state = std::make_shared<TDurableState>(name, 2);
+    state->BindVoters({1, 3});
+    state->CurrentTerm = 3;
+    TConfigurationRecord joint{EConfigurationPhase::Joint, 2, 0, 0, {1, 3}, {1, 2}};
+    state->Append(EncodeConfigurationEntry(joint));
+    state->Append(Ordinary(2));
+    state->CommitIndex = 2;
+    state->Commit();
+
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> replies;
+    auto peer = std::make_shared<TEndpoint>();
+    peer->Route = [&](auto message) { replies.push_back(message.template Cast<TInstallSnapshotResponse>()); };
+    auto oldOnlyPeer = std::make_shared<TEndpoint>();
+    TNodeDict peers{{1, peer}, {3, oldOnlyPeer}};
+    auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{2});
+    auto app = std::make_shared<TSnapshotRsm>();
+    TRequestProcessor processor(raft, app, peers);
+    assert_true(!state->GetSnapshot());
+    assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2, 3}));
+
+    unsigned seqno = 0;
+    auto sendSnapshot = [&](const TSnapshot& image, uint32_t leaderId = 1) {
+        const auto bytes = EncodeSnapshot(image);
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + bytes.size());
+        request->Src = leaderId; request->Dst = 2; request->Term = 4;
+        request->Seqno = ++seqno;
+        request->SnapshotIndex = image.Index; request->SnapshotTerm = image.Term;
+        request->Offset = 0; request->TotalBytes = bytes.size();
+        request->Done = TInstallSnapshotRequest::DoneFlag |
+            TInstallSnapshotRequest::JointElectionFenceLeader;
+        request->LeaderId = leaderId;
+        memcpy(request->Data, bytes.data(), bytes.size());
+        raft->Process(ITimeSource::Time{}, request);
+    };
+
+    TSnapshot mismatched{3, 3, {1, 2}, "3"};
+    mismatched.StableConfiguration = true;
+    mismatched.ConfigurationIndex = 3; mismatched.ConfigurationTerm = 3;
+    mismatched.PreviousVoters = {1, 4}; // Does not identify the committed joint predecessor.
+    mismatched.PreviousJointIndex = 1; mismatched.PreviousJointTerm = 2;
+    const auto beforeMismatch = static_cast<TStateFields>(*state);
+    sendSnapshot(mismatched);
+    assert_true(static_cast<TStateFields>(*state) == beforeMismatch);
+    assert_true(replies.empty()); // Reject before adopting the higher term.
+
+    TSnapshot stable = mismatched;
+    stable.PreviousVoters = {1, 3};
+    TSnapshot staleSuccessor = stable;
+    staleSuccessor.ConfigurationIndex = 2; staleSuccessor.ConfigurationTerm = 2;
+    sendSnapshot(staleSuccessor);
+    assert_true(static_cast<TStateFields>(*state) == beforeMismatch);
+    assert_true(replies.empty()); // A stable config cannot predate the committed boundary.
+
+    sendSnapshot(stable, 3); // The removed old-only voter cannot certify the stable successor.
+    assert_true(static_cast<TStateFields>(*state) == beforeMismatch);
+    assert_true(replies.empty());
+
+    sendSnapshot(stable);
+    assert_int_equal(replies.size(), 1);
+    assert_true(replies.back()->Success); assert_true(replies.back()->Installed);
+    assert_int_equal(state->CurrentTerm, 4);
+    assert_int_equal(state->GetSnapshot()->Index, stable.Index);
+    assert_true(state->GetSnapshot()->StableConfiguration);
+    assert_true(state->GetSnapshot()->PreviousVoters == (std::vector<uint32_t>{1, 3}));
+    assert_int_equal(app->LastAppliedIndex, stable.Index);
+    assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2}));
+    assert_true(raft->IsVoter(2));
+
+    std::error_code ignored; std::filesystem::remove_all(dir, ignored);
+#endif
+}
 void test_stable_snapshot_successor_rejects_conflicting_earlier_transition_history(void**) {
 #ifdef __linux__
     auto dir = std::filesystem::temp_directory_path() / ("miniraft-joint-history-successor-" +
@@ -5554,6 +5632,7 @@ int main() {
         cmocka_unit_test(test_snapshot_transfer_before_uncommitted_configuration_preserves_suffix),
         cmocka_unit_test(test_joint_snapshot_install_requires_matching_joint_history_and_recovers),
         cmocka_unit_test(test_committed_joint_snapshot_can_install_its_stable_successor),
+        cmocka_unit_test(test_committed_joint_log_can_anchor_stable_snapshot_successor),
         cmocka_unit_test(test_stable_snapshot_successor_rejects_conflicting_earlier_transition_history),
         cmocka_unit_test(test_uncommitted_joint_suffix_replacement_restores_old_voters),
         cmocka_unit_test(test_configuration_application_advances_without_calling_state_machine),

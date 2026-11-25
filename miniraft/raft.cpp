@@ -406,21 +406,28 @@ bool SnapshotMetadataCompletesKnownJoint(const TSnapshot* known,
         uint64_t previousConfigurationTerm, uint64_t previousJointIndex,
         uint64_t previousJointTerm,
         uint64_t configurationIndex, uint64_t configurationTerm, uint32_t leaderId) {
-    if (!known || !known->IsJoint() || known->StableConfiguration || !committed ||
-        !committed->IsJoint() || known->Voters != committed->OldVoters() ||
+    if (!committed || !committed->IsJoint() || !stable ||
+        !newVoters.empty() || oldVoters != committed->NewVoters() ||
+        configurationIndex <= committed->ThroughIndex() ||
+        configurationTerm < committed->ThroughTerm())
+        return false;
+    if (known && (!known->IsJoint() || known->StableConfiguration ||
+        known->Voters != committed->OldVoters() ||
         known->JointVoters != committed->NewVoters() ||
         known->ConfigurationIndex != committed->ConfigurationIndex() ||
-        known->ConfigurationTerm != committed->ConfigurationTerm() || !stable ||
-        !newVoters.empty() || oldVoters != committed->NewVoters() ||
-        configurationIndex <= known->Index ||
-        configurationIndex <= committed->ConfigurationIndex() ||
-        configurationTerm < known->Term ||
-        configurationTerm < committed->ConfigurationTerm())
+        known->ConfigurationTerm != committed->ConfigurationTerm() ||
+        configurationIndex <= known->Index || configurationTerm < known->Term))
         return false;
-    if (stableLineage && (previousVoters != known->Voters ||
+    // Without a local joint snapshot, the committed log history is the proof
+    // of the joint boundary. Require the stable image to carry that exact
+    // predecessor identity so it cannot skip an unknown transition.
+    if (!known && !stableLineage) return false;
+    if (stableLineage && (previousVoters != committed->OldVoters() ||
+        previousConfigurationIndex != committed->PreviousConfigurationIndex() ||
+        previousConfigurationTerm != committed->PreviousConfigurationTerm() ||
         previousJointIndex != committed->ConfigurationIndex() ||
         previousJointTerm != committed->ConfigurationTerm() ||
-        (known->HasConfigurationLineage() &&
+        (known && known->HasConfigurationLineage() &&
             (previousVoters != known->PreviousVoters ||
              previousConfigurationIndex != known->PreviousConfigurationIndex ||
              previousConfigurationTerm != known->PreviousConfigurationTerm ||
@@ -620,7 +627,8 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
     const bool committedConfigurationBoundary = committedConfiguration &&
         (!pendingConfiguration || index < pendingConfiguration->ConfigurationIndex());
     const bool knownJointStableSuccessor = stableImage && committedConfiguration &&
-        committedConfiguration->IsJoint() && !pendingConfiguration && knownSnapshot;
+        committedConfiguration->IsJoint() && !pendingConfiguration &&
+        (knownSnapshot || stableLineage);
     const bool staleJointHistoryCandidate = jointHistory && allowStaleStoreMembershipRecovery &&
         committedConfiguration && !committedConfiguration->IsJoint() && !pendingConfiguration;
     // The active configuration phase is already trusted from local committed
@@ -678,12 +686,19 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
          voterCount != pendingConfiguration->OldVoters().size() ||
          newCount != (joint ? pendingConfiguration->NewVoters().size() : 0)))
         return {true, false, 0};
+    const bool stableSuccessorLineage = stableLineage &&
+        previousVoterCount == committedConfiguration->OldVoters().size() &&
+        previousConfigurationIndex == committedConfiguration->PreviousConfigurationIndex() &&
+        previousConfigurationTerm == committedConfiguration->PreviousConfigurationTerm() &&
+        previousJointIndex == committedConfiguration->ConfigurationIndex() &&
+        previousJointTerm == committedConfiguration->ConfigurationTerm();
     const bool stableSuccessorMetadata = !pendingConfiguration && !pendingConfigurationBoundary && stableImage &&
-        committedConfiguration->IsJoint() && knownSnapshot &&
-        configurationIndex > knownSnapshot->Index &&
-        configurationIndex > committedConfiguration->ConfigurationIndex() &&
-        configurationTerm >= knownSnapshot->Term &&
-        configurationTerm >= committedConfiguration->ConfigurationTerm() &&
+        committedConfiguration->IsJoint() &&
+        configurationIndex > committedConfiguration->ThroughIndex() &&
+        configurationTerm >= committedConfiguration->ThroughTerm() &&
+        (knownSnapshot
+            ? configurationIndex > knownSnapshot->Index && configurationTerm >= knownSnapshot->Term
+            : stableSuccessorLineage) &&
         voterCount == committedConfiguration->NewVoters().size() && newCount == 0;
     const bool staleStableLineageMetadata = !pendingConfiguration && !pendingConfigurationBoundary &&
         stableLineage && allowStaleStoreMembershipRecovery && !committedConfiguration->IsJoint() &&
