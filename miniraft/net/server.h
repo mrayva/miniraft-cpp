@@ -168,7 +168,12 @@ private:
                 // packaged_task stores user exceptions in its future. This
                 // catch protects the worker loop from infrastructure errors.
             }
-            PendingJobs.fetch_sub(1, std::memory_order_release);
+            {
+                // Pair the idle transition with WaitUntilIdle's predicate
+                // check so a waiter cannot miss the transition to zero.
+                std::lock_guard lock(Mutex);
+                PendingJobs.fetch_sub(1, std::memory_order_release);
+            }
             Condition.notify_all();
         }
     }
