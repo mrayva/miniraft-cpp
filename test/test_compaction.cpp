@@ -1736,15 +1736,30 @@ void test_snapshot_install_budget_releases_after_application_validation_failure(
     TKv source;
     const auto image = EncodeSnapshot(TSnapshot{1, 1, {1, 3}, source.SaveSnapshot()});
     assert_true(image.size() < budget->LimitBytes());
-    auto complete = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + image.size());
-    complete->Src = 1; complete->Dst = 3; complete->Term = 1; complete->Seqno = 1;
-    complete->SnapshotIndex = 1; complete->SnapshotTerm = 1; complete->Offset = 0;
-    complete->TotalBytes = image.size(); complete->Done = 1; complete->LeaderId = 1;
-    memcpy(complete->Data, image.data(), image.size());
+    constexpr size_t FirstChunkBytes = 4;
+    auto first = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + FirstChunkBytes);
+    first->Src = 1; first->Dst = 3; first->Term = 1; first->Seqno = 1;
+    first->SnapshotIndex = 1; first->SnapshotTerm = 1; first->Offset = 0;
+    first->TotalBytes = image.size(); first->Done = 0; first->LeaderId = 1;
+    memcpy(first->Data, image.data(), FirstChunkBytes);
+    raft3->Process(ITimeSource::Time{}, first);
+    auto accepted = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_true(accepted->Success); assert_false(accepted->Installed);
+    assert_int_equal(accepted->NextOffset, FirstChunkBytes);
+    assert_int_equal(budget->UsedBytes(), image.size());
 
-    raft3->Process(ITimeSource::Time{}, complete);
+    const auto finalChunkBytes = image.size() - FirstChunkBytes;
+    auto finalChunk = NewHoldedMessage<TInstallSnapshotRequest>(
+        sizeof(TInstallSnapshotRequest) + finalChunkBytes);
+    finalChunk->Src = 1; finalChunk->Dst = 3; finalChunk->Term = 1; finalChunk->Seqno = 2;
+    finalChunk->SnapshotIndex = 1; finalChunk->SnapshotTerm = 1; finalChunk->Offset = FirstChunkBytes;
+    finalChunk->TotalBytes = image.size(); finalChunk->Done = TInstallSnapshotRequest::DoneFlag;
+    finalChunk->LeaderId = 1;
+    memcpy(finalChunk->Data, image.data() + FirstChunkBytes, finalChunkBytes);
+    raft3->Process(ITimeSource::Time{}, finalChunk);
     auto rejected = replies.back().Cast<TInstallSnapshotResponse>();
     assert_false(rejected->Success); assert_false(rejected->Installed);
+    assert_int_equal(rejected->NextOffset, 0);
     assert_int_equal(budget->UsedBytes(), 0);
     assert_int_equal(raft3->GetState()->SnapshotIndex, 0);
     assert_int_equal(rejectingApp->LastAppliedIndex, 0);
@@ -1753,17 +1768,17 @@ void test_snapshot_install_budget_releases_after_application_validation_failure(
         std::vector<uint32_t>{}, limits);
     auto app2 = std::make_shared<TApplication>();
     TRequestProcessor processor2(raft2, app2, peers);
-    constexpr size_t FirstChunkBytes = 4;
-    auto partial = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + FirstChunkBytes);
+    constexpr size_t RetryFirstChunkBytes = 4;
+    auto partial = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + RetryFirstChunkBytes);
     partial->Src = 1; partial->Dst = 2; partial->Term = 1; partial->Seqno = 2;
     partial->SnapshotIndex = 1; partial->SnapshotTerm = 1; partial->Offset = 0;
     partial->TotalBytes = image.size(); partial->Done = 0; partial->LeaderId = 1;
-    memcpy(partial->Data, image.data(), FirstChunkBytes);
+    memcpy(partial->Data, image.data(), RetryFirstChunkBytes);
     replies.clear();
     raft2->Process(ITimeSource::Time{}, partial);
-    auto accepted = replies.back().Cast<TInstallSnapshotResponse>();
-    assert_true(accepted->Success); assert_false(accepted->Installed);
-    assert_int_equal(accepted->NextOffset, FirstChunkBytes);
+    auto retryAccepted = replies.back().Cast<TInstallSnapshotResponse>();
+    assert_true(retryAccepted->Success); assert_false(retryAccepted->Installed);
+    assert_int_equal(retryAccepted->NextOffset, RetryFirstChunkBytes);
     assert_int_equal(budget->UsedBytes(), image.size());
 }
 void test_snapshot_install_budget_releases_after_conflicting_duplicate(void**) {
@@ -3077,6 +3092,30 @@ void test_file_staging_failure_releases_snapshot_reservation(void**) {
     assert_true(response->Installed);
     assert_int_equal(state->SnapshotIndex, 1);
     assert_int_equal(budget->UsedBytes(), 0);
+
+    auto rejectedState = std::make_shared<TState>();
+    auto rejectingApp = std::make_shared<TRejectingSnapshotApplication>();
+    TNodeDict rejectingPeers{{1, peer}};
+    auto rejectingRaft = std::make_shared<TRaft>(rejectedState, 2, rejectingPeers,
+        std::vector<uint32_t>{}, TRaft::TLogLimits{.SnapshotStagingDirectory = files.Name,
+            .SnapshotStagingBudget = budget});
+    TRequestProcessor rejectingProcessor(rejectingRaft, rejectingApp, rejectingPeers);
+    constexpr uint32_t FirstChunkBytes = 8;
+    response = {};
+    rejectingRaft->Process(retryTime, Chunk(snapshot, bytes, 0, FirstChunkBytes));
+    assert_non_null(response);
+    assert_true(response->Success);
+    assert_false(response->Installed);
+    assert_int_equal(budget->UsedBytes(), bytes.size());
+    rejectingRaft->Process(retryTime, Chunk(snapshot, bytes, FirstChunkBytes,
+        static_cast<uint32_t>(bytes.size() - FirstChunkBytes)));
+    assert_false(response->Success);
+    assert_false(response->Installed);
+    assert_int_equal(response->NextOffset, 0);
+    assert_int_equal(budget->UsedBytes(), 0);
+    assert_int_equal(rejectedState->SnapshotIndex, 0);
+    assert_int_equal(rejectingApp->LastAppliedIndex, 0);
+    assert_true(std::filesystem::is_empty(files.Name));
 }
 void test_file_staged_streaming_install_retains_source_quota(void**) {
     TFiles files;
