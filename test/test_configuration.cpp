@@ -2860,6 +2860,14 @@ void run_live_membership_failure_scenario(uint32_t scenario,
     bool reorderStableAppendTo6 = false;
     TMessageHolder<TMessage> delayedStableAppend;
     std::vector<TMessageHolder<TMessage>> heldSnapshotChunks;
+    bool expectSnapshotRestartRetry = false;
+    bool awaitingOutOfOrderSnapshotReply = false;
+    uint64_t outOfOrderSnapshotSeqno = 0;
+    bool sawOutOfOrderSnapshotRejection = false;
+    bool duplicateSnapshotChunkTo6 = false;
+    bool holdDuplicateSnapshotReplies = false;
+    bool duplicatedSnapshotChunk = false;
+    std::vector<TMessageHolder<TMessage>> heldDuplicateSnapshotReplies;
 
     for (uint32_t id = 1; id <= 6; ++id) {
         states[id] = std::make_shared<TDurableState>((dir / "raft").string(), id);
@@ -2889,6 +2897,48 @@ void run_live_membership_failure_scenario(uint32_t scenario,
                     reorderStableAppendTo6 = false;
                     delayedStableAppend = std::move(message);
                     return;
+                }
+                if (expectSnapshotRestartRetry && from == 4 && to == 6 &&
+                    message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_REQUEST)) {
+                    const auto request = message.template Cast<TInstallSnapshotRequest>();
+                    if (request->Offset > 0) {
+                        awaitingOutOfOrderSnapshotReply = true;
+                        outOfOrderSnapshotSeqno = request->Seqno;
+                    }
+                }
+                if (holdDuplicateSnapshotReplies && from == 6 && to == 4 &&
+                    message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_RESPONSE)) {
+                    heldDuplicateSnapshotReplies.push_back(std::move(message));
+                    return;
+                }
+                if (duplicateSnapshotChunkTo6 && from == 4 && to == 6 &&
+                    message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_REQUEST) &&
+                    message.template Cast<TInstallSnapshotRequest>()->Offset == 0) {
+                    duplicateSnapshotChunkTo6 = false;
+                    auto duplicate = message;
+                    holdDuplicateSnapshotReplies = true;
+                    rafts[to]->Process(now, std::move(message));
+                    processors[to]->ProcessCommitted();
+                    rafts[to]->Process(now, std::move(duplicate));
+                    processors[to]->ProcessCommitted();
+                    holdDuplicateSnapshotReplies = false;
+                    assert_int_equal(heldDuplicateSnapshotReplies.size(), size_t(2));
+                    duplicatedSnapshotChunk = true;
+                    while (!heldDuplicateSnapshotReplies.empty()) {
+                        auto reply = std::move(heldDuplicateSnapshotReplies.back());
+                        heldDuplicateSnapshotReplies.pop_back();
+                        endpoints[6][4]->Route(std::move(reply));
+                    }
+                    return;
+                }
+                if (awaitingOutOfOrderSnapshotReply && from == 6 && to == 4 &&
+                    message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_RESPONSE)) {
+                    const auto response = message.template Cast<TInstallSnapshotResponse>();
+                    if (response->Seqno == outOfOrderSnapshotSeqno) {
+                        sawOutOfOrderSnapshotRejection = !response->Success && response->NextOffset == 0;
+                        awaitingOutOfOrderSnapshotReply = false;
+                        expectSnapshotRestartRetry = false;
+                    }
                 }
                 if (holdSnapshotChunks && from == 4 && to == 6 &&
                     message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_REQUEST)) {
@@ -3061,9 +3111,16 @@ void run_live_membership_failure_scenario(uint32_t scenario,
     restartVoter(6); // Partial transfer bytes are volatile and disappear here.
     assert_int_equal(states[6]->SnapshotIndex, 0);
     assert_int_equal(applications[6]->LastAppliedIndex, stableIndex);
+    expectSnapshotRestartRetry = true;
+    duplicateSnapshotChunkTo6 = scenario == 1;
     holdSnapshotChunks = false;
     for (unsigned i = 0; i < 48 && states[6]->SnapshotIndex < snapshotIndex; ++i) tick(4);
     assert_int_equal(states[6]->SnapshotIndex, snapshotIndex);
+    assert_true(sawOutOfOrderSnapshotRejection);
+    if (scenario == 1) {
+        assert_true(duplicatedSnapshotChunk);
+        assert_true(heldDuplicateSnapshotReplies.empty());
+    }
     assert_true(rafts[6]->IsVoter(6));
     assert_true(rafts[6]->GetVoterIds() == newVoters);
     assert_true(states[6]->GetBoundVoters() == oldVoters);
