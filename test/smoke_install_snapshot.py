@@ -72,16 +72,20 @@ def main():
                 time.sleep(0.05)
             raise AssertionError("timed out waiting for cluster progress")
 
-        def reload(contents, diagnostic):
+        def reload(contents, diagnostics):
             log_paths = [directory / "output.log" for directory in directories[:2]]
-            counts = [path.read_text().count(diagnostic) for path in log_paths]
+            if isinstance(diagnostics, str):
+                diagnostics = [diagnostics] * len(log_paths)
+            assert len(diagnostics) == len(log_paths)
+            counts = [path.read_text().count(diagnostic)
+                      for path, diagnostic in zip(log_paths, diagnostics)]
             staged = learner_config.with_suffix(".new")
             staged.write_text(contents)
             staged.replace(learner_config)
             for process in processes[:2]:
                 process.send_signal(signal.SIGHUP)
             wait_for(lambda: all(path.read_text().count(diagnostic) > count
-                                 for path, count in zip(log_paths, counts)), 5)
+                                 for path, diagnostic, count in zip(log_paths, diagnostics, counts)), 5)
 
         try:
             if learner_mode:
@@ -112,8 +116,10 @@ def main():
                 wait_for(write, 30)
                 if key == b"a":
                     if learner_mode:
-                        reload(f"voter {endpoints[0]}\n",
-                               "Peer config reload cannot remove active voter")
+                        reload(f"voter {endpoints[0]}\n", [
+                            "Peer config reload cannot remove active voter",
+                            "Peer config reload cannot remove the local listener",
+                        ])
                         invalid = (f"learner {endpoints[2]}\nlearner {endpoints[0]}\n"
                                    f"voter {endpoints[1]}\n")
                         reload(invalid, "Peer config reload cannot change bootstrap roles")
