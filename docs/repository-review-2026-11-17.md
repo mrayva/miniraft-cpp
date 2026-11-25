@@ -159,7 +159,11 @@ capacity changes before proposing.
   durable operation identity. Forwarding uses negotiated sessionized
   correlation IDs to reject delayed replies across processor instances within
   one process; these IDs do not deduplicate retried writes. Custom adapters
-  still need fresh transport sessions across process restarts.
+  still need fresh transport sessions across process restarts. This finding
+  describes the reviewed baseline; the opt-in replicated idempotent request
+  protocol and client helper were added afterward. Ordinary `TCommandRequest`
+  writes retain the at-least-once behavior. See
+  `client-idempotency-design.md` for current implementation status and limits.
 - Server lifecycle lacks a general stop/cancel/join API for its detached
   accept, timer and connection coroutines. Peer retirement addresses a narrower
   lifecycle. Reusable embedding needs explicit shutdown ownership.

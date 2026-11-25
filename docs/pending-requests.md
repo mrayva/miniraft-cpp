@@ -91,9 +91,11 @@ Cancellation concerns the response, not the replicated command. Committed
 commands still apply even if their client disconnected or their leader changed.
 An error can therefore mean UNKNOWN OUTCOME: the write may already have
 committed. It is not a rollback indication and must not trigger a blind retry of
-a non-idempotent operation. Request IDs and replicated deduplication are not
-implemented; the planned opt-in protocol and recovery contract are described
-in [durable client write deduplication](client-idempotency-design.md). The KV,
+a non-idempotent operation. The ordinary `TCommandRequest` path has no durable
+request identity or replicated deduplication. The repository separately
+provides an opt-in idempotent request protocol and client helper; its contract,
+requirements and remaining integration limits are described in
+[durable client write deduplication](client-idempotency-design.md). The KV,
 SQL and debug clients now display errors rather than printing a successful
 commit for nonzero ErrorCode responses.
 
@@ -144,11 +146,15 @@ processor. No independent reviewer approval is claimed.
 
 ## Remaining gaps
 
-Exactly-once retries, durable request IDs, forwarded-request lifecycle across
-leader failures, transport validation and broader generated
-history/linearizability testing remain open. Forwarding deadlines are local to
-each processor rather than propagated on the wire. The log budget bounds
-resource growth but can stop progress at exhaustion, as described above.
-This change does not promise successful completion during quorum loss or
-establish library-wide linearizability. Unanswered writes after process crashes
-also have unknown outcomes.
+The ordinary `TCommandRequest` path remains at-least-once: it has no durable
+request IDs or replicated deduplication. The opt-in idempotent protocol covers
+retries when all replicas use a conforming `IIdempotentRsm` and the application
+persists deduplication state in snapshots; deployment-specific application
+storage integration and physical power-loss validation remain open. See
+[durable client write deduplication](client-idempotency-design.md). Forwarding
+deadlines are local to each processor rather than propagated on the wire.
+Generated history/linearizability testing remains open. The log budget bounds
+resource growth but can stop progress at exhaustion, as described above. This
+change does not promise successful completion during quorum loss or establish
+library-wide linearizability. Unanswered writes after process crashes also
+have unknown outcomes.

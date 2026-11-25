@@ -39,9 +39,13 @@ reconnection. Forwarding fails safely only after the full 64-bit sequence is
 exhausted.
 
 Cancellation is local bookkeeping. A write already sent or buffered by the
-transport may still execute. No automatic retry, rollback or exactly-once
-execution guarantee is introduced. ErrorCode=1 can indicate an unknown write
-outcome, so non-idempotent writes must not be blindly retried.
+transport may still execute. Ordinary forwarded `TCommandRequest` writes have
+no automatic retry, rollback or exactly-once execution guarantee. ErrorCode=1
+can indicate an unknown write outcome, so non-idempotent writes must not be
+blindly retried. The separate opt-in idempotent request path supports retrying
+the same operation identity and payload under the requirements in
+[durable client write deduplication](client-idempotency-design.md); it does not
+change the semantics of ordinary forwarded requests.
 
 ## Transport integration and compatibility
 
