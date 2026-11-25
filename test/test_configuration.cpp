@@ -146,6 +146,64 @@ void test_configuration_snapshot_projection_and_history_resume(void**) {
     unbound.Snapshot = std::make_shared<TSnapshot>(pendingSnapshot);
     Reject([&] { unbound.BindVoters(pendingSnapshot.Voters); });
 }
+void test_generated_membership_sets_roundtrip_through_joint_and_stable_snapshots(void**) {
+    uint32_t random = UINT32_C(0x6d2b79f5);
+    auto nextRandom = [&] {
+        random ^= random << 13;
+        random ^= random >> 17;
+        random ^= random << 5;
+        return random;
+    };
+
+    auto history = TConfigurationHistory::Stable({1, 2, 3}, 0, 0, 0, 0)
+        .Observe(1, Ordinary(1));
+    for (uint64_t transition = 0; transition < 96; ++transition) {
+        // Alternate disjoint ID ranges with overlapping ranges so the generated
+        // chain exercises both kinds of membership transition.
+        const uint32_t firstId = transition % 4 == 0 ? 13 : 1;
+        const uint32_t lastId = firstId + 11;
+        std::vector<uint32_t> nextVoters;
+        for (uint32_t id = firstId; id <= lastId; ++id)
+            if (nextRandom() & 1) nextVoters.push_back(id);
+        if (nextVoters.empty()) nextVoters.push_back(firstId + nextRandom() % 12);
+        if (nextVoters == history.OldVoters()) {
+            if (nextVoters.size() > 1) {
+                nextVoters.pop_back();
+            } else {
+                const auto additional = nextVoters.front() == lastId
+                    ? firstId : nextVoters.front() + 1;
+                nextVoters.push_back(additional);
+                std::sort(nextVoters.begin(), nextVoters.end());
+            }
+        }
+
+        const auto jointIndex = history.ThroughIndex() + 1;
+        TConfigurationRecord joint{EConfigurationPhase::Joint, jointIndex,
+            history.ConfigurationIndex(), history.ConfigurationTerm(),
+            history.OldVoters(), nextVoters};
+        history = history.Advance(jointIndex, EncodeConfigurationEntry(joint));
+        const auto jointImage = history.MakeSnapshot("joint/" + std::to_string(transition));
+        const auto decodedJoint = DecodeSnapshot(EncodeSnapshot(jointImage));
+        assert_true(decodedJoint == jointImage);
+        history = TConfigurationHistory::FromJointSnapshot(decodedJoint);
+        assert_true(history.IsJoint());
+        assert_true(history.NewVoters() == nextVoters);
+
+        const auto stableIndex = history.ThroughIndex() + 1;
+        TConfigurationRecord stable{EConfigurationPhase::Stable, stableIndex,
+            history.ConfigurationIndex(), history.ConfigurationTerm(),
+            history.OldVoters(), history.NewVoters()};
+        history = history.Advance(stableIndex, EncodeConfigurationEntry(stable));
+        const auto stableImage = history.MakeSnapshot("stable/" + std::to_string(transition));
+        const auto decodedStable = DecodeSnapshot(EncodeSnapshot(stableImage));
+        assert_true(decodedStable == stableImage);
+        history = TConfigurationHistory::FromStableSnapshot(decodedStable);
+        assert_false(history.IsJoint());
+        assert_true(history.OldVoters() == nextVoters);
+        assert_int_equal(history.ConfigurationIndex(), stableIndex);
+        assert_int_equal(history.ConfigurationTransitions().size(), transition + 1);
+    }
+}
 void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void**) {
     const std::vector<uint32_t> firstSet{1, 2, 3};
     const std::vector<uint32_t> secondSet{2, 3, 4};
@@ -5591,6 +5649,7 @@ int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_raft_accepts_full_width_voter_ids),
         cmocka_unit_test(test_configuration_snapshot_projection_and_history_resume),
+        cmocka_unit_test(test_generated_membership_sets_roundtrip_through_joint_and_stable_snapshots),
         cmocka_unit_test(test_configuration_history_rolls_bounded_transition_suffix_and_resumes),
         cmocka_unit_test(test_history_validates_joint_stable_chain_and_independent_rollback),
         cmocka_unit_test(test_configuration_scan_compares_full_configuration_state),
