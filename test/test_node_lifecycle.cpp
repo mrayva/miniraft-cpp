@@ -19,6 +19,24 @@ extern "C" {
 }
 
 namespace {
+unsigned UnhandledCoroutineExceptionCount = 0;
+std::exception_ptr LastUnhandledCoroutineException;
+
+void CaptureUnhandledCoroutineException(std::exception_ptr error) noexcept {
+    ++UnhandledCoroutineExceptionCount;
+    LastUnhandledCoroutineException = std::move(error);
+}
+
+NNet::TVoidTask ThrowFromDetachedCoroutine() {
+    throw std::runtime_error("detached coroutine failure");
+    co_return;
+}
+
+NNet::TVoidSuspendedTask ThrowFromSuspendedCoroutine() {
+    throw std::runtime_error("suspended coroutine failure");
+    co_return;
+}
+
 struct TPoller : NNet::TPollerBase {
     std::vector<std::coroutine_handle<>> Ready;
     void Tick() { ProcessTimers(); }
@@ -460,6 +478,31 @@ void test_peer_response_reader_start_failure_can_retry(void**) {
     reconcile();
     assert_int_equal(startCount, 2);
 }
+void test_unhandled_coroutine_exception_is_reported(void**) {
+    const auto previousHandler = NNet::SetUnhandledCoroutineExceptionHandler(
+        &CaptureUnhandledCoroutineException);
+    UnhandledCoroutineExceptionCount = 0;
+    LastUnhandledCoroutineException = {};
+
+    ThrowFromDetachedCoroutine();
+    auto suspended = ThrowFromSuspendedCoroutine();
+    const bool suspendedTaskCompleted = suspended.done();
+    if (suspended) suspended.destroy();
+
+    const auto reportedCount = UnhandledCoroutineExceptionCount;
+    const auto reportedException = LastUnhandledCoroutineException;
+    NNet::SetUnhandledCoroutineExceptionHandler(previousHandler);
+
+    assert_true(suspendedTaskCompleted);
+    assert_int_equal(reportedCount, 2);
+    bool reportedExpectedError = false;
+    try {
+        std::rethrow_exception(reportedException);
+    } catch (const std::runtime_error& ex) {
+        reportedExpectedError = std::string(ex.what()) == "suspended coroutine failure";
+    }
+    assert_true(reportedExpectedError);
+}
 NNet::TVoidTask WaitForRetiredResponseReader(
         std::shared_ptr<TNode<TAsyncSocket>> node, bool& stopped) {
     char byte = 0;
@@ -817,6 +860,7 @@ int main() {
         cmocka_unit_test(test_connect_timeout_cancels_a_ready_event_before_retry),
         cmocka_unit_test(test_peer_response_readers_start_once_for_replication_targets),
         cmocka_unit_test(test_peer_response_reader_start_failure_can_retry),
+        cmocka_unit_test(test_unhandled_coroutine_exception_is_reported),
         cmocka_unit_test(test_retirement_wakes_reader_and_writer_before_socket_cleanup),
 #ifdef __linux__
         cmocka_unit_test(test_socket_shutdown_wakes_a_real_pending_read),
