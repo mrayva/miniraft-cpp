@@ -749,6 +749,83 @@ void test_uncommitted_log_budget_survives_disconnect_and_releases_after_commit(v
     assert_int_equal(raft->GetLastIndex(), acceptedIndex + 1);
 }
 
+void test_raising_log_capacity_resumes_current_term_commit(void**) {
+    constexpr uint64_t EntryBytes = sizeof(TLogEntry);
+    const TRaft::TLogLimits limits{
+        .MaxUncommittedBytes = 2 * EntryBytes,
+        .MaxUncommittedEntries = 2,
+    };
+    std::array<std::shared_ptr<TState>, 3> states;
+    std::array<std::shared_ptr<TRaft>, 3> nodes;
+    std::deque<TMessageHolder<TMessage>> packets;
+    ITimeSource::Time now{};
+    for (uint32_t id = 1; id <= nodes.size(); ++id) {
+        states[id - 1] = std::make_shared<TState>();
+        for (int i = 0; i < 2; ++i) {
+            auto entry = NewHoldedMessage<TLogEntry>();
+            entry->Term = 1;
+            states[id - 1]->Append(std::move(entry));
+        }
+        TNodeDict peers;
+        for (uint32_t destination = 1; destination <= nodes.size(); ++destination) {
+            if (destination == id) continue;
+            peers[destination] = std::make_shared<TEndpoint>([&](auto message) {
+                packets.push_back(std::move(message));
+            });
+        }
+        nodes[id - 1] = std::make_shared<TRaft>(states[id - 1], id, peers,
+            std::vector<uint32_t>{}, limits);
+    }
+    auto drain = [&] {
+        size_t budget = 10000;
+        while (!packets.empty()) {
+            assert_true(budget-- > 0);
+            auto message = std::move(packets.front());
+            packets.pop_front();
+            auto rpc = message.Cast<TMessageEx>();
+            nodes.at(rpc->Dst - 1)->Process(now, std::move(message));
+        }
+    };
+
+    now += std::chrono::seconds(30);
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        nodes[0]->ProcessTimeout(now);
+        drain();
+    }
+    assert_true(nodes[0]->CurrentStateName() == EState::LEADER);
+    assert_int_equal(states[0]->LastLogIndex, 2); // The reserved no-op did not fit.
+    assert_int_equal(states[0]->LastLogTerm, 1);
+
+    bool insufficientRaiseRejected = false;
+    try { nodes[0]->RaiseUncommittedLogLimits(2 * EntryBytes, 2); }
+    catch (const TRaftLogCapacityExceeded&) { insufficientRaiseRejected = true; }
+    assert_true(insufficientRaiseRejected);
+    assert_int_equal(states[0]->LastLogIndex, 2);
+
+    // Followers must also increase their receive bounds before the leader can
+    // replicate the recovery entry.
+    for (size_t i = 1; i < nodes.size(); ++i)
+        nodes[i]->RaiseUncommittedLogLimits(3 * EntryBytes, 3);
+    nodes[0]->RaiseUncommittedLogLimits(3 * EntryBytes, 3);
+    assert_int_equal(states[0]->LastLogIndex, 3);
+    assert_int_equal(states[0]->LastLogTerm, 2);
+
+    for (int attempt = 0; attempt < 8 && states[0]->CommitIndex < 3; ++attempt) {
+        now += std::chrono::seconds(1);
+        nodes[0]->ProcessTimeout(now);
+        drain();
+    }
+    assert_int_equal(states[0]->CommitIndex, 3);
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        now += std::chrono::seconds(1);
+        nodes[0]->ProcessTimeout(now);
+        drain();
+    }
+    for (const auto& state : states) assert_true(state->CommitIndex >= 3);
+
+    assert_int_equal(nodes[0]->Append(NewHoldedMessage<TLogEntry>()), 4);
+}
+
 void test_follower_rejects_append_batch_that_exceeds_uncommitted_log_budget(void**) {
     TMessageHolder<TAppendEntriesResponse> response;
     auto peer = std::make_shared<TEndpoint>([&](auto message) {
@@ -1621,6 +1698,7 @@ int main() {
         cmocka_unit_test(test_leader_initial_expiration_uses_configured_timeout),
         cmocka_unit_test(test_invalid_leadership_expiration_is_rejected),
         cmocka_unit_test(test_uncommitted_log_budget_survives_disconnect_and_releases_after_commit),
+        cmocka_unit_test(test_raising_log_capacity_resumes_current_term_commit),
         cmocka_unit_test(test_follower_rejects_append_batch_that_exceeds_uncommitted_log_budget),
         cmocka_unit_test(test_follower_log_budget_counts_only_post_commit_suffix),
         cmocka_unit_test(test_follower_log_budget_is_reclaimed_when_leader_replaces_uncommitted_suffix),

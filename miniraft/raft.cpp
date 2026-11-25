@@ -2444,7 +2444,8 @@ void TRaft::ProcessTimeout(ITimeSource::Time now) {
             StartElection(now);
 
         if (!VolatileState->PreVoting && VotingQuorum->HasQuorum(VolatileState->Votes, Id)) {
-            if (State->LastLogIndex >= uint64_t(INT64_MAX)) throw std::overflow_error("Raft log index exhausted");
+            if (State->LastLogIndex >= uint64_t(INT64_MAX))
+                throw std::overflow_error("Raft log index exhausted");
             auto value = State->LastLogIndex+1;
             const std::vector<uint32_t>* previousVoters = nullptr;
             uint64_t transitionJointIndex = 0;
@@ -2485,23 +2486,9 @@ void TRaft::ProcessTimeout(ITimeSource::Time now) {
 
             VolatileState = std::move(nextVolatileState);
             StateName = EState::LEADER;
-
-            // Add fake empty entry for faster commit
-            //
-            {
-                auto empty = NewHoldedMessage<TLogEntry>();
-                empty->Term = State->CurrentTerm;
-                empty->Flags = TLogEntry::EStub;
-                // A full log must not prevent election itself. The hard cap
-                // may prevent this current-term entry; in that case proposals
-                // also fail until a conflicting leader suffix replaces entries
-                // or the cluster is otherwise recovered.
-                if (FitsUncommittedLog(empty->Len, 1)) {
-                    const auto bytes = empty->Len;
-                    State->Append(std::move(empty));
-                    RecordUncommittedLogEntry(State->LastLogIndex, bytes);
-                }
-            }
+            // Election itself must succeed even if the hard log cap prevents
+            // this entry. An operator can raise capacity later to resume commit.
+            (void)AppendLeaderNoopIfNeeded();
         }
     }
 
@@ -2538,6 +2525,44 @@ void TRaft::ProcessTimeout(ITimeSource::Time now) {
 ITimeSource::Time TRaft::MakeElection(ITimeSource::Time now) {
     uint64_t delta = (uint64_t)((1.0 + (double)rand_(&Seed) / (double)UINT_MAX) * TTimeout::Election.count());
     return now + std::chrono::milliseconds(delta);
+}
+
+bool TRaft::AppendLeaderNoopIfNeeded() {
+    if (StateName != EState::LEADER || State->LastLogTerm == State->CurrentTerm) return false;
+    if (State->LastLogIndex >= uint64_t(INT64_MAX))
+        throw std::overflow_error("Raft log index exhausted");
+    auto empty = NewHoldedMessage<TLogEntry>();
+    empty->Term = State->CurrentTerm;
+    empty->Flags = TLogEntry::EStub;
+    if (!FitsUncommittedLog(empty->Len, 1)) return false;
+    const auto bytes = empty->Len;
+    State->Append(std::move(empty));
+    RecordUncommittedLogEntry(State->LastLogIndex, bytes);
+    return true;
+}
+
+void TRaft::RaiseUncommittedLogLimits(uint64_t maxBytes, size_t maxEntries) {
+    if (maxBytes < LogLimits.MaxUncommittedBytes || maxEntries < LogLimits.MaxUncommittedEntries)
+        throw std::invalid_argument("Uncommitted Raft log limits can only be raised");
+    if (StateName == EState::LEADER && State->LastLogTerm != State->CurrentTerm &&
+        State->LastLogIndex >= uint64_t(INT64_MAX))
+        throw std::overflow_error("Raft log index exhausted");
+
+    const auto previousBytes = LogLimits.MaxUncommittedBytes;
+    const auto previousEntries = LogLimits.MaxUncommittedEntries;
+    LogLimits.MaxUncommittedBytes = maxBytes;
+    LogLimits.MaxUncommittedEntries = maxEntries;
+
+    const auto probe = NewHoldedMessage<TLogEntry>();
+    if (!FitsUncommittedLog(probe->Len, 1)) {
+        LogLimits.MaxUncommittedBytes = previousBytes;
+        LogLimits.MaxUncommittedEntries = previousEntries;
+        throw TRaftLogCapacityExceeded();
+    }
+    if (StateName == EState::LEADER && State->LastLogTerm != State->CurrentTerm) {
+        (void)AppendLeaderNoopIfNeeded();
+    }
+    if (StateName == EState::LEADER) AdvanceLeaderCommit();
 }
 
 uint64_t TRaft::Append(TMessageHolder<TLogEntry> entry) {

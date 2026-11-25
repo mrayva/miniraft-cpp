@@ -574,6 +574,12 @@ public:
     // Local proposals require leader state. Role rejection leaves storage and
     // the supplied entry unchanged; followers receive entries through Process.
     uint64_t Append(TMessageHolder<TLogEntry> entry);
+    // Monotonically raise the hard uncommitted-log caps. If this node is a
+    // leader without a current-term entry, the new bounds must fit the retained
+    // suffix plus a no-op; the leader appends that no-op to resume progress.
+    // Apply compatible bounds on every replica before it receives the entry.
+    // Serialize this operation with Raft work.
+    void RaiseUncommittedLogLimits(uint64_t maxBytes, size_t maxEntries);
     // Set from the request processor's actual RSM contract before serving
     // traffic. Peers advertise the capability only when their RSM can apply it.
     void SetLocalIdempotentLogSupport(bool supported) noexcept {
@@ -724,6 +730,7 @@ private:
     TMessageHolder<TPreVoteRequest> CreatePreVote(uint32_t nodeId);
     void StartPreVote(ITimeSource::Time now);
     void StartElection(ITimeSource::Time now);
+    bool AppendLeaderNoopIfNeeded();
     TMessageHolder<TAppendEntriesRequest> CreateAppendEntries(
         uint32_t nodeId, bool snapshotBoundaryProbe = false);
     ITimeSource::Time MakeElection(ITimeSource::Time now);

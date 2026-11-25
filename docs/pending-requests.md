@@ -79,10 +79,13 @@ AppendEntries suffix and rejects the RPC without partial mutation if it would
 cross its hard log limit. Replication then retries through the normal Raft
 backoff path. The finite control reserve protects a current-term no-op when
 application entries fill their quota, but repeated uncommitted leadership terms
-can consume it. If a node reaches the hard limit before a current-term entry can
-commit, Raft cannot promise progress until a conflicting leader suffix replaces
-entries or the cluster is otherwise recovered. This is the storage bound's
-explicit availability tradeoff.
+can consume it. An operator can raise the hard limits in place with
+`TRaft::RaiseUncommittedLogLimits()` without discarding the retained suffix. Use
+compatible limits on every replica before replication resumes; the leader
+appends its current-term no-op when capacity permits. The raised limits are
+process-local and must be supplied again after restart. The API rejects a raise
+that does not leave room for the retained suffix, one control entry and any
+joint stable successor.
 
 Cancellation concerns the response, not the replicated command. Committed
 commands still apply even if their client disconnected or their leader changed.

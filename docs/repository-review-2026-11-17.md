@@ -62,8 +62,11 @@ reserves one no-op entry for control progress, rejects over-budget local writes
 as Overloaded, and makes followers reject oversized AppendEntries batches before
 mutation. Repeated uncommitted terms can consume the finite control reserve;
 recovered suffixes above the configured cap are retained and prevent further
-proposals. This bounds storage but does not provide a recovery protocol for a
-saturated log. A timed-out or cancelled write still has an unknown outcome.
+proposals. `TRaft::RaiseUncommittedLogLimits()` now provides an operator recovery
+path that raises bounds without deleting the retained suffix and appends a
+current-term no-op on a leader when the raised capacity allows it. Apply
+compatible limits on every replica, and supply them again after restart. A
+timed-out or cancelled write still has an unknown outcome.
 
 ### P2: readiness omitted exhausted log capacity — fixed
 
