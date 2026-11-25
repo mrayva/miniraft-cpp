@@ -1270,9 +1270,8 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
             if (heapBytes && !reservation)
                 throw std::runtime_error("Stored snapshot exceeds the available heap budget");
             snapshot->HeapReservation = std::move(reservation);
-            if (snapshot->HeapReservation)
-                snapshot->HeapReservationBudget = SnapshotInstallBudget;
         }
+        snapshot->HeapReservationBudget = SnapshotInstallBudget;
     }
     bool hasConfigurationHistory = snapshot && snapshot->HasConfigurationMetadata();
     const bool durableBinding = State->SupportsVoterBinding() && State->SupportsCommitIndexPersistence();
@@ -3870,9 +3869,9 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         for (auto voter : snapshot.JointVoters)
             if (voter != Id && !Nodes.contains(voter))
                 throw TMessageError("Snapshot configuration is missing a voter peer target");
+        snapshot.HeapReservationBudget = SnapshotInstallBudget;
         stagedApplicationInstall = PrepareApplicationSnapshotInstallation(*application, snapshot);
         snapshot.HeapReservation = std::move(installationReservation);
-        snapshot.HeapReservationBudget = SnapshotInstallBudget;
     } catch (const std::exception&) {
         IncomingSnapshot.reset(); reply(false, false, 0); return;
     }

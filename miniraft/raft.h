@@ -151,6 +151,14 @@ inline void InstallApplicationSnapshot(IRsm& rsm, const TSnapshot& snapshot,
     if (installation) {
         installation->Install();
     } else if (snapshot.DataSource) {
+        const auto budget = snapshot.HeapReservationBudget;
+        std::shared_ptr<TSnapshotInstallBudget::TReservation> materializationReservation;
+        const auto materializedBytes = snapshot.DataSize();
+        if (budget && materializedBytes) {
+            materializationReservation = budget->TryReserveLease(materializedBytes);
+            if (!materializationReservation)
+                throw std::runtime_error("Snapshot materialization exceeds the available heap budget");
+        }
         const auto bytes = snapshot.MaterializeData();
         rsm.LoadSnapshot(bytes, snapshot.Index);
     } else {
@@ -329,6 +337,14 @@ inline std::unique_ptr<IStagedSnapshotInstallation> PrepareApplicationSnapshotIn
         }
         if (auto* idempotent = dynamic_cast<IIdempotentRsm*>(&rsm))
             return idempotent->PrepareSnapshotInstallation(*snapshot.DataSource, snapshot.Index);
+        const auto budget = snapshot.HeapReservationBudget;
+        std::shared_ptr<TSnapshotInstallBudget::TReservation> materializationReservation;
+        const auto materializedBytes = snapshot.DataSize();
+        if (budget && materializedBytes) {
+            materializationReservation = budget->TryReserveLease(materializedBytes);
+            if (!materializationReservation)
+                throw std::runtime_error("Snapshot materialization exceeds the available heap budget");
+        }
         const auto bytes = snapshot.MaterializeData();
         return PrepareApplicationSnapshotInstallation(rsm, bytes, snapshot.Index);
     }

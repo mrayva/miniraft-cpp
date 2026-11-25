@@ -1127,10 +1127,8 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
     if (reservation && !heapBudget->TryResize(reservation, snapshot.HeapBytes()))
         throw std::runtime_error("Captured snapshot exceeds the available heap budget");
     Validate(snapshot);
-    if (reservation) {
-        snapshot.HeapReservation = std::move(reservation);
-        snapshot.HeapReservationBudget = std::move(heapBudget);
-    }
+    if (reservation) snapshot.HeapReservation = std::move(reservation);
+    snapshot.HeapReservationBudget = std::move(heapBudget);
     return snapshot;
 }
 

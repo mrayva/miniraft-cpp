@@ -104,6 +104,18 @@ struct TBoundedSnapshotApplication : IRsm {
     void LoadSnapshot(std::string_view, uint64_t index) override { LastAppliedIndex = index; }
     bool SupportsApplicationSnapshotInstall() const override { return true; }
 };
+struct THeapBudgetObservingSnapshotApplication : TBoundedSnapshotApplication {
+    std::shared_ptr<TSnapshotInstallBudget> Budget;
+    mutable uint64_t ValidationHeapBytes = 0;
+    uint64_t LoadHeapBytes = 0;
+    void ValidateSnapshot(std::string_view, uint64_t) const override {
+        ValidationHeapBytes = Budget->UsedBytes();
+    }
+    void LoadSnapshot(std::string_view, uint64_t index) override {
+        LoadHeapBytes = Budget->UsedBytes();
+        LastAppliedIndex = index;
+    }
+};
 struct TUnboundedSnapshotApplication : TBoundedSnapshotApplication {
     std::optional<uint64_t> SnapshotSizeUpperBound() const override { return std::nullopt; }
 };
@@ -197,6 +209,11 @@ struct TStringSnapshotDataSource : TSnapshotDataSource {
         BytesRead += count;
         return count;
     }
+};
+struct TUnchargedStringSnapshotDataSource : TStringSnapshotDataSource,
+        ISnapshotDataHeapUsage {
+    using TStringSnapshotDataSource::TStringSnapshotDataSource;
+    uint64_t HeapBytes() const override { return 0; }
 };
 struct TNoopSnapshotInstallation : IStagedSnapshotInstallation {
     void Install() override { }
@@ -806,6 +823,60 @@ void test_recovered_source_snapshot_is_charged_to_heap_budget(void**) {
     }
     assert_int_equal(budget->UsedBytes(), 40);
     state.reset();
+    assert_int_equal(budget->UsedBytes(), 0);
+}
+void test_snapshot_materialization_reserves_temporary_heap_bytes(void**) {
+    TSnapshot snapshot{1, 1, {1}, {}};
+    snapshot.DataSource = std::make_shared<TStringSnapshotDataSource>(std::string(40, 's'));
+    auto tooSmallBudget = std::make_shared<TSnapshotInstallBudget>(79);
+    snapshot.HeapReservation = tooSmallBudget->TryReserve(40);
+    snapshot.HeapReservationBudget = tooSmallBudget;
+    TBoundedSnapshotApplication rejected;
+    Reject([&] { PrepareApplicationSnapshotInstallation(rejected, snapshot); });
+    Reject([&] { InstallApplicationSnapshot(rejected, snapshot, {}); });
+    assert_int_equal(tooSmallBudget->UsedBytes(), 40);
+    snapshot.HeapReservation.reset();
+    assert_int_equal(tooSmallBudget->UsedBytes(), 0);
+
+    auto budget = std::make_shared<TSnapshotInstallBudget>(80);
+    snapshot.HeapReservation = budget->TryReserve(40);
+    snapshot.HeapReservationBudget = budget;
+    THeapBudgetObservingSnapshotApplication accepted;
+    accepted.Budget = budget;
+    auto installation = PrepareApplicationSnapshotInstallation(accepted, snapshot);
+    assert_false(bool(installation));
+    assert_int_equal(accepted.ValidationHeapBytes, 80);
+    assert_int_equal(budget->UsedBytes(), 40);
+    InstallApplicationSnapshot(accepted, snapshot, std::move(installation));
+    assert_int_equal(accepted.LoadHeapBytes, 80);
+    assert_int_equal(accepted.LastAppliedIndex, snapshot.Index);
+    assert_int_equal(budget->UsedBytes(), 40);
+    snapshot.HeapReservation.reset();
+    assert_int_equal(budget->UsedBytes(), 0);
+}
+void test_recovered_file_snapshot_budgets_fallback_materialization(void**) {
+    auto state = std::make_shared<TState>();
+    TSnapshot image{1, 1, {1}, {}};
+    image.DataSource = std::make_shared<TUnchargedStringSnapshotDataSource>(std::string(40, 's'));
+    state->InstallSnapshot(image);
+
+    auto tooSmallBudget = std::make_shared<TSnapshotInstallBudget>(39);
+    TRaft::TLogLimits limits;
+    limits.SnapshotInstallBudget = tooSmallBudget;
+    TRaft rejectedRaft(state, 1, TNodeDict{}, {}, limits);
+    TBoundedSnapshotApplication rejected;
+    const auto rejectedImage = state->GetSnapshot();
+    Reject([&] { RestoreSnapshot(*rejectedImage, rejectedRaft, rejected); });
+    assert_int_equal(rejected.LastAppliedIndex, 0);
+    assert_int_equal(tooSmallBudget->UsedBytes(), 0);
+
+    auto budget = std::make_shared<TSnapshotInstallBudget>(40);
+    limits.SnapshotInstallBudget = budget;
+    TRaft raft(state, 1, TNodeDict{}, {}, limits);
+    TBoundedSnapshotApplication accepted;
+    const auto recoveredImage = state->GetSnapshot();
+    RestoreSnapshot(*recoveredImage, raft, accepted);
+    assert_int_equal(accepted.LastAppliedIndex, 1);
     assert_int_equal(budget->UsedBytes(), 0);
 }
 struct TCluster {
@@ -3710,6 +3781,8 @@ int main() {
         cmocka_unit_test(test_snapshot_source_can_report_non_heap_payload_storage),
         cmocka_unit_test(test_recovered_snapshot_retains_heap_budget_lease),
         cmocka_unit_test(test_recovered_source_snapshot_is_charged_to_heap_budget),
+        cmocka_unit_test(test_snapshot_materialization_reserves_temporary_heap_bytes),
+        cmocka_unit_test(test_recovered_file_snapshot_budgets_fallback_materialization),
         cmocka_unit_test(test_shared_compaction_reuses_storage_snapshot_image),
         cmocka_unit_test(test_zero_index_follower_compaction_waits_for_capability_barrier),
         cmocka_unit_test(test_restarted_follower_reacquires_compaction_certificate_without_new_term),

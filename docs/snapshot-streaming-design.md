@@ -72,7 +72,10 @@ local compaction and startup recovery also charge retained image data. Outgoing
 pins keep that same image lease alive. Range-source capture reserves the
 reported heap bound, or its exact size for an unmarked source, and retains the
 source after checking it in bounded ranges. Internal file-backed snapshot
-sources report zero heap payload bytes. Legacy
+sources report zero heap payload bytes. Fallback installation paths that
+materialize a source-backed image reserve an additional image-sized temporary
+lease during validation and load. Application allocations made by callbacks
+remain outside this budget. Legacy
 `SaveSnapshot()` capture reserves a declared upper bound before invoking the
 callback, then shrinks the lease to the captured size. Incremental snapshot
 writers extend the lease before each append even without a size bound. Legacy
