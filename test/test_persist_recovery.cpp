@@ -1096,9 +1096,33 @@ void test_snapshot_generation_crashes_publish_old_or_new_complete_image(void**) 
         assert_int_equal(waitpid(child, &status, 0), child);
         assert_true(WIFEXITED(status));
         assert_int_equal(WEXITSTATUS(status), 120 + static_cast<int>(stage));
-        TDiskState recovered(files.Name, 1);
         const bool published = stage == TDiskState::ECommitStage::MetadataRenamed ||
             stage == TDiskState::ECommitStage::DirectorySynced;
+        const auto generation = replacing ? 2 : 1;
+        const auto uncommittedEntries = files.Name + ".entries.1.g" + std::to_string(generation);
+        const auto uncommittedIndex = files.Name + ".index.1.g" + std::to_string(generation);
+        const auto uncommittedSnapshot = files.Name + ".state.1.snapshot.g" + std::to_string(generation);
+        const auto metadataTemp = files.Name + ".state.1.tmp";
+        if (!published) {
+            // Offline inspection validates the selected image but must leave
+            // interrupted publication artifacts untouched.
+            TDiskState inspection(files.Name, 1, {}, false);
+            assert_true(fs::exists(uncommittedEntries));
+        }
+        TDiskState recovered(files.Name, 1);
+        assert_false(fs::exists(metadataTemp));
+        assert_false(fs::exists(uncommittedEntries + ".tmp"));
+        assert_false(fs::exists(uncommittedIndex + ".tmp"));
+        assert_false(fs::exists(uncommittedSnapshot + ".tmp"));
+        if (published) {
+            assert_true(fs::exists(uncommittedEntries));
+            assert_true(fs::exists(uncommittedIndex));
+            assert_true(fs::exists(uncommittedSnapshot));
+        } else {
+            assert_false(fs::exists(uncommittedEntries));
+            assert_false(fs::exists(uncommittedIndex));
+            assert_false(fs::exists(uncommittedSnapshot));
+        }
         const auto expectedSnapshot = published ? &replacement : replacing ? &previous : nullptr;
         assert_int_equal(recovered.SnapshotIndex,
             expectedSnapshot ? expectedSnapshot->Index : 0);

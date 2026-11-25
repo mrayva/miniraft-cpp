@@ -21,12 +21,12 @@ struct TDiskState : IState {
     // Exposes publication boundaries for deterministic crash/failure tests.
     using TCommitHook = std::function<void(ECommitStage)>;
 
-    // Recovery normally removes the previous snapshot generation after the
-    // published generation is selected. Offline validation can disable that
-    // cleanup to keep dry runs from mutating the store.
+    // Recovery normally removes previous and interrupted generations after
+    // the metadata-selected generation is validated. Offline validation can
+    // disable cleanup to keep dry runs from mutating the store.
     TDiskState(const std::string& name, uint32_t id, TCommitHook commitHook = {});
     TDiskState(const std::string& name, uint32_t id, TCommitHook commitHook,
-        bool reclaimPreviousGenerationOnRecovery);
+        bool reclaimUnselectedGenerationsOnRecovery);
     
     void RemoveLast() override;
     void Append(TMessageHolder<TLogEntry> entry) override;
@@ -93,7 +93,7 @@ private:
     bool CommitIndexTrusted = true;
     bool ChecksummedRecords = true;
     bool RaftStarted = false;
-    bool ReclaimPreviousGenerationOnRecovery = true;
+    bool ReclaimUnselectedGenerationsOnRecovery = true;
     [[noreturn]] void Fail(const char* message) const;
     std::fstream Open(const std::string& name, bool create);
     TMessageHolder<TMessage> Read() const;
@@ -104,6 +104,7 @@ private:
     std::string GenerationPath(uint64_t generation) const;
     std::string EntryGenerationPath(uint64_t generation) const;
     std::string SnapshotPath(uint64_t generation) const;
+    void ReclaimUncommittedGeneration();
     void InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated);
     void InstallSnapshotImpl(std::shared_ptr<const TSnapshot> snapshot);
     void InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snapshot,

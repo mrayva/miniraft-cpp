@@ -422,8 +422,8 @@ TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitH
 { }
 
 TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitHook,
-        bool reclaimPreviousGenerationOnRecovery)
-    : ReclaimPreviousGenerationOnRecovery(reclaimPreviousGenerationOnRecovery)
+        bool reclaimUnselectedGenerationsOnRecovery)
+    : ReclaimUnselectedGenerationsOnRecovery(reclaimUnselectedGenerationsOnRecovery)
     , CommitHook(std::move(commitHook))
 {
     const auto suffix = "." + std::to_string(id);
@@ -536,8 +536,11 @@ TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitH
     }
     ValidateStoredVoteMembershipHistory();
     Recovering = false;
-    if (ReclaimPreviousGenerationOnRecovery && EntriesGeneration && EntriesGeneration == IndexGeneration)
-        ReclaimPreviousGeneration(EntriesGeneration - 1, IndexGeneration - 1);
+    if (ReclaimUnselectedGenerationsOnRecovery) {
+        ReclaimUncommittedGeneration();
+        if (EntriesGeneration && EntriesGeneration == IndexGeneration)
+            ReclaimPreviousGeneration(EntriesGeneration - 1, IndexGeneration - 1);
+    }
 }
 
 std::string TDiskState::GenerationPath(uint64_t generation) const {
@@ -1035,6 +1038,31 @@ void TDiskState::ReclaimPreviousGeneration(uint64_t previousEntriesGeneration,
     } else {
         changed |= TruncateAndSyncRegularFileNoFollow(IndexBasePath);
     }
+    if (changed) (void)SyncDirectory(StatePath);
+}
+
+void TDiskState::ReclaimUncommittedGeneration() {
+    bool changed = false;
+    std::error_code ignored;
+    auto remove = [&](const std::string& path) {
+        ignored.clear();
+        changed |= std::filesystem::remove(path, ignored);
+    };
+    if (IndexGeneration != UINT64_MAX) {
+        const auto uncommitted = IndexGeneration + 1;
+        const auto entries = EntryGenerationPath(uncommitted);
+        const auto index = GenerationPath(uncommitted);
+        const auto snapshot = SnapshotPath(uncommitted);
+        remove(entries);
+        remove(entries + ".tmp");
+        remove(index);
+        remove(index + ".tmp");
+        remove(snapshot);
+        remove(snapshot + ".tmp");
+    }
+    // A crash after syncing the candidate metadata but before its rename leaves
+    // this file behind. The selected metadata remains authoritative on restart.
+    remove(StatePath + ".tmp");
     if (changed) (void)SyncDirectory(StatePath);
 }
 
