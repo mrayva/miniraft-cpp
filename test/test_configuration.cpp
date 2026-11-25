@@ -3181,6 +3181,20 @@ void run_live_membership_failure_scenario(uint32_t scenario,
     assert_int_equal(followerSnapshot.Index, snapshotIndex);
     assert_true(followerSnapshot.StableConfiguration);
 
+    const auto replacementSnapshotLeaderId = newVoters.front() == 4
+        ? newVoters[1] : newVoters.front();
+    for (unsigned i = 0; i < 8 &&
+        states[replacementSnapshotLeaderId]->CommitIndex < tailBeforeSnapshot; ++i) tick(4);
+    assert_int_equal(states[replacementSnapshotLeaderId]->CommitIndex, tailBeforeSnapshot);
+    for (unsigned i = 0; i < 8 &&
+        !rafts[replacementSnapshotLeaderId]->CheckCompactionMembershipReadiness().Ready(); ++i)
+        tick(4);
+    assert_true(rafts[replacementSnapshotLeaderId]->CheckCompactionMembershipReadiness().Ready());
+    const auto replacementSnapshot = rafts[replacementSnapshotLeaderId]->Compact();
+    assert_int_equal(replacementSnapshot.Index, snapshotIndex);
+    assert_true(replacementSnapshot.StableConfiguration);
+    assert_true(replacementSnapshot.Voters == newVoters);
+
     holdSnapshotChunks = true;
     isolateSnapshotReceiver = false;
     for (unsigned i = 0; i < 8 && heldSnapshotChunks.empty(); ++i) tick(4);
@@ -3192,6 +3206,16 @@ void run_live_membership_failure_scenario(uint32_t scenario,
     processors[6]->ProcessCommitted();
     assert_int_equal(states[6]->SnapshotIndex, jointSnapshotIndex);
     assert_int_equal(applications[6]->LastAppliedIndex, stableIndex);
+
+    // Hold a later chunk from the old leader so it can be replayed after the
+    // replacement leader wins an election and the restarted follower resets.
+    for (unsigned i = 0; i < 8 && heldSnapshotChunks.empty(); ++i) tick(4);
+    assert_false(heldSnapshotChunks.empty());
+    auto staleStableChunk = std::move(heldSnapshotChunks.front());
+    heldSnapshotChunks.erase(heldSnapshotChunks.begin());
+    assert_int_equal(staleStableChunk.Cast<TInstallSnapshotRequest>()->Offset,
+        TInstallSnapshotRequest::MaxChunkBytes);
+    assert_false(staleStableChunk.Cast<TInstallSnapshotRequest>()->Done & TInstallSnapshotRequest::DoneFlag);
 
     auto restartVoter = [&](uint32_t id) {
         processors[id].reset();
@@ -3213,12 +3237,35 @@ void run_live_membership_failure_scenario(uint32_t scenario,
     assert_int_equal(applications[6]->LastAppliedIndex, stableIndex);
     sawOutOfOrderSnapshotRejection = false;
     duplicatedSnapshotChunk = false;
+    const auto oldSnapshotLeaderTerm = states[4]->CurrentTerm;
+    snapshotSenderId = replacementSnapshotLeaderId;
+    for (unsigned i = 0; i < 16 &&
+        rafts[replacementSnapshotLeaderId]->CurrentStateName() != EState::LEADER; ++i)
+        tick(replacementSnapshotLeaderId);
+    assert_true(rafts[replacementSnapshotLeaderId]->CurrentStateName() == EState::LEADER);
+    assert_true(rafts[4]->CurrentStateName() == EState::FOLLOWER);
+    assert_true(states[replacementSnapshotLeaderId]->CurrentTerm > oldSnapshotLeaderTerm);
+    for (unsigned i = 0; i < 8 &&
+        rafts[replacementSnapshotLeaderId]->GetVolatileState()->CommitIndex <
+            states[replacementSnapshotLeaderId]->LastLogIndex; ++i)
+        tick(replacementSnapshotLeaderId);
+    assert_true(rafts[replacementSnapshotLeaderId]->GetVolatileState()->CommitIndex > stableIndex);
+
+    snapshotSenderId = 4;
     expectSnapshotRestartRetry = true;
-    duplicateSnapshotChunkTo6 = scenario == 1;
     holdSnapshotChunks = false;
-    for (unsigned i = 0; i < 48 && states[6]->SnapshotIndex < snapshotIndex; ++i) tick(4);
-    assert_int_equal(states[6]->SnapshotIndex, snapshotIndex);
+    endpoints[4][6]->Route(std::move(staleStableChunk));
     assert_true(sawOutOfOrderSnapshotRejection);
+    assert_int_equal(states[6]->SnapshotIndex, jointSnapshotIndex);
+
+    snapshotSenderId = replacementSnapshotLeaderId;
+    expectSnapshotRestartRetry = false;
+    awaitingOutOfOrderSnapshotReply = false;
+    heldSnapshotChunks.clear(); // Drop undelivered chunks from the new leader's first attempt.
+    duplicateSnapshotChunkTo6 = scenario == 1;
+    for (unsigned i = 0; i < 48 && states[6]->SnapshotIndex < snapshotIndex; ++i)
+        tick(replacementSnapshotLeaderId);
+    assert_int_equal(states[6]->SnapshotIndex, snapshotIndex);
     if (scenario == 1) {
         assert_true(duplicatedSnapshotChunk);
         assert_true(heldDuplicateSnapshotReplies.empty());
@@ -3230,14 +3277,17 @@ void run_live_membership_failure_scenario(uint32_t scenario,
     assert_true(states[6]->GetSnapshot()->Voters == newVoters);
     assert_int_equal(states[6]->GetSnapshot()->ConfigurationIndex, stableIndex);
     assert_int_equal(applications[6]->LastAppliedIndex, snapshotIndex);
-    assert_true(rafts[4]->GetVolatileState()->MatchIndex.at(6) >= snapshotIndex);
+    assert_true(rafts[replacementSnapshotLeaderId]->GetVolatileState()->MatchIndex.at(6) >= snapshotIndex);
 
     // Replicate a tail after installation, then restart again to prove the
     // remote snapshot and final voter identity recover together.
-    const auto tailAfterSnapshot = rafts[4]->Append(Ordinary(states[4]->CurrentTerm));
-    for (unsigned i = 0; i < 8 && rafts[4]->GetVolatileState()->CommitIndex < tailAfterSnapshot; ++i)
-        tick(4);
-    for (unsigned i = 0; i < 8 && states[6]->CommitIndex < tailAfterSnapshot; ++i) tick(4);
+    const auto tailAfterSnapshot = rafts[replacementSnapshotLeaderId]->Append(
+        Ordinary(states[replacementSnapshotLeaderId]->CurrentTerm));
+    for (unsigned i = 0; i < 8 &&
+        rafts[replacementSnapshotLeaderId]->GetVolatileState()->CommitIndex < tailAfterSnapshot; ++i)
+        tick(replacementSnapshotLeaderId);
+    for (unsigned i = 0; i < 8 && states[6]->CommitIndex < tailAfterSnapshot; ++i)
+        tick(replacementSnapshotLeaderId);
     assert_int_equal(states[6]->CommitIndex, tailAfterSnapshot);
     restartVoter(6);
     assert_true(rafts[6]->GetVoterIds() == newVoters);
