@@ -2857,6 +2857,8 @@ void run_live_membership_failure_scenario(uint32_t scenario,
     bool isolateNewMajority = false;
     bool isolateSnapshotReceiver = false;
     bool holdSnapshotChunks = false;
+    bool reorderStableAppendTo6 = false;
+    TMessageHolder<TMessage> delayedStableAppend;
     std::vector<TMessageHolder<TMessage>> heldSnapshotChunks;
 
     for (uint32_t id = 1; id <= 6; ++id) {
@@ -2882,6 +2884,12 @@ void run_live_membership_failure_scenario(uint32_t scenario,
                 if (isolateNewMajority && from == 1 &&
                     std::binary_search(blockedJointReplicas.begin(), blockedJointReplicas.end(), to)) return;
                 if (isolateSnapshotReceiver && (from == 6 || to == 6)) return;
+                if (reorderStableAppendTo6 && from == 4 && to == 6 &&
+                    message->Type == uint32_t(EMessageType::APPEND_ENTRIES_REQUEST)) {
+                    reorderStableAppendTo6 = false;
+                    delayedStableAppend = std::move(message);
+                    return;
+                }
                 if (holdSnapshotChunks && from == 4 && to == 6 &&
                     message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_REQUEST)) {
                     heldSnapshotChunks.push_back(std::move(message));
@@ -2954,6 +2962,7 @@ void run_live_membership_failure_scenario(uint32_t scenario,
         tick(4); // Commit the new leader's current-term entry under both majorities.
     assert_true(rafts[4]->GetVolatileState()->CommitIndex > jointIndex);
 
+    reorderStableAppendTo6 = scenario == 1;
     const auto stableIndex = rafts[4]->FinalizeConfiguration();
     for (unsigned i = 0; i < 8 && rafts[4]->GetVolatileState()->CommitIndex < stableIndex; ++i) tick(4);
     assert_int_equal(rafts[4]->GetVolatileState()->CommitIndex, stableIndex);
@@ -2968,6 +2977,26 @@ void run_live_membership_failure_scenario(uint32_t scenario,
         assert_true(rafts[id]->IsVoter(id) ==
             std::binary_search(newVoters.begin(), newVoters.end(), id));
         assert_true(states[id]->GetBoundVoters() == oldVoters);
+    }
+    if (scenario == 1) {
+        assert_true(bool(delayedStableAppend));
+        const auto delayed = delayedStableAppend.Cast<TAppendEntriesRequest>();
+        const auto delayedCommit = delayed->LeaderCommit &
+            ~TAppendEntriesRequest::JointElectionFenceLeader;
+        assert_true(delayedCommit < stableIndex);
+        assert_true(states[6]->CommitIndex >= stableIndex);
+
+        // Deliver an older stable-entry replication after a newer one reached
+        // this follower, then replay the same RPC. Neither stale commit metadata
+        // nor a duplicate append may roll back the committed voter set or log.
+        const auto committedBeforeReplay = states[6]->CommitIndex;
+        const auto lastLogBeforeReplay = states[6]->LastLogIndex;
+        auto duplicate = delayedStableAppend;
+        endpoints[4][6]->Route(std::move(delayedStableAppend));
+        endpoints[4][6]->Route(std::move(duplicate));
+        assert_int_equal(states[6]->CommitIndex, committedBeforeReplay);
+        assert_int_equal(states[6]->LastLogIndex, lastLogBeforeReplay);
+        assert_true(rafts[6]->GetVoterIds() == newVoters);
     }
 
     for (unsigned i = 0; i < 8; ++i) {
