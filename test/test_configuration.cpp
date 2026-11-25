@@ -3021,6 +3021,18 @@ void run_live_membership_failure_scenario(uint32_t scenario,
     assert_int_equal(jointSnapshot.ConfigurationIndex, jointIndex);
     assert_true(jointSnapshotIndex > jointIndex);
 
+    // Give the replacement leader its own copy of the same joint snapshot.
+    for (unsigned i = 0; i < 8 && states[4]->CommitIndex < jointSnapshotTail; ++i) tick(1);
+    assert_int_equal(states[4]->CommitIndex, jointSnapshotTail);
+    for (unsigned i = 0; i < 8 && !rafts[4]->CheckCompactionMembershipReadiness().Ready(); ++i)
+        tick(1);
+    assert_true(rafts[4]->CheckCompactionMembershipReadiness().Ready());
+    const auto followerJointSnapshot = rafts[4]->Compact();
+    assert_int_equal(followerJointSnapshot.Index, jointSnapshotIndex);
+    assert_true(followerJointSnapshot.IsJoint());
+    assert_true(followerJointSnapshot.Voters == oldVoters);
+    assert_true(followerJointSnapshot.JointVoters == newVoters);
+
     snapshotSenderId = 1;
     holdSnapshotChunks = true;
     isolateSnapshotReceiver = false;
@@ -3034,6 +3046,16 @@ void run_live_membership_failure_scenario(uint32_t scenario,
     processors[6]->ProcessCommitted();
     assert_int_equal(states[6]->SnapshotIndex, 0);
     assert_int_equal(applications[6]->LastAppliedIndex, jointIndex);
+
+    // Preserve a later chunk from the old leader. The restarted follower must
+    // reject it after leadership changes, then accept a clean transfer from 4.
+    for (unsigned i = 0; i < 8 && heldSnapshotChunks.empty(); ++i) tick(1);
+    assert_false(heldSnapshotChunks.empty());
+    auto staleJointChunk = std::move(heldSnapshotChunks.front());
+    heldSnapshotChunks.erase(heldSnapshotChunks.begin());
+    assert_int_equal(staleJointChunk.Cast<TInstallSnapshotRequest>()->Offset,
+        TInstallSnapshotRequest::MaxChunkBytes);
+    assert_false(staleJointChunk.Cast<TInstallSnapshotRequest>()->Done & TInstallSnapshotRequest::DoneFlag);
 
     processors[6].reset();
     applications[6].reset();
@@ -3051,12 +3073,33 @@ void run_live_membership_failure_scenario(uint32_t scenario,
     assert_int_equal(states[6]->SnapshotIndex, 0);
     assert_int_equal(applications[6]->LastAppliedIndex, jointIndex);
 
+    for (unsigned i = 0; i < 8 &&
+        (rafts[1]->GetVolatileState()->MatchIndex.at(4) < states[1]->LastLogIndex ||
+         rafts[1]->GetVolatileState()->CommitAckIndex.at(4) < rafts[1]->GetVolatileState()->CommitIndex); ++i)
+        tick(1);
+    rafts[1]->TransferLeadership(4, now);
+    assert_true(rafts[1]->CurrentStateName() == EState::FOLLOWER);
+    snapshotSenderId = 4;
+    for (unsigned i = 0; i < 4 && rafts[4]->CurrentStateName() != EState::LEADER; ++i) tick(4);
+    assert_true(rafts[4]->CurrentStateName() == EState::LEADER);
+    for (unsigned i = 0; i < 8 && rafts[4]->GetVolatileState()->CommitIndex < states[4]->LastLogIndex; ++i)
+        tick(4); // Commit the new leader's current-term entry under both majorities.
+    assert_true(rafts[4]->GetVolatileState()->CommitIndex > jointIndex);
+
+    snapshotSenderId = 1;
     expectSnapshotRestartRetry = true;
-    duplicateSnapshotChunkTo6 = scenario == 1;
     holdSnapshotChunks = false;
-    for (unsigned i = 0; i < 48 && states[6]->SnapshotIndex < jointSnapshotIndex; ++i) tick(1);
-    assert_int_equal(states[6]->SnapshotIndex, jointSnapshotIndex);
+    endpoints[1][6]->Route(std::move(staleJointChunk));
     assert_true(sawOutOfOrderSnapshotRejection);
+    assert_int_equal(states[6]->SnapshotIndex, 0);
+
+    snapshotSenderId = 4;
+    expectSnapshotRestartRetry = false;
+    awaitingOutOfOrderSnapshotReply = false;
+    heldSnapshotChunks.clear(); // Discard undelivered chunks from the new leader's first attempt.
+    duplicateSnapshotChunkTo6 = scenario == 1;
+    for (unsigned i = 0; i < 48 && states[6]->SnapshotIndex < jointSnapshotIndex; ++i) tick(4);
+    assert_int_equal(states[6]->SnapshotIndex, jointSnapshotIndex);
     assert_true(rafts[6]->GetVoterIds() == jointVoters);
     assert_true(rafts[6]->IsVoter(6));
     assert_true(states[6]->GetBoundVoters() == oldVoters);
@@ -3068,19 +3111,6 @@ void run_live_membership_failure_scenario(uint32_t scenario,
         assert_true(duplicatedSnapshotChunk);
         assert_true(heldDuplicateSnapshotReplies.empty());
     }
-    snapshotSenderId = 4;
-
-    for (unsigned i = 0; i < 8 &&
-        (rafts[1]->GetVolatileState()->MatchIndex.at(4) < states[1]->LastLogIndex ||
-         rafts[1]->GetVolatileState()->CommitAckIndex.at(4) < rafts[1]->GetVolatileState()->CommitIndex); ++i)
-        tick(1);
-    rafts[1]->TransferLeadership(4, now);
-    assert_true(rafts[1]->CurrentStateName() == EState::FOLLOWER);
-    for (unsigned i = 0; i < 4 && rafts[4]->CurrentStateName() != EState::LEADER; ++i) tick(4);
-    assert_true(rafts[4]->CurrentStateName() == EState::LEADER);
-    for (unsigned i = 0; i < 8 && rafts[4]->GetVolatileState()->CommitIndex < states[4]->LastLogIndex; ++i)
-        tick(4); // Commit the new leader's current-term entry under both majorities.
-    assert_true(rafts[4]->GetVolatileState()->CommitIndex > jointIndex);
 
     reorderStableAppendTo6 = scenario == 1;
     const auto stableIndex = rafts[4]->FinalizeConfiguration();
