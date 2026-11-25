@@ -272,7 +272,7 @@ void RemoveOrphanedLogFiles(int directory, const std::string& stateFile,
     }
     if (removed) Sync(directory);
 }
-class TReadOnlyMap final : public TSnapshotDataSource {
+class TReadOnlyMap final : public TSnapshotDataSource, public ISnapshotDataHeapUsage {
 public:
     explicit TReadOnlyMap(int fd) {
         struct stat info;
@@ -295,6 +295,7 @@ public:
         return {static_cast<const uint8_t*>(Address), SizeBytes};
     }
     uint64_t Size() const override { return SizeBytes; }
+    uint64_t HeapBytes() const override { return 0; }
     size_t Read(uint64_t offset, std::span<char> destination) const override {
         if (offset >= SizeBytes || destination.empty()) return 0;
         const auto count = size_t(std::min<uint64_t>(destination.size(), SizeBytes - offset));

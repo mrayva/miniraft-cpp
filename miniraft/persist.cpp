@@ -330,7 +330,7 @@ bool IsRegularFileNoFollow(const std::string& path) {
 }
 
 #ifdef __linux__
-class TSnapshotGenerationMap final : public TSnapshotDataSource {
+class TSnapshotGenerationMap final : public TSnapshotDataSource, public ISnapshotDataHeapUsage {
 public:
     explicit TSnapshotGenerationMap(const std::string& path) {
         const int file = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
@@ -368,6 +368,7 @@ public:
         return {static_cast<const char*>(Mapping), SizeBytes};
     }
     uint64_t Size() const override { return SizeBytes; }
+    uint64_t HeapBytes() const override { return 0; }
     size_t Read(uint64_t offset, std::span<char> destination) const override {
         if (offset >= SizeBytes || destination.empty()) return 0;
         const auto count = size_t(std::min<uint64_t>(destination.size(), SizeBytes - offset));

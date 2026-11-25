@@ -218,6 +218,16 @@ struct TLargeSourceSnapshotApplication : IRsm, IStreamingSnapshotRsm, IStreaming
     void LoadSnapshot(std::string_view, uint64_t index) override { LastAppliedIndex = index; }
     bool SupportsApplicationSnapshotInstall() const override { return true; }
 };
+struct TUnchargedGeneratedSnapshotDataSource : TGeneratedSnapshotDataSource,
+        ISnapshotSourceHeapUsage {
+    using TGeneratedSnapshotDataSource::TGeneratedSnapshotDataSource;
+    uint64_t HeapBytes() const override { return 0; }
+};
+struct TUnchargedLargeSourceSnapshotApplication : TLargeSourceSnapshotApplication {
+    std::shared_ptr<const ISnapshotSource> OpenSnapshotSource(uint64_t) const override {
+        return std::make_shared<TUnchargedGeneratedSnapshotDataSource>(Bytes);
+    }
+};
 void test_kv_snapshot_precomputes_size_without_changing_encoding(void**) {
     TKv source;
     const std::string binaryKey("a\0", 2), binaryValue("\0v", 2);
@@ -398,6 +408,28 @@ void test_incremental_snapshot_capture_charges_each_growth_before_writing(void**
     assert_int_equal(budget->UsedBytes(), 40);
     snapshot.reset();
     state.reset();
+    assert_int_equal(budget->UsedBytes(), 0);
+}
+void test_snapshot_source_can_report_non_heap_payload_storage(void**) {
+    auto state = std::make_shared<TState>();
+    auto entry = NewHoldedMessage<TLogEntry>();
+    entry->Term = 1;
+    state->Append(entry);
+    state->CommitIndex = 1;
+
+    auto budget = std::make_shared<TSnapshotInstallBudget>(1);
+    TRaft::TLogLimits limits;
+    limits.SnapshotInstallBudget = budget;
+    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{},
+        std::vector<uint32_t>{}, limits);
+    auto app = std::make_shared<TUnchargedLargeSourceSnapshotApplication>();
+    app->Bytes = 40;
+    app->LastAppliedIndex = 1;
+    TRequestProcessor processor(raft, app, {});
+
+    const auto snapshot = raft->CompactShared();
+    assert_int_equal(snapshot->DataSize(), 40);
+    assert_int_equal(snapshot->HeapBytes(), 0);
     assert_int_equal(budget->UsedBytes(), 0);
 }
 #ifdef __linux__
@@ -749,6 +781,30 @@ void test_recovered_snapshot_retains_heap_budget_lease(void**) {
     }
     // The storage snapshot outlives the Raft object and keeps its lease.
     assert_int_equal(budget->UsedBytes(), image.DataSize());
+    state.reset();
+    assert_int_equal(budget->UsedBytes(), 0);
+}
+void test_recovered_source_snapshot_is_charged_to_heap_budget(void**) {
+    auto state = std::make_shared<TState>();
+    TSnapshot image{1, 1, {1}, {}};
+    image.DataSource = std::make_shared<TStringSnapshotDataSource>(std::string(40, 's'));
+    state->InstallSnapshot(image);
+
+    auto tooSmallBudget = std::make_shared<TSnapshotInstallBudget>(39);
+    TRaft::TLogLimits limits;
+    limits.SnapshotInstallBudget = tooSmallBudget;
+    Reject([&] { TRaft raft(state, 1, TNodeDict{}, {}, limits); });
+    assert_int_equal(tooSmallBudget->UsedBytes(), 0);
+    assert_false(bool(state->GetSnapshot()->HeapReservation));
+
+    auto budget = std::make_shared<TSnapshotInstallBudget>(40);
+    limits.SnapshotInstallBudget = budget;
+    {
+        TRaft raft(state, 1, TNodeDict{}, {}, limits);
+        assert_int_equal(budget->UsedBytes(), 40);
+        assert_true(*state->GetSnapshot() == image);
+    }
+    assert_int_equal(budget->UsedBytes(), 40);
     state.reset();
     assert_int_equal(budget->UsedBytes(), 0);
 }
@@ -3651,7 +3707,9 @@ int main() {
         cmocka_unit_test(test_snapshot_capture_preflights_application_size_bound),
         cmocka_unit_test(test_snapshot_capture_reserves_declared_bound_before_materializing),
         cmocka_unit_test(test_incremental_snapshot_capture_charges_each_growth_before_writing),
+        cmocka_unit_test(test_snapshot_source_can_report_non_heap_payload_storage),
         cmocka_unit_test(test_recovered_snapshot_retains_heap_budget_lease),
+        cmocka_unit_test(test_recovered_source_snapshot_is_charged_to_heap_budget),
         cmocka_unit_test(test_shared_compaction_reuses_storage_snapshot_image),
         cmocka_unit_test(test_zero_index_follower_compaction_waits_for_capability_barrier),
         cmocka_unit_test(test_restarted_follower_reacquires_compaction_certificate_without_new_term),

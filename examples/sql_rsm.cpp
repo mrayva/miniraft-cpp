@@ -441,12 +441,13 @@ private:
 #endif
 
 #ifdef __linux__
-class TSqlFileSnapshotSource final : public ISnapshotSource {
+class TSqlFileSnapshotSource final : public ISnapshotSource, public ISnapshotSourceHeapUsage {
 public:
     TSqlFileSnapshotSource(int fd, uint64_t size) : Fd(fd), Length(size) { }
     ~TSqlFileSnapshotSource() override { if (Fd >= 0) close(Fd); }
 
     uint64_t Size() const override { return Length; }
+    uint64_t HeapBytes() const override { return 0; }
 
     size_t Read(uint64_t offset, std::span<char> destination) const override {
         if (offset >= Length || destination.empty()) return 0;

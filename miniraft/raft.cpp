@@ -967,7 +967,7 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
 
 } // namespace
 
-class TRaft::TIncomingSnapshotFile final : public TSnapshotDataSource {
+class TRaft::TIncomingSnapshotFile final : public TSnapshotDataSource, public ISnapshotDataHeapUsage {
 public:
     TIncomingSnapshotFile(const std::string& directory, size_t size)
         : SizeBytes(size) {
@@ -1000,6 +1000,7 @@ public:
     TIncomingSnapshotFile& operator=(const TIncomingSnapshotFile&) = delete;
 
     uint64_t Size() const override { return SizeBytes; }
+    uint64_t HeapBytes() const override { return 0; }
 
     size_t Read(uint64_t offset, std::span<char> destination) const override {
         if (offset >= SizeBytes || destination.empty()) return 0;
@@ -1263,9 +1264,10 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
         if (snapshot->HeapReservation) {
             if (snapshot->HeapReservationBudget != SnapshotInstallBudget)
                 throw std::invalid_argument("Stored snapshot is charged to a different heap budget");
-        } else if (!snapshot->DataSource) {
-            auto reservation = SnapshotInstallBudget->TryReserve(snapshot->DataSize());
-            if (snapshot->DataSize() && !reservation)
+        } else {
+            const auto heapBytes = snapshot->HeapBytes();
+            auto reservation = SnapshotInstallBudget->TryReserve(heapBytes);
+            if (heapBytes && !reservation)
                 throw std::runtime_error("Stored snapshot exceeds the available heap budget");
             snapshot->HeapReservation = std::move(reservation);
             if (snapshot->HeapReservation)

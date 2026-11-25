@@ -25,8 +25,11 @@ limit and `SnapshotSizeUpperBound()` when the application also supplies that
 bound. Capture then verifies that the complete source is readable using a
 fixed 64 KiB scratch buffer. The source must remain immutable and readable
 until the snapshot and all transfer pins are released. Raft conservatively
-charges its size against the retained snapshot heap budget even when the source
-is file-backed.
+charges its size against the retained snapshot heap budget by default. A source
+that implements `ISnapshotSourceHeapUsage` can report a tighter upper bound,
+including zero for a file-backed payload. The same charge is restored when a
+source-backed snapshot is recovered; unmarked sources remain conservatively
+charged by size.
 Existing applications retain the `SaveSnapshot()` path. On Linux, the SQL
 example backs up into a private temporary database with a bounded SQLite page
 cache and serves ranges from a read-only file descriptor. This avoids a
@@ -66,8 +69,10 @@ chunks, so chunk appends do not grow the buffer geometrically.
 Rejection, term change and idle expiry release temporary reservations. A
 successful installation transfers its heap lease to the retained snapshot;
 local compaction and startup recovery also charge retained image data. Outgoing
-pins keep that same image lease alive. Range-source capture reserves its exact
-size and retains the source after checking it in bounded ranges. Legacy
+pins keep that same image lease alive. Range-source capture reserves the
+reported heap bound, or its exact size for an unmarked source, and retains the
+source after checking it in bounded ranges. Internal file-backed snapshot
+sources report zero heap payload bytes. Legacy
 `SaveSnapshot()` capture reserves a declared upper bound before invoking the
 callback, then shrinks the lease to the captured size. Incremental snapshot
 writers extend the lease before each append even without a size bound. Legacy

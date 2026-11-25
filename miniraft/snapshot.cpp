@@ -383,7 +383,7 @@ void Sync(int fd) {
     do { rc = fsync(fd); } while (rc < 0 && errno == EINTR);
     Require(rc == 0, "sync snapshot");
 }
-class TSnapshotImageMap final : public TSnapshotDataSource {
+class TSnapshotImageMap final : public TSnapshotDataSource, public ISnapshotDataHeapUsage {
 public:
     explicit TSnapshotImageMap(int fd) {
         struct stat info{};
@@ -410,6 +410,7 @@ public:
         return {static_cast<const char*>(Mapping), SizeBytes};
     }
     uint64_t Size() const override { return SizeBytes; }
+    uint64_t HeapBytes() const override { return 0; }
     size_t Read(uint64_t offset, std::span<char> destination) const override {
         if (offset >= SizeBytes || destination.empty()) return 0;
         const auto count = size_t(std::min<uint64_t>(destination.size(), SizeBytes - offset));
@@ -422,7 +423,7 @@ private:
     size_t SizeBytes = 0;
 };
 #endif
-class TApplicationSnapshotSource final : public TSnapshotDataSource {
+class TApplicationSnapshotSource final : public TSnapshotDataSource, public ISnapshotDataHeapUsage {
 public:
     TApplicationSnapshotSource(std::shared_ptr<const ISnapshotSource> source, uint64_t size)
         : Source(std::move(source)), SizeBytes(size) {
@@ -434,6 +435,10 @@ public:
     }
 
     uint64_t Size() const override { return SizeBytes; }
+    uint64_t HeapBytes() const override {
+        const auto accounted = dynamic_cast<const ISnapshotSourceHeapUsage*>(Source.get());
+        return accounted ? accounted->HeapBytes() : SizeBytes;
+    }
 
     size_t Read(uint64_t offset, std::span<char> destination) const override {
         if (offset >= SizeBytes || destination.empty()) return 0;
@@ -446,7 +451,7 @@ private:
     uint64_t SizeBytes = 0;
 };
 
-class TSnapshotCaptureFile final : public TSnapshotDataSource {
+class TSnapshotCaptureFile final : public TSnapshotDataSource, public ISnapshotDataHeapUsage {
 public:
     explicit TSnapshotCaptureFile(const std::string& directory)
 #ifdef __linux__
@@ -465,6 +470,7 @@ public:
     }
 
     uint64_t Size() const override { return WrittenBytes; }
+    uint64_t HeapBytes() const override { return 0; }
 
     size_t Read(uint64_t offset, std::span<char> destination) const override {
         if (offset >= WrittenBytes || destination.empty()) return 0;
@@ -540,6 +546,13 @@ size_t TSnapshot::DataSize() const {
     if (size > TSnapshot::MaxBytes || size > SIZE_MAX)
         throw std::runtime_error("Snapshot payload source exceeds the size limit");
     return size_t(size);
+}
+
+uint64_t TSnapshot::HeapBytes() const {
+    if (!DataSource) return Data.size();
+    if (!Data.empty()) throw std::logic_error("Snapshot cannot own and source the payload at once");
+    const auto accounted = dynamic_cast<const ISnapshotDataHeapUsage*>(DataSource.get());
+    return accounted ? accounted->HeapBytes() : DataSource->Size();
 }
 
 size_t TSnapshot::ReadDataRange(uint64_t offset, std::span<char> destination) const {
@@ -740,12 +753,16 @@ void CopySnapshotEncodingRange(const TSnapshot& snapshot, const TSnapshotEncodin
 }
 
 namespace {
-class TSnapshotDataSlice final : public TSnapshotDataSource {
+class TSnapshotDataSlice final : public TSnapshotDataSource, public ISnapshotDataHeapUsage {
 public:
     TSnapshotDataSlice(std::shared_ptr<const TSnapshotDataSource> image,
             uint64_t offset, uint64_t length)
         : Image(std::move(image)), Offset(offset), Length(length) { }
     uint64_t Size() const override { return Length; }
+    uint64_t HeapBytes() const override {
+        const auto accounted = dynamic_cast<const ISnapshotDataHeapUsage*>(Image.get());
+        return accounted ? accounted->HeapBytes() : Image->Size();
+    }
     size_t Read(uint64_t offset, std::span<char> destination) const override {
         if (offset >= Length || destination.empty()) return 0;
         const auto count = size_t(std::min<uint64_t>(destination.size(), Length - offset));
@@ -1045,12 +1062,14 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         if (upperBound && dataBytes > *upperBound)
             throw std::logic_error("Application snapshot source exceeded its declared size bound");
         std::shared_ptr<TSnapshotCaptureFile> stagedSource;
+        std::shared_ptr<TApplicationSnapshotSource> retainedSource;
         if (!stagingDirectory.empty()) {
             if (!stagingBudget)
                 stagingBudget = heapBudget ? heapBudget : TSnapshotInstallBudget::DefaultProcessBudget();
             stagedSource = std::make_shared<TSnapshotCaptureFile>(std::string(stagingDirectory));
         } else {
-            reserveCaptureBytes(dataBytes);
+            retainedSource = std::make_shared<TApplicationSnapshotSource>(source, dataBytes);
+            reserveCaptureBytes(retainedSource->HeapBytes());
         }
         std::array<char, 64 * 1024> buffer{};
         for (uint64_t offset = 0; offset < dataBytes;) {
@@ -1071,7 +1090,7 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         if (source->Size() != dataBytes)
             throw std::logic_error("Application snapshot source changed size during capture");
         if (stagedSource) snapshot.DataSource = std::move(stagedSource);
-        else snapshot.DataSource = std::make_shared<TApplicationSnapshotSource>(std::move(source), dataBytes);
+        else snapshot.DataSource = std::move(retainedSource);
     } else if (writerRsm || (!stagingDirectory.empty() && idempotentRsm)) {
         if (!stagingDirectory.empty() && !stagingBudget)
             stagingBudget = heapBudget ? heapBudget : TSnapshotInstallBudget::DefaultProcessBudget();
@@ -1105,7 +1124,7 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
             reservation.reset();
         }
     }
-    if (reservation && !heapBudget->TryResize(reservation, snapshot.DataSize()))
+    if (reservation && !heapBudget->TryResize(reservation, snapshot.HeapBytes()))
         throw std::runtime_error("Captured snapshot exceeds the available heap budget");
     Validate(snapshot);
     if (reservation) {

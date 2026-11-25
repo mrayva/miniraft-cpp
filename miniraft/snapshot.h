@@ -26,6 +26,14 @@ struct TSnapshotDataSource {
     virtual size_t Read(uint64_t offset, std::span<char> destination) const = 0;
 };
 
+// Optional accounting contract that does not change TSnapshotDataSource's
+// virtual interface. Unmarked sources are conservatively charged by Size().
+struct ISnapshotDataHeapUsage {
+    virtual ~ISnapshotDataHeapUsage() = default;
+    // Upper bound for payload bytes retained in heap memory.
+    virtual uint64_t HeapBytes() const = 0;
+};
+
 // One committed stable -> joint -> stable voter transition. A zero stable
 // successor identifies the final, currently active joint phase.
 struct TSnapshotConfigurationTransition {
@@ -75,6 +83,7 @@ struct TSnapshot {
     mutable std::shared_ptr<void> HeapReservation;
     mutable std::shared_ptr<TSnapshotInstallBudget> HeapReservationBudget;
     size_t DataSize() const;
+    uint64_t HeapBytes() const;
     size_t ReadDataRange(uint64_t offset, std::span<char> destination) const;
     std::string MaterializeData() const;
     bool HasConfigurationLineage() const { return !PreviousVoters.empty(); }

@@ -43,6 +43,15 @@ struct ISnapshotSource {
     virtual size_t Read(uint64_t offset, std::span<char> destination) const = 0;
 };
 
+// Optional accounting contract for application snapshot sources. Implement
+// this when the payload is not retained in heap memory (for example, when
+// reads are served from a file). The returned value must remain a valid upper
+// bound while the source is retained. Unmarked sources are charged by Size().
+struct ISnapshotSourceHeapUsage {
+    virtual ~ISnapshotSourceHeapUsage() = default;
+    virtual uint64_t HeapBytes() const = 0;
+};
+
 // Optional application contract for range-readable snapshot capture. Keeping
 // this separate from IRsm preserves the existing application's virtual ABI.
 struct IStreamingSnapshotRsm {
