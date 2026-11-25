@@ -107,9 +107,18 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--server")) {
             server = true;
-        } else if (!strcmp(argv[i], "--node") && i < argc - 1) {
+        } else if (!strcmp(argv[i], "--node")) {
             // address:port:id
-            hosts.push_back(THost{argv[++i]});
+            if (i + 1 >= argc || !argv[i + 1][0]) {
+                std::cerr << "--node requires a non-empty address:port:id\n";
+                return 1;
+            }
+            try {
+                hosts.push_back(THost{argv[++i]});
+            } catch (const std::exception& error) {
+                std::cerr << "Invalid --node endpoint: " << error.what() << "\n";
+                return 1;
+            }
         } else if (!strcmp(argv[i], "--id") && i < argc - 1) {
             id = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--durable")) {
@@ -133,6 +142,10 @@ int main(int argc, char** argv)
 
     if (snapshotInterval && (!server || !durable)) {
         std::cerr << "--snapshots requires --server --durable\n"; return 1;
+    }
+    if (!server && hosts.empty()) {
+        std::cerr << "Client requires at least one --node address:port:id\n";
+        return 1;
     }
     if (!snapshotStagingDirectory.empty()) {
 #ifdef __linux__

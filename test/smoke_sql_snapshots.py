@@ -51,13 +51,19 @@ def main():
                 for options in (["--server", "--snapshots", "1"],
                                 ["--server", "--durable", "--snapshots", "0"],
                                 ["--server", "--durable", "--snapshots"],
+                                ["--client"],
+                                ["--client", "--node"],
+                                ["--client", "--node", ""],
+                                ["--client", "--node", "not-an-endpoint"],
+                                ["--server", "--id", "1", "--node", ""],
                                 ["--client", "--snapshot-staging-dir", str(staging)],
                                 ["--server", "--durable", "--snapshot-staging-dir"],
                                 ["--server", "--durable", "--snapshot-staging-dir",
                                     str(root / "missing-staging")]):
-                    rejected = subprocess.run([binary, *options], cwd=root, stdout=log,
-                        stderr=log, timeout=5, preexec_fn=no_core)
-                    assert rejected.returncode != 0, options
+                    rejected = subprocess.run([binary, *options], cwd=root,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                        timeout=5, preexec_fn=no_core)
+                    assert rejected.returncode == 1, (options, rejected.returncode, rejected.stdout)
 
                 process = start(periodic=True)
                 wait_ready(process)
