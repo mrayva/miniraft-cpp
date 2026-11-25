@@ -4453,7 +4453,8 @@ void test_committed_joint_snapshot_can_install_its_stable_successor(void**) {
     auto state = std::make_shared<TDurableState>(name, 2);
     state->BindVoters({1, 3}); // The original binding remains distinct from active joint voters.
     state->CurrentTerm = 3;
-    TSnapshot joint{4, 2, {1, 3}, "4"};
+    const size_t snapshotPaddingBytes = 2 * TInstallSnapshotRequest::MaxChunkBytes + 17;
+    TSnapshot joint{4, 2, {1, 3}, "4" + std::string(snapshotPaddingBytes, 's')};
     joint.JointVoters = {1, 2};
     joint.ConfigurationIndex = 2; joint.ConfigurationTerm = 2;
     state->InstallSnapshot(joint);
@@ -4465,21 +4466,31 @@ void test_committed_joint_snapshot_can_install_its_stable_successor(void**) {
     TNodeDict peers{{1, peer}, {3, oldOnlyPeer}};
     auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{2});
     auto app = std::make_shared<TSnapshotRsm>();
-    TRequestProcessor processor(raft, app, peers);
+    app->SnapshotPaddingBytes = snapshotPaddingBytes;
+    auto processor = std::make_unique<TRequestProcessor>(raft, app, peers);
     assert_int_equal(app->LastAppliedIndex, joint.Index);
 
-    auto sendSnapshot = [&](const TSnapshot& image, uint32_t leaderId = 1) {
+    auto sendSnapshotChunk = [&](const TSnapshot& image, uint64_t offset,
+            uint32_t count, uint32_t leaderId = 1) {
         const auto bytes = EncodeSnapshot(image);
-        auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + bytes.size());
+        assert_true(offset <= bytes.size());
+        assert_true(count <= bytes.size() - offset);
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
         request->Src = leaderId; request->Dst = 2; request->Term = 4;
         request->Seqno = replies.size() + 1;
         request->SnapshotIndex = image.Index; request->SnapshotTerm = image.Term;
-        request->Offset = 0; request->TotalBytes = bytes.size();
-        request->Done = TInstallSnapshotRequest::DoneFlag |
+        request->Offset = offset; request->TotalBytes = bytes.size();
+        request->Done = (offset + count == bytes.size() ? TInstallSnapshotRequest::DoneFlag : 0u) |
             TInstallSnapshotRequest::JointElectionFenceLeader;
         request->LeaderId = leaderId;
-        memcpy(request->Data, bytes.data(), bytes.size());
+        memcpy(request->Data, bytes.data() + offset, count);
         raft->Process(ITimeSource::Time{}, request);
+    };
+    auto sendSnapshot = [&](const TSnapshot& image, uint32_t leaderId = 1) {
+        const auto bytes = EncodeSnapshot(image);
+        const auto count = static_cast<uint32_t>(std::min<size_t>(
+            bytes.size(), TInstallSnapshotRequest::MaxChunkBytes));
+        sendSnapshotChunk(image, 0, count, leaderId);
     };
 
     TSnapshot wrongVoters{5, 3, {1, 3}, "5"};
@@ -4497,16 +4508,63 @@ void test_committed_joint_snapshot_can_install_its_stable_successor(void**) {
     assert_true(static_cast<TStateFields>(*state) == beforeWrongVoters);
     assert_true(replies.empty());
 
-    TSnapshot stable{5, 3, {1, 2}, "5"};
+    TSnapshot stable{5, 3, {1, 2}, "5" + std::string(snapshotPaddingBytes, 's')};
     stable.StableConfiguration = true;
     stable.ConfigurationIndex = 5; stable.ConfigurationTerm = 3;
     sendSnapshot(stable, 3); // An old-only member cannot lead after stable finalization.
     assert_true(static_cast<TStateFields>(*state) == beforeWrongVoters);
     assert_true(replies.empty());
 
-    sendSnapshot(stable);
+    const auto stableBytes = EncodeSnapshot(stable);
+    assert_true(stableBytes.size() > TInstallSnapshotRequest::MaxChunkBytes);
+    sendSnapshotChunk(stable, 0, TInstallSnapshotRequest::MaxChunkBytes);
     assert_int_equal(replies.size(), 1);
-    assert_true(replies.back()->Success); assert_true(replies.back()->Installed);
+    assert_true(replies.back()->Success); assert_false(replies.back()->Installed);
+    assert_int_equal(replies.back()->NextOffset, TInstallSnapshotRequest::MaxChunkBytes);
+    assert_int_equal(state->SnapshotIndex, joint.Index);
+    assert_true(*state->GetSnapshot() == joint);
+    assert_int_equal(app->LastAppliedIndex, joint.Index);
+
+    // Reconstruct the follower before completing the transfer. The partial
+    // image is volatile, while the committed joint snapshot and original
+    // bootstrap voter binding survive the restart.
+    processor.reset();
+    raft.reset();
+    app.reset();
+    state.reset();
+    state = std::make_shared<TDurableState>(name, 2);
+    raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{2});
+    app = std::make_shared<TSnapshotRsm>();
+    app->SnapshotPaddingBytes = snapshotPaddingBytes;
+    processor = std::make_unique<TRequestProcessor>(raft, app, peers);
+    processor->ProcessCommitted();
+    assert_true(*state->GetSnapshot() == joint);
+    assert_true(state->GetBoundVoters() == (std::vector<uint32_t>{1, 3}));
+    assert_true(raft->GetVoterIds() == (std::vector<uint32_t>{1, 2, 3}));
+    assert_int_equal(app->LastAppliedIndex, joint.Index);
+
+    // A continuation from the lost transfer cannot skip the new assembly's
+    // required zero offset. A complete retry then installs the stable successor.
+    sendSnapshotChunk(stable, TInstallSnapshotRequest::MaxChunkBytes,
+        TInstallSnapshotRequest::MaxChunkBytes);
+    assert_int_equal(replies.size(), 2);
+    assert_false(replies.back()->Success);
+    assert_false(replies.back()->Installed);
+    assert_int_equal(replies.back()->NextOffset, 0);
+    assert_int_equal(state->SnapshotIndex, joint.Index);
+    assert_true(*state->GetSnapshot() == joint);
+    assert_int_equal(app->LastAppliedIndex, joint.Index);
+
+    for (uint64_t offset = 0; offset < stableBytes.size();) {
+        const auto count = static_cast<uint32_t>(std::min<uint64_t>(
+            TInstallSnapshotRequest::MaxChunkBytes, stableBytes.size() - offset));
+        sendSnapshotChunk(stable, offset, count);
+        const auto& response = replies.back();
+        assert_true(response->Success);
+        assert_int_equal(response->NextOffset, offset + count);
+        assert_int_equal(response->Installed, offset + count == stableBytes.size());
+        offset += count;
+    }
     assert_int_equal(state->CurrentTerm, 4);
     assert_true(*state->GetSnapshot() == stable);
     assert_int_equal(app->LastAppliedIndex, stable.Index);
