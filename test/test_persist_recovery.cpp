@@ -1065,13 +1065,21 @@ void test_snapshot_generation_crashes_publish_old_or_new_complete_image(void**) 
         TDiskState::ECommitStage::MetadataRenamed,
         TDiskState::ECommitStage::DirectorySynced,
     };
-    for (const auto stage : stages) {
+    for (const bool replacing : {false, true}) for (const auto stage : stages) {
         TFiles files;
         files.Seed();
+        const TSnapshot previous{1, 2, {1, 2}, "previous durable image"};
+        const TSnapshot replacement = replacing
+            ? TSnapshot{2, 5, {1, 2}, "replacement durable image"}
+            : TSnapshot{1, 2, {1, 2}, "durable image"};
         {
             TDiskState state(files.Name, 1);
-            state.CommitIndex = 1;
+            auto suffix = NewHoldedMessage<TLogEntry>();
+            suffix->Term = 7;
+            state.Append(suffix);
+            state.CommitIndex = 2;
             state.Commit();
+            if (replacing) state.InstallSnapshot(previous);
         }
         const auto child = fork();
         assert_true(child >= 0);
@@ -1080,7 +1088,7 @@ void test_snapshot_generation_crashes_publish_old_or_new_complete_image(void**) 
                 TDiskState state(files.Name, 1, [stage](TDiskState::ECommitStage reached) {
                     if (reached == stage) _exit(120 + static_cast<int>(stage));
                 });
-                state.InstallSnapshot(TSnapshot{1, 2, {1, 2}, "durable image"});
+                state.InstallSnapshot(replacement);
             } catch (...) { _exit(130); }
             _exit(131);
         }
@@ -1091,10 +1099,19 @@ void test_snapshot_generation_crashes_publish_old_or_new_complete_image(void**) 
         TDiskState recovered(files.Name, 1);
         const bool published = stage == TDiskState::ECommitStage::MetadataRenamed ||
             stage == TDiskState::ECommitStage::DirectorySynced;
-        assert_int_equal(recovered.SnapshotIndex, published ? 1 : 0);
-        assert_int_equal(recovered.LastLogIndex, 2);
-        assert_int_equal(recovered.Get(2)->Term, 5);
-        assert_true(bool(recovered.GetSnapshot()) == published);
+        const auto expectedSnapshot = published ? &replacement : replacing ? &previous : nullptr;
+        assert_int_equal(recovered.SnapshotIndex,
+            expectedSnapshot ? expectedSnapshot->Index : 0);
+        assert_int_equal(recovered.LastLogIndex, 3);
+        assert_int_equal(recovered.LastLogTerm, 7);
+        assert_int_equal(recovered.CommitIndex, 2);
+        if (expectedSnapshot) assert_true(*recovered.GetSnapshot() == *expectedSnapshot);
+        else assert_false(bool(recovered.GetSnapshot()));
+        if (!replacing && !published) assert_int_equal(recovered.Get(1)->Term, 2);
+        else assert_false(bool(recovered.Get(1)));
+        if (replacing && published) assert_false(bool(recovered.Get(2)));
+        else assert_int_equal(recovered.Get(2)->Term, 5);
+        assert_int_equal(recovered.Get(3)->Term, 7);
     }
 }
 
