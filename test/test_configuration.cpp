@@ -146,13 +146,125 @@ void test_configuration_snapshot_projection_and_history_resume(void**) {
     unbound.Snapshot = std::make_shared<TSnapshot>(pendingSnapshot);
     Reject([&] { unbound.BindVoters(pendingSnapshot.Voters); });
 }
-void test_generated_membership_sets_roundtrip_through_joint_and_stable_snapshots(void**) {
+void test_generated_membership_sets_roundtrip_and_bootstrap_from_snapshots(void**) {
     uint32_t random = UINT32_C(0x6d2b79f5);
     auto nextRandom = [&] {
         random ^= random << 13;
         random ^= random >> 17;
         random ^= random << 5;
         return random;
+    };
+
+    auto bootstrapFreshLearner = [](const TSnapshot& snapshot,
+            std::vector<uint32_t> peerVoters, std::vector<uint32_t> configuredVoters,
+            uint32_t leaderId, bool restartPartial) {
+        constexpr uint32_t LearnerId = 1000;
+        constexpr size_t ChunkBytes = 32;
+        TNodeDict peers;
+        std::shared_ptr<TEndpoint> leaderEndpoint;
+        for (const auto voter : peerVoters) {
+            auto endpoint = std::make_shared<TEndpoint>();
+            if (voter == leaderId) leaderEndpoint = endpoint;
+            peers.emplace(voter, std::move(endpoint));
+        }
+        assert_true(bool(leaderEndpoint));
+
+        std::vector<uint32_t> learners{LearnerId};
+        for (const auto peer : peerVoters)
+            if (!std::binary_search(configuredVoters.begin(), configuredVoters.end(), peer))
+                learners.push_back(peer);
+        std::sort(learners.begin(), learners.end());
+
+        auto state = std::make_shared<TState>();
+        state->BindVoters(configuredVoters);
+        state->CurrentTerm = snapshot.Term;
+        auto raft = std::make_shared<TRaft>(state, LearnerId, peers, learners);
+        auto application = std::make_shared<TSnapshotRsm>();
+        auto processor = std::make_unique<TRequestProcessor>(raft, application, peers);
+        const auto bytes = EncodeSnapshot(snapshot);
+        const bool jointElectionFenceLeader = snapshot.IsJoint() || snapshot.HasConfigurationLineage() ||
+            !snapshot.ConfigurationTransitions.empty();
+        auto sendChunk = [&](uint64_t offset, uint32_t count, uint32_t seqno) {
+            auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
+            request->Src = leaderId; request->Dst = LearnerId;
+            request->Term = std::max<uint64_t>(snapshot.Term, state->CurrentTerm);
+            request->Seqno = seqno;
+            request->SnapshotIndex = snapshot.Index; request->SnapshotTerm = snapshot.Term;
+            request->Offset = offset; request->TotalBytes = bytes.size();
+            request->Done = (offset + count == bytes.size() ? TInstallSnapshotRequest::DoneFlag : 0u) |
+                (jointElectionFenceLeader ? TInstallSnapshotRequest::JointElectionFenceLeader : 0u);
+            request->LeaderId = leaderId;
+            memcpy(request->Data, bytes.data() + offset, count);
+            raft->Process(ITimeSource::Time{}, request);
+            assert_false(leaderEndpoint->Messages.empty());
+            return leaderEndpoint->Messages.back().Cast<TInstallSnapshotResponse>();
+        };
+
+        const auto firstCount = uint32_t(std::min<size_t>(ChunkBytes, bytes.size()));
+        if (bytes.size() > firstCount) {
+            const auto gap = sendChunk(firstCount, 1, 1);
+            assert_false(gap->Success);
+            assert_int_equal(gap->NextOffset, 0);
+            leaderEndpoint->Messages.clear();
+        }
+        const auto accepted = sendChunk(0, firstCount, 2);
+        assert_true(accepted->Success);
+        assert_false(accepted->Installed);
+        assert_int_equal(accepted->NextOffset, firstCount);
+        const auto duplicate = sendChunk(0, firstCount, 2);
+        assert_true(duplicate->Success);
+        assert_false(duplicate->Installed);
+        assert_int_equal(duplicate->NextOffset, firstCount);
+
+        uint64_t offset = firstCount;
+        uint32_t seqno = 3;
+        if (restartPartial) {
+            // Only the durable Raft/application state survives; an incomplete
+            // receive must restart from byte zero after volatile state is lost.
+            processor.reset();
+            raft.reset();
+            application.reset();
+            raft = std::make_shared<TRaft>(state, LearnerId, peers, learners);
+            application = std::make_shared<TSnapshotRsm>();
+            processor = std::make_unique<TRequestProcessor>(raft, application, peers);
+            assert_int_equal(application->LastAppliedIndex, 0);
+            leaderEndpoint->Messages.clear();
+            offset = 0;
+            seqno = 1;
+        }
+
+        while (offset < bytes.size()) {
+            const auto count = uint32_t(std::min<uint64_t>(ChunkBytes, bytes.size() - offset));
+            const auto response = sendChunk(offset, count, seqno++);
+            assert_true(response->Success);
+            assert_int_equal(response->NextOffset, offset + count);
+            assert_int_equal(response->Installed, offset + count == bytes.size());
+            offset += count;
+        }
+        assert_int_equal(state->SnapshotIndex, snapshot.Index);
+        assert_int_equal(state->CommitIndex, snapshot.Index);
+        assert_int_equal(application->LastAppliedIndex, snapshot.Index);
+        assert_true(state->GetSnapshot() && *state->GetSnapshot() == snapshot);
+        assert_false(raft->IsVoter(LearnerId));
+
+        processor.reset();
+        raft.reset();
+        application.reset();
+        raft = std::make_shared<TRaft>(state, LearnerId, peers, learners);
+        application = std::make_shared<TSnapshotRsm>();
+        processor = std::make_unique<TRequestProcessor>(raft, application, peers);
+        processor->ProcessCommitted();
+        auto expectedActiveVoters = snapshot.Voters;
+        if (snapshot.IsJoint()) {
+            expectedActiveVoters.insert(expectedActiveVoters.end(), snapshot.JointVoters.begin(),
+                snapshot.JointVoters.end());
+            std::sort(expectedActiveVoters.begin(), expectedActiveVoters.end());
+            expectedActiveVoters.erase(std::unique(expectedActiveVoters.begin(), expectedActiveVoters.end()),
+                expectedActiveVoters.end());
+        }
+        assert_true(raft->GetVoterIds() == expectedActiveVoters);
+        assert_false(raft->IsVoter(LearnerId));
+        assert_int_equal(application->LastAppliedIndex, snapshot.Index);
     };
 
     auto history = TConfigurationHistory::Stable({1, 2, 3}, 0, 0, 0, 0)
@@ -182,19 +294,29 @@ void test_generated_membership_sets_roundtrip_through_joint_and_stable_snapshots
             history.ConfigurationIndex(), history.ConfigurationTerm(),
             history.OldVoters(), nextVoters};
         history = history.Advance(jointIndex, EncodeConfigurationEntry(joint));
-        const auto jointImage = history.MakeSnapshot("joint/" + std::to_string(transition));
+        const auto jointImage = history.MakeSnapshot(std::to_string(history.ThroughIndex()));
         const auto decodedJoint = DecodeSnapshot(EncodeSnapshot(jointImage));
         assert_true(decodedJoint == jointImage);
         history = TConfigurationHistory::FromJointSnapshot(decodedJoint);
         assert_true(history.IsJoint());
         assert_true(history.NewVoters() == nextVoters);
+        if (transition < 12) {
+            auto peerVoters = decodedJoint.Voters;
+            peerVoters.insert(peerVoters.end(), decodedJoint.JointVoters.begin(),
+                decodedJoint.JointVoters.end());
+            std::sort(peerVoters.begin(), peerVoters.end());
+            peerVoters.erase(std::unique(peerVoters.begin(), peerVoters.end()), peerVoters.end());
+            bootstrapFreshLearner(decodedJoint, peerVoters, peerVoters,
+                decodedJoint.Voters.front(),
+                transition % 2 == 0);
+        }
 
         const auto stableIndex = history.ThroughIndex() + 1;
         TConfigurationRecord stable{EConfigurationPhase::Stable, stableIndex,
             history.ConfigurationIndex(), history.ConfigurationTerm(),
             history.OldVoters(), history.NewVoters()};
         history = history.Advance(stableIndex, EncodeConfigurationEntry(stable));
-        const auto stableImage = history.MakeSnapshot("stable/" + std::to_string(transition));
+        const auto stableImage = history.MakeSnapshot(std::to_string(history.ThroughIndex()));
         const auto decodedStable = DecodeSnapshot(EncodeSnapshot(stableImage));
         assert_true(decodedStable == stableImage);
         history = TConfigurationHistory::FromStableSnapshot(decodedStable);
@@ -202,6 +324,10 @@ void test_generated_membership_sets_roundtrip_through_joint_and_stable_snapshots
         assert_true(history.OldVoters() == nextVoters);
         assert_int_equal(history.ConfigurationIndex(), stableIndex);
         assert_int_equal(history.ConfigurationTransitions().size(), transition + 1);
+        if (transition < 12)
+            bootstrapFreshLearner(decodedStable, decodedStable.Voters, decodedStable.Voters,
+                decodedStable.Voters.front(),
+                transition % 2 != 0);
     }
 }
 void test_configuration_history_rolls_bounded_transition_suffix_and_resumes(void**) {
@@ -5649,7 +5775,7 @@ int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_raft_accepts_full_width_voter_ids),
         cmocka_unit_test(test_configuration_snapshot_projection_and_history_resume),
-        cmocka_unit_test(test_generated_membership_sets_roundtrip_through_joint_and_stable_snapshots),
+        cmocka_unit_test(test_generated_membership_sets_roundtrip_and_bootstrap_from_snapshots),
         cmocka_unit_test(test_configuration_history_rolls_bounded_transition_suffix_and_resumes),
         cmocka_unit_test(test_history_validates_joint_stable_chain_and_independent_rollback),
         cmocka_unit_test(test_configuration_scan_compares_full_configuration_state),
