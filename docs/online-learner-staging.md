@@ -76,20 +76,23 @@ File roles supply the configured bootstrap baseline. Use the replicated joint
 configuration API for voter changes. Raft validates the durable voter binding
 and derives live roles from committed history.
 
-On Linux, you can add learner endpoints or replace a remote address for the
-same node ID while KV is serving. Publish a complete file using an atomic
-rename, then send `SIGHUP` to each replica you want to update. Look for
-`Reloaded peer config` in each process log before checking learner catch-up or
-proposing a voter change. Reload rejects bootstrap role edits, endpoint
-removals, address reassignment across node IDs, and local listener changes.
-Restart a node to change its own listener. Existing cluster membership and
-voter proofs still govern which changes can be committed.
+On Linux, you can add learner endpoints, replace a remote address for the same
+node ID, or remove a remote non-voter while KV is serving. Publish a complete
+file using an atomic rename, then send `SIGHUP` to each replica you want to
+update. Look for `Reloaded peer config` in each process log before checking
+learner catch-up or proposing a voter change. Reload rejects bootstrap role
+edits, removal of an active voter (including either side of a pending joint
+configuration), address reassignment across node IDs, and local listener
+changes. Commit the stable voter configuration without a removed node before
+retiring its endpoint. Restart a node to change its own listener. Endpoint
+reload is local to each process; it does not distribute or persist addresses.
 
 Each process validates the file and creates replacement endpoints before
-applying changes. The server applies endpoints individually. If an endpoint
+applying changes. The server applies endpoint changes individually. If an
 operation fails during application, earlier successful changes can remain in
 effect. Fix the cause and send another `SIGHUP` to reconcile the rest.
-Distribution and signaling are handled by your deployment system.
+Distribution and signaling are handled by your deployment system; the KV
+example does not provide a cluster-wide administrator or rollout coordinator.
 
 Deterministic tests cover live add, snapshot catch-up, voter partitions and strong
 reads, removal and re-addition with delayed append replies, removal during a

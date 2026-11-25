@@ -174,6 +174,19 @@ def main():
                 wait_for(lambda: call(0, b"moved", b"new endpoint")[0] > last[0], 15)
                 wait_for(lambda: call(2, b"moved")[1] == b"new endpoint", 15)
                 reload(learner_catalog(False), "Reloaded peer config (1 endpoint changes)")
+                for index in range(3):
+                    processes[index].terminate()
+                    processes[index].wait(timeout=5)
+                start(0)
+                start(1)
+                wait_for(lambda: call(0, b"moved")[1] == b"new endpoint" and
+                         call(1, b"moved")[1] == b"new endpoint", 15)
+                removed_peer_write = [0]
+                def write_after_peer_retirement():
+                    removed_peer_write[0], _ = call(0, b"retired", b"restart")
+                    return removed_peer_write[0] > 0
+                wait_for(write_after_peer_retirement, 15)
+                wait_for(lambda: call(1, b"retired")[1] == b"restart", 15)
             for log in logs:
                 log.flush(); log.seek(0)
                 output = log.read()

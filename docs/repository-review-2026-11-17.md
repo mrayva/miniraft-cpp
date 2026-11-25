@@ -84,6 +84,10 @@ capacity changes before proposing.
 - Endpoints are provisioned separately on every replica. The readiness report
   exposes missing local targets and proposal capacity, but there is no
   cluster-wide endpoint rollout protocol or automated administrator workflow.
+  The Linux KV example can reload local endpoints with `SIGHUP`, including
+  retiring non-voters after they leave the stable or joint voter set. It rejects
+  active-voter removal and keeps endpoint state local to each process; address
+  distribution, cross-replica coordination and rollout status remain external.
   For newly added voters, leader readiness also requires a successful
   AppendEntries reply to the latest replication request at the current commit
   boundary, plus InstallSnapshot capability.
