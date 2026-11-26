@@ -16,9 +16,14 @@ typename TNode<TSocket>::EQueueClass TNode<TSocket>::QueueClassFor(uint32_t type
 
 template<typename TSocket>
 bool TNode<TSocket>::TryGetMessageTreeBytes(const TMessageHolder<TMessage>& message, uint64_t& bytes) {
-    bytes = message->Len;
+    bytes = message.Capacity;
+    if (message.PayloadCapacity > UINT64_MAX / sizeof(TMessageHolder<TMessage>)) return false;
+    const auto payloadBytes = uint64_t(message.PayloadCapacity) * sizeof(TMessageHolder<TMessage>);
+    if (payloadBytes > UINT64_MAX - bytes) return false;
+    bytes += payloadBytes;
     for (uint32_t i = 0; i < message.PayloadSize; ++i) {
-        const auto childBytes = message.Payload[i]->Len;
+        uint64_t childBytes = 0;
+        if (!TryGetMessageTreeBytes(message.Payload[i], childBytes)) return false;
         if (childBytes > UINT64_MAX - bytes) return false;
         bytes += childBytes;
     }

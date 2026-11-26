@@ -395,6 +395,27 @@ void test_node_send_queue_bounds_data_and_coalesces_raft_retries(void**) {
     assert_true(byteSecond.TrySend(NewHoldedMessage<TCommandResponse>()));
     byteSecond.Retire();
 
+    auto allocationBudget = std::make_shared<TOutboundQueueBudget>(TOutboundQueueLimits{
+        1, sizeof(TCommandResponse)});
+    auto allocationBounded = makeNode();
+    assert_true(allocationBounded.AttachQueueBudget(allocationBudget));
+    auto overallocated = NewHoldedMessage<TCommandResponse>(1024);
+    overallocated->Len = sizeof(TCommandResponse);
+    assert_false(allocationBounded.TrySend(std::move(overallocated)));
+
+    auto batch = NewHoldedMessage<TAppendEntriesRequest>();
+    batch->Nentries = 1;
+    batch.InitPayload(4);
+    batch.PayloadSize = 1;
+    batch.Payload[0] = NewHoldedMessage<TLogEntry>();
+    const auto wireBytes = uint64_t(batch->Len) + batch.Payload[0]->Len;
+    const auto holderBytes = uint64_t(batch.PayloadCapacity) * sizeof(TMessageHolder<TMessage>);
+    auto holderBudget = std::make_shared<TOutboundQueueBudget>(TOutboundQueueLimits{
+        1, wireBytes + holderBytes - 1});
+    auto holderBounded = makeNode();
+    assert_true(holderBounded.AttachQueueBudget(holderBudget));
+    assert_false(holderBounded.TrySend(std::move(batch)));
+
     struct TImmediatePoller {
         NNet::TValueTask<void> Sleep(std::chrono::milliseconds) { co_return; }
     };

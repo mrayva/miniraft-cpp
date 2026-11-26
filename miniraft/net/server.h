@@ -201,6 +201,7 @@ private:
 
 struct TOutboundQueueLimits {
     size_t MaxMessages = 4096;
+    // Bounds retained frame capacity and payload-holder arrays, not wire length alone.
     uint64_t MaxBytes = 256ULL * 1024 * 1024;
 };
 
