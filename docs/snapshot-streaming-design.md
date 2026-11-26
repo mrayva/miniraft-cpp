@@ -9,9 +9,11 @@ of their snapshot sidecars while preserving the payload as a range source after
 restart. Each backend atomically stores the reference with its snapshot
 boundary and retained suffix. Recovery requires the resolver for a nonempty
 external payload and verifies its size and digest before exposing the snapshot.
-The negotiated range path still assembles the complete encoded image at the
-receiver, so it does not remove the image limit. The current snapshot format,
-storage behavior and transfer limits are described in
+Negotiated transfers now keep metadata and payload separate at the receiver,
+using a budgeted heap payload by default or a staged file when configured.
+Legacy chunk transfers still assemble the complete encoded image. Neither path
+removes the 128 MiB image limit. The current snapshot format, storage behavior
+and transfer limits are described in
 [compaction and InstallSnapshot](compaction.md).
 
 ## Current incremental step
@@ -49,15 +51,17 @@ builds retain the in-memory serialized source.
 
 `IStreamingSnapshotWriterRsm` is an alternative for applications that generate
 snapshot bytes incrementally. Raft supplies a sink that checks the
-metadata-adjusted image limit and extends the shared heap lease before each
-append. This path does not require a size bound and avoids constructing a
-separate `SaveSnapshot()` result, but still materializes one complete final
-image in memory. The KV example writes its sorted records directly to this
-sink, avoiding a second complete encoded buffer. Legacy `SaveSnapshot()`
-callbacks without a bound reserve the maximum accepted payload before they run,
-then shrink the lease to retained capacity. This conservative reservation can
-reject capture when less than that amount is available; a declared size bound
-allows a smaller reservation, while the writer interface charges incrementally.
+metadata-adjusted image limit and charges each append to the shared heap lease
+or staging quota. This path does not require a size bound and avoids constructing a
+separate `SaveSnapshot()` result. Without file staging, the sink retains the
+application payload in budgeted heap memory; with file staging, it writes the
+payload to a quota-limited file and retains a source for that file. The KV
+example writes its sorted records directly to this sink, avoiding a second
+complete encoded buffer. Legacy `SaveSnapshot()` callbacks without a bound
+reserve the maximum accepted payload before they run, then shrink the lease to
+retained capacity. This conservative reservation can reject capture when less
+than that amount is available; a declared size bound allows a smaller
+reservation, while the writer interface charges incrementally.
 
 `TSnapshotTransferManifest` represents snapshot metadata, application payload
 length and the existing complete-image checksum separately. Its decoder
@@ -65,10 +69,11 @@ validates the checksum over bounded payload reads and retains the supplied
 immutable source without joining metadata and application bytes into a
 complete encoded image. Peers that negotiate `SnapshotTransferManifest` use
 `INSTALL_SNAPSHOT_RANGE_REQUEST` for distinct metadata, payload and checksum
-phases; peers without the feature retain the existing chunk RPC. The receiver
-maps each validated range into the existing encoded-image installer, preserving
-its membership checks, retry offsets, staging quotas and durable publication.
-It still stages the complete encoded image and enforces the 128 MiB limit.
+phases; peers without the feature retain the existing complete-image chunk RPC.
+The negotiated receiver keeps the manifest and payload in separate buffers or
+sources, then validates and installs the same logical snapshot while preserving
+membership checks, retry offsets, staging quotas and durable publication. Both
+transfer paths still enforce the 128 MiB image limit.
 
 Applications can opt into `IApplicationSnapshotGenerationRsm`. The application
 stages an immutable generation bound to the exact snapshot index, byte count and
@@ -87,12 +92,12 @@ backend can be constructed with a generation resolver to write metadata-only
 snapshot sidecars for nonempty referenced payloads. The resolver is checked
 against the reference before publication and supplies the range source during
 recovery, before Raft construction. Without a resolver, the existing
-full-payload sidecar behavior remains. Every peer still receives the complete
-image in the existing InstallSnapshot format. This reduces local durable
-storage when applications opt in, but does not remove the 128 MiB ceiling or
-introduce wire negotiation. Deterministic tests cover generation publication
-and activation crashes for durable snapshot installation; split-backend crash
-tests cover recovery before and after metadata selection.
+full-payload sidecar behavior remains. Negotiated peers receive metadata,
+payload and checksum in separate ranges; older peers receive complete-image
+chunks. This reduces local durable storage when applications opt in, but does
+not remove the 128 MiB ceiling. Deterministic tests cover generation
+publication and activation crashes for durable snapshot installation;
+split-backend crash tests cover recovery before and after metadata selection.
 
 `IStagedSnapshotRsm` lets an application validate and prepare an installation
 before Raft publishes the durable snapshot, then install that same prepared
@@ -181,8 +186,8 @@ metadata again before decoding and installing the complete snapshot.
 
 ## Why this needs a storage contract
 
-InstallSnapshot sends bounded chunks and can stage the complete encoded image
-on disk before decoding it. `IRsm::SaveSnapshot()` returns
+The legacy InstallSnapshot path sends bounded chunks and can stage the complete
+encoded image on disk before decoding it. `IRsm::SaveSnapshot()` returns
 one `std::string` and `ValidateSnapshot()` receives a complete view. The durable
 backend stores current snapshot bytes in an immutable sidecar; Linux recovery
 validates the mapped image and retains a range source for its application
@@ -270,13 +275,12 @@ generation interfaces now coexist with the existing string callbacks.
 Generation-aware applications publish immutable images before Raft publishes
 the corresponding reference, and activate them after that publication.
 Existing applications keep the current API; peers without size negotiation
-remain limited to 64 MiB. The negotiated range RPC uses separate receiver
-staging only when a Linux staging directory is configured; other receivers
-keep the complete-image compatibility path. The remaining storage work is to
-extend separate-object staging to the default in-memory receiver and define a
-versioned durable payload-generation format whose size limit is independent of
-the current 128 MiB encoded-image cap. Never infer streaming support from the
-peer's ability to read the existing chunk RPC.
+remain limited to 64 MiB. The negotiated range RPC keeps receiver metadata and
+payload separate with either a budgeted heap buffer or a Linux staging file;
+legacy RPCs retain complete-image assembly. The remaining storage work is to
+define a versioned durable payload-generation format whose size limit is
+independent of the current 128 MiB encoded-image cap. Never infer streaming
+support from the peer's ability to read the existing chunk RPC.
 
 Keep a configurable maximum image size, per-transfer temporary-disk quota,
 aggregate in-flight quota, and a cap on retained generations. A digest detects
@@ -297,9 +301,9 @@ commitment.
   stage. No failure may acknowledge an uninstalled snapshot or expose partial
   application state.
 
-The existing complete-image receiver remains the compatibility baseline and
-fallback. Deterministic tests cover negotiated phase selection and range
-assembly in addition to pre-manifest orphan generations and post-manifest
-recovery before activation. The broader transfer, membership and quota
-schedules remain required before separate-object receiver publication replaces
-the complete-image path on every supported backend.
+The complete-image receiver remains the compatibility fallback for peers that
+do not negotiate manifest transfer. Deterministic tests cover negotiated phase
+selection and range assembly in addition to pre-manifest orphan generations and
+post-manifest recovery before activation. Broader transfer, membership and
+quota schedules are still required before relying on separate-object
+installation across every supported backend.
