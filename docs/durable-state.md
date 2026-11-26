@@ -186,13 +186,14 @@ recovery's refusal to adopt temporary images. No independent approval is claimed
 
 ## Limits and assumptions
 
-This implementation rewrites the retained log and manifest on every
-publication, uses memory proportional to the log, and blocks the calling thread
-during sync. Snapshot bytes are written only when a new snapshot is published.
-`AppendBatch` reduces publications for a follower request, including a commit
-advance carried in that request. Individual client proposals and commit-only advances still
-publish separately. There is no WAL or group commit across requests; this remains
-a conservative protocol baseline, not NuRaft-level throughput.
+Ordinary tail appends extend the selected log generation and publish a small
+manifest; suffix replacement, `RemoveLast`, and compaction write a replacement
+log generation. The in-memory state still retains the log, so memory use remains
+proportional to the retained log. Publication blocks the calling thread during
+sync. `AppendBatch` reduces publications for a follower request, including a
+commit advance carried in that request. Individual client proposals and
+commit-only advances still publish separately. There is no WAL or group commit
+across requests; per-operation sync latency remains a throughput limit.
 
 The durability contract assumes Linux, a pre-existing durable parent directory,
 and a local filesystem/storage stack honoring fsync and same-directory atomic

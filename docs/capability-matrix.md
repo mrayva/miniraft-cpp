@@ -61,10 +61,12 @@ design notes. This is a capability summary, not a production-readiness claim.
 - Automatic recovery when a stale store lacks an allowed history anchor, or
   its transition chain is disjoint from the sender's voter lineage.
 - An efficient WAL or cross-request group-commit storage path. `TDurableState`
-  publishes one complete image for each state-changing follower `AppendEntries`
-  request, including suffix replacement and any commit advance carried in that
-  request, but republishes synchronously for individual proposals and commit-only
-  advances.
+  appends ordinary tail records to the selected log generation and publishes a
+  small manifest. Suffix replacement and compaction publish a copy-on-write log
+  generation. A state-changing follower `AppendEntries` request, including any
+  commit advance it carries, is published synchronously as one operation, but
+  individual proposals and commit-only advances still incur separate
+  publications and syncs. There is no batching across requests.
   Legacy `TDiskState` writes append-only follower batches before one log/index
   sync and versioned metadata publication. Conflicting suffix replacements
   write a new entries/index generation and switch the retained prefix,
