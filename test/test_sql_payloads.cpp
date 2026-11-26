@@ -856,6 +856,31 @@ void test_sql_generation_snapshot_recovers_with_raft_manifest(void**) {
             orphanedGeneration = orphan->Reference();
             orphan->Publish();
             assert_false(*orphanedGeneration == *reference);
+
+            // A fresh Raft store has no selected generation, so startup must
+            // reclaim published images left behind by an earlier attempt.
+            TDatabase freshFile;
+            const auto freshRaftPath = freshFile.Path + "-raft";
+            auto freshSql = std::make_shared<TSql>(freshFile.Path, 1);
+            TApplicationSnapshotGenerationResolver freshResolver =
+                [freshSql](const TApplicationSnapshotGenerationReference& reference) {
+                    return freshSql->ResolveSnapshotGeneration(reference);
+                };
+            auto freshState = durable
+                ? std::static_pointer_cast<IState>(std::make_shared<TDurableState>(
+                    freshRaftPath, 1, TDurableState::THook{}, freshResolver))
+                : std::static_pointer_cast<IState>(std::make_shared<TDiskState>(
+                    freshRaftPath, 1, TDiskState::TCommitHook{}, true, freshResolver));
+            assert_false(freshState->GetApplicationSnapshotGenerationReference().has_value());
+            auto unselected = freshSql->PrepareSnapshotGeneration(*snapshot);
+            const auto unselectedReference = unselected->Reference();
+            unselected->Publish();
+            freshSql->ReconcileSnapshotGenerations(
+                freshState->GetApplicationSnapshotGenerationReference());
+            bool unselectedWasReclaimed = false;
+            try { (void)freshSql->ResolveSnapshotGeneration(unselectedReference); }
+            catch (const std::exception&) { unselectedWasReclaimed = true; }
+            assert_true(unselectedWasReclaimed);
         }
 
         // Simulate the application database lagging behind a committed Raft
