@@ -282,6 +282,25 @@ std::shared_ptr<const TSnapshotEncoding> PrepareSnapshotEncoding(
 uint64_t SnapshotEncodingSize(const TSnapshotEncoding& encoding);
 void CopySnapshotEncodingRange(const TSnapshot& snapshot, const TSnapshotEncoding& encoding,
     uint64_t offset, char* destination, size_t length);
+
+// Versioned transfer manifest separates bounded Raft metadata from the
+// immutable application payload source. Checksum retains the complete-image
+// CRC semantics used by the existing snapshot codec.
+struct TSnapshotTransferManifest {
+    static constexpr uint32_t CurrentVersion = 1;
+    uint32_t Version = CurrentVersion;
+    std::string Metadata;
+    uint64_t PayloadBytes = 0;
+    uint32_t Checksum = 0;
+};
+TSnapshotTransferManifest PrepareSnapshotTransferManifest(const TSnapshot& snapshot,
+    size_t maxConfigurationTransitions = TSnapshot::MaxConfigurationTransitions,
+    bool includeMembershipHistory = true);
+// Validates the manifest and payload ranges without joining them into a
+// complete encoded image. The returned snapshot retains the supplied source.
+TSnapshot DecodeSnapshotTransferManifest(const TSnapshotTransferManifest& manifest,
+    std::shared_ptr<const TSnapshotDataSource> payload);
+
 // Validate metadata and size without copying the application image.
 void ValidateSnapshot(const TSnapshot& snapshot);
 // Preserve a trusted stable identity on legacy refresh and validate snapshot

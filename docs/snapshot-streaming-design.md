@@ -58,6 +58,15 @@ then shrink the lease to retained capacity. This conservative reservation can
 reject capture when less than that amount is available; a declared size bound
 allows a smaller reservation, while the writer interface charges incrementally.
 
+`TSnapshotTransferManifest` now represents snapshot metadata, application
+payload length and the existing complete-image checksum separately. Its
+decoder validates the checksum over bounded payload reads and retains the
+supplied immutable source, without joining metadata and application bytes into
+a complete encoded image. This is codec groundwork only: the network sender
+and receiver still use the existing complete-image InstallSnapshot chunks, and
+the 128 MiB image limit remains. Peer negotiation and separate manifest/payload
+RPC phases are still required before transfers use this representation.
+
 Applications can opt into `IApplicationSnapshotGenerationRsm`. The application
 stages an immutable generation bound to the exact snapshot index, byte count and
 SHA-256 digest, durably publishes it before Raft updates storage, and activates

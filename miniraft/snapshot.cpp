@@ -754,6 +754,17 @@ std::shared_ptr<const TSnapshotEncoding> PrepareSnapshotEncoding(
     return encoding;
 }
 
+TSnapshotTransferManifest PrepareSnapshotTransferManifest(const TSnapshot& snapshot,
+        size_t maxConfigurationTransitions, bool includeMembershipHistory) {
+    const auto encoding = PrepareSnapshotEncoding(
+        snapshot, maxConfigurationTransitions, includeMembershipHistory);
+    TSnapshotTransferManifest manifest;
+    manifest.Metadata = encoding->Metadata;
+    manifest.PayloadBytes = snapshot.DataSize();
+    manifest.Checksum = encoding->Checksum;
+    return manifest;
+}
+
 uint64_t SnapshotEncodingSize(const TSnapshotEncoding& encoding) {
     return encoding.TotalBytes;
 }
@@ -826,15 +837,49 @@ private:
 };
 
 TSnapshot DecodeSnapshotImpl(std::string_view bytes, std::string* reusableStorage,
-        std::shared_ptr<const TSnapshotDataSource> image) {
-    if (bytes.size() < 44 || bytes.size() > TSnapshot::MaxBytes)
-        throw std::runtime_error("Invalid snapshot size");
-    if (reusableStorage && bytes.data() != reusableStorage->data())
-        throw std::invalid_argument("Snapshot decode buffer does not match its input");
-    TReader trailer{bytes.substr(bytes.size() - 4)};
-    if (Checksum(bytes.substr(0, bytes.size() - 4)) != trailer.Take(4))
-        throw std::runtime_error("Snapshot checksum mismatch");
-    TReader reader{bytes.substr(0, bytes.size() - 4)};
+        std::shared_ptr<const TSnapshotDataSource> image,
+        const TSnapshotTransferManifest* manifest = nullptr) {
+    if (manifest) {
+        if (manifest->Version != TSnapshotTransferManifest::CurrentVersion)
+            throw std::runtime_error("Unsupported snapshot transfer manifest version");
+        if (bytes.size() > TSnapshot::MaxBytes - 4 ||
+            manifest->PayloadBytes > TSnapshot::MaxBytes - 4 - bytes.size() ||
+            bytes.size() + manifest->PayloadBytes + 4 < 44 ||
+            manifest->PayloadBytes > SIZE_MAX)
+            throw std::runtime_error("Invalid snapshot transfer manifest size");
+        if (manifest->PayloadBytes && !image)
+            throw std::invalid_argument("Missing snapshot transfer payload source");
+        if (image && image->Size() != manifest->PayloadBytes)
+            throw std::invalid_argument("Snapshot transfer payload size does not match its manifest");
+
+        TChecksum checksum;
+        checksum.Update(bytes);
+        std::array<char, 64 * 1024> buffer{};
+        for (uint64_t offset = 0; offset < manifest->PayloadBytes;) {
+            const auto count = size_t(std::min<uint64_t>(buffer.size(), manifest->PayloadBytes - offset));
+            size_t copied = 0;
+            while (copied < count) {
+                const auto read = image->Read(offset + copied,
+                    std::span<char>(buffer.data() + copied, count - copied));
+                if (!read || read > count - copied)
+                    throw std::runtime_error("Cannot verify snapshot transfer payload range");
+                copied += read;
+            }
+            checksum.Update(reinterpret_cast<const uint8_t*>(buffer.data()), count);
+            offset += count;
+        }
+        if (checksum.Finish() != manifest->Checksum)
+            throw std::runtime_error("Snapshot transfer checksum mismatch");
+    } else {
+        if (bytes.size() < 44 || bytes.size() > TSnapshot::MaxBytes)
+            throw std::runtime_error("Invalid snapshot size");
+        if (reusableStorage && bytes.data() != reusableStorage->data())
+            throw std::invalid_argument("Snapshot decode buffer does not match its input");
+        TReader trailer{bytes.substr(bytes.size() - 4)};
+        if (Checksum(bytes.substr(0, bytes.size() - 4)) != trailer.Take(4))
+            throw std::runtime_error("Snapshot checksum mismatch");
+    }
+    TReader reader{manifest ? bytes : bytes.substr(0, bytes.size() - 4)};
     const auto magic = reader.Read(Magic.size());
     const bool jointHistory = magic == JointHistoryMagic || magic == JointExtendedHistoryMagic ||
         magic == JointLargeHistoryMagic;
@@ -905,15 +950,24 @@ TSnapshot DecodeSnapshotImpl(std::string_view bytes, std::string* reusableStorag
         }
     }
     if (joint && !snapshot.IsJoint()) throw std::runtime_error("Empty joint snapshot configuration");
-    if (length > reader.Input.size()) throw std::runtime_error("Invalid snapshot data length");
-    const auto dataOffset = bytes.size() - 4 - reader.Input.size();
-    const auto data = reader.Read(size_t(length));
-    if (!reader.Input.empty()) throw std::runtime_error("Trailing snapshot data");
-    if (image) {
-        if (image->Size() != bytes.size())
-            throw std::invalid_argument("Snapshot image source size does not match its view");
-        snapshot.DataSource = std::make_shared<TSnapshotDataSlice>(
-            std::move(image), dataOffset, length);
+    std::string_view data;
+    size_t dataOffset = 0;
+    if (manifest) {
+        if (length != manifest->PayloadBytes)
+            throw std::runtime_error("Snapshot transfer payload length does not match metadata");
+        if (!reader.Input.empty()) throw std::runtime_error("Trailing snapshot transfer metadata");
+        if (length) snapshot.DataSource = std::move(image);
+    } else {
+        if (length > reader.Input.size()) throw std::runtime_error("Invalid snapshot data length");
+        dataOffset = bytes.size() - 4 - reader.Input.size();
+        data = reader.Read(size_t(length));
+        if (!reader.Input.empty()) throw std::runtime_error("Trailing snapshot data");
+        if (image) {
+            if (image->Size() != bytes.size())
+                throw std::invalid_argument("Snapshot image source size does not match its view");
+            snapshot.DataSource = std::make_shared<TSnapshotDataSlice>(
+                std::move(image), dataOffset, length);
+        }
     }
     Validate(snapshot, size_t(length));
     if (reusableStorage) {
@@ -933,6 +987,11 @@ TSnapshot DecodeSnapshot(std::string_view bytes) {
 
 TSnapshot DecodeSnapshotOwned(std::string&& bytes) {
     return DecodeSnapshotImpl(bytes, &bytes, {});
+}
+
+TSnapshot DecodeSnapshotTransferManifest(const TSnapshotTransferManifest& manifest,
+        std::shared_ptr<const TSnapshotDataSource> payload) {
+    return DecodeSnapshotImpl(manifest.Metadata, nullptr, std::move(payload), &manifest);
 }
 
 TSnapshot DecodeSnapshotBacked(std::string_view bytes,

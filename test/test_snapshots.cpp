@@ -145,6 +145,68 @@ void test_snapshot_encoding_ranges_match_complete_wire_image(void**) {
         });
     }
 }
+struct TManifestPayloadSource final : TSnapshotDataSource {
+    std::string Bytes;
+    size_t MaxReadBytes;
+    TManifestPayloadSource(std::string bytes, size_t maxReadBytes = SIZE_MAX)
+        : Bytes(std::move(bytes)), MaxReadBytes(maxReadBytes) { }
+    uint64_t Size() const override { return Bytes.size(); }
+    size_t Read(uint64_t offset, std::span<char> destination) const override {
+        if (offset >= Bytes.size() || destination.empty()) return 0;
+        const auto count = std::min({destination.size(), MaxReadBytes, Bytes.size() - size_t(offset)});
+        memcpy(destination.data(), Bytes.data() + size_t(offset), count);
+        return count;
+    }
+};
+void test_snapshot_transfer_manifest_separates_metadata_and_payload(void**) {
+    auto stable = Sample();
+    stable.StableConfiguration = true;
+    stable.ConfigurationIndex = 1;
+    stable.ConfigurationTerm = 1;
+    for (auto snapshot : {Sample(), JointSample(), stable}) {
+        const auto payload = snapshot.Data;
+        snapshot.Data.clear();
+        snapshot.DataSource = std::make_shared<TManifestPayloadSource>(payload, 2);
+
+        const auto completeImage = EncodeSnapshot(snapshot);
+        const auto manifest = PrepareSnapshotTransferManifest(snapshot);
+        assert_int_equal(manifest.Version, TSnapshotTransferManifest::CurrentVersion);
+        assert_int_equal(manifest.PayloadBytes, payload.size());
+        assert_true(manifest.Metadata.size() + manifest.PayloadBytes + 4 == completeImage.size());
+        assert_true(manifest.Metadata == completeImage.substr(0,
+            completeImage.size() - payload.size() - 4));
+
+        auto restored = DecodeSnapshotTransferManifest(manifest, snapshot.DataSource);
+        assert_true(restored.Data.empty());
+        assert_non_null(restored.DataSource.get());
+        assert_true(restored == snapshot);
+        assert_true(EncodeSnapshot(restored) == completeImage);
+
+        auto damagedManifest = manifest;
+        damagedManifest.Metadata[0] ^= 1;
+        Reject([&] { DecodeSnapshotTransferManifest(damagedManifest, snapshot.DataSource); });
+
+        auto damagedPayload = std::make_shared<TManifestPayloadSource>(payload, 1);
+        damagedPayload->Bytes[0] ^= 1;
+        Reject([&] { DecodeSnapshotTransferManifest(manifest, damagedPayload); });
+        Reject([&] { DecodeSnapshotTransferManifest(manifest, {}); });
+
+        auto badLength = manifest;
+        --badLength.PayloadBytes;
+        Reject([&] { DecodeSnapshotTransferManifest(badLength, snapshot.DataSource); });
+
+        auto badVersion = manifest;
+        ++badVersion.Version;
+        Reject([&] { DecodeSnapshotTransferManifest(badVersion, snapshot.DataSource); });
+    }
+
+    auto emptyPayload = Sample();
+    emptyPayload.Data.clear();
+    const auto emptyManifest = PrepareSnapshotTransferManifest(emptyPayload);
+    auto restoredEmpty = DecodeSnapshotTransferManifest(emptyManifest, {});
+    assert_int_equal(restoredEmpty.DataSize(), 0);
+    assert_true(restoredEmpty == emptyPayload);
+}
 void test_joint_snapshot_codec_roundtrip_and_corruption(void**) {
     auto fixed = EncodeSnapshot(Sample());
     // Golden v1 image, including the original CRC and embedded NUL byte.
@@ -989,6 +1051,7 @@ int main() {
         cmocka_unit_test(test_raft_binds_custom_snapshot_budget_to_effective_process_root),
         cmocka_unit_test(test_snapshot_codec_roundtrip_and_all_byte_corruption),
         cmocka_unit_test(test_snapshot_encoding_ranges_match_complete_wire_image),
+        cmocka_unit_test(test_snapshot_transfer_manifest_separates_metadata_and_payload),
         cmocka_unit_test(test_joint_snapshot_codec_roundtrip_and_corruption),
         cmocka_unit_test(test_stable_configuration_snapshot_codec_and_runtime_guards),
         cmocka_unit_test(test_transition_lineage_snapshot_codecs_and_stable_identity_guard),
