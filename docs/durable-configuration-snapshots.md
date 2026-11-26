@@ -29,7 +29,11 @@ The manifest may also carry an application-generation ID, byte count and
 digest bound to the snapshot index. That reference is local to the replica and
 is atomically selected with the snapshot sidecar, membership history, commit
 boundary and retained suffix. The sidecar still contains the complete
-application payload in this format.
+application payload when no generation resolver is configured. A
+`TDurableState` constructed with an application-generation resolver can store
+only the snapshot metadata in its sidecar; it resolves and validates the
+referenced payload before Raft startup. `TDiskState` continues to store the
+complete payload.
 
 `ScanCommittedConfigurationHistory` uses the recovered commit index directly
 and requires both durable commit-index support and a persisted original voter

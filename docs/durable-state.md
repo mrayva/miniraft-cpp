@@ -20,19 +20,28 @@ marker[4]. When present, the marker is followed by the application snapshot
 index[8], byte count[8], SHA-256 digest[32], ID length[4] and opaque ID bytes.
 The manifest CRC covers the v8 magic and payload. Stores without an application
 generation write a zero marker. The reference is local to this replica; it is
-not included in the snapshot wire image. Snapshot bytes remain in the Raft
-sidecar in this format. Retained log records live in
+not included in the snapshot wire image. Without a generation resolver, the
+complete snapshot remains in the Raft sidecar. When a resolver is supplied to
+`TDurableState`, a referenced nonempty application payload is omitted from the
+sidecar; the sidecar still contains the complete snapshot boundary and
+membership metadata. Before publishing, the resolver's immutable source is
+checked against the generation byte count and digest. Recovery verifies the
+sidecar, resolves and checks the generation source, and fails closed if the
+required resolver or generation is missing. Retained log records live in
 `NAME.durable.ID.log.GENERATION`.
 Each log image has a 20-byte header containing its magic, generation and header
 CRC, followed by term/flags/length/data records; the manifest's log CRC covers
 all records.
 
-Snapshot bytes live in an immutable sidecar named
-`NAME.durable.ID.snapshot.INDEX.TERM`; ordinary log, term, vote and commit
-updates do not rewrite it. A changed snapshot is written and synced to a
-temporary sidecar, renamed and directory-synced before the manifest references
-it. Tail appends extend and fsync the selected log generation before publishing
-the small manifest. Suffix replacement, `RemoveLast`, and snapshot compaction
+Snapshot sidecars are immutable and named
+`NAME.durable.ID.snapshot.INDEX.TERM`; without a generation resolver they
+contain the encoded snapshot, and with one they contain only snapshot metadata
+when a nonempty application payload is generation-backed. Ordinary log, term,
+vote and commit updates do not rewrite the sidecar. A changed snapshot is
+written and synced to a temporary sidecar, renamed and directory-synced before
+the manifest references it. Tail appends extend and fsync the selected log
+generation before publishing the small manifest. Suffix replacement,
+`RemoveLast`, and snapshot compaction
 write a complete replacement log generation and sync its name before the
 manifest switches to it. The manifest remains the atomic commit point. After it
 is durable, storage removes superseded snapshot and log generations. A crash

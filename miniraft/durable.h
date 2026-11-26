@@ -32,6 +32,9 @@ TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(
 // Linux: atomic hard-state + snapshot + suffix replacement, with file/directory
 // fsync. Snapshot sidecars are immutable between snapshots, so ordinary
 // updates append to the selected log generation and publish a small manifest.
+using TApplicationSnapshotGenerationResolver = std::function<
+    std::shared_ptr<const TSnapshotDataSource>(const TApplicationSnapshotGenerationReference&)>;
+
 class TDurableState : public IState {
 public:
     enum class EStage {
@@ -44,7 +47,12 @@ public:
     // Diagnostics/fault injection. Throwing from this hook during a live
     // operation is fatal, just like an I/O failure.
     using THook = std::function<void(EStage)>;
-    TDurableState(const std::string& name, uint32_t id, THook hook = {});
+    // Supplying a generation resolver enables metadata-only snapshot sidecars
+    // when a published application generation is referenced. The resolver is
+    // called before publication and during recovery, and must return an
+    // immutable range-readable source matching the reference.
+    TDurableState(const std::string& name, uint32_t id, THook hook = {},
+        TApplicationSnapshotGenerationResolver generationResolver = {});
     ~TDurableState() override;
     TDurableState(const TDurableState&) = delete;
     TDurableState& operator=(const TDurableState&) = delete;

@@ -3,10 +3,13 @@
 This design describes the staged work to remove the current 128 MiB
 complete-image limit. The application capture-source API, optional receive
 staging files, and an opt-in durable application-generation reference are
-implemented. Raft atomically stores that reference with its snapshot boundary,
-commit index, membership-bearing snapshot and retained suffix. Replacing the
-complete Raft snapshot payload and wire image with the application generation
-remains open. The current snapshot format, storage behavior and transfer limits are described in
+implemented. `TDurableState` can now use a generation resolver to keep the
+application payload out of its snapshot sidecar while preserving the payload as
+a range source after restart. Raft atomically stores the reference with its
+snapshot boundary, commit index, membership-bearing snapshot and retained
+suffix. `TDiskState` still stores the complete sidecar payload, and all peers
+still transfer the complete image using the existing wire format. The current
+snapshot format, storage behavior and transfer limits are described in
 [compaction and InstallSnapshot](compaction.md).
 
 ## Current incremental step
@@ -36,9 +39,10 @@ Existing applications retain the `SaveSnapshot()` path. On Linux, the SQL
 example backs up into a private temporary database with a bounded SQLite page
 cache and serves ranges from a read-only file descriptor. This avoids a
 full-size `sqlite3_serialize()` allocation and a second complete payload
-allocation during capture. Durable publication still copies ranges into its own
-snapshot generation, and images remain capped at 128 MiB. Non-Linux builds
-retain the in-memory serialized source.
+allocation during capture. `TDiskState` still copies ranges into its snapshot
+generation; `TDurableState` can instead publish only snapshot metadata when
+constructed with an application-generation resolver. Images remain capped at
+128 MiB. Non-Linux builds retain the in-memory serialized source.
 
 `IStreamingSnapshotWriterRsm` is an alternative for applications that generate
 snapshot bytes incrementally. Raft supplies a sink that checks the
@@ -65,14 +69,17 @@ snapshot path.
 
 The durable backends persist this reference in MRFTD008 and MRFTL006 metadata;
 MRFTD001 through MRFTD007 and MRFTL001 through MRFTL005 remain readable. The
-snapshot payload is still stored in the existing Raft sidecar/generation and is
-still sent in the existing complete-image InstallSnapshot format. This step
-therefore establishes identity binding and crash-recoverable activation, but
-does not reduce Raft storage, remove the 128 MiB ceiling, or introduce a new
-wire negotiation. Deterministic tests cover a crash after generation publication
-but before Raft publication, and a crash after Raft publication but before
-activation, on `TDurableState`; both durable backends have generation-reference
-round-trip coverage.
+snapshot payload remains in the `TDiskState` generation. For `TDurableState`,
+passing a generation resolver writes a valid metadata-only snapshot sidecar;
+the resolver is checked against the reference before publication and supplies
+the range source during recovery, before Raft construction. Without a resolver,
+the existing full-payload sidecar behavior remains. Every peer still receives
+the complete image in the existing InstallSnapshot format. This step reduces
+local `TDurableState` storage when applications opt in, but does not remove the
+128 MiB ceiling or introduce wire negotiation. Deterministic tests cover
+generation publication and activation crashes for both local compaction and
+remote installation; storage-size coverage confirms that the durable sidecar
+excludes a 1 MiB application payload.
 
 `IStagedSnapshotRsm` lets an application validate and prepare an installation
 before Raft publishes the durable snapshot, then install that same prepared
@@ -175,17 +182,18 @@ buffer. This avoids the Raft heap copy but still keeps the complete received
 wire image on disk while it is the active in-memory snapshot. Current durable
 sidecars and Linux snapshot generations remain mapped and range-backed after
 restart; older embedded formats and RSMs without the streaming-install contract
-can still materialize payloads. The generation-reference lifecycle is now
-implemented, but the Raft sidecar still contains the full application payload.
-Removing that duplicate payload and recovering it before Raft startup remains
-open.
+can still materialize payloads. The generation-reference lifecycle and
+`TDurableState` sidecar externalization are implemented. The legacy `TDiskState`
+backend still duplicates the complete application payload, and payload bytes
+are still sent over the existing wire protocol. `TDurableState` recovery
+requires a configured generation resolver when its selected sidecar is
+metadata-only.
 
-The generation reference is now published atomically with the snapshot
-boundary, commit index, membership metadata and retained suffix. The remaining
-replacement must let storage construct its snapshot from the referenced
-application generation before Raft startup, and must keep the application
-payload out of the Raft sidecar and wire image. That storage/startup contract is
-needed before the Raft image can stay small while preserving recovery.
+The generation reference is published atomically with the snapshot boundary,
+commit index, membership metadata and retained suffix. The remaining work is to
+apply source-backed storage and the corresponding startup resolver contract to
+`TDiskState`, then define a negotiated wire format that streams application
+generation bytes without embedding them in the Raft image.
 
 ## Proposed lifecycle
 

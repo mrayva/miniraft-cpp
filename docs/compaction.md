@@ -1,8 +1,10 @@
 # Compaction and InstallSnapshot: v0.1.0-alpha.16
 
 The [learner follow-up](learners.md) adds non-voting replication and durable
-voter binding. Current MRFTD008 images persist commit progress and keep snapshot
-bytes in immutable sidecars; readers continue to accept MRFTD001 through
+voter binding. Current MRFTD008 images persist commit progress. Without an
+application-generation resolver, `TDurableState` keeps snapshot bytes in
+immutable sidecars; with a resolver, it can externalize nonempty application
+payloads and keep only snapshot metadata there. Readers continue to accept MRFTD001 through
 MRFTD007 images. The current writer uses MRFTD008.
 
 This milestone adds prefix deletion and follower state transfer to the alpha.15
@@ -18,8 +20,11 @@ entries generation is reclaimed. MRFTL003 and MRFTL004 stores remain readable;
 their old entries file moves into a versioned generation at the next suffix
 replacement or snapshot installation. MRFTL001 through MRFTL005 and 20-byte
 metadata remain readable. MRFTL006 can also persist an optional opaque
-application-generation reference in the same metadata publication; snapshot
-payload bytes remain in the existing sidecar.
+application-generation reference in the same metadata publication;
+`TDiskState` still stores snapshot payload bytes in its sidecar.
+`TDurableState` callers that externalize payloads must configure the generation
+resolver during construction so recovery resolves the referenced immutable
+source before constructing Raft.
 The disk backend writes the encoded snapshot sidecar in 64 KiB ranges, avoiding
 an additional full-size encoded string. Recovery decodes the owned sidecar
 buffer in place, avoiding a second heap allocation for the application payload.

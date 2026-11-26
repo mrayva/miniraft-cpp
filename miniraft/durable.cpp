@@ -310,6 +310,26 @@ private:
 #endif
 }
 
+namespace {
+TSnapshot CopySnapshotMetadata(const TSnapshot& source) {
+    TSnapshot result;
+    result.Index = source.Index;
+    result.Term = source.Term;
+    result.Voters = source.Voters;
+    result.JointVoters = source.JointVoters;
+    result.ConfigurationIndex = source.ConfigurationIndex;
+    result.ConfigurationTerm = source.ConfigurationTerm;
+    result.StableConfiguration = source.StableConfiguration;
+    result.PreviousVoters = source.PreviousVoters;
+    result.PreviousConfigurationIndex = source.PreviousConfigurationIndex;
+    result.PreviousConfigurationTerm = source.PreviousConfigurationTerm;
+    result.PreviousJointIndex = source.PreviousJointIndex;
+    result.PreviousJointTerm = source.PreviousJointTerm;
+    result.ConfigurationTransitions = source.ConfigurationTransitions;
+    return result;
+}
+}
+
 struct TDurableState::TImpl {
     std::vector<TMessageHolder<TLogEntry>> Log;
     uint64_t LogGeneration = 0;
@@ -320,6 +340,7 @@ struct TDurableState::TImpl {
     bool ForceLogGeneration = true;
     std::shared_ptr<const TSnapshot> Snapshot;
     std::optional<TApplicationSnapshotGenerationReference> SnapshotGenerationReference;
+    TApplicationSnapshotGenerationResolver SnapshotGenerationResolver;
     uint64_t PublishedSnapshotBytes = 0;
     TSnapshotDigest PublishedSnapshotDigest{};
     std::string PublishedSnapshotFile;
@@ -336,7 +357,8 @@ struct TDurableState::TImpl {
     void Stage(EStage stage) { if (Hook) Hook(stage); }
 };
 
-TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
+TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook,
+        TApplicationSnapshotGenerationResolver generationResolver)
     : Impl(std::make_unique<TImpl>())
 {
 #ifndef __linux__
@@ -348,6 +370,7 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
     Impl->File = base.filename().string() + ".durable." + std::to_string(id);
     Impl->Temp = Impl->File + ".tmp";
     Impl->Hook = std::move(hook);
+    Impl->SnapshotGenerationResolver = std::move(generationResolver);
     Impl->Directory.Value = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     Require(Impl->Directory.Value >= 0, "open durable directory");
     // Never interpret a legacy store as a fresh node. Migration must be explicit.
@@ -472,8 +495,19 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
             if (snapshot.Index != SnapshotIndex || snapshot.Term != SnapshotTerm || snapshot.Term > CurrentTerm ||
                 (!Impl->Voters.empty() && !SnapshotCompatibleWithVoterBinding(snapshot, Impl->Voters)))
                 throw std::runtime_error("External durable snapshot does not match its manifest");
-            if (Impl->SnapshotGenerationReference)
-                ValidateApplicationSnapshotGenerationReference(*Impl->SnapshotGenerationReference, snapshot);
+            if (Impl->SnapshotGenerationReference) {
+                const auto& reference = *Impl->SnapshotGenerationReference;
+                if (snapshot.DataSize() == 0 && reference.DataBytes > 0) {
+                    if (!Impl->SnapshotGenerationResolver)
+                        throw std::runtime_error(
+                            "Durable snapshot payload is external; a generation resolver is required");
+                    auto source = Impl->SnapshotGenerationResolver(reference);
+                    if (!source)
+                        throw std::runtime_error("Cannot resolve durable application snapshot generation");
+                    snapshot.DataSource = std::move(source);
+                }
+                ValidateApplicationSnapshotGenerationReference(reference, snapshot);
+            }
             LastLogTerm = SnapshotTerm;
             Impl->Snapshot = std::make_shared<const TSnapshot>(std::move(snapshot));
             Impl->PublishedSnapshotFile = snapshotFileName;
@@ -641,7 +675,21 @@ void TDurableState::Publish()
     bool snapshotDirectoryChanged = false;
     bool logDirectoryChanged = false;
     if (Impl->Snapshot && snapshotFile != previousSnapshotFile) {
-        const auto snapshotEncoding = PrepareSnapshotEncoding(*Impl->Snapshot);
+        std::optional<TSnapshot> metadataOnlySnapshot;
+        const TSnapshot* snapshotToPersist = Impl->Snapshot.get();
+        if (Impl->SnapshotGenerationResolver && Impl->SnapshotGenerationReference &&
+            Impl->SnapshotGenerationReference->DataBytes > 0) {
+            const auto& reference = *Impl->SnapshotGenerationReference;
+            auto source = Impl->SnapshotGenerationResolver(reference);
+            if (!source)
+                throw std::runtime_error("Cannot resolve application snapshot generation before publication");
+            auto resolvedSnapshot = CopySnapshotMetadata(*Impl->Snapshot);
+            resolvedSnapshot.DataSource = std::move(source);
+            ValidateApplicationSnapshotGenerationReference(reference, resolvedSnapshot);
+            metadataOnlySnapshot.emplace(CopySnapshotMetadata(*Impl->Snapshot));
+            snapshotToPersist = &*metadataOnlySnapshot;
+        }
+        const auto snapshotEncoding = PrepareSnapshotEncoding(*snapshotToPersist);
         imageBytes = SnapshotEncodingSize(*snapshotEncoding);
         const auto snapshotTemp = snapshotFile + ".tmp";
         TFd snapshot(openat(Impl->Directory.Value, snapshotTemp.c_str(),
@@ -655,7 +703,7 @@ void TDurableState::Publish()
         TSha256DigestBuilder snapshotDigest;
         for (uint64_t offset = 0; offset < imageBytes;) {
             const auto count = size_t(std::min<uint64_t>(chunk.size(), imageBytes - offset));
-            CopySnapshotEncodingRange(*Impl->Snapshot, *snapshotEncoding, offset, chunk.data(), count);
+            CopySnapshotEncodingRange(*snapshotToPersist, *snapshotEncoding, offset, chunk.data(), count);
             snapshotDigest.Update(std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(chunk.data()), count));
             WriteAll(snapshot.Value, chunk.data(), count);
