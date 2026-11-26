@@ -13,6 +13,8 @@
 #include <string_view>
 #include <vector>
 
+#include <miniraft/memory_budget.h>
+
 class TRaft;
 class TSnapshotInstallBudget;
 struct IRsm;
@@ -111,21 +113,35 @@ public:
 
     static constexpr uint64_t DefaultMaxBytes = 256ULL * 1024 * 1024;
 
-    explicit TSnapshotInstallBudget(uint64_t maxBytes = DefaultMaxBytes)
-        : MaxBytes(maxBytes) {
+    explicit TSnapshotInstallBudget(uint64_t maxBytes = DefaultMaxBytes,
+            std::shared_ptr<TProcessMemoryBudget> processBudget = {})
+        : MaxBytes(maxBytes)
+        , ProcessBudget(std::move(processBudget)) {
         if (!MaxBytes) throw std::invalid_argument("Snapshot install budget must be positive");
     }
 
     static std::shared_ptr<TSnapshotInstallBudget> DefaultProcessBudget() {
+        static auto budget = std::make_shared<TSnapshotInstallBudget>(DefaultMaxBytes,
+            TProcessMemoryBudget::DefaultProcessBudget());
+        return budget;
+    }
+
+    // Disk staging has its own quota and does not consume the process heap cap.
+    static std::shared_ptr<TSnapshotInstallBudget> DefaultStagingBudget() {
         static auto budget = std::make_shared<TSnapshotInstallBudget>();
         return budget;
     }
+
+    std::shared_ptr<TProcessMemoryBudget> ProcessMemoryBudget() const { return ProcessBudget; }
 
     std::shared_ptr<TReservation> TryReserveLease(uint64_t bytes) {
         if (!bytes) return {};
         {
             std::lock_guard lock(Mutex);
             if (Used > MaxBytes || bytes > MaxBytes - Used) return {};
+            if (ProcessBudget && !ProcessBudget->TryReplace(
+                    EProcessMemoryCategory::SnapshotHeap, 0, 0, 0, bytes))
+                return {};
             Used += bytes;
         }
         TReservation* lease = nullptr;
@@ -153,6 +169,12 @@ public:
         if (bytes > previous) {
             const auto additional = bytes - previous;
             if (Used > MaxBytes || additional > MaxBytes - Used) return false;
+        }
+        if (ProcessBudget && !ProcessBudget->TryReplace(
+                EProcessMemoryCategory::SnapshotHeap, 0, previous, 0, bytes))
+            return false;
+        if (bytes > previous) {
+            const auto additional = bytes - previous;
             Used += additional;
         } else {
             Used -= previous - bytes;
@@ -172,10 +194,13 @@ private:
     void Release(uint64_t bytes) noexcept {
         std::lock_guard lock(Mutex);
         if (bytes > Used) std::terminate();
+        if (ProcessBudget)
+            ProcessBudget->Release(EProcessMemoryCategory::SnapshotHeap, 0, bytes);
         Used -= bytes;
     }
 
     const uint64_t MaxBytes;
+    const std::shared_ptr<TProcessMemoryBudget> ProcessBudget;
     mutable std::mutex Mutex;
     uint64_t Used = 0;
 };

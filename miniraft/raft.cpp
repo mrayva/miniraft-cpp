@@ -1203,10 +1203,17 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
     , State(std::move(state))
     , LogLimits(logLimits)
     , SnapshotInstallBudget(LogLimits.SnapshotInstallBudget
-        ? LogLimits.SnapshotInstallBudget : TSnapshotInstallBudget::DefaultProcessBudget())
+        ? LogLimits.SnapshotInstallBudget
+        : LogLimits.ProcessMemoryBudget
+            ? std::make_shared<TSnapshotInstallBudget>(TSnapshotInstallBudget::DefaultMaxBytes,
+                LogLimits.ProcessMemoryBudget)
+            : TSnapshotInstallBudget::DefaultProcessBudget())
     , VolatileState(std::make_unique<TVolatileState>())
     , StateName(EState::FOLLOWER)
 {
+    if (LogLimits.ProcessMemoryBudget &&
+        SnapshotInstallBudget->ProcessMemoryBudget() != LogLimits.ProcessMemoryBudget)
+        throw std::invalid_argument("Raft snapshot and transport budgets must share the process memory budget");
     if (!node || !State) throw std::invalid_argument("Raft requires a positive ID and state");
 #ifndef __linux__
     if (!LogLimits.SnapshotStagingDirectory.empty())
@@ -1216,8 +1223,7 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
         if (LogLimits.SnapshotStagingBudget)
             throw std::invalid_argument("Snapshot staging budget requires a staging directory");
     } else if (!LogLimits.SnapshotStagingBudget) {
-        static const auto defaultStagingBudget = std::make_shared<TSnapshotInstallBudget>();
-        LogLimits.SnapshotStagingBudget = defaultStagingBudget;
+        LogLimits.SnapshotStagingBudget = TSnapshotInstallBudget::DefaultStagingBudget();
     } else if (LogLimits.SnapshotStagingBudget == SnapshotInstallBudget) {
         throw std::invalid_argument("Snapshot staging and heap budgets must be separate");
     }

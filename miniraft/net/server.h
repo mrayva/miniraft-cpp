@@ -30,6 +30,7 @@
 
 #include <miniraft/timesource.h>
 #include <miniraft/messages.h>
+#include <miniraft/memory_budget.h>
 #include <miniraft/raft.h>
 
 namespace NNet::TDetail {
@@ -213,17 +214,25 @@ struct TOutboundQueueLimits {
 class TOutboundQueueBudget {
 public:
     explicit TOutboundQueueBudget(TOutboundQueueLimits limits = {},
-            std::shared_ptr<TOutboundQueueBudget> aggregate = {})
+            std::shared_ptr<TOutboundQueueBudget> aggregate = {},
+            std::shared_ptr<TProcessMemoryBudget> processBudget = {})
         : Limits(limits)
-        , Aggregate(std::move(aggregate)) {
+        , Aggregate(std::move(aggregate))
+        , ProcessBudget(std::move(processBudget)) {
         if (Aggregate && Aggregate->Aggregate)
             throw std::invalid_argument("Outbound queue aggregate must be a root budget");
+        if (Aggregate && ProcessBudget)
+            throw std::invalid_argument("Outbound queue budget cannot use two aggregate roots");
     }
 
     ~TOutboundQueueBudget() {
         if (Aggregate) {
             std::lock_guard lock(Mutex);
             Aggregate->Release(UsedMessages, UsedBytes);
+        } else if (ProcessBudget) {
+            std::lock_guard lock(Mutex);
+            ProcessBudget->Release(EProcessMemoryCategory::OutboundQueue,
+                UsedMessages, UsedBytes);
         }
     }
 
@@ -231,8 +240,15 @@ public:
         // Leave room for several servers at their existing per-server defaults
         // while preventing an unbounded multiplication across server instances.
         static auto budget = std::make_shared<TOutboundQueueBudget>(
-            TOutboundQueueLimits{16 * 1024, 512ULL * 1024 * 1024});
+            TOutboundQueueLimits{16 * 1024, 512ULL * 1024 * 1024},
+            std::shared_ptr<TOutboundQueueBudget>{},
+            TProcessMemoryBudget::DefaultProcessBudget());
         return budget;
+    }
+
+    std::shared_ptr<TProcessMemoryBudget> ProcessMemoryBudget() const {
+        if (ProcessBudget) return ProcessBudget;
+        return Aggregate ? Aggregate->ProcessMemoryBudget() : nullptr;
     }
 
     bool TryReplace(size_t oldMessages, uint64_t oldBytes,
@@ -249,6 +265,10 @@ public:
         if (Aggregate && !Aggregate->TryReplace(
                 oldMessages, oldBytes, newMessages, newBytes))
             return false;
+        if (ProcessBudget && !ProcessBudget->TryReplace(
+                EProcessMemoryCategory::OutboundQueue,
+                oldMessages, oldBytes, newMessages, newBytes))
+            return false;
         UsedMessages = retainedMessages + newMessages;
         UsedBytes = retainedBytes + newBytes;
         return true;
@@ -258,6 +278,8 @@ public:
         std::lock_guard lock(Mutex);
         if (messages > UsedMessages || bytes > UsedBytes) std::terminate();
         if (Aggregate) Aggregate->Release(messages, bytes);
+        else if (ProcessBudget)
+            ProcessBudget->Release(EProcessMemoryCategory::OutboundQueue, messages, bytes);
         UsedMessages -= messages;
         UsedBytes -= bytes;
     }
@@ -265,6 +287,7 @@ public:
 private:
     const TOutboundQueueLimits Limits;
     const std::shared_ptr<TOutboundQueueBudget> Aggregate;
+    const std::shared_ptr<TProcessMemoryBudget> ProcessBudget;
     std::mutex Mutex;
     size_t UsedMessages = 0;
     uint64_t UsedBytes = 0;
@@ -301,20 +324,31 @@ class TInboundMessageBudget : public std::enable_shared_from_this<TInboundMessag
 
 public:
     explicit TInboundMessageBudget(TInboundMessageBudgetLimits limits = {},
-            std::shared_ptr<TInboundMessageBudget> aggregate = {})
+            std::shared_ptr<TInboundMessageBudget> aggregate = {},
+            std::shared_ptr<TProcessMemoryBudget> processBudget = {})
         : Limits(limits)
-        , Aggregate(std::move(aggregate)) {
+        , Aggregate(std::move(aggregate))
+        , ProcessBudget(std::move(processBudget)) {
         if (Limits.ConnectionIdleTimeout.count() < 0)
             throw std::invalid_argument("Inbound connection idle timeout cannot be negative");
         if (Aggregate && Aggregate->Aggregate)
             throw std::invalid_argument("Inbound message aggregate must be a root budget");
+        if (Aggregate && ProcessBudget)
+            throw std::invalid_argument("Inbound message budget cannot use two aggregate roots");
     }
 
     static std::shared_ptr<TInboundMessageBudget> DefaultProcessBudget() {
         static auto budget = std::make_shared<TInboundMessageBudget>(
             TInboundMessageBudgetLimits{512ULL * 1024 * 1024, SIZE_MAX,
-                std::chrono::seconds(60)});
+                std::chrono::seconds(60)},
+            std::shared_ptr<TInboundMessageBudget>{},
+            TProcessMemoryBudget::DefaultProcessBudget());
         return budget;
+    }
+
+    std::shared_ptr<TProcessMemoryBudget> ProcessMemoryBudget() const {
+        if (ProcessBudget) return ProcessBudget;
+        return Aggregate ? Aggregate->ProcessMemoryBudget() : nullptr;
     }
 
     std::shared_ptr<void> TryReserveConnection() {
@@ -352,6 +386,9 @@ private:
         if (UsedBytes > Limits.MaxBytes || bytes > Limits.MaxBytes - UsedBytes)
             return false;
         if (Aggregate && !Aggregate->TryReserveBytes(bytes)) return false;
+        if (ProcessBudget && !ProcessBudget->TryReplace(
+                EProcessMemoryCategory::InboundNetwork, 0, 0, 0, bytes))
+            return false;
         UsedBytes += bytes;
         return true;
     }
@@ -367,10 +404,13 @@ private:
         if (bytes > UsedBytes) std::terminate();
         UsedBytes -= bytes;
         if (Aggregate) Aggregate->Release(bytes);
+        else if (ProcessBudget)
+            ProcessBudget->Release(EProcessMemoryCategory::InboundNetwork, 0, bytes);
     }
 
     const TInboundMessageBudgetLimits Limits;
     const std::shared_ptr<TInboundMessageBudget> Aggregate;
+    const std::shared_ptr<TProcessMemoryBudget> ProcessBudget;
     std::mutex Mutex;
     uint64_t UsedBytes = 0;
     size_t ActiveConnections = 0;
@@ -760,7 +800,9 @@ public:
     // derive identity from credentials, not from the message's claimed Src.
     using TPeerIdentityResolver = std::function<std::optional<uint32_t>(const TSocket&)>;
 
-    // Root budgets override the shared 512 MiB outbound and inbound defaults.
+    // A shared process-memory root ties transport and snapshot heap buffers to
+    // one cap. Legacy domain aggregate roots without that root remain valid and
+    // keep their independent category limit.
     TRaftServer(
         typename TSocket::TPoller& poller,
         TSocket socket,
@@ -773,23 +815,39 @@ public:
         TInboundMessageBudgetLimits inboundMessageBudgetLimits = {},
         TPeerIdentityResolver peerIdentityResolver = {},
         std::shared_ptr<TOutboundQueueBudget> processOutboundQueueBudget = {},
-        std::shared_ptr<TInboundMessageBudget> processInboundMessageBudget = {})
+        std::shared_ptr<TInboundMessageBudget> processInboundMessageBudget = {},
+        std::shared_ptr<TProcessMemoryBudget> processMemoryBudget = {})
         : Poller(poller)
         , Socket(std::move(socket))
         , Raft(raft)
         , TimeSource(ts ? ts : std::make_shared<TTimeSource>())
         , WorkerTimeSource(std::make_shared<TCachedTimeSource>(TimeSource))
+        , ProcessMemoryBudget([&] {
+            if (processMemoryBudget) return processMemoryBudget;
+            if (processOutboundQueueBudget)
+                if (auto budget = processOutboundQueueBudget->ProcessMemoryBudget()) return budget;
+            if (processInboundMessageBudget)
+                if (auto budget = processInboundMessageBudget->ProcessMemoryBudget()) return budget;
+            return TProcessMemoryBudget::DefaultProcessBudget();
+        }())
         , OutboundQueueBudget(std::make_shared<TOutboundQueueBudget>(outboundQueueLimits,
-            processOutboundQueueBudget ? std::move(processOutboundQueueBudget)
-                : TOutboundQueueBudget::DefaultProcessBudget()))
+            processOutboundQueueBudget, processOutboundQueueBudget ? nullptr : ProcessMemoryBudget))
         , InboundMessageBudget(std::make_shared<TInboundMessageBudget>(inboundMessageBudgetLimits,
-            processInboundMessageBudget ? std::move(processInboundMessageBudget)
-                : TInboundMessageBudget::DefaultProcessBudget()))
+            processInboundMessageBudget, processInboundMessageBudget ? nullptr : ProcessMemoryBudget))
         , RequestProcessor(std::make_shared<TRequestProcessor>(raft, rsm, nodes,
             admissionLimits, WorkerTimeSource))
         , ResolvePeerIdentity(std::move(peerIdentityResolver))
         , RaftWorker(RaftAccessMutex)
     {
+        const auto outboundMemoryBudget = processOutboundQueueBudget
+            ? processOutboundQueueBudget->ProcessMemoryBudget() : nullptr;
+        const auto inboundMemoryBudget = processInboundMessageBudget
+            ? processInboundMessageBudget->ProcessMemoryBudget() : nullptr;
+        if ((outboundMemoryBudget && outboundMemoryBudget != ProcessMemoryBudget) ||
+            (inboundMemoryBudget && inboundMemoryBudget != ProcessMemoryBudget) ||
+            (processMemoryBudget && processOutboundQueueBudget && !outboundMemoryBudget) ||
+            (processMemoryBudget && processInboundMessageBudget && !inboundMemoryBudget))
+            throw std::invalid_argument("Server budget roots must share its process memory budget");
         try {
             for (const auto& [id, node] : nodes) {
                 if (!Nodes.insert(node).second)
@@ -997,6 +1055,7 @@ private:
     std::shared_ptr<ITimeSource> TimeSource;
     std::shared_ptr<TCachedTimeSource> WorkerTimeSource;
     mutable std::mutex TimeSourceMutex;
+    std::shared_ptr<TProcessMemoryBudget> ProcessMemoryBudget;
     std::shared_ptr<TOutboundQueueBudget> OutboundQueueBudget;
     std::shared_ptr<TInboundMessageBudget> InboundMessageBudget;
     std::shared_ptr<TRequestProcessor> RequestProcessor;

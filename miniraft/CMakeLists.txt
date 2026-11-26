@@ -34,6 +34,7 @@ install(FILES
     state.h
     timesource.h
     quorum.h
+    memory_budget.h
     snapshot.h
     snapshot_codec.h
     idempotency.h

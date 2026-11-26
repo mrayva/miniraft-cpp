@@ -1078,7 +1078,7 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         std::shared_ptr<TApplicationSnapshotSource> retainedSource;
         if (!stagingDirectory.empty()) {
             if (!stagingBudget)
-                stagingBudget = heapBudget ? heapBudget : TSnapshotInstallBudget::DefaultProcessBudget();
+                stagingBudget = TSnapshotInstallBudget::DefaultStagingBudget();
             stagedSource = std::make_shared<TSnapshotCaptureFile>(std::string(stagingDirectory));
         } else {
             retainedSource = std::make_shared<TApplicationSnapshotSource>(source, dataBytes);
@@ -1106,7 +1106,7 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         else snapshot.DataSource = std::move(retainedSource);
     } else if (writerRsm || (!stagingDirectory.empty() && idempotentRsm)) {
         if (!stagingDirectory.empty() && !stagingBudget)
-            stagingBudget = heapBudget ? heapBudget : TSnapshotInstallBudget::DefaultProcessBudget();
+            stagingBudget = TSnapshotInstallBudget::DefaultStagingBudget();
         TCaptureSink sink(heapBudget, stagingBudget, stagingDirectory,
             TSnapshot::MaxBytes - metadataBytes, upperBound);
         if (writerRsm) writerRsm->WriteSnapshot(index, sink);
@@ -1134,7 +1134,7 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
             if (reservation && !heapBudget->TryResize(reservation, retainedBytes))
                 throw std::runtime_error("Captured snapshot exceeds the available heap budget");
             if (!stagingBudget)
-                stagingBudget = heapBudget ? heapBudget : TSnapshotInstallBudget::DefaultProcessBudget();
+                stagingBudget = TSnapshotInstallBudget::DefaultStagingBudget();
             auto stagedSource = std::make_shared<TSnapshotCaptureFile>(std::string(stagingDirectory));
             stagedSource->Append(std::span<const char>(data.data(), data.size()), stagingBudget);
             snapshot.DataSource = std::move(stagedSource);

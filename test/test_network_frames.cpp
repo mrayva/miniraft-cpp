@@ -216,6 +216,66 @@ void test_inbound_budget_is_aggregated_across_servers(void**) {
     auto recoveredFrame = secondServerBudget->TryReserve(400);
     assert_true(bool(recoveredFrame));
 }
+void test_process_memory_budget_is_shared_across_transport_and_snapshot(void**) {
+    TProcessMemoryBudgetLimits limits;
+    limits.MaxBytes = 1024;
+    limits.MaxOutboundQueueBytes = 768;
+    limits.MaxInboundNetworkBytes = 768;
+    limits.MaxSnapshotHeapBytes = 768;
+    limits.ReservedOutboundQueueBytes = 128;
+    limits.ReservedInboundNetworkBytes = 128;
+    limits.ReservedSnapshotHeapBytes = 128;
+    limits.MaxOutboundQueueMessages = 4;
+    auto processBudget = std::make_shared<TProcessMemoryBudget>(limits);
+
+    TOutboundQueueBudget outbound({4, 900}, {}, processBudget);
+    auto inbound = std::make_shared<TInboundMessageBudget>(
+        TInboundMessageBudgetLimits{900, SIZE_MAX, std::chrono::milliseconds::zero()},
+        std::shared_ptr<TInboundMessageBudget>{}, processBudget);
+    auto snapshots = std::make_shared<TSnapshotInstallBudget>(900, processBudget);
+
+    // The other two categories' 128-byte reserves remain available.
+    assert_false(outbound.TryReplace(0, 0, 1, 769));
+    assert_true(outbound.TryReplace(0, 0, 1, 768));
+    auto inboundLease = inbound->TryReserve(128);
+    assert_true(bool(inboundLease));
+    auto snapshotLease = snapshots->TryReserveLease(128);
+    assert_true(bool(snapshotLease));
+    assert_int_equal(processBudget->UsedTotalBytes(), 1024);
+    assert_int_equal(processBudget->UsedBytes(EProcessMemoryCategory::OutboundQueue), 768);
+    assert_int_equal(processBudget->UsedBytes(EProcessMemoryCategory::InboundNetwork), 128);
+    assert_int_equal(processBudget->UsedBytes(EProcessMemoryCategory::SnapshotHeap), 128);
+
+    // A rejected replacement leaves all three accounting domains unchanged.
+    assert_false(outbound.TryReplace(1, 768, 1, 769));
+    assert_int_equal(processBudget->UsedTotalBytes(), 1024);
+    snapshotLease.reset();
+    inboundLease.reset();
+    outbound.Release(1, 768);
+    assert_int_equal(processBudget->UsedTotalBytes(), 0);
+}
+void test_snapshot_resize_local_rejection_does_not_leak_process_charge(void**) {
+    TProcessMemoryBudgetLimits limits;
+    limits.MaxBytes = 4096;
+    limits.MaxOutboundQueueBytes = 2048;
+    limits.MaxInboundNetworkBytes = 2048;
+    limits.MaxSnapshotHeapBytes = 2048;
+    limits.ReservedOutboundQueueBytes = 0;
+    limits.ReservedInboundNetworkBytes = 0;
+    limits.ReservedSnapshotHeapBytes = 0;
+    auto processBudget = std::make_shared<TProcessMemoryBudget>(limits);
+    auto snapshots = std::make_shared<TSnapshotInstallBudget>(128, processBudget);
+    auto lease = snapshots->TryReserveLease(64);
+    assert_true(bool(lease));
+
+    assert_false(snapshots->TryResize(lease, 129));
+    assert_int_equal(snapshots->UsedBytes(), 64);
+    assert_int_equal(processBudget->UsedBytes(EProcessMemoryCategory::SnapshotHeap), 64);
+    assert_int_equal(processBudget->UsedTotalBytes(), 64);
+
+    lease.reset();
+    assert_int_equal(processBudget->UsedTotalBytes(), 0);
+}
 void test_inbound_connection_budget_releases_admission_on_disconnect(void**) {
     auto budget = std::make_shared<TInboundMessageBudget>(
         TInboundMessageBudgetLimits{.MaxBytes = 1024, .MaxConnections = 1});
@@ -405,6 +465,8 @@ int main() {
         cmocka_unit_test(test_aggregate_budget_is_shared_between_entries),
         cmocka_unit_test(test_inbound_frame_budget_is_held_until_all_message_copies_are_released),
         cmocka_unit_test(test_inbound_budget_is_aggregated_across_servers),
+        cmocka_unit_test(test_process_memory_budget_is_shared_across_transport_and_snapshot),
+        cmocka_unit_test(test_snapshot_resize_local_rejection_does_not_leak_process_charge),
         cmocka_unit_test(test_failed_reader_cannot_resume_at_another_frame),
         cmocka_unit_test(test_inbound_connection_budget_releases_admission_on_disconnect),
         cmocka_unit_test(test_idle_inbound_connection_expiry_uses_activity_deadline),

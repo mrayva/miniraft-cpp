@@ -579,6 +579,9 @@ public:
         // Share this separately from SnapshotInstallBudget to limit staged
         // file bytes. Defaults to a separate 256 MiB process-wide budget.
         std::shared_ptr<TSnapshotInstallBudget> SnapshotStagingBudget;
+        // Optional shared cap to use across transport buffers and snapshot heap.
+        // Pass the same root to TRaftServer when overriding the process default.
+        std::shared_ptr<TProcessMemoryBudget> ProcessMemoryBudget;
     };
 
     // Nodes contains every configured replication peer; learners may include
