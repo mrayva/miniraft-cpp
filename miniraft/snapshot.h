@@ -85,10 +85,12 @@ struct TSnapshotConfigurationTransition {
 
 // Versioned application snapshot, shared by local compaction and state transfer.
 struct TSnapshot {
-    // The former limit remains the safe fallback for peers that predate
-    // snapshot-size capability advertisement.
+    // Legacy formats, EncodeSnapshot, and non-owning DecodeSnapshot retain this cap.
     static constexpr size_t LegacyMaxBytes = 64 * 1024 * 1024;
     static constexpr size_t MaxBytes = 128 * 1024 * 1024;
+    // Versioned large-image formats are accepted only by bounded/source-backed
+    // paths; the configured per-node limit may lower this hard ceiling.
+    static constexpr size_t MaxStreamedBytes = 256 * 1024 * 1024;
     static constexpr uint32_t MaxVoters = 4096;
     static constexpr size_t MaxLegacyConfigurationTransitions = 32;
     static constexpr size_t MaxExtendedConfigurationTransitions = 256;

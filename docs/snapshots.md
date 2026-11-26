@@ -62,13 +62,20 @@ The versioned image contains little-endian fields in this order:
 | Application bytes | declared length |
 | CRC32 covering every preceding byte | 4 |
 
-The complete image is capped at 128 MiB and the voter count at 4,096. Decoding
-checks lengths/counts against remaining input before allocation/copying, rejects
-unknown versions and trailing bytes, and validates metadata after CRC verification.
-AppendEntries capability acknowledgements advertise each peer's image limit;
-older peers without that bit are treated as accepting at most 64 MiB. The
-leader's current-term all-voter compaction certificate carries the minimum limit,
-so an image above 64 MiB is compacted only when every active voter accepts it.
+Original formats MRFTS001 through MRFTS011, `EncodeSnapshot()`, and the
+non-owning `DecodeSnapshot()` view are capped at 128 MiB; the voter count is
+capped at 4,096. Versioned formats MRFTS012 through
+MRFTS022 preserve the matching original metadata layouts and CRC, and support
+larger images through bounded storage and manifest-transfer paths up to the
+256 MiB hard limit. The default per-node limit remains 128 MiB; configured
+limits and receive budgets may be lower.
+Decoding checks lengths/counts against remaining input before allocation/copying,
+rejects unknown versions and trailing bytes, and validates metadata after CRC
+verification. AppendEntries capability acknowledgements advertise each peer's
+image limit; older peers without that bit are treated as accepting at most 64
+MiB. Images above 128 MiB also require manifest-transfer support. The leader's
+current-term all-voter compaction certificate carries the minimum limit, so an
+image above 64 MiB is compacted only when every active voter accepts it.
 Learners without that certificate retain the 64 MiB local-compaction limit.
 Older binaries cannot reopen a snapshot larger than 64 MiB, so do not downgrade
 while any node's authoritative snapshot exceeds that legacy limit.

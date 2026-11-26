@@ -57,7 +57,9 @@ bool SnapshotNeedsJointElectionFence(std::string_view prefix) {
     const auto magic = prefix.substr(0, 8);
     return magic == "MRFTS002" || magic == "MRFTS004" || magic == "MRFTS005" ||
         magic == "MRFTS006" || magic == "MRFTS007" || magic == "MRFTS008" ||
-        magic == "MRFTS009" || magic == "MRFTS010" || magic == "MRFTS011";
+        magic == "MRFTS009" || magic == "MRFTS010" || magic == "MRFTS011" ||
+        magic == "MRFTS013" || magic == "MRFTS016" || magic == "MRFTS018" ||
+        magic == "MRFTS020" || magic == "MRFTS022";
 }
 
 uint64_t AllocateForwardingSession() {
@@ -202,6 +204,17 @@ bool IsSupportedSnapshotMagicPrefix(std::string_view prefix) {
     constexpr std::string_view jointExtendedHistory = "MRFTS009";
     constexpr std::string_view stableLargeHistory = "MRFTS010";
     constexpr std::string_view jointLargeHistory = "MRFTS011";
+    constexpr std::string_view streamed = "MRFTS012";
+    constexpr std::string_view streamedJoint = "MRFTS013";
+    constexpr std::string_view streamedStable = "MRFTS014";
+    constexpr std::string_view streamedStableLineage = "MRFTS015";
+    constexpr std::string_view streamedJointLineage = "MRFTS016";
+    constexpr std::string_view streamedStableHistory = "MRFTS017";
+    constexpr std::string_view streamedJointHistory = "MRFTS018";
+    constexpr std::string_view streamedStableExtendedHistory = "MRFTS019";
+    constexpr std::string_view streamedJointExtendedHistory = "MRFTS020";
+    constexpr std::string_view streamedStableLargeHistory = "MRFTS021";
+    constexpr std::string_view streamedJointLargeHistory = "MRFTS022";
     const auto bytes = prefix.substr(0, std::min(prefix.size(), legacy.size()));
     return legacy.substr(0, bytes.size()) == bytes || joint.substr(0, bytes.size()) == bytes ||
         stable.substr(0, bytes.size()) == bytes || stableLineage.substr(0, bytes.size()) == bytes ||
@@ -209,7 +222,16 @@ bool IsSupportedSnapshotMagicPrefix(std::string_view prefix) {
         stableHistory.substr(0, bytes.size()) == bytes || jointHistory.substr(0, bytes.size()) == bytes ||
         stableExtendedHistory.substr(0, bytes.size()) == bytes ||
         jointExtendedHistory.substr(0, bytes.size()) == bytes ||
-        stableLargeHistory.substr(0, bytes.size()) == bytes || jointLargeHistory.substr(0, bytes.size()) == bytes;
+        stableLargeHistory.substr(0, bytes.size()) == bytes || jointLargeHistory.substr(0, bytes.size()) == bytes ||
+        streamed.substr(0, bytes.size()) == bytes || streamedJoint.substr(0, bytes.size()) == bytes ||
+        streamedStable.substr(0, bytes.size()) == bytes || streamedStableLineage.substr(0, bytes.size()) == bytes ||
+        streamedJointLineage.substr(0, bytes.size()) == bytes ||
+        streamedStableHistory.substr(0, bytes.size()) == bytes ||
+        streamedJointHistory.substr(0, bytes.size()) == bytes ||
+        streamedStableExtendedHistory.substr(0, bytes.size()) == bytes ||
+        streamedJointExtendedHistory.substr(0, bytes.size()) == bytes ||
+        streamedStableLargeHistory.substr(0, bytes.size()) == bytes ||
+        streamedJointLargeHistory.substr(0, bytes.size()) == bytes;
 }
 
 bool ReadSnapshotInteger(std::string_view bytes, size_t offset, unsigned width, uint64_t& value) {
@@ -609,17 +631,22 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
         bool allowStaleStoreMembershipRecovery, uint32_t leaderId, uint32_t receiverId) {
     if (prefix.size() < 8) return {false, false, 8};
     const auto magic = prefix.substr(0, 8);
-    const bool stable = magic == "MRFTS003";
-    const bool stableHistory = magic == "MRFTS006" || magic == "MRFTS008" || magic == "MRFTS010";
-    const bool stableLineage = magic == "MRFTS004" || stableHistory;
+    const bool stable = magic == "MRFTS003" || magic == "MRFTS014";
+    const bool stableHistory = magic == "MRFTS006" || magic == "MRFTS008" || magic == "MRFTS010" ||
+        magic == "MRFTS017" || magic == "MRFTS019" || magic == "MRFTS021";
+    const bool stableLineage = magic == "MRFTS004" || magic == "MRFTS015" || stableHistory;
     const bool stableImage = stable || stableLineage;
-    const bool jointHistory = magic == "MRFTS007" || magic == "MRFTS009" || magic == "MRFTS011";
-    const bool jointLineage = magic == "MRFTS005" || jointHistory;
-    const bool joint = magic == "MRFTS002" || jointLineage;
+    const bool jointHistory = magic == "MRFTS007" || magic == "MRFTS009" || magic == "MRFTS011" ||
+        magic == "MRFTS018" || magic == "MRFTS020" || magic == "MRFTS022";
+    const bool jointLineage = magic == "MRFTS005" || magic == "MRFTS016" || jointHistory;
+    const bool joint = magic == "MRFTS002" || magic == "MRFTS013" || jointLineage;
     const bool configurationHistory = stableHistory || jointHistory;
-    const bool extendedHistory = magic == "MRFTS008" || magic == "MRFTS009";
-    const bool largeHistory = magic == "MRFTS010" || magic == "MRFTS011";
-    if (!stableImage && !joint && magic != "MRFTS001") return {true, false, 0};
+    const bool extendedHistory = magic == "MRFTS008" || magic == "MRFTS009" ||
+        magic == "MRFTS019" || magic == "MRFTS020";
+    const bool largeHistory = magic == "MRFTS010" || magic == "MRFTS011" ||
+        magic == "MRFTS021" || magic == "MRFTS022";
+    if (!stableImage && !joint && magic != "MRFTS001" && magic != "MRFTS012")
+        return {true, false, 0};
     const bool freshLearnerBootstrap = allowFreshLearnerBootstrap && (stableImage || joint);
     const bool pendingConfigurationBoundary = pendingConfiguration && committedConfiguration &&
         pendingConfiguration->ConfigurationIndex() > committedConfiguration->ConfigurationIndex() &&
@@ -1254,7 +1281,8 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
     } else if (LogLimits.SnapshotStagingBudget == SnapshotInstallBudget) {
         throw std::invalid_argument("Snapshot staging and heap budgets must be separate");
     }
-    if (!LogLimits.MaxSnapshotImageBytes || LogLimits.MaxSnapshotImageBytes > TSnapshot::MaxBytes)
+    if (!LogLimits.MaxSnapshotImageBytes ||
+        LogLimits.MaxSnapshotImageBytes > TSnapshot::MaxStreamedBytes)
         throw std::invalid_argument("Raft snapshot image limit must be positive and within the format maximum");
     if (!LogLimits.MaxUncommittedBytes || !LogLimits.MaxUncommittedEntries ||
         LogLimits.ReservedControlBytes < sizeof(TLogEntry) || !LogLimits.ReservedControlEntries ||
@@ -1548,8 +1576,10 @@ uint64_t TRaft::LocalSnapshotReceiveLimit(bool splitManifest) const {
     const bool sourceBackedInstall = application &&
         (dynamic_cast<IStreamingSnapshotInstallRsm*>(application.get()) ||
          dynamic_cast<IIdempotentRsm*>(application.get()));
+    const auto formatLimit = splitManifest ? TSnapshot::MaxStreamedBytes : TSnapshot::MaxBytes;
+    const auto imageLimit = std::min<uint64_t>(LogLimits.MaxSnapshotImageBytes, formatLimit);
     if (LogLimits.SnapshotStagingDirectory.empty()) {
-        auto limit = std::min<uint64_t>(LogLimits.MaxSnapshotImageBytes, heapLimit);
+        auto limit = std::min<uint64_t>(imageLimit, heapLimit);
         // A split transfer keeps its received payload alive while a legacy RSM
         // validates or loads a materialized copy. Reserve room for both at
         // admission, otherwise the final range can be accepted but can never
@@ -1562,13 +1592,12 @@ uint64_t TRaft::LocalSnapshotReceiveLimit(bool splitManifest) const {
     const auto stagingLimit = LogLimits.SnapshotStagingBudget
         ? LogLimits.SnapshotStagingBudget->LimitBytes() : heapLimit;
     if (!sourceBackedInstall)
-        return std::min<uint64_t>(LogLimits.MaxSnapshotImageBytes, std::min(heapLimit, stagingLimit));
+        return std::min<uint64_t>(imageLimit, std::min(heapLimit, stagingLimit));
     if (!splitManifest)
-        return std::min<uint64_t>(LogLimits.MaxSnapshotImageBytes, stagingLimit);
-    const auto combinedLimit = stagingLimit >= LogLimits.MaxSnapshotImageBytes -
-            std::min(heapLimit, LogLimits.MaxSnapshotImageBytes)
-        ? LogLimits.MaxSnapshotImageBytes : heapLimit + stagingLimit;
-    return std::min<uint64_t>(LogLimits.MaxSnapshotImageBytes, combinedLimit);
+        return std::min<uint64_t>(imageLimit, stagingLimit);
+    const auto combinedLimit = stagingLimit >= imageLimit - std::min(heapLimit, imageLimit)
+        ? imageLimit : heapLimit + stagingLimit;
+    return std::min<uint64_t>(imageLimit, combinedLimit);
 }
 
 void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntriesRequest> message) {
@@ -1995,11 +2024,11 @@ TMessageHolder<TMessage> NormalizeSnapshotTransferRange(TMessageHolder<TMessage>
     if (range->ManifestVersion != TSnapshotTransferManifest::CurrentVersion ||
         range->Reserved != 0 ||
         (range->Flags & ~TInstallSnapshotRangeRequest::JointElectionFenceLeader) ||
-        range->MetadataBytes == 0 || range->PayloadBytes > TSnapshot::MaxBytes - 4 ||
-        range->MetadataBytes > TSnapshot::MaxBytes - 4 - range->PayloadBytes)
+        range->MetadataBytes == 0 || range->PayloadBytes > TSnapshot::MaxStreamedBytes - 4 ||
+        range->MetadataBytes > TSnapshot::MaxStreamedBytes - 4 - range->PayloadBytes)
         return {};
     const auto totalBytes = range->MetadataBytes + range->PayloadBytes + 4;
-    if (totalBytes < 44 || totalBytes > TSnapshot::MaxBytes) return {};
+    if (totalBytes < 44 || totalBytes > TSnapshot::MaxStreamedBytes) return {};
 
     uint64_t imageOffset = 0;
     switch (TInstallSnapshotRangeRequest::EPhase(range->Phase)) {
@@ -2059,7 +2088,7 @@ void TRaft::Process(ITimeSource::Time now, TMessageHolder<TMessage> message, con
         snapshotTransfer = TSnapshotTransferIdentity{
             range->ManifestVersion, range->MetadataBytes, range->PayloadBytes, range->Checksum};
     }
-    if (!ValidateRpc(message)) return;
+    if (!ValidateRpc(message, snapshotTransfer.has_value())) return;
     if (message.IsEx()) {
         auto messageEx = message.Cast<TMessageEx>();
         const auto type = EMessageType(message->Type);
@@ -2089,7 +2118,7 @@ void TRaft::Process(ITimeSource::Time now, TMessageHolder<TMessage> message, con
     }
 }
 
-bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
+bool TRaft::ValidateRpc(TMessageHolder<TMessage> message, bool manifestTransfer) const {
     if (!message || !message.IsEx()) return false;
     try { ValidateMessageTree(message); } catch (const TMessageError&) { return false; }
     auto header = message.Cast<TMessageEx>();
@@ -2168,7 +2197,8 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
             (request->SnapshotIndex > VolatileState->CommitIndex || request->SnapshotIndex < State->SnapshotIndex ||
                 request->SnapshotTerm == State->LogTerm(request->SnapshotIndex)) &&
             (request->SnapshotIndex >= State->SnapshotIndex || request->SnapshotTerm <= State->SnapshotTerm) &&
-            request->TotalBytes >= 44 && request->TotalBytes <= TSnapshot::MaxBytes &&
+            request->TotalBytes >= 44 && request->TotalBytes <=
+                (manifestTransfer ? TSnapshot::MaxStreamedBytes : TSnapshot::MaxBytes) &&
             request->Offset <= request->TotalBytes && length > 0 && length <= TInstallSnapshotRequest::MaxChunkBytes &&
             length <= request->TotalBytes - request->Offset &&
             bool(done) == (request->Offset + length == request->TotalBytes);
@@ -2221,7 +2251,7 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
     case EMessageType::INSTALL_SNAPSHOT_RESPONSE: {
         auto response = message.Cast<TInstallSnapshotResponse>();
         return response->SnapshotIndex > 0 && response->SnapshotIndex <= maxIndex &&
-            response->NextOffset <= TSnapshot::MaxBytes && response->Success <= 1 && response->Installed <= 1 &&
+            response->NextOffset <= TSnapshot::MaxStreamedBytes && response->Success <= 1 && response->Installed <= 1 &&
             (!response->Installed || response->Success) && (response->Success || response->NextOffset == 0);
     }
     case EMessageType::TIMEOUT_NOW_REQUEST: {
@@ -2252,8 +2282,11 @@ bool TRaft::ValidateRpc(TMessageHolder<TMessage> message) const {
         const auto certifiedSnapshotLimit = encodedSnapshotLimit
             ? uint64_t(encodedSnapshotLimit) * TAppendEntriesResponse::SnapshotSizeUnitBytes
             : uint64_t(TSnapshot::LegacyMaxBytes);
+        const auto sourceNode = Nodes.find(header->Src);
+        const bool sourceSupportsManifest = sourceNode != Nodes.end() && sourceNode->second &&
+            sourceNode->second->SupportsSnapshotTransferManifest();
         return header->Term == State->CurrentTerm && request->LeaderId == header->Src &&
-            certifiedSnapshotLimit <= TSnapshot::MaxBytes &&
+            certifiedSnapshotLimit <= LocalSnapshotReceiveLimit(sourceSupportsManifest) &&
             request->ConfigurationIndex <= maxIndex &&
             request->ConfigurationTerm <= header->Term &&
             ((request->ConfigurationIndex == 0) == (request->ConfigurationTerm == 0));
@@ -3150,7 +3183,15 @@ void TRaft::MaybeDistributeConfigurationBarrier(ITimeSource::Time now) {
             !capability->second.InstallSnapshot ||
             !capability->second.ApplicationSnapshotInstall ||
             capability->second.AppendAckSeqno != lastSent->second) return;
-        maxSnapshotBytes = std::min(maxSnapshotBytes, capability->second.MaxSnapshotBytes);
+        const auto peer = Nodes.find(voter);
+        // The receive budget is directional. A peer can advertise room for
+        // streamed images because this leader can send manifests to it, while
+        // this leader may still lack manifest support on the reverse route.
+        const auto formatLimit = peer != Nodes.end() && peer->second &&
+            peer->second->SupportsSnapshotTransferManifest()
+            ? TSnapshot::MaxStreamedBytes : TSnapshot::MaxBytes;
+        maxSnapshotBytes = std::min(maxSnapshotBytes,
+            std::min(capability->second.MaxSnapshotBytes, formatLimit));
     }
 
     if (VolatileState->CompactionSafeMaxSnapshotBytes != maxSnapshotBytes) {
@@ -3542,14 +3583,15 @@ TMessageHolder<TMessage> TRaft::CreateInstallSnapshot(uint32_t nodeId) {
     // start a separate transfer of the newest image.
     const auto& snapshot = rpc.Snapshot;
     const auto totalBytes = SnapshotEncodingSize(*rpc.Encoding);
-    if (totalBytes > maxSnapshotBytes) {
+    const auto node = Nodes.find(nodeId);
+    const bool useManifestProtocol = node != Nodes.end() && node->second &&
+        node->second->SupportsSnapshotTransferManifest();
+    if (totalBytes > maxSnapshotBytes ||
+        (totalBytes > TSnapshot::MaxBytes && !useManifestProtocol)) {
         VolatileState->SnapshotRpcs.erase(nodeId);
         return {};
     }
     if (rpc.Offset >= totalBytes) return {};
-    const auto node = Nodes.find(nodeId);
-    const bool useManifestProtocol = node != Nodes.end() && node->second &&
-        node->second->SupportsSnapshotTransferManifest();
     const auto metadataBytes = uint64_t(rpc.Manifest.Metadata.size());
     const auto payloadEnd = metadataBytes + rpc.Manifest.PayloadBytes;
     auto phase = TInstallSnapshotRangeRequest::EPhase::Metadata;

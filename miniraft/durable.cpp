@@ -278,7 +278,8 @@ public:
     explicit TReadOnlyMap(int fd) {
         struct stat info;
         Require(fstat(fd, &info) == 0, "stat durable state");
-        if (!S_ISREG(info.st_mode) || info.st_size < 20 || uint64_t(info.st_size) > SIZE_MAX)
+        if (!S_ISREG(info.st_mode) || info.st_size < 20 ||
+            uint64_t(info.st_size) > TSnapshot::MaxStreamedBytes || uint64_t(info.st_size) > SIZE_MAX)
             throw std::runtime_error("Invalid durable state file size/type");
         SizeBytes = size_t(info.st_size);
         Address = mmap(nullptr, SizeBytes, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -426,7 +427,7 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook,
             expectedBytes = Take(bytes, position, 8);
             for (auto& byte : expectedDigest) byte = Take(bytes, position, 1);
             if ((!SnapshotIndex && (expectedBytes || expectedDigest != TSnapshotDigest{})) ||
-                (SnapshotIndex && (!expectedBytes || expectedBytes > TSnapshot::MaxBytes)))
+                (SnapshotIndex && (!expectedBytes || expectedBytes > TSnapshot::MaxStreamedBytes)))
                 throw std::runtime_error("Invalid durable snapshot identity");
         }
         if (externalLog) {
@@ -463,7 +464,7 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook,
             Require(snapshotFile.Value >= 0, "open external durable snapshot");
             auto snapshotMap = std::make_shared<TReadOnlyMap>(snapshotFile.Value);
             const auto snapshotBytes = snapshotMap->Bytes();
-            if (snapshotBytes.size() > TSnapshot::MaxBytes)
+            if (snapshotBytes.size() > TSnapshot::MaxStreamedBytes)
                 throw std::runtime_error("External durable snapshot exceeds size limit");
             const std::string_view image(reinterpret_cast<const char*>(snapshotBytes.data()), snapshotBytes.size());
             if (boundSnapshot && image.size() != expectedBytes)

@@ -624,8 +624,8 @@ public:
         // process default. Pass this same root to TRaftServer when overriding
         // the default; configure its category limit to raise the snapshot cap.
         std::shared_ptr<TProcessMemoryBudget> ProcessMemoryBudget;
-        // Per-node snapshot image ceiling. This may lower the protocol maximum,
-        // but cannot raise it until the snapshot format and storage limits change.
+        // Per-node snapshot image ceiling. A value above MaxBytes enables the
+        // versioned streamed-image formats up to MaxStreamedBytes.
         uint64_t MaxSnapshotImageBytes = TSnapshot::MaxBytes;
     };
 
@@ -825,7 +825,7 @@ private:
     ITimeSource::Time MakeElection(ITimeSource::Time now);
     uint64_t NextSeqno();
     void AdvanceTerm(ITimeSource::Time now, uint64_t term, bool preserveIncomingSnapshot = false);
-    bool ValidateRpc(TMessageHolder<TMessage> message) const;
+    bool ValidateRpc(TMessageHolder<TMessage> message, bool manifestTransfer = false) const;
     bool ValidateAppendConfiguration(TMessageHolder<TAppendEntriesRequest> message) const;
     void RequireLiveConfigurationStorage() const;
     void RefreshConfiguration(uint64_t commitIndex);

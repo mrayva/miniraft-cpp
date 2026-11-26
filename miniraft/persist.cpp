@@ -380,7 +380,7 @@ public:
         try {
             struct stat info{};
             if (fstat(file, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 44 ||
-                uint64_t(info.st_size) > TSnapshot::MaxBytes || uint64_t(info.st_size) > SIZE_MAX)
+                uint64_t(info.st_size) > TSnapshot::MaxStreamedBytes || uint64_t(info.st_size) > SIZE_MAX)
                 throw std::runtime_error("Invalid Raft snapshot file type or size: " + path);
             const auto size = size_t(info.st_size);
             void* mapping = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, file, 0);
@@ -547,7 +547,7 @@ TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitH
             if (!snapshotFile) throw std::runtime_error("Cannot open Raft snapshot: " + SnapshotFilePath);
             snapshotFile.seekg(0, std::ios::end);
             const auto snapshotSize = static_cast<std::streamoff>(snapshotFile.tellg());
-            if (snapshotSize < 44 || snapshotSize > std::streamoff(TSnapshot::MaxBytes))
+            if (snapshotSize < 44 || snapshotSize > std::streamoff(TSnapshot::MaxStreamedBytes))
                 throw std::runtime_error("Invalid Raft snapshot file size: " + SnapshotFilePath);
             std::string encodedSnapshot(size_t(snapshotSize), '\0');
             snapshotFile.seekg(0);

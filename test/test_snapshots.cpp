@@ -2,6 +2,7 @@
 #include <miniraft/snapshot_codec.h>
 #include <miniraft/raft.h>
 #include <miniraft/durable.h>
+#include <miniraft/persist.h>
 #include "durable_snapshot_fixture.h"
 #include "../examples/kv.h"
 #include "../examples/kv_messages.h"
@@ -926,6 +927,95 @@ void test_joint_snapshot_export_and_durable_roundtrip_but_runtime_rejects(void**
     std::ifstream after(path, std::ios::binary);
     assert_true(std::string(std::istreambuf_iterator<char>(after), {}) == bytes);
 }
+void test_streamed_snapshot_format_above_complete_image_limit_roundtrips(void**) {
+    struct TConstantSource final : TSnapshotDataSource {
+        uint64_t Bytes;
+        explicit TConstantSource(uint64_t bytes) : Bytes(bytes) { }
+        uint64_t Size() const override { return Bytes; }
+        size_t Read(uint64_t offset, std::span<char> destination) const override {
+            if (offset >= Bytes || destination.empty()) return 0;
+            const auto count = size_t(std::min<uint64_t>(destination.size(), Bytes - offset));
+            memset(destination.data(), 's', count);
+            return count;
+        }
+    };
+
+    TSnapshot snapshot;
+    snapshot.Index = 1;
+    snapshot.Term = 1;
+    snapshot.Voters = {1};
+    snapshot.DataSource = std::make_shared<TConstantSource>(TSnapshot::MaxBytes + 1);
+    const auto manifest = PrepareSnapshotTransferManifest(snapshot);
+    assert_true(manifest.Metadata.substr(0, 8) == "MRFTS012");
+    const auto totalBytes = manifest.Metadata.size() + manifest.PayloadBytes + 4;
+    assert_true(totalBytes > TSnapshot::MaxBytes);
+    assert_true(totalBytes <= TSnapshot::MaxStreamedBytes);
+    auto transferred = DecodeSnapshotTransferManifest(manifest, snapshot.DataSource);
+    assert_true(transferred.DataSize() == snapshot.DataSize());
+    std::array<char, 1> byte{};
+    assert_int_equal(transferred.ReadDataRange(0, byte), 1);
+    assert_int_equal(byte[0], 's');
+    assert_int_equal(transferred.ReadDataRange(transferred.DataSize() - 1, byte), 1);
+    assert_int_equal(byte[0], 's');
+    Reject([&] { EncodeSnapshot(snapshot); });
+
+    TFiles files;
+    TSnapshotStore store(files.Name, 1);
+    store.Save(snapshot);
+    auto loaded = store.Load();
+    assert_true(loaded.has_value());
+    assert_int_equal(loaded->Index, snapshot.Index);
+    assert_true(loaded->DataSize() == snapshot.DataSize());
+    assert_true(bool(loaded->DataSource));
+    assert_int_equal(loaded->ReadDataRange(loaded->DataSize() - 1, byte), 1);
+    assert_int_equal(byte[0], 's');
+}
+void test_disk_backends_recover_versioned_large_snapshots(void**) {
+    struct TConstantSource final : TSnapshotDataSource {
+        uint64_t Bytes;
+        explicit TConstantSource(uint64_t bytes) : Bytes(bytes) { }
+        uint64_t Size() const override { return Bytes; }
+        size_t Read(uint64_t offset, std::span<char> destination) const override {
+            if (offset >= Bytes || destination.empty()) return 0;
+            const auto count = size_t(std::min<uint64_t>(destination.size(), Bytes - offset));
+            memset(destination.data(), 'd', count);
+            return count;
+        }
+    };
+    TSnapshot snapshot;
+    snapshot.Index = 1;
+    snapshot.Term = 1;
+    snapshot.Voters = {1};
+    snapshot.DataSource = std::make_shared<TConstantSource>(TSnapshot::MaxBytes + 1);
+    std::array<char, 1> byte{};
+
+    {
+        TFiles files;
+        {
+            TDurableState state(files.Name, 1);
+            state.InstallSnapshot(snapshot);
+        }
+        TDurableState recovered(files.Name, 1);
+        const auto loaded = recovered.GetSnapshot();
+        assert_true(bool(loaded && loaded->DataSource));
+        assert_true(loaded->DataSize() == snapshot.DataSize());
+        assert_int_equal(loaded->ReadDataRange(loaded->DataSize() - 1, byte), 1);
+        assert_int_equal(byte[0], 'd');
+    }
+    {
+        TFiles files;
+        {
+            TDiskState state(files.Name, 1);
+            state.InstallSnapshot(snapshot);
+        }
+        TDiskState recovered(files.Name, 1);
+        const auto loaded = recovered.GetSnapshot();
+        assert_true(bool(loaded && loaded->DataSource));
+        assert_true(loaded->DataSize() == snapshot.DataSize());
+        assert_int_equal(loaded->ReadDataRange(loaded->DataSize() - 1, byte), 1);
+        assert_int_equal(byte[0], 'd');
+    }
+}
 void test_snapshot_store_rejects_oversized_files_and_temp_symlinks(void**) {
     TFiles files;
     TSnapshotStore store(files.Name, 1);
@@ -934,9 +1024,9 @@ void test_snapshot_store_rejects_oversized_files_and_temp_symlinks(void**) {
     std::filesystem::create_symlink(files.Image(), files.Image() + ".tmp");
     Reject([&] { store.Save(Sample()); });
     assert_true(store.Load() == saved);
-    std::filesystem::resize_file(files.Image(), TSnapshot::MaxBytes + 1);
+    std::filesystem::resize_file(files.Image(), TSnapshot::MaxStreamedBytes + 1);
     Reject([&] { store.Load(); });
-    assert_true(std::filesystem::file_size(files.Image()) == TSnapshot::MaxBytes + 1);
+    assert_true(std::filesystem::file_size(files.Image()) == TSnapshot::MaxStreamedBytes + 1);
 }
 void test_snapshot_store_roundtrip_lock_and_corrupt_recovery(void**) {
     TFiles files;
@@ -1075,6 +1165,8 @@ int main() {
         cmocka_unit_test(test_stable_configuration_snapshot_durable_runtime_recovery_and_compaction),
         cmocka_unit_test(test_unbound_durable_configuration_snapshot_recovery_fails_closed),
         cmocka_unit_test(test_joint_snapshot_export_and_durable_roundtrip_but_runtime_rejects),
+        cmocka_unit_test(test_streamed_snapshot_format_above_complete_image_limit_roundtrips),
+        cmocka_unit_test(test_disk_backends_recover_versioned_large_snapshots),
         cmocka_unit_test(test_snapshot_store_rejects_oversized_files_and_temp_symlinks),
         cmocka_unit_test(test_snapshot_store_roundtrip_lock_and_corrupt_recovery),
         cmocka_unit_test(test_snapshot_crash_at_each_publication_boundary),

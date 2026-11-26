@@ -30,7 +30,12 @@ complete snapshot payload.
 The disk backend writes the encoded snapshot sidecar in 64 KiB ranges, avoiding
 an additional full-size encoded string. Recovery decodes the owned sidecar
 buffer in place, avoiding a second heap allocation for the application payload.
-Snapshot capture and InstallSnapshot support complete images up to 128 MiB.
+Streaming capture and the negotiated manifest InstallSnapshot path support
+versioned images up to 256 MiB, subject to the configured per-node limit and
+resource budgets. Original formats, `EncodeSnapshot()`, the non-owning
+`DecodeSnapshot()` view, and legacy chunk RPCs remain capped at 128 MiB. Images
+above 128 MiB require manifest-transfer support.
+The default per-node limit remains 128 MiB; raising it is opt-in.
 Peers that do not advertise the snapshot-size capability remain limited to
 64 MiB; the leader includes the minimum active-voter limit in its configuration
 barrier before allowing compaction. Learners without that all-voter certificate
@@ -143,7 +148,9 @@ still need to acknowledge the committed configuration, remote active voters
 whose storage or application restore support is unknown, and whether the local
 RSM can restore snapshots. The leader blocks compaction until every active
 voter advertises both installation capabilities; its barrier carries an
-application-restore certificate as well as the size limit. A follower accepts
+application-restore certificate as well as the size limit. The leader clamps
+each voter's advertised receive budget to 128 MiB when that peer connection
+lacks manifest-transfer support. A follower accepts
 that certificate only in the Raft term in which it arrived; after a term
 change, the current leader must establish it again. The barrier also covers the
 fixed initial voter set with configuration index zero. A ready result still
@@ -156,10 +163,14 @@ The previously reserved message types 6/7 now carry InstallSnapshot requests and
 responses. A request identifies leader/term, boundary index/term, total image size,
 offset and final-chunk flag. Responses carry the boundary, next offset, success
 and an explicit Installed flag. Seqno correlates acknowledgements to the active
-per-peer RPC. Frames are capped at a 64 KiB body before allocation; complete
-images remain bounded at 128 MiB with at most 4,096 fixed voters. The existing
-AppendEntries response padding carries the receiver's limit in 64 KiB units. A
-peer without the negotiation bit is treated as a 64 MiB receiver.
+per-peer RPC. Frames are capped at a 64 KiB body before allocation; versioned
+manifest transfers support images up to 256 MiB with at most 4,096 fixed
+voters. Original formats, `EncodeSnapshot()`, the non-owning
+`DecodeSnapshot()` view and legacy chunk RPCs remain capped at 128 MiB. The
+existing AppendEntries response padding carries the receiver's limit
+in 64 KiB units. A peer without the negotiation bit is treated as a 64 MiB
+receiver; peers without manifest-transfer support cannot receive images above
+128 MiB.
 
 Leaders use stop-and-wait chunks when NextIndex is at or below their compacted
 boundary. Offset and RPC context survive retries within the leadership term;

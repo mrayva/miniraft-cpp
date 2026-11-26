@@ -93,6 +93,28 @@ struct TStreamingInstallApplication : TApplication, IStreamingSnapshotInstallRsm
         return std::make_unique<TInstallation>(*this, std::move(bytes), index);
     }
 };
+struct TLargeStreamingInstallApplication : TApplication, IStreamingSnapshotInstallRsm {
+    struct TInstallation final : IStagedSnapshotInstallation {
+        TLargeStreamingInstallApplication& Application;
+        uint64_t Index;
+        TInstallation(TLargeStreamingInstallApplication& application, uint64_t index)
+            : Application(application), Index(index) { }
+        void Install() override { Application.LastAppliedIndex = Index; }
+    };
+    uint64_t ExpectedBytes = 0;
+    size_t Preparations = 0;
+    std::unique_ptr<IStagedSnapshotInstallation> PrepareSnapshotInstallation(
+            const TSnapshotDataSource& source, uint64_t index) override {
+        ++Preparations;
+        if (source.Size() != ExpectedBytes || !source.Size())
+            throw std::runtime_error("Unexpected large streamed snapshot size");
+        std::array<char, 1> first{}, last{};
+        if (source.Read(0, first) != 1 || source.Read(source.Size() - 1, last) != 1 ||
+            first[0] != 's' || last[0] != 's')
+            throw std::runtime_error("Large streamed snapshot source failed range validation");
+        return std::make_unique<TInstallation>(*this, index);
+    }
+};
 struct TCollectingSnapshotSink : ISnapshotSink {
     std::string Data;
     void Write(std::span<const char> bytes) override {
@@ -1820,19 +1842,30 @@ struct TCluster {
     std::set<uint32_t> Isolated;
     std::vector<uint32_t> Learners;
     bool ManifestTransfer = false;
+    bool AsymmetricManifest = false;
+    uint64_t MaxSnapshotImageBytes = TSnapshot::MaxBytes;
+    std::string SnapshotStagingDirectory;
     explicit TCluster(std::vector<uint32_t> learners = {}, uint32_t nodeCount = 3,
-            bool manifestTransfer = false)
+            bool manifestTransfer = false, uint64_t maxSnapshotImageBytes = TSnapshot::MaxBytes,
+            std::string snapshotStagingDirectory = {}, bool asymmetricManifest = false)
         : NodeCount(nodeCount), Nodes(nodeCount), Apps(nodeCount), Processors(nodeCount),
-          Learners(std::move(learners)), ManifestTransfer(manifestTransfer) {
+          Learners(std::move(learners)), ManifestTransfer(manifestTransfer),
+          AsymmetricManifest(asymmetricManifest), MaxSnapshotImageBytes(maxSnapshotImageBytes),
+          SnapshotStagingDirectory(std::move(snapshotStagingDirectory)) {
         for (uint32_t id = 1; id <= NodeCount; ++id) Build(id, std::make_shared<TState>());
     }
     void Build(uint32_t id, std::shared_ptr<IState> state) {
         TNodeDict peers;
-        for (uint32_t dst = 1; dst <= NodeCount; ++dst) if (dst != id)
+        for (uint32_t dst = 1; dst <= NodeCount; ++dst) if (dst != id) {
+            const bool manifestTransfer = AsymmetricManifest ? dst == 1 : ManifestTransfer;
             peers[dst] = std::make_shared<TEndpoint>(
-                [this](auto message) { Packets.push_back(std::move(message)); }, ManifestTransfer);
+                [this](auto message) { Packets.push_back(std::move(message)); }, manifestTransfer);
+        }
         Processors[id - 1].reset();
-        Nodes[id - 1] = std::make_shared<TRaft>(state, id, peers, Learners);
+        TRaft::TLogLimits limits;
+        limits.MaxSnapshotImageBytes = MaxSnapshotImageBytes;
+        limits.SnapshotStagingDirectory = SnapshotStagingDirectory;
+        Nodes[id - 1] = std::make_shared<TRaft>(state, id, peers, Learners, limits);
         Apps[id - 1] = std::make_shared<TApplication>();
         Processors[id - 1] = std::make_unique<TRequestProcessor>(Nodes[id - 1], Apps[id - 1], peers);
     }
@@ -2065,6 +2098,24 @@ void test_snapshot_size_negotiation_keeps_legacy_fallback_and_certifies_voter_li
     cluster.Deliver(currentPeerBarrier);
     assert_int_equal(cluster.Nodes[1]->GetVolatileState()->CompactionSafeMaxSnapshotBytes, legacyLimit);
     assert_int_equal(cluster.Nodes[2]->GetVolatileState()->CompactionSafeMaxSnapshotBytes, legacyLimit);
+}
+void test_configuration_barrier_respects_each_voters_manifest_capability(void**) {
+    // The follower can accept a 256 MiB manifest from this leader, so its
+    // response advertises that budget. The leader cannot send manifests to
+    // this follower, though, and must certify only the legacy 128 MiB limit.
+    TCluster cluster({}, 3, false, TSnapshot::MaxStreamedBytes,
+        std::filesystem::temp_directory_path().string(), true);
+    cluster.Elect(1);
+    cluster.Pump(1);
+
+    assert_int_equal(cluster.Nodes[0]->GetVolatileState()->PeerCapabilities.at(2).MaxSnapshotBytes,
+        TSnapshot::MaxStreamedBytes);
+    assert_int_equal(cluster.Nodes[0]->GetVolatileState()->PeerCapabilities.at(3).MaxSnapshotBytes,
+        TSnapshot::MaxStreamedBytes);
+    assert_int_equal(cluster.Nodes[1]->GetVolatileState()->CompactionSafeMaxSnapshotBytes,
+        TSnapshot::MaxBytes);
+    assert_int_equal(cluster.Nodes[2]->GetVolatileState()->CompactionSafeMaxSnapshotBytes,
+        TSnapshot::MaxBytes);
 }
 void test_snapshot_size_capability_respects_receiver_budgets(void**) {
     constexpr uint64_t unit = TAppendEntriesResponse::SnapshotSizeUnitBytes;
@@ -3149,6 +3200,68 @@ void test_snapshot_manifest_without_streaming_installer_reserves_copy_headroom(v
     assert_int_equal(responses.back()->NextOffset, 0);
     assert_int_equal(application->Loads, 0);
     assert_int_equal(budget->UsedBytes(), 0);
+}
+void test_large_versioned_snapshot_installs_over_manifest_ranges(void**) {
+    auto payload = std::make_shared<TGeneratedSnapshotDataSource>(TSnapshot::MaxBytes + 1);
+    TSnapshot snapshot;
+    snapshot.Index = 1;
+    snapshot.Term = 1;
+    snapshot.Voters = {1, 2};
+    snapshot.DataSource = payload;
+    const auto manifest = PrepareSnapshotTransferManifest(snapshot);
+    assert_true(manifest.Metadata.substr(0, 8) == "MRFTS012");
+    const auto totalBytes = manifest.Metadata.size() + manifest.PayloadBytes + 4;
+    assert_true(totalBytes > TSnapshot::MaxBytes);
+    assert_true(totalBytes <= TSnapshot::MaxStreamedBytes);
+
+    auto budget = std::make_shared<TSnapshotInstallBudget>(TSnapshot::MaxStreamedBytes);
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) {
+        if (message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_RESPONSE))
+            responses.push_back(message.template Cast<TInstallSnapshotResponse>());
+    });
+    auto state = std::make_shared<TState>();
+    state->BindVoters({1, 2});
+    state->CurrentTerm = 3;
+    state->Commit();
+    TRaft::TLogLimits limits{.SnapshotInstallBudget = budget,
+        .MaxSnapshotImageBytes = TSnapshot::MaxStreamedBytes};
+    auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}}, std::vector<uint32_t>{}, limits);
+    auto application = std::make_shared<TLargeStreamingInstallApplication>();
+    application->ExpectedBytes = payload->Size();
+    TRequestProcessor processor(raft, application, {});
+
+    uint64_t sequence = 1;
+    auto transfer = [&](TInstallSnapshotRangeRequest::EPhase phase, uint64_t offset,
+            std::string_view bytes) {
+        auto request = RangeChunk(snapshot, manifest, phase, offset, bytes, sequence++);
+        raft->Process({}, request);
+        assert_false(responses.empty());
+        return responses.back();
+    };
+    auto metadata = transfer(TInstallSnapshotRangeRequest::EPhase::Metadata, 0, manifest.Metadata);
+    assert_true(metadata->Success);
+    assert_int_equal(metadata->NextOffset, manifest.Metadata.size());
+
+    for (uint64_t offset = 0; offset < manifest.PayloadBytes;) {
+        const auto count = size_t(std::min<uint64_t>(TInstallSnapshotRangeRequest::MaxChunkBytes,
+            manifest.PayloadBytes - offset));
+        const std::string chunk(count, 's');
+        auto response = transfer(TInstallSnapshotRangeRequest::EPhase::Payload, offset, chunk);
+        offset += count;
+        assert_true(response->Success);
+        assert_false(response->Installed);
+        assert_int_equal(response->NextOffset, manifest.Metadata.size() + offset);
+    }
+    std::string checksum(4, '\0');
+    for (unsigned i = 0; i < 4; ++i) checksum[i] = char(manifest.Checksum >> (8 * i));
+    auto installed = transfer(TInstallSnapshotRangeRequest::EPhase::Checksum, 0, checksum);
+    assert_true(installed->Success);
+    assert_true(installed->Installed);
+    assert_int_equal(application->Preparations, 1);
+    assert_int_equal(application->LastAppliedIndex, snapshot.Index);
+    assert_true(state->GetSnapshot()->DataSize() == payload->Size());
+    assert_true(bool(state->GetSnapshot()->DataSource));
 }
 void test_idle_snapshot_transfer_discards_partial_image_and_restarts(void**) {
     TCluster cluster({3}); // Learners must also reclaim stalled transfers.
@@ -5221,6 +5334,7 @@ int main() {
         cmocka_unit_test(test_negotiated_snapshot_manifest_transfer_uses_distinct_wire_phases),
         cmocka_unit_test(test_snapshot_manifest_ranges_use_budgeted_heap_payload_without_file_staging),
         cmocka_unit_test(test_snapshot_manifest_without_streaming_installer_reserves_copy_headroom),
+        cmocka_unit_test(test_large_versioned_snapshot_installs_over_manifest_ranges),
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),
         cmocka_unit_test(test_outgoing_snapshot_chunk_holds_heap_budget_lease),
         cmocka_unit_test(test_simultaneous_startup_candidates_use_distinct_election_deadlines),

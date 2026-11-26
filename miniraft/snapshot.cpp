@@ -28,12 +28,54 @@ constexpr std::string_view StableExtendedHistoryMagic = "MRFTS008";
 constexpr std::string_view JointExtendedHistoryMagic = "MRFTS009";
 constexpr std::string_view StableLargeHistoryMagic = "MRFTS010";
 constexpr std::string_view JointLargeHistoryMagic = "MRFTS011";
+constexpr std::string_view StreamedMagic = "MRFTS012";
+constexpr std::string_view StreamedJointMagic = "MRFTS013";
+constexpr std::string_view StreamedStableMagic = "MRFTS014";
+constexpr std::string_view StreamedStableLineageMagic = "MRFTS015";
+constexpr std::string_view StreamedJointLineageMagic = "MRFTS016";
+constexpr std::string_view StreamedStableHistoryMagic = "MRFTS017";
+constexpr std::string_view StreamedJointHistoryMagic = "MRFTS018";
+constexpr std::string_view StreamedStableExtendedHistoryMagic = "MRFTS019";
+constexpr std::string_view StreamedJointExtendedHistoryMagic = "MRFTS020";
+constexpr std::string_view StreamedStableLargeHistoryMagic = "MRFTS021";
+constexpr std::string_view StreamedJointLargeHistoryMagic = "MRFTS022";
+constexpr std::string_view StreamedMagicFor(std::string_view magic) {
+    if (magic == Magic) return StreamedMagic;
+    if (magic == JointMagic) return StreamedJointMagic;
+    if (magic == StableMagic) return StreamedStableMagic;
+    if (magic == StableLineageMagic) return StreamedStableLineageMagic;
+    if (magic == JointLineageMagic) return StreamedJointLineageMagic;
+    if (magic == StableHistoryMagic) return StreamedStableHistoryMagic;
+    if (magic == JointHistoryMagic) return StreamedJointHistoryMagic;
+    if (magic == StableExtendedHistoryMagic) return StreamedStableExtendedHistoryMagic;
+    if (magic == JointExtendedHistoryMagic) return StreamedJointExtendedHistoryMagic;
+    if (magic == StableLargeHistoryMagic) return StreamedStableLargeHistoryMagic;
+    if (magic == JointLargeHistoryMagic) return StreamedJointLargeHistoryMagic;
+    return {};
+}
+constexpr std::string_view BaseMagicFor(std::string_view magic) {
+    if (magic == StreamedMagic) return Magic;
+    if (magic == StreamedJointMagic) return JointMagic;
+    if (magic == StreamedStableMagic) return StableMagic;
+    if (magic == StreamedStableLineageMagic) return StableLineageMagic;
+    if (magic == StreamedJointLineageMagic) return JointLineageMagic;
+    if (magic == StreamedStableHistoryMagic) return StableHistoryMagic;
+    if (magic == StreamedJointHistoryMagic) return JointHistoryMagic;
+    if (magic == StreamedStableExtendedHistoryMagic) return StableExtendedHistoryMagic;
+    if (magic == StreamedJointExtendedHistoryMagic) return JointExtendedHistoryMagic;
+    if (magic == StreamedStableLargeHistoryMagic) return StableLargeHistoryMagic;
+    if (magic == StreamedJointLargeHistoryMagic) return JointLargeHistoryMagic;
+    return magic;
+}
+constexpr bool IsStreamedMagic(std::string_view magic) {
+    return magic.size() == 8 && BaseMagicFor(magic) != magic;
+}
 void Validate(const TSnapshot& snapshot, size_t dataSize) {
     size_t historyBytes = snapshot.ConfigurationTransitions.empty() ? 0 : 4;
     for (const auto& transition : snapshot.ConfigurationTransitions) {
         if (transition.OldVoters.size() > TSnapshot::MaxVoters ||
             transition.NewVoters.size() > TSnapshot::MaxVoters ||
-            historyBytes > TSnapshot::MaxBytes - 56 -
+            historyBytes > TSnapshot::MaxStreamedBytes - 56 -
                 4 * (transition.OldVoters.size() + transition.NewVoters.size()))
             throw std::runtime_error("Invalid snapshot configuration history size");
         historyBytes += 56 + 4 * (transition.OldVoters.size() + transition.NewVoters.size());
@@ -48,9 +90,9 @@ void Validate(const TSnapshot& snapshot, size_t dataSize) {
         snapshot.JointVoters.size() > TSnapshot::MaxVoters ||
         snapshot.PreviousVoters.size() > TSnapshot::MaxVoters ||
         snapshot.ConfigurationTransitions.size() > TSnapshot::MaxConfigurationTransitions ||
-        baseBytes > TSnapshot::MaxBytes || voterBytes > TSnapshot::MaxBytes - baseBytes ||
-        historyBytes > TSnapshot::MaxBytes - baseBytes - voterBytes ||
-        dataSize > TSnapshot::MaxBytes - baseBytes - voterBytes - historyBytes)
+        baseBytes > TSnapshot::MaxStreamedBytes || voterBytes > TSnapshot::MaxStreamedBytes - baseBytes ||
+        historyBytes > TSnapshot::MaxStreamedBytes - baseBytes - voterBytes ||
+        dataSize > TSnapshot::MaxStreamedBytes - baseBytes - voterBytes - historyBytes)
         throw std::runtime_error("Invalid snapshot metadata/size");
     const auto validateVoters = [](const auto& voters) {
         uint32_t previous = 0;
@@ -286,14 +328,14 @@ std::string EncodeSnapshotMetadata(const TSnapshot& snapshot, size_t maxConfigur
         TSnapshot::MaxLegacyConfigurationTransitions;
     const bool largeHistory = transitionCount >
         TSnapshot::MaxExtendedConfigurationTransitions;
-    const std::string_view magic = transitionCount
+    const std::string_view baseMagic = transitionCount
         ? (snapshot.StableConfiguration
             ? (largeHistory ? StableLargeHistoryMagic : extendedHistory ? StableExtendedHistoryMagic : StableHistoryMagic)
             : (largeHistory ? JointLargeHistoryMagic : extendedHistory ? JointExtendedHistoryMagic : JointHistoryMagic))
         : hasStablePredecessor ? StableLineageMagic :
         hasLineage ? JointLineageMagic :
         snapshot.StableConfiguration ? StableMagic : snapshot.IsJoint() ? JointMagic : Magic;
-    size_t metadataSize = magic.size();
+    size_t metadataSize = baseMagic.size();
     const auto addSize = [&](size_t bytes) {
         if (bytes > SIZE_MAX - metadataSize)
             throw std::overflow_error("Snapshot metadata size overflow");
@@ -324,6 +366,12 @@ std::string EncodeSnapshotMetadata(const TSnapshot& snapshot, size_t maxConfigur
     }
     if (metadataSize > TSnapshot::MaxBytes)
         throw std::runtime_error("Snapshot metadata exceeds size limit");
+    const auto payloadBytes = snapshot.DataSize();
+    if (payloadBytes > TSnapshot::MaxStreamedBytes - 4 - metadataSize)
+        throw std::runtime_error("Snapshot exceeds size limit");
+    const auto magic = metadataSize + payloadBytes + 4 > TSnapshot::MaxBytes
+        ? StreamedMagicFor(baseMagic) : baseMagic;
+    if (magic.empty()) throw std::logic_error("Snapshot has no streamed format mapping");
     std::string out;
     out.reserve(metadataSize);
     out.append(magic);
@@ -389,7 +437,7 @@ public:
         struct stat info{};
         Require(fstat(fd, &info) == 0, "stat snapshot image");
         if (!S_ISREG(info.st_mode) || info.st_size < 44 ||
-            uint64_t(info.st_size) > TSnapshot::MaxBytes)
+            uint64_t(info.st_size) > TSnapshot::MaxStreamedBytes)
             throw std::runtime_error("Invalid snapshot file type/size");
         SizeBytes = size_t(info.st_size);
         Mapping = mmap(nullptr, SizeBytes, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -428,7 +476,7 @@ public:
     TApplicationSnapshotSource(std::shared_ptr<const ISnapshotSource> source, uint64_t size)
         : Source(std::move(source)), SizeBytes(size) {
         if (!Source) throw std::invalid_argument("Missing application snapshot source");
-        if (SizeBytes > TSnapshot::MaxBytes || SizeBytes > SIZE_MAX)
+        if (SizeBytes > TSnapshot::MaxStreamedBytes || SizeBytes > SIZE_MAX)
             throw std::runtime_error("Application snapshot source exceeds the size limit");
         if (Source->Size() != SizeBytes)
             throw std::logic_error("Application snapshot source changed size during capture");
@@ -543,7 +591,7 @@ size_t TSnapshot::DataSize() const {
     if (!DataSource) return Data.size();
     if (!Data.empty()) throw std::logic_error("Snapshot cannot own and source the payload at once");
     const auto size = DataSource->Size();
-    if (size > TSnapshot::MaxBytes || size > SIZE_MAX)
+    if (size > TSnapshot::MaxStreamedBytes || size > SIZE_MAX)
         throw std::runtime_error("Snapshot payload source exceeds the size limit");
     return size_t(size);
 }
@@ -708,7 +756,11 @@ void PreserveStableSnapshotIdentity(const TSnapshot* current, TSnapshot& incomin
 }
 
 std::string EncodeSnapshot(const TSnapshot& snapshot) {
+    if (snapshot.DataSize() > TSnapshot::MaxBytes)
+        throw std::runtime_error("Snapshot exceeds complete-image size limit");
     const auto encoding = PrepareSnapshotEncoding(snapshot);
+    if (SnapshotEncodingSize(*encoding) > TSnapshot::MaxBytes)
+        throw std::runtime_error("Snapshot exceeds complete-image size limit");
     std::string out(size_t(SnapshotEncodingSize(*encoding)), '\0');
     CopySnapshotEncodingRange(snapshot, *encoding, 0, out.data(), out.size());
     return out;
@@ -731,9 +783,9 @@ std::shared_ptr<const TSnapshotEncoding> PrepareSnapshotEncoding(
     auto encoding = std::make_shared<TSnapshotEncoding>();
     encoding->Metadata = EncodeSnapshotMetadata(snapshot, maxConfigurationTransitions, includeMembershipHistory);
     const auto dataSize = snapshot.DataSize();
-    encoding->TotalBytes = encoding->Metadata.size() + dataSize + 4;
-    if (encoding->TotalBytes > TSnapshot::MaxBytes)
+    if (dataSize > TSnapshot::MaxStreamedBytes - 4 - encoding->Metadata.size())
         throw std::runtime_error("Snapshot exceeds size limit");
+    encoding->TotalBytes = encoding->Metadata.size() + dataSize + 4;
     TChecksum checksum;
     checksum.Update(encoding->Metadata);
     std::array<char, 64 * 1024> buffer{};
@@ -765,7 +817,7 @@ TSnapshotTransferManifest PrepareSnapshotTransferManifest(
         const TSnapshot& snapshot, const TSnapshotEncoding& encoding) {
     const auto payloadBytes = snapshot.DataSize();
     if (encoding.TotalBytes != encoding.Metadata.size() + payloadBytes + 4 ||
-        encoding.TotalBytes > TSnapshot::MaxBytes)
+        encoding.TotalBytes > TSnapshot::MaxStreamedBytes)
         throw std::invalid_argument("Snapshot encoding does not match its transfer manifest");
     TSnapshotTransferManifest manifest;
     manifest.Metadata = encoding.Metadata;
@@ -780,7 +832,8 @@ uint64_t SnapshotEncodingSize(const TSnapshotEncoding& encoding) {
 
 void CopySnapshotEncodingRange(const TSnapshot& snapshot, const TSnapshotEncoding& encoding,
         uint64_t offset, char* destination, size_t length) {
-    if (offset > encoding.TotalBytes || length > encoding.TotalBytes - offset ||
+    if (encoding.TotalBytes > TSnapshot::MaxStreamedBytes ||
+        offset > encoding.TotalBytes || length > encoding.TotalBytes - offset ||
         (length && !destination) || encoding.TotalBytes != encoding.Metadata.size() + snapshot.DataSize() + 4)
         throw std::invalid_argument("Invalid snapshot encoding range");
     char checksumBytes[4];
@@ -852,7 +905,7 @@ TSnapshot DecodeSnapshotImpl(std::string_view bytes, std::string* reusableStorag
         if (manifest->Version != TSnapshotTransferManifest::CurrentVersion)
             throw std::runtime_error("Unsupported snapshot transfer manifest version");
         if (bytes.size() > TSnapshot::MaxBytes - 4 ||
-            manifest->PayloadBytes > TSnapshot::MaxBytes - 4 - bytes.size() ||
+            manifest->PayloadBytes > TSnapshot::MaxStreamedBytes - 4 - bytes.size() ||
             bytes.size() + manifest->PayloadBytes + 4 < 44 ||
             manifest->PayloadBytes > SIZE_MAX)
             throw std::runtime_error("Invalid snapshot transfer manifest size");
@@ -880,7 +933,8 @@ TSnapshot DecodeSnapshotImpl(std::string_view bytes, std::string* reusableStorag
         if (checksum.Finish() != manifest->Checksum)
             throw std::runtime_error("Snapshot transfer checksum mismatch");
     } else {
-        if (bytes.size() < 44 || bytes.size() > TSnapshot::MaxBytes)
+        if (bytes.size() < 44 || bytes.size() > TSnapshot::MaxStreamedBytes ||
+            (bytes.size() > TSnapshot::MaxBytes && !reusableStorage && !image))
             throw std::runtime_error("Invalid snapshot size");
         if (reusableStorage && bytes.data() != reusableStorage->data())
             throw std::invalid_argument("Snapshot decode buffer does not match its input");
@@ -890,18 +944,24 @@ TSnapshot DecodeSnapshotImpl(std::string_view bytes, std::string* reusableStorag
     }
     TReader reader{manifest ? bytes : bytes.substr(0, bytes.size() - 4)};
     const auto magic = reader.Read(Magic.size());
-    const bool jointHistory = magic == JointHistoryMagic || magic == JointExtendedHistoryMagic ||
-        magic == JointLargeHistoryMagic;
-    const bool stableHistory = magic == StableHistoryMagic || magic == StableExtendedHistoryMagic ||
-        magic == StableLargeHistoryMagic;
-    const bool extendedHistory = magic == StableExtendedHistoryMagic || magic == JointExtendedHistoryMagic;
-    const bool largeHistory = magic == StableLargeHistoryMagic || magic == JointLargeHistoryMagic;
-    const bool jointLineage = magic == JointLineageMagic || jointHistory;
-    const bool joint = magic == JointMagic || jointLineage;
-    const bool stableLineage = magic == StableLineageMagic || stableHistory;
-    const bool stable = magic == StableMagic || stableLineage;
+    const auto baseMagic = BaseMagicFor(magic);
+    const bool streamedFormat = IsStreamedMagic(magic);
+    const auto totalBytes = manifest
+        ? uint64_t(bytes.size()) + manifest->PayloadBytes + 4 : uint64_t(bytes.size());
+    if (streamedFormat != (totalBytes > TSnapshot::MaxBytes))
+        throw std::runtime_error("Snapshot format does not match its image size");
+    const bool jointHistory = baseMagic == JointHistoryMagic || baseMagic == JointExtendedHistoryMagic ||
+        baseMagic == JointLargeHistoryMagic;
+    const bool stableHistory = baseMagic == StableHistoryMagic || baseMagic == StableExtendedHistoryMagic ||
+        baseMagic == StableLargeHistoryMagic;
+    const bool extendedHistory = baseMagic == StableExtendedHistoryMagic || baseMagic == JointExtendedHistoryMagic;
+    const bool largeHistory = baseMagic == StableLargeHistoryMagic || baseMagic == JointLargeHistoryMagic;
+    const bool jointLineage = baseMagic == JointLineageMagic || jointHistory;
+    const bool joint = baseMagic == JointMagic || jointLineage;
+    const bool stableLineage = baseMagic == StableLineageMagic || stableHistory;
+    const bool stable = baseMagic == StableMagic || stableLineage;
     const bool configurationHistory = stableHistory || jointHistory;
-    if (!joint && !stable && magic != Magic) throw std::runtime_error("Unknown snapshot format");
+    if (!joint && !stable && baseMagic != Magic) throw std::runtime_error("Unknown snapshot format");
     TSnapshot snapshot;
     snapshot.StableConfiguration = stable;
     snapshot.Index = reader.Take(8);
@@ -1006,7 +1066,7 @@ TSnapshot DecodeSnapshotTransferManifest(const TSnapshotTransferManifest& manife
 TSnapshot DecodeSnapshotBacked(std::string_view bytes,
         std::shared_ptr<const TSnapshotDataSource> image) {
     if (!image) throw std::invalid_argument("Missing snapshot image source");
-    if (bytes.size() < 44 || bytes.size() > TSnapshot::MaxBytes)
+    if (bytes.size() < 44 || bytes.size() > TSnapshot::MaxStreamedBytes)
         throw std::runtime_error("Invalid snapshot size");
     if (image->Size() != bytes.size())
         throw std::invalid_argument("Snapshot image source size does not match its view");
@@ -1041,7 +1101,7 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         std::shared_ptr<TSnapshotInstallBudget> heapBudget,
         std::shared_ptr<TSnapshotInstallBudget> stagingBudget,
         std::string_view stagingDirectory, uint64_t maxImageBytes) {
-    if (!maxImageBytes || maxImageBytes > TSnapshot::MaxBytes)
+    if (!maxImageBytes || maxImageBytes > TSnapshot::MaxStreamedBytes)
         throw std::invalid_argument("Snapshot capture limit must be positive and within the format maximum");
     const auto index = rsm.LastAppliedIndex;
     if (!index || index > raft.GetVolatileState()->CommitIndex || index > raft.GetLastIndex())

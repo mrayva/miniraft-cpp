@@ -1,7 +1,7 @@
 # Design: streamed application snapshots
 
-This design describes the staged work to remove the current 128 MiB
-complete-image limit. The application capture-source API, optional receive
+This design tracks the staged work to expand the 128 MiB complete-image
+compatibility limit. The application capture-source API, optional receive
 staging files, an opt-in durable application-generation reference, and a
 negotiated range-transfer wire path are implemented. `TDurableState` and
 `TDiskState` can use a generation resolver to keep the application payload out
@@ -11,9 +11,15 @@ boundary and retained suffix. Recovery requires the resolver for a nonempty
 external payload and verifies its size and digest before exposing the snapshot.
 Negotiated transfers now keep metadata and payload separate at the receiver,
 using a budgeted heap payload by default or a staged file when configured.
-Legacy chunk transfers still assemble the complete encoded image. Neither path
-removes the 128 MiB image limit. The current snapshot format, storage behavior
-and transfer limits are described in
+Legacy chunk transfers still assemble the complete encoded image. Versioned
+formats MRFTS012 through MRFTS022 let the negotiated manifest path carry a
+complete snapshot up to 256 MiB. Original formats, `EncodeSnapshot()`, the
+non-owning `DecodeSnapshot()` view and legacy chunk RPCs remain capped at 128
+MiB. The default per-node limit remains 128 MiB; configuring a
+higher limit is opt-in, and configured node limits may lower either path. The
+shipped KV and SQL RSMs also enforce their own application-payload limits at
+or below 128 MiB; another RSM must implement and budget its larger-image
+validation and restore path. The snapshot format, storage behavior and transfer limits are described in
 [compaction and InstallSnapshot](compaction.md).
 
 ## Current incremental step
@@ -23,8 +29,9 @@ the application's bound against the remaining Raft image budget, including
 membership metadata, before calling `SaveSnapshot()`. The KV example reports
 its encoded size and the SQL example reports its database page-size bound. An
 application that does not implement the callback keeps the legacy post-capture
-size check. This preflight still uses complete in-memory images and does not
-change the 128 MiB limit.
+size check. `SaveSnapshot()` still returns one in-memory application payload;
+with an opt-in per-node limit it can exceed 128 MiB up to the 256 MiB hard
+limit, so the application and heap budget must account for that allocation.
 
 `IStreamingSnapshotRsm::OpenSnapshotSource(index)` now optionally returns an immutable,
 range-readable source for exactly the requested applied index. Capture retains
@@ -46,7 +53,10 @@ full-size `sqlite3_serialize()` allocation and a second complete payload
 allocation during capture. Without a generation resolver, both disk backends
 store the complete snapshot payload in their snapshot generation. With a
 resolver, either backend can publish only snapshot metadata there for a
-generation-backed nonempty payload. Images remain capped at 128 MiB. Non-Linux
+generation-backed nonempty payload. Versioned source-backed images can reach
+256 MiB when configured and transferred through the manifest path. Original
+formats, `EncodeSnapshot()`, the non-owning `DecodeSnapshot()` view, and legacy
+chunk RPCs remain capped at 128 MiB. Non-Linux
 builds retain the in-memory serialized source.
 
 `IStreamingSnapshotWriterRsm` is an alternative for applications that generate
@@ -72,8 +82,9 @@ complete encoded image. Peers that negotiate `SnapshotTransferManifest` use
 phases; peers without the feature retain the existing complete-image chunk RPC.
 The negotiated receiver keeps the manifest and payload in separate buffers or
 sources, then validates and installs the same logical snapshot while preserving
-membership checks, retry offsets, staging quotas and durable publication. Both
-transfer paths still enforce the 128 MiB image limit.
+membership checks, retry offsets, staging quotas and durable publication. The
+manifest path accepts versioned images up to 256 MiB, subject to the receiver's
+configured limit; legacy complete-image chunks remain capped at 128 MiB.
 
 Applications can opt into `IApplicationSnapshotGenerationRsm`. The application
 stages an immutable generation bound to the exact snapshot index, byte count and
@@ -94,8 +105,9 @@ against the reference before publication and supplies the range source during
 recovery, before Raft construction. Without a resolver, the existing
 full-payload sidecar behavior remains. Negotiated peers receive metadata,
 payload and checksum in separate ranges; older peers receive complete-image
-chunks. This reduces local durable storage when applications opt in, but does
-not remove the 128 MiB ceiling. Deterministic tests cover generation
+chunks. This reduces local durable storage when applications opt in. The
+versioned manifest path supports images up to 256 MiB; the legacy encoder, view
+decoder and original formats retain their 128 MiB ceiling. Deterministic tests cover generation
 publication and activation crashes for durable snapshot installation;
 split-backend crash tests cover recovery before and after metadata selection.
 
@@ -181,10 +193,13 @@ active snapshot pins its anonymous receive file or durable snapshot mapping
 until replaced and all transfer pins are released. Retained anonymous receive
 files remain charged to the shared staging quota; durable storage's own snapshot
 files are governed by its storage and filesystem capacity. Partial transfers
-restart at offset zero after process restart. The wire format, 128 MiB limit and
-publication, application-installation and acknowledgement ordering stay the same.
+restart at offset zero after process restart. Publication,
+application-installation and acknowledgement ordering stay the same; the
+versioned and compatibility limits are described above.
 `TLogLimits::MaxSnapshotImageBytes` can lower the per-node image ceiling for
-capture and receive admission; it cannot raise the 128 MiB format maximum.
+capture and receive admission. Values above 128 MiB require a peer that
+negotiates the manifest range protocol; the default per-node limit is 128 MiB
+and the hard limit is 256 MiB.
 
 After a full transfer's metadata is verified, intermediate payload chunks
 reuse that result while the sender is still the recognized leader in the
@@ -201,8 +216,12 @@ backend stores current snapshot bytes in an immutable sidecar; Linux recovery
 validates the mapped image and retains a range source for its application
 payload. The versioned `TDiskState` backend does the same for snapshot-generation
 files on Linux. Older embedded durable images and non-Linux generation recovery
-still use the materializing decoder. Raising `TSnapshot::MaxBytes` would raise
-peak memory without making the fallback path streaming.
+still use the materializing decoder. MRFTS012 through MRFTS022 preserve the
+metadata shapes of MRFTS001 through MRFTS011 while marking images over 128 MiB
+for bounded/source-backed decoding. Their total image limit is 256 MiB.
+`EncodeSnapshot()`, the non-owning `DecodeSnapshot()` view, original formats and
+legacy chunk RPCs remain limited to 128 MiB. Owned and source-backed decoders
+accept the new formats up to the 256 MiB cap.
 
 The SQL adapter can validate and stage a range-backed application image from
 the received mapping on Linux; non-Linux builds retain the padded deserialize
@@ -219,21 +238,21 @@ receiver keeps metadata and payload as separate objects: on Linux, a configured
 `SnapshotStagingDirectory` puts payload ranges directly into an anonymous file;
 without one, it uses a separately budgeted heap buffer. Both paths decode
 against the payload source without rebuilding the full encoded image. Legacy
-snapshot RPCs retain the complete-image compatibility path.
+snapshot RPCs retain the complete-image compatibility path and its 128 MiB cap.
 
 The generation reference is published atomically with the snapshot boundary,
 commit index, membership metadata and retained suffix. Both durable backends
 support source-backed local storage and require the startup resolver when the
 selected sidecar omits a nonempty payload. The negotiated wire format and
 receiver now keep metadata, payload, and checksum separate. Without configured
-file staging, the payload still resides wholly in heap memory, and transfers
-remain capped at 128 MiB. Operators can set
-`TLogLimits::MaxSnapshotImageBytes` below that cap to fit local memory and
-storage budgets; every member that may receive a snapshot must be configured
-to accept the images its peers produce. Removing the global cap requires a
-versioned storage and application-install contract that can publish the
-validated manifest and payload source atomically while streaming payload bytes
-to durable storage.
+file staging, the payload still resides wholly in heap memory. The negotiated
+path accepts versioned images through 256 MiB, while legacy chunk RPCs and the
+`EncodeSnapshot()` / view-based `DecodeSnapshot()` APIs remain capped at 128 MiB.
+Operators can set `TLogLimits::MaxSnapshotImageBytes` below the applicable cap to fit local memory
+and storage budgets; every member that may receive a snapshot must be
+configured to accept the images its peers produce. Raising the remaining
+256 MiB ceiling would require another versioned contract for application and
+durable storage that streams validated payload bytes to publication.
 
 ## Proposed lifecycle
 
@@ -285,10 +304,10 @@ the corresponding reference, and activate them after that publication.
 Existing applications keep the current API; peers without size negotiation
 remain limited to 64 MiB. The negotiated range RPC keeps receiver metadata and
 payload separate with either a budgeted heap buffer or a Linux staging file;
-legacy RPCs retain complete-image assembly. The remaining storage work is to
-define a versioned durable payload-generation format whose size limit is
-independent of the current 128 MiB encoded-image cap. Never infer streaming
-support from the peer's ability to read the existing chunk RPC.
+legacy RPCs retain complete-image assembly and the 128 MiB cap. MRFTS012 through
+MRFTS022 provide the larger versioned snapshot encoding, with a 256 MiB hard
+limit. Never infer manifest-transfer support from the peer's ability to read
+the existing chunk RPC.
 
 Keep a configurable maximum image size, per-transfer temporary-disk quota,
 aggregate in-flight quota, and a cap on retained generations. A digest detects

@@ -47,6 +47,16 @@ accept at most 1,024. All retain the CRC32 trailer and the 128 MiB total
 snapshot bound. A peer without snapshot-size negotiation remains limited to
 64 MiB.
 
+MRFTS012 through MRFTS022 reuse the metadata layouts of MRFTS001 through
+MRFTS011, respectively, and change the magic to identify the larger-image
+encoding. The encoder selects these formats only when the complete image is
+larger than 128 MiB. They retain the same CRC32 trailer and voter/history
+limits, and allow a total image up to 256 MiB through bounded storage and the
+negotiated manifest-transfer path. The default per-node limit remains 128 MiB.
+`EncodeSnapshot()`, the non-owning `DecodeSnapshot()` view, and the original
+MRFTS001 through MRFTS011 encodings remain capped at 128 MiB. Peers without
+manifest-transfer support cannot receive these larger images.
+
 `TConfigurationHistory::FromStableSnapshot` initializes offline history from
 this identity. The retained-log scanner checks the baseline identity against
 the snapshot before checking subsequent joint/stable entries. These checks do
