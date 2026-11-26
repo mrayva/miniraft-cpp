@@ -605,9 +605,6 @@ public:
         size_t ReservedControlEntries = 1;
         // Yield leadership after this long without a fresh voter quorum.
         std::chrono::milliseconds LeadershipExpiration = TTimeout::LeadershipExpiration;
-        // Per-node snapshot image ceiling. This may lower the protocol maximum,
-        // but cannot raise it until the snapshot format and storage limits change.
-        uint64_t MaxSnapshotImageBytes = TSnapshot::MaxBytes;
         // The default budget is shared by Raft instances in this process.
         // A custom budget sets the Raft snapshot-local limit; process-root
         // category limits still apply to its reservations. The advertised
@@ -627,6 +624,9 @@ public:
         // process default. Pass this same root to TRaftServer when overriding
         // the default; configure its category limit to raise the snapshot cap.
         std::shared_ptr<TProcessMemoryBudget> ProcessMemoryBudget;
+        // Per-node snapshot image ceiling. This may lower the protocol maximum,
+        // but cannot raise it until the snapshot format and storage limits change.
+        uint64_t MaxSnapshotImageBytes = TSnapshot::MaxBytes;
     };
 
     // Nodes contains every configured replication peer; learners may include

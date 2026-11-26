@@ -2165,8 +2165,8 @@ void test_snapshot_size_capability_respects_receiver_budgets(void**) {
             configuredSnapshotResponse = snapshot.Cast();
     });
     auto configuredBudget = std::make_shared<TSnapshotInstallBudget>(64 * 1024);
-    TRaft::TLogLimits configuredLimits{.MaxSnapshotImageBytes = configuredLimit,
-        .SnapshotInstallBudget = configuredBudget};
+    TRaft::TLogLimits configuredLimits{.SnapshotInstallBudget = configuredBudget,
+        .MaxSnapshotImageBytes = configuredLimit};
     auto configuredRaft = std::make_shared<TRaft>(configuredState, 2,
         TNodeDict{{1, configuredPeer}}, std::vector<uint32_t>{}, configuredLimits);
     auto configuredApplication = std::make_shared<TApplication>();
