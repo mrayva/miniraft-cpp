@@ -97,7 +97,7 @@ struct TFiles {
         if (bytes.size() < 4 ||
             (bytes.substr(0, 8) != "MRFTL001" && bytes.substr(0, 8) != "MRFTL002" &&
                 bytes.substr(0, 8) != "MRFTL003" && bytes.substr(0, 8) != "MRFTL004" &&
-                bytes.substr(0, 8) != "MRFTL005")) return;
+                bytes.substr(0, 8) != "MRFTL006")) return;
         const auto checksum = NSnapshotCodec::Checksum(std::string_view(bytes).substr(0, bytes.size() - 4));
         for (unsigned i = 0; i < 4; ++i) bytes[bytes.size() - 4 + i] = char(checksum >> (8 * i));
         input.close();
@@ -110,11 +110,11 @@ struct TFiles {
         std::ifstream input(Path("state"), std::ios::binary);
         std::string bytes{std::istreambuf_iterator<char>(input), {}};
         assert_true(bytes.size() >= 92);
-        assert_true(bytes.substr(0, 8) == "MRFTL005");
+        assert_true(bytes.substr(0, 8) == "MRFTL006");
         uint32_t voterCount = 0;
         for (unsigned i = 0; i < 4; ++i)
             voterCount |= uint32_t(uint8_t(bytes[40 + i])) << (8 * i);
-        assert_int_equal(bytes.size(), 92 + 4 * voterCount);
+        assert_int_equal(bytes.size(), 96 + 4 * voterCount);
         bytes.erase(88, 4 * voterCount);
         std::fill(bytes.begin() + 40, bytes.begin() + 44, '\0');
         Rewrite("state", bytes);
@@ -270,7 +270,7 @@ void test_checksums_detect_log_and_index_record_corruption(void**) {
         std::ifstream metadata(files.Path("state"), std::ios::binary);
         std::string magic(8, '\0');
         assert_true(bool(metadata.read(magic.data(), magic.size())));
-        assert_true(magic == "MRFTL005");
+        assert_true(magic == "MRFTL006");
         uint32_t flags = 0;
         metadata.seekg(44);
         assert_true(bool(metadata.read(reinterpret_cast<char*>(&flags), sizeof(flags))));

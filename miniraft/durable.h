@@ -63,11 +63,16 @@ public:
     bool SupportsSnapshots() const override { return true; }
     bool SupportsInstallSnapshot() const override { return true; }
     std::shared_ptr<const TSnapshot> GetSnapshot() const override;
+    std::optional<TApplicationSnapshotGenerationReference>
+    GetApplicationSnapshotGenerationReference() const override;
     void InstallSnapshot(const TSnapshot& snapshot) override;
     void InstallRaftSnapshot(const TSnapshot& snapshot,
         const TRaftInstallSnapshotPermit& permit) override;
     void InstallRaftSnapshot(std::shared_ptr<const TSnapshot> snapshot,
         const TRaftInstallSnapshotPermit& permit) override;
+    void InstallRaftSnapshot(std::shared_ptr<const TSnapshot> snapshot,
+        const TRaftInstallSnapshotPermit& permit,
+        std::optional<TApplicationSnapshotGenerationReference> generation) override;
     bool SupportsVoterBinding() const override { return true; }
     bool HasUnboundRecoveredState() const override;
     std::vector<uint32_t> GetBoundVoters() const override;
@@ -108,8 +113,10 @@ private:
     void ValidateTrustedLegacyVoterHistory(const std::vector<uint32_t>& voters,
         uint64_t commitIndex, const TConfigurationHistory* history) const;
     void InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated);
-    void InstallSnapshotImpl(std::shared_ptr<const TSnapshot> snapshot);
-    void InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snapshot);
+    void InstallSnapshotImpl(std::shared_ptr<const TSnapshot> snapshot,
+        std::optional<TApplicationSnapshotGenerationReference> generation = {});
+    void InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snapshot,
+        std::optional<TApplicationSnapshotGenerationReference> generation = {});
     struct TImpl;
     std::unique_ptr<TImpl> Impl;
     void Publish();

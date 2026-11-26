@@ -1,16 +1,21 @@
 #include <miniraft/raft.h>
 #include <miniraft/durable.h>
+#include <miniraft/persist.h>
 #include <miniraft/snapshot_codec.h>
 #include "../examples/kv.h"
 #include "../examples/kv_messages.h"
 #include <algorithm>
+#include <chrono>
+#include <cerrno>
 #include <cstdlib>
 #include <deque>
 #include <functional>
 #include <set>
 #include <filesystem>
 #include <fstream>
+#include <unordered_map>
 #ifdef __linux__
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -180,6 +185,109 @@ struct TStreamingWriterInstallApplication : TStreamingWriterSnapshotApplication,
             offset += count;
         }
         return std::make_unique<TNoopInstallation>();
+    }
+};
+struct TApplicationGenerationCatalog {
+    std::filesystem::path Directory;
+    std::unordered_map<std::string, std::string> Images;
+    std::string ActiveId;
+    std::string LastPreparedId;
+    std::vector<std::string> Events;
+    uint64_t NextId = 0;
+    bool RaftManifestSynced = false;
+};
+struct TGenerationAwareSnapshotApplication : TStreamingWriterInstallApplication,
+        IApplicationSnapshotGenerationRsm {
+    struct TGeneration : IStagedApplicationSnapshotGeneration {
+        TGenerationAwareSnapshotApplication& Application;
+        TApplicationSnapshotGenerationReference Ref;
+        std::string Bytes;
+        TGeneration(TGenerationAwareSnapshotApplication& application,
+                TApplicationSnapshotGenerationReference reference, std::string bytes)
+            : Application(application), Ref(std::move(reference)), Bytes(std::move(bytes)) { }
+        const TApplicationSnapshotGenerationReference& Reference() const override { return Ref; }
+        void Publish() override {
+            const auto path = Application.Catalog->Directory / Ref.Id;
+            const auto imageFd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+            if (imageFd < 0) throw std::runtime_error("Cannot open application generation image");
+            size_t offset = 0;
+            while (offset < Bytes.size()) {
+                const auto written = write(imageFd, Bytes.data() + offset, Bytes.size() - offset);
+                if (written < 0 && errno == EINTR) continue;
+                if (written <= 0) {
+                    close(imageFd);
+                    throw std::runtime_error("Cannot write application generation image");
+                }
+                offset += size_t(written);
+            }
+            const auto imageSynced = fsync(imageFd) == 0;
+            close(imageFd);
+            if (!imageSynced) throw std::runtime_error("Cannot sync application generation image");
+            const auto directoryFd = open(Application.Catalog->Directory.c_str(),
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (directoryFd < 0) throw std::runtime_error("Cannot open application generation directory");
+            const auto directorySynced = fsync(directoryFd) == 0;
+            close(directoryFd);
+            if (!directorySynced) throw std::runtime_error("Cannot sync application generation directory");
+            if (!Application.Catalog->Images.emplace(Ref.Id, Bytes).second)
+                throw std::logic_error("Application generation ID was reused");
+            Application.Catalog->LastPreparedId = Ref.Id;
+            Application.Catalog->Events.push_back("publish");
+        }
+        void Activate() override {
+            if (!Application.Catalog->RaftManifestSynced)
+                throw std::logic_error("Application generation activated before Raft publication");
+            Application.Catalog->ActiveId = Ref.Id;
+            Application.LastAppliedIndex = Ref.SnapshotIndex;
+            Application.Catalog->Events.push_back("activate");
+        }
+    };
+
+    std::shared_ptr<TApplicationGenerationCatalog> Catalog;
+    explicit TGenerationAwareSnapshotApplication(
+            std::shared_ptr<TApplicationGenerationCatalog> catalog)
+        : Catalog(std::move(catalog)) { }
+
+    std::unique_ptr<IStagedApplicationSnapshotGeneration> PrepareSnapshotGeneration(
+            const TSnapshot& snapshot) override {
+        auto bytes = snapshot.MaterializeData();
+        TApplicationSnapshotGenerationReference reference;
+        reference.Id = "generation-" + std::to_string(++Catalog->NextId);
+        reference.SnapshotIndex = snapshot.Index;
+        reference.DataBytes = bytes.size();
+        TSha256DigestBuilder digest;
+        digest.Update(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()));
+        reference.DataSha256 = digest.Finish();
+        return std::make_unique<TGeneration>(*this, std::move(reference), std::move(bytes));
+    }
+
+    void ValidateSnapshotGeneration(const TApplicationSnapshotGenerationReference& reference,
+            uint64_t index) const override {
+        if (reference.SnapshotIndex != index)
+            throw std::runtime_error("Application snapshot generation index mismatch");
+        auto image = Catalog->Images.find(reference.Id);
+        if (image == Catalog->Images.end()) {
+            std::ifstream input(Catalog->Directory / reference.Id, std::ios::binary);
+            if (!input) throw std::runtime_error("Referenced application snapshot generation is missing");
+            std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+            image = Catalog->Images.emplace(reference.Id, std::move(bytes)).first;
+        }
+        if (image->second.size() != reference.DataBytes)
+            throw std::runtime_error("Referenced application snapshot generation is missing");
+        TSha256DigestBuilder digest;
+        digest.Update(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(image->second.data()), image->second.size()));
+        if (digest.Finish() != reference.DataSha256)
+            throw std::runtime_error("Referenced application snapshot generation is corrupt");
+    }
+
+    void RestoreSnapshotGeneration(const TApplicationSnapshotGenerationReference& reference,
+            uint64_t index) override {
+        ValidateSnapshotGeneration(reference, index);
+        Catalog->ActiveId = reference.Id;
+        LastAppliedIndex = index;
+        Catalog->Events.push_back("restore");
     }
 };
 struct TRejectingSnapshotApplication : TApplication {
@@ -647,6 +755,446 @@ void test_disk_staged_capture_becomes_durable_snapshot_across_restart(void**) {
 
     captured.reset();
     assert_int_equal(stagingBudget->UsedBytes(), 0);
+}
+void test_durable_application_snapshot_generation_is_published_before_raft_and_restored(void**) {
+#ifdef __linux__
+    char directoryTemplate[] = "/tmp/miniraft-application-generation-XXXXXX";
+    auto* createdDirectory = mkdtemp(directoryTemplate);
+    assert_non_null(createdDirectory);
+    struct TDirectoryCleanup {
+        std::filesystem::path Path;
+        ~TDirectoryCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(Path, ignored);
+        }
+    } cleanup{createdDirectory};
+
+    const auto name = (std::filesystem::path(createdDirectory) / "raft").string();
+    auto catalog = std::make_shared<TApplicationGenerationCatalog>();
+    catalog->Directory = createdDirectory;
+    {
+        TDurableState state(name, 1);
+        state.CurrentTerm = 1;
+        state.BindVoters({1});
+        auto entry = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 6);
+        entry->Term = 1;
+        memcpy(entry->Data, "prefix", 6);
+        state.Append(entry);
+        auto suffix = NewHoldedMessage<TLogEntry>(sizeof(TLogEntry) + 6);
+        suffix->Term = 1;
+        memcpy(suffix->Data, "suffix", 6);
+        state.Append(suffix);
+        state.CommitIndex = 2;
+        state.Commit();
+    }
+    const auto orphanedId = std::string("generation-1");
+    const auto child = fork();
+    assert_true(child >= 0);
+    if (child == 0) {
+        try {
+            auto application = std::make_shared<TGenerationAwareSnapshotApplication>(catalog);
+            application->LastAppliedIndex = 1;
+            auto state = std::make_shared<TDurableState>(name, 1,
+                [catalog](TDurableState::EStage stage) {
+                    if (stage == TDurableState::EStage::TempCreated &&
+                        !catalog->LastPreparedId.empty()) {
+                        const auto exists = std::filesystem::exists(
+                            catalog->Directory / catalog->LastPreparedId);
+                        _exit(exists ? 77 : 78);
+                    }
+                });
+            auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+            TRequestProcessor processor(raft, application, {});
+            raft->CompactShared();
+        } catch (...) { _exit(79); }
+        _exit(80);
+    }
+    int childStatus = 0;
+    assert_int_equal(waitpid(child, &childStatus, 0), child);
+    assert_true(WIFEXITED(childStatus));
+    assert_int_equal(WEXITSTATUS(childStatus), 77);
+    assert_true(std::filesystem::exists(catalog->Directory / orphanedId));
+    {
+        TDurableState recovered(name, 1);
+        assert_int_equal(recovered.SnapshotIndex, 0);
+        assert_int_equal(recovered.CommitIndex, 2);
+        assert_int_equal(recovered.LastLogIndex, 2);
+        assert_true(std::string(recovered.Get(2)->Data, 6) == "suffix");
+        assert_true(!recovered.GetApplicationSnapshotGenerationReference());
+    }
+
+    // The generation was durable but unreferenced when the process crashed.
+    // A later compaction may publish a fresh generation.
+    catalog->NextId = 1;
+    catalog->RaftManifestSynced = false;
+    auto application = std::make_shared<TGenerationAwareSnapshotApplication>(catalog);
+    application->LastAppliedIndex = 1;
+    std::shared_ptr<const TSnapshot> snapshot;
+    TApplicationSnapshotGenerationReference reference;
+    {
+        auto state = std::make_shared<TDurableState>(name, 1, [catalog](TDurableState::EStage stage) {
+            if (catalog->LastPreparedId.empty()) return;
+            if (stage == TDurableState::EStage::TempCreated) {
+                assert_true(catalog->Images.count(catalog->LastPreparedId) == 1);
+                catalog->Events.push_back("raft-manifest-start");
+            } else if (stage == TDurableState::EStage::DirectorySynced) {
+                catalog->RaftManifestSynced = true;
+                catalog->Events.push_back("raft-manifest-synced");
+            }
+        });
+        auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+        TRequestProcessor processor(raft, application, {});
+        snapshot = raft->CompactShared();
+        const auto storedReference = state->GetApplicationSnapshotGenerationReference();
+        assert_true(storedReference.has_value());
+        reference = *storedReference;
+        assert_int_equal(reference.SnapshotIndex, snapshot->Index);
+        assert_int_equal(snapshot->Index, 1);
+        assert_true(reference.Id != orphanedId);
+        assert_true(catalog->ActiveId == reference.Id);
+        assert_true(catalog->RaftManifestSynced);
+        assert_int_equal(application->LastAppliedIndex, snapshot->Index);
+    }
+
+    const auto publish = std::find(catalog->Events.begin(), catalog->Events.end(), "publish");
+    const auto manifest = std::find(catalog->Events.begin(), catalog->Events.end(), "raft-manifest-synced");
+    const auto activate = std::find(catalog->Events.begin(), catalog->Events.end(), "activate");
+    assert_true(publish < manifest);
+    assert_true(manifest < activate);
+
+    {
+        auto recovered = std::make_shared<TDurableState>(name, 1);
+        const auto recoveredReference = recovered->GetApplicationSnapshotGenerationReference();
+        assert_true(recoveredReference.has_value());
+        assert_true(*recoveredReference == reference);
+        assert_int_equal(recovered->SnapshotIndex, reference.SnapshotIndex);
+        assert_int_equal(recovered->CommitIndex, 2);
+        assert_int_equal(recovered->LastLogIndex, 2);
+        assert_true(std::string(recovered->Get(2)->Data, 6) == "suffix");
+        auto restoredApplication = std::make_shared<TGenerationAwareSnapshotApplication>(catalog);
+        auto raft = std::make_shared<TRaft>(recovered, 1, TNodeDict{});
+        TRequestProcessor processor(raft, restoredApplication, {});
+        assert_int_equal(restoredApplication->LastAppliedIndex, reference.SnapshotIndex);
+        assert_true(catalog->ActiveId == reference.Id);
+        assert_true(catalog->Images.at(reference.Id) == snapshot->MaterializeData());
+    }
+
+    // A crash after the Raft directory sync but before Activate must recover
+    // the newly selected generation from the application store.
+    catalog->NextId = 2;
+    catalog->LastPreparedId.clear();
+    catalog->RaftManifestSynced = false;
+    const auto activationCrash = fork();
+    assert_true(activationCrash >= 0);
+    if (activationCrash == 0) {
+        try {
+            auto nextApplication = std::make_shared<TGenerationAwareSnapshotApplication>(catalog);
+            nextApplication->LastAppliedIndex = 2;
+            auto state = std::make_shared<TDurableState>(name, 1,
+                [catalog](TDurableState::EStage stage) {
+                    if (stage == TDurableState::EStage::DirectorySynced &&
+                        !catalog->LastPreparedId.empty()) {
+                        const auto exists = std::filesystem::exists(
+                            catalog->Directory / catalog->LastPreparedId);
+                        _exit(exists ? 87 : 88);
+                    }
+                });
+            auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+            TRequestProcessor processor(raft, nextApplication, {});
+            raft->CompactShared();
+        } catch (...) { _exit(89); }
+        _exit(90);
+    }
+    childStatus = 0;
+    assert_int_equal(waitpid(activationCrash, &childStatus, 0), activationCrash);
+    assert_true(WIFEXITED(childStatus));
+    assert_int_equal(WEXITSTATUS(childStatus), 87);
+    {
+        auto recovered = std::make_shared<TDurableState>(name, 1);
+        const auto recoveredReference = recovered->GetApplicationSnapshotGenerationReference();
+        assert_true(recoveredReference.has_value());
+        assert_int_equal(recoveredReference->SnapshotIndex, 2);
+        assert_int_equal(recovered->SnapshotIndex, 2);
+        assert_int_equal(recovered->CommitIndex, 2);
+        auto restoredApplication = std::make_shared<TGenerationAwareSnapshotApplication>(catalog);
+        auto raft = std::make_shared<TRaft>(recovered, 1, TNodeDict{});
+        TRequestProcessor processor(raft, restoredApplication, {});
+        assert_int_equal(restoredApplication->LastAppliedIndex, 2);
+        assert_true(catalog->ActiveId == recoveredReference->Id);
+        assert_true(catalog->Images.at(recoveredReference->Id) == std::string(40, 'w'));
+    }
+#endif
+}
+void test_versioned_disk_application_snapshot_generation_roundtrips(void**) {
+#ifdef __linux__
+    char directoryTemplate[] = "/tmp/miniraft-disk-application-generation-XXXXXX";
+    auto* createdDirectory = mkdtemp(directoryTemplate);
+    assert_non_null(createdDirectory);
+    struct TDirectoryCleanup {
+        std::filesystem::path Path;
+        ~TDirectoryCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(Path, ignored);
+        }
+    } cleanup{createdDirectory};
+
+    const auto name = (std::filesystem::path(createdDirectory) / "raft").string();
+    auto catalog = std::make_shared<TApplicationGenerationCatalog>();
+    catalog->Directory = createdDirectory;
+    auto application = std::make_shared<TGenerationAwareSnapshotApplication>(catalog);
+    application->LastAppliedIndex = 1;
+    TApplicationSnapshotGenerationReference reference;
+    {
+        auto state = std::make_shared<TDiskState>(name, 1,
+            [catalog](TDiskState::ECommitStage stage) {
+                if (stage == TDiskState::ECommitStage::DirectorySynced &&
+                    !catalog->LastPreparedId.empty())
+                    catalog->RaftManifestSynced = true;
+            });
+        state->CurrentTerm = 1;
+        state->BindVoters({1});
+        auto entry = NewHoldedMessage<TLogEntry>();
+        entry->Term = 1;
+        state->Append(entry);
+        state->CommitIndex = 1;
+        state->Commit();
+        auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+        TRequestProcessor processor(raft, application, {});
+        const auto snapshot = raft->CompactShared();
+        const auto storedReference = state->GetApplicationSnapshotGenerationReference();
+        assert_true(storedReference.has_value());
+        reference = *storedReference;
+        assert_int_equal(reference.SnapshotIndex, snapshot->Index);
+        assert_int_equal(state->SnapshotIndex, snapshot->Index);
+    }
+    {
+        auto recovered = std::make_shared<TDiskState>(name, 1);
+        const auto recoveredReference = recovered->GetApplicationSnapshotGenerationReference();
+        assert_true(recoveredReference.has_value());
+        assert_true(*recoveredReference == reference);
+        auto restoredApplication = std::make_shared<TGenerationAwareSnapshotApplication>(catalog);
+        auto raft = std::make_shared<TRaft>(recovered, 1, TNodeDict{});
+        TRequestProcessor processor(raft, restoredApplication, {});
+        assert_int_equal(restoredApplication->LastAppliedIndex, reference.SnapshotIndex);
+        assert_true(catalog->ActiveId == reference.Id);
+    }
+#endif
+}
+void test_remote_snapshot_install_publishes_and_activates_local_generation(void**) {
+#ifdef __linux__
+    char directoryTemplate[] = "/tmp/miniraft-remote-application-generation-XXXXXX";
+    auto* createdDirectory = mkdtemp(directoryTemplate);
+    assert_non_null(createdDirectory);
+    struct TDirectoryCleanup {
+        std::filesystem::path Path;
+        ~TDirectoryCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(Path, ignored);
+        }
+    } cleanup{createdDirectory};
+
+    const auto name = (std::filesystem::path(createdDirectory) / "raft").string();
+    auto catalog = std::make_shared<TApplicationGenerationCatalog>();
+    catalog->Directory = createdDirectory;
+    std::vector<TMessageHolder<TMessage>> replies;
+    auto replyTarget = std::make_shared<TEndpoint>([&](auto message) {
+        replies.push_back(std::move(message));
+    });
+    TNodeDict peers{{1, replyTarget}, {3, replyTarget}};
+    TApplicationSnapshotGenerationReference reference;
+    {
+        auto state = std::make_shared<TDurableState>(name, 2,
+            [catalog](TDurableState::EStage stage) {
+                if (stage == TDurableState::EStage::DirectorySynced &&
+                    !catalog->LastPreparedId.empty())
+                    catalog->RaftManifestSynced = true;
+            });
+        state->BindVoters({1, 2, 3});
+        state->CurrentTerm = 2;
+        state->Commit();
+        auto raft = std::make_shared<TRaft>(state, 2, peers);
+        auto application = std::make_shared<TGenerationAwareSnapshotApplication>(catalog);
+        TRequestProcessor processor(raft, application, peers);
+
+        const TSnapshot image{1, 1, {1, 2, 3}, std::string(40, 'r')};
+        const auto encoded = EncodeSnapshot(image);
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(
+            sizeof(TInstallSnapshotRequest) + encoded.size());
+        request->Src = 1;
+        request->Dst = 2;
+        request->Term = 2;
+        request->Seqno = 1;
+        request->SnapshotIndex = image.Index;
+        request->SnapshotTerm = image.Term;
+        request->TotalBytes = encoded.size();
+        request->LeaderId = 1;
+        request->Done = TInstallSnapshotRequest::DoneFlag;
+        memcpy(request->Data, encoded.data(), encoded.size());
+        raft->Process(ITimeSource::Time{}, request);
+
+        assert_int_equal(state->SnapshotIndex, image.Index);
+        const auto storedReference = state->GetApplicationSnapshotGenerationReference();
+        assert_true(storedReference.has_value());
+        reference = *storedReference;
+        assert_int_equal(reference.SnapshotIndex, image.Index);
+        assert_true(catalog->ActiveId == reference.Id);
+        assert_true(catalog->RaftManifestSynced);
+        assert_int_equal(application->LastAppliedIndex, image.Index);
+        assert_int_equal(replies.size(), 1);
+        const auto response = replies.back().Cast<TInstallSnapshotResponse>();
+        assert_true(response->Success && response->Installed);
+        assert_int_equal(response->NextOffset, encoded.size());
+    }
+    {
+        auto recovered = std::make_shared<TDurableState>(name, 2);
+        const auto recoveredReference = recovered->GetApplicationSnapshotGenerationReference();
+        assert_true(recoveredReference.has_value());
+        assert_true(*recoveredReference == reference);
+        auto application = std::make_shared<TGenerationAwareSnapshotApplication>(catalog);
+        auto raft = std::make_shared<TRaft>(recovered, 2, peers);
+        TRequestProcessor processor(raft, application, peers);
+        assert_int_equal(application->LastAppliedIndex, reference.SnapshotIndex);
+        assert_true(catalog->ActiveId == reference.Id);
+        assert_true(catalog->Images.at(reference.Id) == std::string(40, 'r'));
+    }
+#endif
+}
+void test_remote_application_snapshot_generation_crash_boundaries(void**) {
+#ifdef __linux__
+    char directoryTemplate[] = "/tmp/miniraft-remote-generation-crash-XXXXXX";
+    auto* createdDirectory = mkdtemp(directoryTemplate);
+    assert_non_null(createdDirectory);
+    struct TDirectoryCleanup {
+        std::filesystem::path Path;
+        ~TDirectoryCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(Path, ignored);
+        }
+    } cleanup{createdDirectory};
+
+    const auto root = std::filesystem::path(createdDirectory);
+    auto makeStore = [](const std::string& name) {
+        auto state = std::make_shared<TDurableState>(name, 2);
+        state->BindVoters({1, 2, 3});
+        state->CurrentTerm = 2;
+        state->Commit();
+        return state;
+    };
+    auto installRemoteSnapshot = [](const std::shared_ptr<TDurableState>& state,
+            const std::shared_ptr<TGenerationAwareSnapshotApplication>& application) {
+        std::vector<TMessageHolder<TMessage>> replies;
+        auto peer = std::make_shared<TEndpoint>([&](auto message) {
+            replies.push_back(std::move(message));
+        });
+        TNodeDict peers{{1, peer}, {3, peer}};
+        auto raft = std::make_shared<TRaft>(state, 2, peers);
+        TRequestProcessor processor(raft, application, peers);
+        const TSnapshot image{1, 1, {1, 2, 3}, std::string(40, 'r')};
+        const auto encoded = EncodeSnapshot(image);
+        auto request = NewHoldedMessage<TInstallSnapshotRequest>(
+            sizeof(TInstallSnapshotRequest) + encoded.size());
+        request->Src = 1;
+        request->Dst = 2;
+        request->Term = 2;
+        request->Seqno = 1;
+        request->SnapshotIndex = image.Index;
+        request->SnapshotTerm = image.Term;
+        request->TotalBytes = encoded.size();
+        request->LeaderId = 1;
+        request->Done = TInstallSnapshotRequest::DoneFlag;
+        memcpy(request->Data, encoded.data(), encoded.size());
+        raft->Process(ITimeSource::Time{}, request);
+    };
+
+    const auto beforeRaft = root / "before-raft";
+    const auto beforeApplication = root / "before-raft-application";
+    assert_true(std::filesystem::create_directory(beforeRaft));
+    assert_true(std::filesystem::create_directory(beforeApplication));
+    const auto beforeName = (beforeRaft / "raft").string();
+    auto beforeCatalog = std::make_shared<TApplicationGenerationCatalog>();
+    beforeCatalog->Directory = beforeApplication;
+    makeStore(beforeName).reset();
+
+    const auto beforeCrash = fork();
+    assert_true(beforeCrash >= 0);
+    if (beforeCrash == 0) {
+        try {
+            auto state = std::make_shared<TDurableState>(beforeName, 2,
+                [beforeCatalog](TDurableState::EStage stage) {
+                    if (stage == TDurableState::EStage::SnapshotTempCreated) {
+                        const auto generationExists = std::filesystem::exists(
+                            beforeCatalog->Directory / "generation-1");
+                        _exit(generationExists ? 91 : 92);
+                    }
+                });
+            auto application = std::make_shared<TGenerationAwareSnapshotApplication>(beforeCatalog);
+            installRemoteSnapshot(state, application);
+        } catch (...) { _exit(93); }
+        _exit(94);
+    }
+    int childStatus = 0;
+    assert_int_equal(waitpid(beforeCrash, &childStatus, 0), beforeCrash);
+    assert_true(WIFEXITED(childStatus));
+    assert_int_equal(WEXITSTATUS(childStatus), 91);
+    assert_true(std::filesystem::exists(beforeApplication / "generation-1"));
+    {
+        TDurableState recovered(beforeName, 2);
+        assert_int_equal(recovered.SnapshotIndex, 0);
+        assert_int_equal(recovered.CommitIndex, 0);
+        assert_int_equal(recovered.LastLogIndex, 0);
+        assert_true(!recovered.GetApplicationSnapshotGenerationReference());
+    }
+
+    const auto afterRaft = root / "after-raft";
+    const auto afterApplication = root / "after-raft-application";
+    assert_true(std::filesystem::create_directory(afterRaft));
+    assert_true(std::filesystem::create_directory(afterApplication));
+    const auto afterName = (afterRaft / "raft").string();
+    auto afterCatalog = std::make_shared<TApplicationGenerationCatalog>();
+    afterCatalog->Directory = afterApplication;
+    makeStore(afterName).reset();
+
+    const auto activationCrash = fork();
+    assert_true(activationCrash >= 0);
+    if (activationCrash == 0) {
+        try {
+            auto state = std::make_shared<TDurableState>(afterName, 2,
+                [afterCatalog](TDurableState::EStage stage) {
+                    if (stage == TDurableState::EStage::DirectorySynced &&
+                        !afterCatalog->LastPreparedId.empty()) {
+                        const auto generationExists = std::filesystem::exists(
+                            afterCatalog->Directory / afterCatalog->LastPreparedId);
+                        _exit(generationExists ? 95 : 96);
+                    }
+                });
+            auto application = std::make_shared<TGenerationAwareSnapshotApplication>(afterCatalog);
+            installRemoteSnapshot(state, application);
+        } catch (...) { _exit(97); }
+        _exit(98);
+    }
+    childStatus = 0;
+    assert_int_equal(waitpid(activationCrash, &childStatus, 0), activationCrash);
+    assert_true(WIFEXITED(childStatus));
+    assert_int_equal(WEXITSTATUS(childStatus), 95);
+    {
+        auto recovered = std::make_shared<TDurableState>(afterName, 2);
+        assert_int_equal(recovered->SnapshotIndex, 1);
+        assert_int_equal(recovered->CommitIndex, 1);
+        const auto reference = recovered->GetApplicationSnapshotGenerationReference();
+        assert_true(reference.has_value());
+        assert_int_equal(reference->SnapshotIndex, 1);
+        assert_true(std::filesystem::exists(afterApplication / reference->Id));
+
+        auto application = std::make_shared<TGenerationAwareSnapshotApplication>(afterCatalog);
+        auto peer = std::make_shared<TEndpoint>([](auto) {});
+        TNodeDict peers{{1, peer}, {3, peer}};
+        auto raft = std::make_shared<TRaft>(recovered, 2, peers);
+        TRequestProcessor processor(raft, application, peers);
+        assert_int_equal(application->LastAppliedIndex, reference->SnapshotIndex);
+        assert_true(afterCatalog->ActiveId == reference->Id);
+        assert_true(afterCatalog->Images.at(reference->Id) == std::string(40, 'r'));
+    }
+#endif
 }
 void test_range_snapshot_source_uses_disk_staging_quota(void**) {
     char directoryTemplate[] = "/tmp/miniraft-range-capture-XXXXXX";
@@ -3239,7 +3787,10 @@ struct TFiles {
     std::string Name;
     TFiles() {
         static unsigned next = 0;
-        Directory = std::filesystem::temp_directory_path() / ("miniraft-compaction-" + std::to_string(getpid()) + "-" + std::to_string(next++));
+        Directory = std::filesystem::temp_directory_path() / ("miniraft-compaction-" +
+            std::to_string(getpid()) + "-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" +
+            std::to_string(next++));
         assert_true(std::filesystem::create_directory(Directory)); Name = (Directory / "raft").string();
     }
     ~TFiles() { std::error_code ignored; std::filesystem::remove_all(Directory, ignored); }
@@ -3822,14 +4373,14 @@ void test_compaction_reclaims_durable_prefix_bytes(void**) {
     assert_false(std::filesystem::exists(files.Name + ".durable.1.log.1"));
     assert_true(bool(state.Get(30))); assert_false(state.Get(29));
 }
-void test_durable_v7_semantic_corruption_rejects_without_rewriting(void**) {
+void test_durable_v8_semantic_corruption_rejects_without_rewriting(void**) {
     for (int invalid = 0; invalid < 3; ++invalid) {
         TFiles files;
         { TDurableState state(files.Name, 1); ExerciseBoundary(state); }
         const auto path = files.Name + ".durable.1";
         std::ifstream input(path, std::ios::binary);
         std::string bytes(std::istreambuf_iterator<char>(input), {}); input.close();
-        assert_true(bytes.substr(0, 8) == "MRFTD007");
+        assert_true(bytes.substr(0, 8) == "MRFTD008");
         const auto snapshotPath = path + ".snapshot.3.2";
         if (invalid < 2) {
             const auto offset = invalid == 0 ? 52 : 32; // snapshot index reference or retained entry count
@@ -3920,6 +4471,10 @@ int main() {
         cmocka_unit_test(test_file_staged_snapshot_install_accepts_every_small_fixed_chunk_size),
         cmocka_unit_test(test_incremental_snapshot_capture_uses_disk_staging_quota),
         cmocka_unit_test(test_disk_staged_capture_becomes_durable_snapshot_across_restart),
+        cmocka_unit_test(test_durable_application_snapshot_generation_is_published_before_raft_and_restored),
+        cmocka_unit_test(test_versioned_disk_application_snapshot_generation_roundtrips),
+        cmocka_unit_test(test_remote_snapshot_install_publishes_and_activates_local_generation),
+        cmocka_unit_test(test_remote_application_snapshot_generation_crash_boundaries),
         cmocka_unit_test(test_range_snapshot_source_uses_disk_staging_quota),
         cmocka_unit_test(test_legacy_bounded_snapshot_uses_disk_staging_quota),
         cmocka_unit_test(test_legacy_unbounded_snapshot_uses_disk_staging_quota),
@@ -3937,7 +4492,7 @@ int main() {
         cmocka_unit_test(test_durable_stale_snapshot_membership_recovery_survives_restart),
         cmocka_unit_test(test_durable_membership_snapshot_install_is_atomic_across_restart),
         cmocka_unit_test(test_compaction_reclaims_durable_prefix_bytes),
-        cmocka_unit_test(test_durable_v7_semantic_corruption_rejects_without_rewriting),
+        cmocka_unit_test(test_durable_v8_semantic_corruption_rejects_without_rewriting),
 #endif
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);

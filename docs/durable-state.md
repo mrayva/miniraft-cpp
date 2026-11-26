@@ -1,6 +1,6 @@
 # Linux durable state: v0.1.0-alpha.3
 
-## Commit recovery: MRFTD007
+## Commit recovery and application generations: MRFTD008
 
 The current durable store persists `CommitIndex` alongside the current term,
 vote, voter binding, snapshot and retained log. Recovery requires
@@ -11,13 +11,18 @@ entries even when the application checkpoint trails them. Installed snapshots
 advance the persisted commit floor to at least their included index, and storage
 rejects truncation of committed entries.
 
-MRFTD007 keeps the 20-byte file header: magic[8], payload length[8] and CRC[4].
+MRFTD008 keeps the 20-byte file header: magic[8], payload length[8] and CRC[4].
 Its payload is CurrentTerm[8], VotedFor[4], retained-log count[8],
 CommitIndex[8], voter count[4], sorted voter IDs[4 each], SnapshotIndex[8],
 SnapshotTerm[8], encoded snapshot length[8], SHA-256 digest[32], log
-generation[8], log image length[8], and log CRC[4]. The manifest CRC covers
-the v7 magic and payload. Stores without a snapshot write zero length and
-digest fields. Retained log records live in `NAME.durable.ID.log.GENERATION`.
+generation[8], log image length[8], log CRC[4], and an application-generation
+marker[4]. When present, the marker is followed by the application snapshot
+index[8], byte count[8], SHA-256 digest[32], ID length[4] and opaque ID bytes.
+The manifest CRC covers the v8 magic and payload. Stores without an application
+generation write a zero marker. The reference is local to this replica; it is
+not included in the snapshot wire image. Snapshot bytes remain in the Raft
+sidecar in this format. Retained log records live in
+`NAME.durable.ID.log.GENERATION`.
 Each log image has a 20-byte header containing its magic, generation and header
 CRC, followed by term/flags/length/data records; the manifest's log CRC covers
 all records.
@@ -40,6 +45,7 @@ and digest of the exact encoded snapshot sidecar before decoding it. A sidecar
 from another store with the same snapshot index, term, and voters is rejected
 if its bytes differ.
 
+MRFTD007 remains readable with the bound-snapshot and external-log format.
 MRFTD006 remains readable with inline log records; its next successful
 publication migrates them into an external log generation. MRFTD005 remains
 readable. It has no recorded digest, so the next successful publication binds
@@ -47,7 +53,7 @@ the sidecar that passed legacy recovery checks without rewriting it. MRFTD004
 remains readable with its snapshot inline. MRFTD001 through MRFTD003 also
 remain readable and initialize their commit floor to SnapshotIndex because
 those formats did not record commit progress. All new publications write
-MRFTD007, which older binaries cannot open.
+MRFTD008, which older binaries cannot open.
 Recovered unbound MRFTD002 snapshots with configuration metadata remain offline
 until explicitly bound. `BindVotersFromTrustedHistory` accepts them only when
 their complete retained membership chain starts from the independently trusted
@@ -67,9 +73,10 @@ the filesystem assumptions below. `TDiskState` syncs its split log/index files
 before atomically replacing hard-state metadata. It supports snapshot install
 and compaction through generation-specific snapshot, entries and retained-suffix
 index files; metadata switches generations before the covered prefix is
-reclaimed. Fresh stores use checksummed log/index records and MRFTL005 metadata
-that includes CRC32, the commit boundary, original voter binding and log
-generation. MRFTL001 through MRFTL004 and old 20-byte stores remain readable;
+reclaimed. Fresh stores use checksummed log/index records and MRFTL006 metadata
+that includes CRC32, the commit boundary, original voter binding, log
+generation and an optional application snapshot-generation reference.
+MRFTL001 through MRFTL005 and old 20-byte stores remain readable;
 after binding an old store, its existing records keep the legacy encoding
 selected by their metadata until a generation rewrite.
 An old 20-byte metadata record has no commit boundary or voter binding; supply

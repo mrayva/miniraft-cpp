@@ -129,6 +129,40 @@ struct IRsm {
     uint64_t LastAppliedIndex = 0;
 };
 
+// Optional durable application snapshot-generation lifecycle. Preparation
+// validates/stages an immutable generation without changing active state.
+// Publish must make the generation durable before Raft publishes a reference;
+// Activate switches the application to it after that Raft publication. A crash
+// between the two publications leaves an unreferenced generation, which the
+// application may collect. The generation ID is local to one replica and is
+// never used as a peer's identifier.
+struct IStagedApplicationSnapshotGeneration {
+    virtual ~IStagedApplicationSnapshotGeneration() = default;
+    virtual const TApplicationSnapshotGenerationReference& Reference() const = 0;
+    virtual void Publish() = 0;
+    virtual void Activate() = 0;
+};
+
+struct IApplicationSnapshotGenerationRsm {
+    virtual ~IApplicationSnapshotGenerationRsm() = default;
+    virtual std::unique_ptr<IStagedApplicationSnapshotGeneration>
+        PrepareSnapshotGeneration(const TSnapshot& snapshot) = 0;
+    virtual void ValidateSnapshotGeneration(
+        const TApplicationSnapshotGenerationReference& reference, uint64_t index) const = 0;
+    virtual void RestoreSnapshotGeneration(
+        const TApplicationSnapshotGenerationReference& reference, uint64_t index) = 0;
+};
+
+inline std::unique_ptr<IStagedApplicationSnapshotGeneration> PrepareApplicationSnapshotGeneration(
+        IRsm& rsm, const TSnapshot& snapshot) {
+    auto* generations = dynamic_cast<IApplicationSnapshotGenerationRsm*>(&rsm);
+    if (!generations) return {};
+    auto staged = generations->PrepareSnapshotGeneration(snapshot);
+    if (!staged) throw std::logic_error("Application snapshot generation preparation returned no generation");
+    ValidateApplicationSnapshotGenerationReference(staged->Reference(), snapshot);
+    return staged;
+}
+
 inline std::unique_ptr<IStagedSnapshotInstallation> PrepareApplicationSnapshotInstallation(
         IRsm& rsm, std::string_view bytes, uint64_t index) {
     if (auto* staged = dynamic_cast<IStagedSnapshotRsm*>(&rsm)) {

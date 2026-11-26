@@ -86,6 +86,11 @@ struct IState: TStateFields {
     // True when this backend can durably adopt an InstallSnapshot image.
     virtual bool SupportsInstallSnapshot() const { return false; }
     virtual std::shared_ptr<const TSnapshot> GetSnapshot() const { return {}; }
+    // Optional application-owned immutable generation committed with the
+    // Raft snapshot boundary. Backends that do not implement this must reject
+    // a nonempty reference rather than silently dropping it.
+    virtual std::optional<TApplicationSnapshotGenerationReference>
+    GetApplicationSnapshotGenerationReference() const { return {}; }
     virtual void InstallSnapshot(const TSnapshot&) { throw std::logic_error("Storage snapshots are unsupported"); }
     // Raft calls this after validating configuration lineage, either from its
     // local scan during compaction or from the sender during snapshot transfer.
@@ -99,6 +104,13 @@ struct IState: TStateFields {
             const class TRaftInstallSnapshotPermit& permit) {
         if (!snapshot) throw std::invalid_argument("Missing Raft snapshot");
         InstallRaftSnapshot(*snapshot, permit);
+    }
+    virtual void InstallRaftSnapshot(std::shared_ptr<const TSnapshot> snapshot,
+            const class TRaftInstallSnapshotPermit& permit,
+            std::optional<TApplicationSnapshotGenerationReference> generation) {
+        if (generation)
+            throw std::logic_error("Storage cannot atomically publish application snapshot generations");
+        InstallRaftSnapshot(std::move(snapshot), permit);
     }
     virtual bool SupportsVoterBinding() const { return false; }
     // True when this backend recovered a persistent image without a stored
@@ -192,6 +204,7 @@ struct TState: IState {
     }
     std::vector<TMessageHolder<TLogEntry>> Log;
     std::shared_ptr<const TSnapshot> Snapshot;
+    std::optional<TApplicationSnapshotGenerationReference> SnapshotGeneration;
     std::vector<uint32_t> BoundVoters;
 
     TState() = default;
@@ -205,14 +218,16 @@ struct TState: IState {
             LastLogTerm = Log.back()->Term;
         }
     }
-    TState(const TState& other) : IState(other), Snapshot(other.Snapshot), BoundVoters(other.BoundVoters) {
+    TState(const TState& other) : IState(other), Snapshot(other.Snapshot),
+        SnapshotGeneration(other.SnapshotGeneration), BoundVoters(other.BoundVoters) {
         for (const auto& entry : other.Log) Log.push_back(CloneEntry(entry));
     }
     TState& operator=(const TState& other) {
         if (this != &other) {
             TState copy(other);
             static_cast<TStateFields&>(*this) = copy;
-            Log.swap(copy.Log); Snapshot.swap(copy.Snapshot); BoundVoters.swap(copy.BoundVoters);
+            Log.swap(copy.Log); Snapshot.swap(copy.Snapshot);
+            SnapshotGeneration.swap(copy.SnapshotGeneration); BoundVoters.swap(copy.BoundVoters);
         }
         return *this;
     }
@@ -302,11 +317,23 @@ struct TState: IState {
         BoundVoters = voters;
     }
     std::shared_ptr<const TSnapshot> GetSnapshot() const override { return Snapshot; }
+    std::optional<TApplicationSnapshotGenerationReference>
+    GetApplicationSnapshotGenerationReference() const override { return SnapshotGeneration; }
     void InstallSnapshot(const TSnapshot& snapshot) override { InstallSnapshotImpl(snapshot, false); }
     void InstallRaftSnapshot(const TSnapshot& snapshot,
             const TRaftInstallSnapshotPermit&) override { InstallSnapshotImpl(snapshot, true); }
     void InstallRaftSnapshot(std::shared_ptr<const TSnapshot> snapshot,
             const TRaftInstallSnapshotPermit&) override { InstallSnapshotImpl(std::move(snapshot)); }
+    void InstallRaftSnapshot(std::shared_ptr<const TSnapshot> snapshot,
+            const TRaftInstallSnapshotPermit& permit,
+            std::optional<TApplicationSnapshotGenerationReference> generation) override {
+        if (generation) {
+            if (!snapshot) throw std::invalid_argument("Missing Raft snapshot");
+            ValidateApplicationSnapshotGenerationReference(*generation, *snapshot);
+        }
+        InstallRaftSnapshot(std::move(snapshot), permit);
+        SnapshotGeneration = std::move(generation);
+    }
 private:
     void InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated) {
         ValidateSnapshot(snapshot);
@@ -333,6 +360,7 @@ private:
             suffix.assign(Log.begin() + (saved->Index - SnapshotIndex), Log.end());
         Log.swap(suffix);
         Snapshot = std::move(saved);
+        SnapshotGeneration.reset();
         SnapshotIndex = Snapshot->Index;
         SnapshotTerm = Snapshot->Term;
         LastLogIndex = SnapshotIndex + Log.size();

@@ -1,9 +1,9 @@
 # Compaction and InstallSnapshot: v0.1.0-alpha.16
 
 The [learner follow-up](learners.md) adds non-voting replication and durable
-voter binding. Current MRFTD007 images persist commit progress and keep snapshot
+voter binding. Current MRFTD008 images persist commit progress and keep snapshot
 bytes in immutable sidecars; readers continue to accept MRFTD001 through
-MRFTD005 images.
+MRFTD007 images. The current writer uses MRFTD008.
 
 This milestone adds prefix deletion and follower state transfer to the alpha.15
 KV checkpoint foundation. TState and Linux TDurableState support compacted logs;
@@ -12,12 +12,14 @@ support is described in [the SQL snapshot follow-up](sql-snapshots.md); the dumm
 state machine remains unsupported for compaction and installation.
 
 Current split-format `TDiskState` stores also support snapshot publication and
-InstallSnapshot. MRFTL005 metadata atomically selects a snapshot sidecar, when
+InstallSnapshot. MRFTL006 metadata atomically selects a snapshot sidecar, when
 present, and matching entries/index generation. After publication, the previous
 entries generation is reclaimed. MRFTL003 and MRFTL004 stores remain readable;
 their old entries file moves into a versioned generation at the next suffix
-replacement or snapshot installation. MRFTL001, MRFTL002 and 20-byte metadata
-remain readable.
+replacement or snapshot installation. MRFTL001 through MRFTL005 and 20-byte
+metadata remain readable. MRFTL006 can also persist an optional opaque
+application-generation reference in the same metadata publication; snapshot
+payload bytes remain in the existing sidecar.
 The disk backend writes the encoded snapshot sidecar in 64 KiB ranges, avoiding
 an additional full-size encoded string. Recovery decodes the owned sidecar
 buffer in place, avoiding a second heap allocation for the application payload.
@@ -91,7 +93,7 @@ does not install an image at or below known commitment, so stale snapshots canno
 rewind application state. Retained suffix entries are applied only after a leader
 establishes their commitment.
 
-MRFTD007 publishes hard state, the persisted commit boundary, voter binding,
+MRFTD008 publishes hard state, the persisted commit boundary, voter binding,
 snapshot reference and log-generation reference in one atomic manifest. Snapshot
 bytes are published to a separate immutable sidecar before the manifest can
 reference them. Tail appends extend and sync the selected log generation;

@@ -1,10 +1,12 @@
 # Design: streamed application snapshots
 
 This design describes the staged work to remove the current 128 MiB
-complete-image limit. The application capture-source API and optional receive
-staging files are implemented. Durable application generations and
-crash-recoverable activation remain open. The current
-snapshot format, storage behavior and transfer limits are described in
+complete-image limit. The application capture-source API, optional receive
+staging files, and an opt-in durable application-generation reference are
+implemented. Raft atomically stores that reference with its snapshot boundary,
+commit index, membership-bearing snapshot and retained suffix. Replacing the
+complete Raft snapshot payload and wire image with the application generation
+remains open. The current snapshot format, storage behavior and transfer limits are described in
 [compaction and InstallSnapshot](compaction.md).
 
 ## Current incremental step
@@ -49,6 +51,28 @@ callbacks without a bound reserve the maximum accepted payload before they run,
 then shrink the lease to retained capacity. This conservative reservation can
 reject capture when less than that amount is available; a declared size bound
 allows a smaller reservation, while the writer interface charges incrementally.
+
+Applications can opt into `IApplicationSnapshotGenerationRsm`. The application
+stages an immutable generation bound to the exact snapshot index, byte count and
+SHA-256 digest, durably publishes it before Raft updates storage, and activates
+it only after Raft's storage publication succeeds. On startup, request-processor
+construction validates the referenced generation and restores it before the
+node accepts requests. A generation published before a failed Raft publication
+is an orphan; applications own its cleanup. InstallSnapshot creates a local
+generation on the receiver rather than transferring the sender's local ID.
+Applications that do not implement this optional interface keep the existing
+snapshot path.
+
+The durable backends persist this reference in MRFTD008 and MRFTL006 metadata;
+MRFTD001 through MRFTD007 and MRFTL001 through MRFTL005 remain readable. The
+snapshot payload is still stored in the existing Raft sidecar/generation and is
+still sent in the existing complete-image InstallSnapshot format. This step
+therefore establishes identity binding and crash-recoverable activation, but
+does not reduce Raft storage, remove the 128 MiB ceiling, or introduce a new
+wire negotiation. Deterministic tests cover a crash after generation publication
+but before Raft publication, and a crash after Raft publication but before
+activation, on `TDurableState`; both durable backends have generation-reference
+round-trip coverage.
 
 `IStagedSnapshotRsm` lets an application validate and prepare an installation
 before Raft publishes the durable snapshot, then install that same prepared
@@ -151,13 +175,17 @@ buffer. This avoids the Raft heap copy but still keeps the complete received
 wire image on disk while it is the active in-memory snapshot. Current durable
 sidecars and Linux snapshot generations remain mapped and range-backed after
 restart; older embedded formats and RSMs without the streaming-install contract
-can still materialize payloads. Durable application generations remain an open
-gap.
+can still materialize payloads. The generation-reference lifecycle is now
+implemented, but the Raft sidecar still contains the full application payload.
+Removing that duplicate payload and recovering it before Raft startup remains
+open.
 
-The replacement needs an immutable application-image reference that Raft can
-publish atomically with the snapshot boundary, commit index, membership
-metadata and retained suffix. Keeping the application payload in a separate
-durable object lets the Raft image stay small while preserving crash recovery.
+The generation reference is now published atomically with the snapshot
+boundary, commit index, membership metadata and retained suffix. The remaining
+replacement must let storage construct its snapshot from the referenced
+application generation before Raft startup, and must keep the application
+payload out of the Raft sidecar and wire image. That storage/startup contract is
+needed before the Raft image can stay small while preserving recovery.
 
 ## Proposed lifecycle
 
@@ -235,6 +263,7 @@ commitment.
   stage. No failure may acknowledge an uninstalled snapshot or expose partial
   application state.
 
-The existing complete-image path remains the compatibility baseline until the
-new storage and application contracts pass these schedules on every supported
-backend.
+The existing complete-image path remains the compatibility baseline. Current
+crash tests cover pre-manifest orphan generations and post-manifest recovery
+before activation; the broader transfer, membership and quota schedules remain
+required before replacing the complete-image path on every supported backend.

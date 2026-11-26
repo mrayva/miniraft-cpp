@@ -42,11 +42,16 @@ struct TDiskState : IState {
     bool SupportsSnapshots() const override { return true; }
     bool SupportsInstallSnapshot() const override { return true; }
     std::shared_ptr<const TSnapshot> GetSnapshot() const override { return Snapshot; }
+    std::optional<TApplicationSnapshotGenerationReference>
+    GetApplicationSnapshotGenerationReference() const override { return SnapshotGenerationReference; }
     void InstallSnapshot(const TSnapshot& snapshot) override;
     void InstallRaftSnapshot(const TSnapshot& snapshot,
         const TRaftInstallSnapshotPermit&) override;
     void InstallRaftSnapshot(std::shared_ptr<const TSnapshot> snapshot,
         const TRaftInstallSnapshotPermit&) override;
+    void InstallRaftSnapshot(std::shared_ptr<const TSnapshot> snapshot,
+        const TRaftInstallSnapshotPermit&,
+        std::optional<TApplicationSnapshotGenerationReference> generation) override;
     bool SupportsVoterBinding() const override { return true; }
     bool HasUnboundRecoveredState() const override;
     std::vector<uint32_t> GetBoundVoters() const override;
@@ -108,7 +113,8 @@ private:
     void InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated);
     void InstallSnapshotImpl(std::shared_ptr<const TSnapshot> snapshot);
     void InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snapshot,
-        bool allowSameBoundary = false);
+        bool allowSameBoundary = false,
+        std::optional<TApplicationSnapshotGenerationReference> generation = {});
     void WriteSnapshotGenerationFile(const std::string& path, const TSnapshot& snapshot);
     uint64_t WriteCompactedLogGeneration(const std::string& entriesPath, const std::string& indexPath,
         uint64_t firstIndex, uint64_t lastIndex, uint64_t& lastTerm,
@@ -124,6 +130,7 @@ private:
     TCommitHook CommitHook;
     std::vector<uint32_t> Voters;
     std::shared_ptr<const TSnapshot> Snapshot;
+    std::optional<TApplicationSnapshotGenerationReference> SnapshotGenerationReference;
     uint64_t EntriesGeneration = 0;
     uint64_t IndexGeneration = 0;
     uint64_t IndexBaseIndex = 1;

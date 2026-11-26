@@ -65,12 +65,15 @@ Recovery rejection requires restoring verified state or deliberately rebuilding
 the node through a safe cluster procedure; never delete metadata alone to force
 startup. Previously created empty or partial file sets are deliberately rejected.
 
-Fresh `TDiskState` stores use MRFTL005 with CRC32 for hard-state metadata, log
+Fresh `TDiskState` stores use MRFTL006 with CRC32 for hard-state metadata, log
 entries and index offsets, plus snapshot and log-generation references.
-MRFTL001 through MRFTL004 and old 20-byte stores remain readable. MRFTL005 can
+MRFTL001 through MRFTL005 and old 20-byte stores remain readable. MRFTL006 can
 select a versioned entries/index generation before the first snapshot, which
 lets follower suffix replacement publish the retained prefix, replacement
-entries and commit boundary with one metadata switch. MRFTL002's metadata flag
+entries and commit boundary with one metadata switch. It also stores an
+optional immutable application snapshot-generation reference atomically with
+the snapshot boundary and retained suffix. The Raft snapshot payload remains
+in its existing generation. MRFTL002's metadata flag
 selects whether its records are checksummed; MRFTL001 and 20-byte stores have
 unchecked records. CRCs detect accidental corruption, not a malicious rewrite.
 The alpha.2 follow-up added ordered log/index synchronization, temporary

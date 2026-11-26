@@ -569,6 +569,32 @@ size_t TSnapshot::ReadDataRange(uint64_t offset, std::span<char> destination) co
     return copied;
 }
 
+void ValidateApplicationSnapshotGenerationReference(
+        const TApplicationSnapshotGenerationReference& reference, const TSnapshot& snapshot) {
+    ValidateApplicationSnapshotGenerationReference(reference, snapshot.Index);
+    const auto dataBytes = snapshot.DataSize();
+    if (reference.DataBytes != dataBytes)
+        throw std::invalid_argument("Application snapshot generation size does not match its image");
+    TSha256DigestBuilder digest;
+    std::array<char, 64 * 1024> chunk{};
+    for (uint64_t offset = 0; offset < dataBytes;) {
+        const auto count = size_t(std::min<uint64_t>(chunk.size(), dataBytes - offset));
+        size_t copied = 0;
+        while (copied < count) {
+            const auto read = snapshot.ReadDataRange(offset + copied,
+                std::span<char>(chunk.data() + copied, count - copied));
+            if (!read || read > count - copied)
+                throw std::runtime_error("Cannot verify application snapshot generation image");
+            copied += read;
+        }
+        digest.Update(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(chunk.data()), count));
+        offset += count;
+    }
+    if (digest.Finish() != reference.DataSha256)
+        throw std::invalid_argument("Application snapshot generation digest does not match its image");
+}
+
 std::string TSnapshot::MaterializeData() const {
     std::string result(DataSize(), '\0');
     size_t copied = 0;

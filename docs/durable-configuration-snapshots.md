@@ -17,13 +17,19 @@ log, then persists the binding before Raft startup. The API does not establish
 that the caller's assertion is true; absent an independent trusted baseline, the
 store still cannot infer its voter set.
 
-The MRFTD007 manifest records the snapshot sidecar's length and digest, the
+The MRFTD008 manifest records the snapshot sidecar's length and digest, the
 commit boundary, and the original voter binding. The original binding comes
 from the manifest. MRFTD006 inline log records, MRFTD005 sidecars and MRFTD004
 inline snapshots remain readable. MRFTD001 through MRFTD003 remain readable and use their
 snapshot boundary as the conservative commit floor. The history scanner
 checks configuration-bearing snapshot metadata against the active baseline;
 the original binding may refer to an earlier stable set.
+
+The manifest may also carry an application-generation ID, byte count and
+digest bound to the snapshot index. That reference is local to the replica and
+is atomically selected with the snapshot sidecar, membership history, commit
+boundary and retained suffix. The sidecar still contains the complete
+application payload in this format.
 
 `ScanCommittedConfigurationHistory` uses the recovered commit index directly
 and requires both durable commit-index support and a persisted original voter

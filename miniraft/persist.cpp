@@ -32,18 +32,22 @@ constexpr std::string_view PreviousDiskMetadataMagic = "MRFTL001";
 constexpr std::string_view ChecksummedDiskMetadataMagic = "MRFTL002";
 constexpr std::string_view SnapshotDiskMetadataMagic = "MRFTL003";
 constexpr std::string_view EntriesGenerationDiskMetadataMagic = "MRFTL004";
-constexpr std::string_view DiskMetadataMagic = "MRFTL005";
+constexpr std::string_view PreviousCurrentDiskMetadataMagic = "MRFTL005";
+constexpr std::string_view DiskMetadataMagic = "MRFTL006";
 constexpr uint32_t PreviousDiskMetadataVersion = 1;
 constexpr uint32_t ChecksummedDiskMetadataVersion = 2;
 constexpr uint32_t SnapshotDiskMetadataVersion = 3;
 constexpr uint32_t EntriesGenerationDiskMetadataVersion = 4;
-constexpr uint32_t DiskMetadataVersion = 5;
+constexpr uint32_t PreviousCurrentDiskMetadataVersion = 5;
+constexpr uint32_t DiskMetadataVersion = 6;
 constexpr uint32_t DiskMetadataCommitIndexTrusted = 1u << 0;
 constexpr uint32_t DiskMetadataChecksummedRecords = 1u << 1;
 constexpr size_t LegacyDiskMetadataSize = sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t);
 constexpr size_t ChecksummedDiskMetadataFixedSize = 52;
 constexpr size_t SnapshotDiskMetadataFixedSize = 84;
-constexpr size_t DiskMetadataFixedSize = 92;
+constexpr size_t PreviousCurrentDiskMetadataFixedSize = 92;
+constexpr size_t DiskMetadataFixedSize = 96;
+constexpr size_t DiskMetadataGenerationFixedSize = 52;
 
 struct TDiskMetadata {
     uint64_t LastLogIndex = 0, CurrentTerm = 1, CommitIndex = 0;
@@ -51,6 +55,7 @@ struct TDiskMetadata {
     uint64_t SnapshotIndex = 0, SnapshotTerm = 0;
     uint32_t VotedFor = 0;
     std::vector<uint32_t> Voters;
+    std::optional<TApplicationSnapshotGenerationReference> SnapshotGenerationReference;
     bool CommitIndexTrusted = false, ChecksummedRecords = false;
 };
 
@@ -77,8 +82,12 @@ TDiskMetadata DecodeDiskMetadata(std::string_view bytes) {
     const bool snapshotFormat = magic == SnapshotDiskMetadataMagic && version == SnapshotDiskMetadataVersion;
     const bool entriesGenerationFormat = magic == EntriesGenerationDiskMetadataMagic &&
         version == EntriesGenerationDiskMetadataVersion;
+    const bool previousCurrentFormat = magic == PreviousCurrentDiskMetadataMagic &&
+        version == PreviousCurrentDiskMetadataVersion;
     const bool currentFormat = magic == DiskMetadataMagic && version == DiskMetadataVersion;
-    if (!previousFormat && !checksummedFormat && !snapshotFormat && !entriesGenerationFormat && !currentFormat)
+    const bool generationFormat = previousCurrentFormat || currentFormat;
+    if (!previousFormat && !checksummedFormat && !snapshotFormat && !entriesGenerationFormat &&
+        !previousCurrentFormat && !currentFormat)
         throw std::runtime_error("Unknown Raft metadata format");
     metadata.LastLogIndex = reader.Take(8);
     metadata.CurrentTerm = reader.Take(8);
@@ -87,28 +96,48 @@ TDiskMetadata DecodeDiskMetadata(std::string_view bytes) {
     const auto voterCount = reader.Take(4);
     const auto flags = reader.Take(4);
     const auto allowedFlags = DiskMetadataCommitIndexTrusted |
-        ((checksummedFormat || snapshotFormat || entriesGenerationFormat || currentFormat)
+        ((checksummedFormat || snapshotFormat || entriesGenerationFormat || previousCurrentFormat || currentFormat)
             ? DiskMetadataChecksummedRecords : 0u);
     if (voterCount > TSnapshot::MaxVoters || (flags & ~allowedFlags))
         throw std::runtime_error("Invalid Raft metadata dimensions");
-    if (snapshotFormat || entriesGenerationFormat || currentFormat) {
-        if (entriesGenerationFormat || currentFormat) metadata.EntriesGeneration = reader.Take(8);
+    if (snapshotFormat || entriesGenerationFormat || previousCurrentFormat || currentFormat) {
+        if (entriesGenerationFormat || previousCurrentFormat || currentFormat)
+            metadata.EntriesGeneration = reader.Take(8);
         metadata.IndexGeneration = reader.Take(8);
         metadata.IndexBaseIndex = reader.Take(8);
         metadata.SnapshotIndex = reader.Take(8);
         metadata.SnapshotTerm = reader.Take(8);
     }
-    if (reader.Input.size() != voterCount * sizeof(uint32_t) + sizeof(uint32_t))
+    if (reader.Input.size() < voterCount * sizeof(uint32_t) + sizeof(uint32_t))
         throw std::runtime_error("Invalid Raft metadata dimensions");
     for (uint32_t i = 0; i < voterCount; ++i)
         metadata.Voters.push_back(static_cast<uint32_t>(reader.Take(4)));
+    if (currentFormat) {
+        const auto hasGeneration = reader.Take(4);
+        if (hasGeneration > 1) throw std::runtime_error("Invalid application snapshot generation marker");
+        if (hasGeneration) {
+            TApplicationSnapshotGenerationReference reference;
+            reference.SnapshotIndex = reader.Take(8);
+            reference.DataBytes = reader.Take(8);
+            for (auto& byte : reference.DataSha256) byte = static_cast<uint8_t>(reader.Take(1));
+            const auto idBytes = reader.Take(4);
+            if (!idBytes || idBytes > TApplicationSnapshotGenerationReference::MaxIdBytes)
+                throw std::runtime_error("Invalid application snapshot generation ID length");
+            reference.Id.assign(reader.Read(size_t(idBytes)));
+            if (!reference.IsValid() || reference.SnapshotIndex != metadata.SnapshotIndex)
+                throw std::runtime_error("Invalid application snapshot generation reference");
+            metadata.SnapshotGenerationReference = std::move(reference);
+        }
+    }
+    if (reader.Input.size() != sizeof(uint32_t))
+        throw std::runtime_error("Invalid Raft metadata dimensions");
     const auto checksum = static_cast<uint32_t>(reader.Take(4));
     if (!reader.Input.empty() ||
         NSnapshotCodec::Checksum(bytes.substr(0, bytes.size() - sizeof(uint32_t))) != checksum)
         throw std::runtime_error("Raft metadata checksum mismatch");
     metadata.CommitIndexTrusted = flags & DiskMetadataCommitIndexTrusted;
     metadata.ChecksummedRecords =
-        (checksummedFormat || snapshotFormat || entriesGenerationFormat || currentFormat) &&
+        (checksummedFormat || snapshotFormat || entriesGenerationFormat || previousCurrentFormat || currentFormat) &&
         (flags & DiskMetadataChecksummedRecords);
     if (!metadata.CurrentTerm || metadata.LastLogIndex > uint64_t(INT64_MAX) ||
         metadata.CommitIndex > metadata.LastLogIndex ||
@@ -117,9 +146,10 @@ TDiskMetadata DecodeDiskMetadata(std::string_view bytes) {
         ((metadata.SnapshotIndex == 0) != (metadata.SnapshotTerm == 0)) ||
         metadata.SnapshotTerm > metadata.CurrentTerm ||
         metadata.CommitIndex < metadata.SnapshotIndex ||
-        ((!currentFormat && ((metadata.IndexGeneration == 0) != (metadata.SnapshotIndex == 0))) ||
-            (currentFormat && !metadata.IndexGeneration && metadata.SnapshotIndex)) ||
+        ((!generationFormat && ((metadata.IndexGeneration == 0) != (metadata.SnapshotIndex == 0))) ||
+            (generationFormat && !metadata.IndexGeneration && metadata.SnapshotIndex)) ||
         (metadata.EntriesGeneration && metadata.EntriesGeneration != metadata.IndexGeneration) ||
+        (metadata.SnapshotGenerationReference && !metadata.SnapshotIndex) ||
         (!metadata.Voters.empty() && !metadata.CommitIndexTrusted))
         throw std::runtime_error("Invalid Raft metadata bounds");
     if (!metadata.Voters.empty()) {
@@ -134,7 +164,8 @@ TDiskMetadata DecodeDiskMetadata(std::string_view bytes) {
 std::string EncodeDiskMetadata(uint64_t lastLogIndex, uint64_t currentTerm, uint32_t votedFor,
         uint64_t commitIndex, const std::vector<uint32_t>& voters, bool commitIndexTrusted,
         bool checksummedRecords, uint64_t entriesGeneration, uint64_t indexGeneration, uint64_t indexBaseIndex,
-        uint64_t snapshotIndex, uint64_t snapshotTerm) {
+        uint64_t snapshotIndex, uint64_t snapshotTerm,
+        const std::optional<TApplicationSnapshotGenerationReference>& snapshotGenerationReference) {
     if (!currentTerm || lastLogIndex > uint64_t(INT64_MAX) || commitIndex > lastLogIndex ||
         indexBaseIndex != snapshotIndex + 1 || snapshotIndex > lastLogIndex ||
         ((snapshotIndex == 0) != (snapshotTerm == 0)) || snapshotTerm > currentTerm ||
@@ -147,6 +178,8 @@ std::string EncodeDiskMetadata(uint64_t lastLogIndex, uint64_t currentTerm, uint
         // Do not compare votedFor with this original voter set. Runtime
         // membership changes can make a later voter a valid election target.
     }
+    if (snapshotGenerationReference)
+        ValidateApplicationSnapshotGenerationReference(*snapshotGenerationReference, snapshotIndex);
     std::string bytes;
     NSnapshotCodec::Append(bytes, DiskMetadataMagic);
     NSnapshotCodec::Put(bytes, DiskMetadataVersion, 4);
@@ -164,6 +197,15 @@ std::string EncodeDiskMetadata(uint64_t lastLogIndex, uint64_t currentTerm, uint
     NSnapshotCodec::Put(bytes, snapshotIndex, 8);
     NSnapshotCodec::Put(bytes, snapshotTerm, 8);
     for (auto id : voters) NSnapshotCodec::Put(bytes, id, 4);
+    NSnapshotCodec::Put(bytes, snapshotGenerationReference.has_value(), 4);
+    if (snapshotGenerationReference) {
+        const auto& reference = *snapshotGenerationReference;
+        NSnapshotCodec::Put(bytes, reference.SnapshotIndex, 8);
+        NSnapshotCodec::Put(bytes, reference.DataBytes, 8);
+        for (const auto byte : reference.DataSha256) NSnapshotCodec::Put(bytes, byte, 1);
+        NSnapshotCodec::Put(bytes, reference.Id.size(), 4);
+        NSnapshotCodec::Append(bytes, reference.Id);
+    }
     NSnapshotCodec::Put(bytes, NSnapshotCodec::Checksum(bytes), 4);
     return bytes;
 }
@@ -451,7 +493,9 @@ TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitH
 
     State.seekg(0, std::ios::end);
     const auto size = State.tellg();
-    constexpr auto maxMetadataSize = std::streamoff(DiskMetadataFixedSize + TSnapshot::MaxVoters * sizeof(uint32_t));
+    constexpr auto maxMetadataSize = std::streamoff(DiskMetadataFixedSize +
+        TSnapshot::MaxVoters * sizeof(uint32_t) + DiskMetadataGenerationFixedSize +
+        TApplicationSnapshotGenerationReference::MaxIdBytes);
     if (size < 0 || (size != std::streamoff(LegacyDiskMetadataSize) &&
         (size < std::streamoff(ChecksummedDiskMetadataFixedSize) || size > maxMetadataSize)))
         throw std::runtime_error("Invalid Raft metadata size: " + StatePath);
@@ -472,6 +516,7 @@ TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitH
     IndexBaseIndex = metadata.IndexBaseIndex;
     SnapshotIndex = metadata.SnapshotIndex;
     SnapshotTerm = metadata.SnapshotTerm;
+    SnapshotGenerationReference = metadata.SnapshotGenerationReference;
     if (EntriesGeneration) {
         Entries.close();
         if (Entries.fail()) throw std::runtime_error("Cannot close base Raft log file: " + EntriesBasePath);
@@ -509,6 +554,10 @@ TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitH
         } else {
             SnapshotFilePath.clear();
         }
+    }
+    if (SnapshotGenerationReference) {
+        if (!Snapshot) throw std::runtime_error("Application snapshot generation has no Raft snapshot");
+        ValidateApplicationSnapshotGenerationReference(*SnapshotGenerationReference, *Snapshot);
     }
     RecoveredStore = true;
     if (!CurrentTerm) throw std::runtime_error("Invalid Raft metadata term: " + StatePath);
@@ -877,6 +926,15 @@ void TDiskState::InstallRaftSnapshot(std::shared_ptr<const TSnapshot> snapshot,
     InstallSnapshotImpl(std::move(snapshot));
 }
 
+void TDiskState::InstallRaftSnapshot(std::shared_ptr<const TSnapshot> snapshot,
+        const TRaftInstallSnapshotPermit&,
+        std::optional<TApplicationSnapshotGenerationReference> generation) {
+    if (!snapshot) throw std::invalid_argument("Missing Raft snapshot");
+    if (generation) ValidateApplicationSnapshotGenerationReference(*generation, *snapshot);
+    ValidateSnapshot(*snapshot);
+    InstallValidatedSnapshot(std::move(snapshot), false, std::move(generation));
+}
+
 void TDiskState::InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated) {
     ValidateSnapshot(snapshot);
     TSnapshot image = snapshot;
@@ -892,11 +950,13 @@ void TDiskState::InstallSnapshotImpl(std::shared_ptr<const TSnapshot> snapshot) 
 }
 
 void TDiskState::InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snapshot,
-        bool allowSameBoundary) {
+        bool allowSameBoundary,
+        std::optional<TApplicationSnapshotGenerationReference> generation) {
     if (!SnapshotCompatibleWithVoterBinding(*snapshot, Voters))
         throw std::invalid_argument("Snapshot is incompatible with the persisted voter binding");
     const bool sameBoundary = allowSameBoundary && snapshot->Index == SnapshotIndex &&
         snapshot->Term == SnapshotTerm;
+    if (generation) ValidateApplicationSnapshotGenerationReference(*generation, *snapshot);
     if ((!sameBoundary && snapshot->Index <= SnapshotIndex) || snapshot->Term < SnapshotTerm ||
         snapshot->Term > CurrentTerm)
         throw std::invalid_argument("Obsolete or future disk snapshot");
@@ -935,6 +995,7 @@ void TDiskState::InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snaps
     catch (...) { Fail("Cannot open new Raft log index"); }
     SnapshotFilePath = nextSnapshotPath;
     Snapshot = std::move(snapshot);
+    if (!sameBoundary || generation) SnapshotGenerationReference = std::move(generation);
     SnapshotIndex = Snapshot->Index;
     SnapshotTerm = Snapshot->Term;
     LastLogIndex = SnapshotIndex + suffixCount;
@@ -1083,7 +1144,8 @@ void TDiskState::Commit()
     }
     auto metadata = EncodeDiskMetadata(LastLogIndex, CurrentTerm, VotedFor,
         CommitIndex, Voters, CommitIndexTrusted, ChecksummedRecords,
-        EntriesGeneration, IndexGeneration, IndexBaseIndex, SnapshotIndex, SnapshotTerm);
+        EntriesGeneration, IndexGeneration, IndexBaseIndex, SnapshotIndex, SnapshotTerm,
+        SnapshotGenerationReference);
 
     // The backend requires one process per node, as before. Reusing one
     // same-directory temporary file also makes interrupted writes recoverable

@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <array>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -18,6 +19,7 @@
 class TRaft;
 class TSnapshotInstallBudget;
 struct IRsm;
+struct TSnapshot;
 
 // Immutable, range-readable snapshot payload. Sources must remain stable while
 // a snapshot retains them. Reads may be partial but cannot return zero before
@@ -35,6 +37,37 @@ struct ISnapshotDataHeapUsage {
     // Upper bound for payload bytes retained in heap memory.
     virtual uint64_t HeapBytes() const = 0;
 };
+
+// Application-owned immutable snapshot object. The ID is opaque to Raft and
+// must remain resolvable until Raft retires the referencing snapshot. Its
+// index, size and digest bind the object to one exact application checkpoint.
+struct TApplicationSnapshotGenerationReference {
+    static constexpr size_t MaxIdBytes = 128;
+    std::string Id;
+    uint64_t SnapshotIndex = 0;
+    uint64_t DataBytes = 0;
+    std::array<uint8_t, 32> DataSha256{};
+
+    bool IsValid() const {
+        if (Id.empty() || Id.size() > MaxIdBytes || Id == "." || Id == ".." || !SnapshotIndex)
+            return false;
+        for (const unsigned char ch : Id) {
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                    (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.'))
+                return false;
+        }
+        return true;
+    }
+    bool operator==(const TApplicationSnapshotGenerationReference&) const = default;
+};
+
+inline void ValidateApplicationSnapshotGenerationReference(
+        const TApplicationSnapshotGenerationReference& reference, uint64_t snapshotIndex) {
+    if (!reference.IsValid() || reference.SnapshotIndex != snapshotIndex)
+        throw std::invalid_argument("Invalid application snapshot generation reference");
+}
+void ValidateApplicationSnapshotGenerationReference(
+    const TApplicationSnapshotGenerationReference& reference, const TSnapshot& snapshot);
 
 // One committed stable -> joint -> stable voter transition. A zero stable
 // successor identifies the final, currently active joint phase.

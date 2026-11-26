@@ -824,7 +824,7 @@ void test_trusted_legacy_voter_baseline_migrates_durable_state(void**) {
         const auto path = files.Name + ".durable.1";
         std::ifstream originalInput(path, std::ios::binary);
         const std::string original(std::istreambuf_iterator<char>(originalInput), {});
-        assert_true(original.substr(0, 8) == "MRFTD007");
+        assert_true(original.substr(0, 8) == "MRFTD008");
 
         {
             auto state = std::make_shared<TDurableState>(files.Name, 1);
@@ -853,7 +853,7 @@ void test_trusted_legacy_voter_baseline_migrates_durable_state(void**) {
             assert_int_equal(state->RetainedLogTerm(1), 2);
         }
         { std::ifstream migrated(path, std::ios::binary); std::string magic(8, '\0');
-          migrated.read(magic.data(), magic.size()); assert_true(magic == "MRFTD007"); }
+          migrated.read(magic.data(), magic.size()); assert_true(magic == "MRFTD008"); }
         auto recovered = std::make_shared<TDurableState>(files.Name, 1);
         assert_true(static_cast<TStateFields>(*recovered) == before);
         assert_true(recovered->GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
@@ -875,7 +875,7 @@ void test_trusted_legacy_voter_baseline_migrates_durable_state(void**) {
         const auto path = files.Name + ".durable.1";
         std::ifstream originalInput(path, std::ios::binary);
         const std::string original(std::istreambuf_iterator<char>(originalInput), {});
-        assert_true(original.substr(0, 8) == "MRFTD007");
+        assert_true(original.substr(0, 8) == "MRFTD008");
 
         {
             auto state = std::make_shared<TDurableState>(files.Name, 1);
@@ -897,7 +897,7 @@ void test_trusted_legacy_voter_baseline_migrates_durable_state(void**) {
             assert_true(state->GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
         }
         { std::ifstream migrated(path, std::ios::binary); std::string magic(8, '\0');
-          migrated.read(magic.data(), magic.size()); assert_true(magic == "MRFTD007"); }
+          migrated.read(magic.data(), magic.size()); assert_true(magic == "MRFTD008"); }
         auto recovered = std::make_shared<TDurableState>(files.Name, 1);
         assert_true(static_cast<TStateFields>(*recovered) == before);
         assert_true(recovered->GetBoundVoters() == (std::vector<uint32_t>{1, 2, 3}));
@@ -1026,7 +1026,7 @@ void test_durable_v7_corrupt_commit_or_roles_fail_without_rewriting(void**) {
         { auto state = std::make_shared<TDurableState>(files.Name, 4); TRaft raft(state, 4, Peers(4), {4}); }
         const auto path = files.Name + ".durable.4";
         std::ifstream input(path, std::ios::binary); std::string bytes(std::istreambuf_iterator<char>(input), {}); input.close();
-        assert_true(bytes.substr(0, 8) == "MRFTD007");
+        assert_true(bytes.substr(0, 8) == "MRFTD008");
         const auto width = offset == 40 || offset == 64 ? 8 : 4;
         for (size_t i = offset; i < offset + width; ++i) bytes[i] = offset == 52 || offset == 56 ? 0 : char(0xff);
         const auto crc = NSnapshotCodec::Checksum(bytes.substr(0, 8) + bytes.substr(20));
@@ -1046,7 +1046,7 @@ void test_durable_snapshot_adoption_preserves_vote_log_and_application(void**) {
         state.Append(app.Prepare(Command("b", "tail"))); before = state;
     }
     const auto path = files.Name + ".durable.1";
-    { std::ifstream input(path, std::ios::binary); std::string magic(8, '\0'); input.read(magic.data(), 8); assert_true(magic == "MRFTD007"); }
+    { std::ifstream input(path, std::ios::binary); std::string magic(8, '\0'); input.read(magic.data(), 8); assert_true(magic == "MRFTD008"); }
     {
         auto state = std::make_shared<TDurableState>(files.Name, 1);
         auto raft = std::make_shared<TRaft>(state, 1, Peers(1), std::vector<uint32_t>{4});

@@ -253,7 +253,7 @@ void test_v1_v2_v3_images_recover_conservatively_and_upgrade_on_publish(void**) 
         }
         std::ifstream upgraded(files.Image(), std::ios::binary);
         std::string published(8, '\0'); upgraded.read(published.data(), published.size());
-        assert_true(published == "MRFTD007");
+        assert_true(published == "MRFTD008");
     }
 }
 void test_v4_inline_snapshot_recovers_and_upgrades_to_sidecar(void**) {
@@ -287,7 +287,7 @@ void test_v4_inline_snapshot_recovers_and_upgrades_to_sidecar(void**) {
     {
         std::ifstream manifest(files.Image(), std::ios::binary);
         std::string magic(8, '\0'); manifest.read(magic.data(), magic.size());
-        assert_true(magic == "MRFTD007");
+        assert_true(magic == "MRFTD008");
         std::ifstream sidecar(sidecarPath, std::ios::binary);
         assert_true(bool(sidecar));
         TDurableState recovered(files.Name, 1);
@@ -323,7 +323,7 @@ void test_v5_sidecar_is_bound_on_next_manifest_publication(void**) {
     }
     std::ifstream manifest(files.Image(), std::ios::binary);
     std::string magic(8, '\0'); manifest.read(magic.data(), magic.size());
-    assert_true(magic == "MRFTD007");
+    assert_true(magic == "MRFTD008");
     TDurableState recovered(files.Name, 1);
     assert_true(recovered.GetSnapshot() && *recovered.GetSnapshot() == snapshot);
 }

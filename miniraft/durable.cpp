@@ -31,6 +31,7 @@ constexpr std::array<uint8_t, 8> CommitMagic{'M','R','F','T','D','0','0','4'};
 constexpr std::array<uint8_t, 8> ExternalSnapshotMagic{'M','R','F','T','D','0','0','5'};
 constexpr std::array<uint8_t, 8> BoundSnapshotMagic{'M','R','F','T','D','0','0','6'};
 constexpr std::array<uint8_t, 8> ExternalLogMagic{'M','R','F','T','D','0','0','7'};
+constexpr std::array<uint8_t, 8> ApplicationGenerationMagic{'M','R','F','T','D','0','0','8'};
 constexpr std::array<uint8_t, 8> DurableLogMagic{'M','R','F','T','L','0','0','1'};
 constexpr size_t DurableLogHeaderSize = 20;
 using TSnapshotDigest = std::array<uint8_t, 32>;
@@ -318,6 +319,7 @@ struct TDurableState::TImpl {
     size_t PublishedLogCount = 0;
     bool ForceLogGeneration = true;
     std::shared_ptr<const TSnapshot> Snapshot;
+    std::optional<TApplicationSnapshotGenerationReference> SnapshotGenerationReference;
     uint64_t PublishedSnapshotBytes = 0;
     TSnapshotDigest PublishedSnapshotDigest{};
     std::string PublishedSnapshotFile;
@@ -375,7 +377,10 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
     TReadOnlyMap mapped(file.Value);
     const auto bytes = mapped.Bytes();
     if (bytes.size() < Magic.size()) throw std::runtime_error("Truncated durable state magic");
-    const bool externalLog = std::equal(ExternalLogMagic.begin(), ExternalLogMagic.end(), bytes.begin());
+    const bool applicationGeneration = std::equal(
+        ApplicationGenerationMagic.begin(), ApplicationGenerationMagic.end(), bytes.begin());
+    const bool externalLog = applicationGeneration ||
+        std::equal(ExternalLogMagic.begin(), ExternalLogMagic.end(), bytes.begin());
     const bool boundSnapshot = externalLog ||
         std::equal(BoundSnapshotMagic.begin(), BoundSnapshotMagic.end(), bytes.begin());
     const bool externalSnapshot = boundSnapshot ||
@@ -383,7 +388,8 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
     const bool commitAware = externalSnapshot || std::equal(CommitMagic.begin(), CommitMagic.end(), bytes.begin());
     const bool configured = std::equal(ConfigurationMagic.begin(), ConfigurationMagic.end(), bytes.begin());
     const bool compacted = std::equal(SnapshotMagic.begin(), SnapshotMagic.end(), bytes.begin());
-    const auto* version = externalLog ? &ExternalLogMagic : boundSnapshot ? &BoundSnapshotMagic : externalSnapshot ? &ExternalSnapshotMagic :
+    const auto* version = applicationGeneration ? &ApplicationGenerationMagic :
+        externalLog ? &ExternalLogMagic : boundSnapshot ? &BoundSnapshotMagic : externalSnapshot ? &ExternalSnapshotMagic :
         commitAware ? &CommitMagic : configured ? &ConfigurationMagic : compacted ? &SnapshotMagic : nullptr;
     if (!version && !std::equal(Magic.begin(), Magic.end(), bytes.begin()))
         throw std::runtime_error("Unknown durable state format");
@@ -427,6 +433,27 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
             if (!Impl->LogGeneration || Impl->LogBytes < DurableLogHeaderSize)
                 throw std::runtime_error("Invalid durable log identity");
         }
+        if (applicationGeneration) {
+            const auto hasGeneration = Take(bytes, position, 4);
+            if (hasGeneration > 1)
+                throw std::runtime_error("Invalid application snapshot generation marker");
+            if (hasGeneration) {
+                TApplicationSnapshotGenerationReference reference;
+                reference.SnapshotIndex = Take(bytes, position, 8);
+                reference.DataBytes = Take(bytes, position, 8);
+                for (auto& byte : reference.DataSha256) byte = static_cast<uint8_t>(Take(bytes, position, 1));
+                const auto idBytes = Take(bytes, position, 4);
+                if (!idBytes || idBytes > TApplicationSnapshotGenerationReference::MaxIdBytes)
+                    throw std::runtime_error("Invalid application snapshot generation ID length");
+                if (idBytes > bytes.size() - position)
+                    throw std::runtime_error("Truncated application snapshot generation ID");
+                reference.Id.assign(reinterpret_cast<const char*>(bytes.data() + position), size_t(idBytes));
+                position += size_t(idBytes);
+                if (!SnapshotIndex || !reference.IsValid() || reference.SnapshotIndex != SnapshotIndex)
+                    throw std::runtime_error("Invalid application snapshot generation reference");
+                Impl->SnapshotGenerationReference = std::move(reference);
+            }
+        }
         if (SnapshotIndex) {
             const auto snapshotFileName = SnapshotImageName(Impl->File, SnapshotIndex, SnapshotTerm);
             TFd snapshotFile(openat(Impl->Directory.Value, snapshotFileName.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
@@ -445,6 +472,8 @@ TDurableState::TDurableState(const std::string& name, uint32_t id, THook hook)
             if (snapshot.Index != SnapshotIndex || snapshot.Term != SnapshotTerm || snapshot.Term > CurrentTerm ||
                 (!Impl->Voters.empty() && !SnapshotCompatibleWithVoterBinding(snapshot, Impl->Voters)))
                 throw std::runtime_error("External durable snapshot does not match its manifest");
+            if (Impl->SnapshotGenerationReference)
+                ValidateApplicationSnapshotGenerationReference(*Impl->SnapshotGenerationReference, snapshot);
             LastLogTerm = SnapshotTerm;
             Impl->Snapshot = std::make_shared<const TSnapshot>(std::move(snapshot));
             Impl->PublishedSnapshotFile = snapshotFileName;
@@ -596,6 +625,8 @@ void TDurableState::Publish()
     if (!Impl->Voters.empty()) {
         ValidateFixedVoters(Impl->Voters);
     }
+    if (Impl->SnapshotGenerationReference)
+        ValidateApplicationSnapshotGenerationReference(*Impl->SnapshotGenerationReference, SnapshotIndex);
     // Recovery and trusted migration validate the complete log. Online appends
     // and suffix replacement validate new entries against the retained prefix;
     // snapshot installation retains only a matching suffix, and RemoveLast only
@@ -729,14 +760,14 @@ void TDurableState::Publish()
     Impl->Stage(EStage::TempCreated);
     constexpr size_t PayloadOffset = CommitMagic.size() + 8 + 4;
     std::array<uint8_t, PayloadOffset> header{};
-    std::copy(ExternalLogMagic.begin(), ExternalLogMagic.end(), header.begin());
+    std::copy(ApplicationGenerationMagic.begin(), ApplicationGenerationMagic.end(), header.begin());
     WriteAll(temp.Value, header.data(), header.size());
 
     NSnapshotCodec::TChecksum checksum;
     auto updateChecksum = [&](const uint8_t* data, size_t size) {
         checksum.Update(data, size);
     };
-    updateChecksum(ExternalLogMagic.data(), ExternalLogMagic.size());
+    updateChecksum(ApplicationGenerationMagic.data(), ApplicationGenerationMagic.size());
     uint64_t payloadLength = 0;
     bool payloadStarted = false;
     auto writePayload = [&](const void* data, size_t size) {
@@ -769,12 +800,21 @@ void TDurableState::Publish()
     writeInteger(logGeneration, 8);
     writeInteger(logBytes, 8);
     writeInteger(logChecksumValue, 4);
+    writeInteger(Impl->SnapshotGenerationReference.has_value(), 4);
+    if (Impl->SnapshotGenerationReference) {
+        const auto& reference = *Impl->SnapshotGenerationReference;
+        writeInteger(reference.SnapshotIndex, 8);
+        writeInteger(reference.DataBytes, 8);
+        writePayload(reference.DataSha256.data(), reference.DataSha256.size());
+        writeInteger(reference.Id.size(), 4);
+        writePayload(reference.Id.data(), reference.Id.size());
+    }
 
     std::array<uint8_t, 12> encodedHeader{};
     for (unsigned i = 0; i < 8; ++i) encodedHeader[i] = uint8_t(payloadLength >> (8 * i));
     const auto checksumValue = checksum.Finish();
     for (unsigned i = 0; i < 4; ++i) encodedHeader[8 + i] = uint8_t(checksumValue >> (8 * i));
-    WriteAtAll(temp.Value, encodedHeader.data(), encodedHeader.size(), off_t(ExternalLogMagic.size()));
+    WriteAtAll(temp.Value, encodedHeader.data(), encodedHeader.size(), off_t(ApplicationGenerationMagic.size()));
     Impl->Stage(EStage::Written);
     Sync(temp.Value);
     Impl->Stage(EStage::FileSynced);
@@ -908,6 +948,11 @@ uint64_t TDurableState::RetainedLogFlags(int64_t index) const {
 
 std::shared_ptr<const TSnapshot> TDurableState::GetSnapshot() const { return Impl->Snapshot; }
 
+std::optional<TApplicationSnapshotGenerationReference>
+TDurableState::GetApplicationSnapshotGenerationReference() const {
+    return Impl->SnapshotGenerationReference;
+}
+
 void TDurableState::InstallSnapshot(const TSnapshot& snapshot) {
     InstallSnapshotImpl(snapshot, false);
 }
@@ -922,6 +967,15 @@ void TDurableState::InstallRaftSnapshot(std::shared_ptr<const TSnapshot> snapsho
     InstallSnapshotImpl(std::move(snapshot));
 }
 
+void TDurableState::InstallRaftSnapshot(std::shared_ptr<const TSnapshot> snapshot,
+        const TRaftInstallSnapshotPermit&,
+        std::optional<TApplicationSnapshotGenerationReference> generation) {
+    if (!snapshot) throw std::invalid_argument("Missing Raft snapshot");
+    if (generation) ValidateApplicationSnapshotGenerationReference(*generation, *snapshot);
+    ValidateSnapshot(*snapshot);
+    InstallValidatedSnapshot(std::move(snapshot), std::move(generation));
+}
+
 void TDurableState::InstallSnapshotImpl(const TSnapshot& snapshot, bool configurationHistoryValidated) {
     ValidateSnapshot(snapshot);
     TSnapshot image = snapshot;
@@ -930,13 +984,16 @@ void TDurableState::InstallSnapshotImpl(const TSnapshot& snapshot, bool configur
     InstallValidatedSnapshot(std::make_shared<const TSnapshot>(std::move(image)));
 }
 
-void TDurableState::InstallSnapshotImpl(std::shared_ptr<const TSnapshot> saved) {
+void TDurableState::InstallSnapshotImpl(std::shared_ptr<const TSnapshot> saved,
+        std::optional<TApplicationSnapshotGenerationReference> generation) {
     if (!saved) throw std::invalid_argument("Missing Raft snapshot");
+    if (generation) ValidateApplicationSnapshotGenerationReference(*generation, *saved);
     ValidateSnapshot(*saved);
-    InstallValidatedSnapshot(std::move(saved));
+    InstallValidatedSnapshot(std::move(saved), std::move(generation));
 }
 
-void TDurableState::InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> saved) {
+void TDurableState::InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> saved,
+        std::optional<TApplicationSnapshotGenerationReference> generation) {
     if (!SnapshotCompatibleWithVoterBinding(*saved, Impl->Voters))
         throw std::invalid_argument("Snapshot is incompatible with the persisted voter binding");
     if (saved->Index <= SnapshotIndex || saved->Term < SnapshotTerm || saved->Term > CurrentTerm)
@@ -950,6 +1007,7 @@ void TDurableState::InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> sa
     Impl->Log.swap(suffix);
     Impl->ForceLogGeneration = true;
     Impl->Snapshot = std::move(saved);
+    Impl->SnapshotGenerationReference = std::move(generation);
     SnapshotIndex = Impl->Snapshot->Index;
     SnapshotTerm = Impl->Snapshot->Term;
     LastLogIndex = SnapshotIndex + Impl->Log.size();

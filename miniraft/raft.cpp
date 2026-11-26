@@ -3276,9 +3276,16 @@ std::shared_ptr<const TSnapshot> TRaft::CompactShared() {
     } else {
         application->ValidateSnapshot(snapshot->Data, snapshot->Index);
     }
+    auto stagedApplicationGeneration = PrepareApplicationSnapshotGeneration(*application, *snapshot);
+    std::optional<TApplicationSnapshotGenerationReference> generationReference;
+    if (stagedApplicationGeneration) {
+        generationReference = stagedApplicationGeneration->Reference();
+        stagedApplicationGeneration->Publish();
+    }
     AdvanceCommitIndex(VolatileState->CommitIndex);
     TRaftInstallSnapshotPermit permit;
-    State->InstallRaftSnapshot(snapshot, permit);
+    State->InstallRaftSnapshot(snapshot, permit, std::move(generationReference));
+    if (stagedApplicationGeneration) stagedApplicationGeneration->Activate();
     RebuildUncommittedLogUsage();
     ConfigurationBaseline = snapshot->StableConfiguration
         ? TConfigurationHistory::FromStableSnapshot(*snapshot)
@@ -3724,6 +3731,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     // A staged file retains its separate disk reservation until we close it.
     std::shared_ptr<void> installationReservation;
     std::unique_ptr<IStagedSnapshotInstallation> stagedApplicationInstall;
+    std::unique_ptr<IStagedApplicationSnapshotGeneration> stagedApplicationGeneration;
     TSnapshot snapshot;
     try {
         const bool sourceBackedInstall = incoming.File && supportsSourceBackedInstall;
@@ -3897,7 +3905,12 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             if (voter != Id && !Nodes.contains(voter))
                 throw TMessageError("Snapshot configuration is missing a voter peer target");
         snapshot.HeapReservationBudget = SnapshotInstallBudget;
-        stagedApplicationInstall = PrepareApplicationSnapshotInstallation(*application, snapshot);
+        stagedApplicationGeneration = PrepareApplicationSnapshotGeneration(*application, snapshot);
+        if (stagedApplicationGeneration) {
+            stagedApplicationGeneration->Publish();
+        } else {
+            stagedApplicationInstall = PrepareApplicationSnapshotInstallation(*application, snapshot);
+        }
         snapshot.HeapReservation = std::move(installationReservation);
     } catch (const std::exception&) {
         IncomingSnapshot.reset(); reply(false, false, 0); return;
@@ -3906,8 +3919,12 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     try {
         installedSnapshot = std::make_shared<const TSnapshot>(std::move(snapshot));
         TRaftInstallSnapshotPermit permit;
-        State->InstallRaftSnapshot(installedSnapshot, permit); // publish Raft state before app replacement or ACK
-        InstallApplicationSnapshot(*application, *installedSnapshot,
+        std::optional<TApplicationSnapshotGenerationReference> generationReference;
+        if (stagedApplicationGeneration)
+            generationReference = stagedApplicationGeneration->Reference();
+        State->InstallRaftSnapshot(installedSnapshot, permit, std::move(generationReference));
+        if (stagedApplicationGeneration) stagedApplicationGeneration->Activate();
+        else InstallApplicationSnapshot(*application, *installedSnapshot,
             std::move(stagedApplicationInstall));
         if (application->LastAppliedIndex != installedSnapshot->Index) std::terminate();
     } catch (...) { std::terminate(); }
@@ -4065,8 +4082,23 @@ TRequestProcessor::TRequestProcessor(std::shared_ptr<TRaft> raft, std::shared_pt
     if (AdmissionLimits.RequestTimeout <= ITimeSource::Time::duration::zero())
         throw std::invalid_argument("Request timeout must be positive");
     ForwardingSession = AllocateForwardingSession();
-    if (auto snapshot = Raft->GetState()->GetSnapshot(); snapshot && Rsm->LastAppliedIndex < snapshot->Index)
-        RestoreSnapshot(*snapshot, *Raft, *Rsm);
+    if (auto snapshot = Raft->GetState()->GetSnapshot(); snapshot) {
+        const auto generation = Raft->GetState()->GetApplicationSnapshotGenerationReference();
+        if (generation) {
+            auto* generationRsm = dynamic_cast<IApplicationSnapshotGenerationRsm*>(Rsm.get());
+            if (!generationRsm)
+                throw std::invalid_argument("Recovered Raft state requires application snapshot generations");
+            ValidateApplicationSnapshotGenerationReference(*generation, *snapshot);
+            generationRsm->ValidateSnapshotGeneration(*generation, snapshot->Index);
+            if (Rsm->LastAppliedIndex < snapshot->Index) {
+                generationRsm->RestoreSnapshotGeneration(*generation, snapshot->Index);
+                if (Rsm->LastAppliedIndex != snapshot->Index)
+                    throw std::runtime_error("Application failed to restore its snapshot generation progress");
+            }
+        } else if (Rsm->LastAppliedIndex < snapshot->Index) {
+            RestoreSnapshot(*snapshot, *Raft, *Rsm);
+        }
+    }
     if (Rsm->LastAppliedIndex < Raft->GetState()->SnapshotIndex)
         throw std::invalid_argument("Application progress precedes compacted log");
     const bool supportsIdempotentLog = dynamic_cast<IIdempotentRsm*>(Rsm.get()) != nullptr;
