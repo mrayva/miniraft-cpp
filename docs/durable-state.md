@@ -84,7 +84,12 @@ and compaction through generation-specific snapshot, entries and retained-suffix
 index files; metadata switches generations before the covered prefix is
 reclaimed. Fresh stores use checksummed log/index records and MRFTL006 metadata
 that includes CRC32, the commit boundary, original voter binding, log
-generation and an optional application snapshot-generation reference.
+generation and an optional application snapshot-generation reference. Like
+`TDurableState`, `TDiskState` can be constructed with a resolver to keep a
+referenced nonempty application payload out of the snapshot sidecar; recovery
+requires that resolver and validates the exact size and digest before exposing
+the payload. Without the resolver, snapshot bytes remain embedded in the
+sidecar.
 MRFTL001 through MRFTL005 and old 20-byte stores remain readable;
 after binding an old store, its existing records keep the legacy encoding
 selected by their metadata until a generation rewrite.

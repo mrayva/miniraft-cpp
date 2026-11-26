@@ -61,6 +61,9 @@ struct TApplicationSnapshotGenerationReference {
     bool operator==(const TApplicationSnapshotGenerationReference&) const = default;
 };
 
+using TApplicationSnapshotGenerationResolver = std::function<
+    std::shared_ptr<const TSnapshotDataSource>(const TApplicationSnapshotGenerationReference&)>;
+
 inline void ValidateApplicationSnapshotGenerationReference(
         const TApplicationSnapshotGenerationReference& reference, uint64_t snapshotIndex) {
     if (!reference.IsValid() || reference.SnapshotIndex != snapshotIndex)
@@ -127,6 +130,10 @@ struct TSnapshot {
     bool HasConfigurationMetadata() const { return StableConfiguration || IsJoint(); }
     bool operator==(const TSnapshot& other) const;
 };
+
+// Copies the snapshot boundary and membership metadata without copying or
+// retaining its application payload.
+TSnapshot SnapshotMetadataOnly(const TSnapshot& snapshot);
 
 // Shares an aggregate heap limit across snapshot transfers and retained images.
 // Temporary file staging uses a separate budget. Callers can supply shared

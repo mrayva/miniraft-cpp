@@ -310,26 +310,6 @@ private:
 #endif
 }
 
-namespace {
-TSnapshot CopySnapshotMetadata(const TSnapshot& source) {
-    TSnapshot result;
-    result.Index = source.Index;
-    result.Term = source.Term;
-    result.Voters = source.Voters;
-    result.JointVoters = source.JointVoters;
-    result.ConfigurationIndex = source.ConfigurationIndex;
-    result.ConfigurationTerm = source.ConfigurationTerm;
-    result.StableConfiguration = source.StableConfiguration;
-    result.PreviousVoters = source.PreviousVoters;
-    result.PreviousConfigurationIndex = source.PreviousConfigurationIndex;
-    result.PreviousConfigurationTerm = source.PreviousConfigurationTerm;
-    result.PreviousJointIndex = source.PreviousJointIndex;
-    result.PreviousJointTerm = source.PreviousJointTerm;
-    result.ConfigurationTransitions = source.ConfigurationTransitions;
-    return result;
-}
-}
-
 struct TDurableState::TImpl {
     std::vector<TMessageHolder<TLogEntry>> Log;
     uint64_t LogGeneration = 0;
@@ -683,10 +663,10 @@ void TDurableState::Publish()
             auto source = Impl->SnapshotGenerationResolver(reference);
             if (!source)
                 throw std::runtime_error("Cannot resolve application snapshot generation before publication");
-            auto resolvedSnapshot = CopySnapshotMetadata(*Impl->Snapshot);
+            auto resolvedSnapshot = SnapshotMetadataOnly(*Impl->Snapshot);
             resolvedSnapshot.DataSource = std::move(source);
             ValidateApplicationSnapshotGenerationReference(reference, resolvedSnapshot);
-            metadataOnlySnapshot.emplace(CopySnapshotMetadata(*Impl->Snapshot));
+            metadataOnlySnapshot.emplace(SnapshotMetadataOnly(*Impl->Snapshot));
             snapshotToPersist = &*metadataOnlySnapshot;
         }
         const auto snapshotEncoding = PrepareSnapshotEncoding(*snapshotToPersist);

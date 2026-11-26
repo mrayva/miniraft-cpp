@@ -73,7 +73,10 @@ lets follower suffix replacement publish the retained prefix, replacement
 entries and commit boundary with one metadata switch. It also stores an
 optional immutable application snapshot-generation reference atomically with
 the snapshot boundary and retained suffix. The Raft snapshot payload remains
-in its existing generation. MRFTL002's metadata flag
+in its existing generation unless an application-generation resolver is
+configured; then a nonempty referenced payload is omitted from the sidecar and
+resolved and digest-checked during startup. The resolver must be configured on
+every recovery. MRFTL002's metadata flag
 selects whether its records are checksummed; MRFTL001 and 20-byte stores have
 unchecked records. CRCs detect accidental corruption, not a malicious rewrite.
 The alpha.2 follow-up added ordered log/index synchronization, temporary

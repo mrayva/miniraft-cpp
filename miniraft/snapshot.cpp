@@ -608,6 +608,24 @@ std::string TSnapshot::MaterializeData() const {
     return result;
 }
 
+TSnapshot SnapshotMetadataOnly(const TSnapshot& source) {
+    TSnapshot result;
+    result.Index = source.Index;
+    result.Term = source.Term;
+    result.Voters = source.Voters;
+    result.JointVoters = source.JointVoters;
+    result.ConfigurationIndex = source.ConfigurationIndex;
+    result.ConfigurationTerm = source.ConfigurationTerm;
+    result.StableConfiguration = source.StableConfiguration;
+    result.PreviousVoters = source.PreviousVoters;
+    result.PreviousConfigurationIndex = source.PreviousConfigurationIndex;
+    result.PreviousConfigurationTerm = source.PreviousConfigurationTerm;
+    result.PreviousJointIndex = source.PreviousJointIndex;
+    result.PreviousJointTerm = source.PreviousJointTerm;
+    result.ConfigurationTransitions = source.ConfigurationTransitions;
+    return result;
+}
+
 bool TSnapshot::operator==(const TSnapshot& other) const {
     if (Index != other.Index || Term != other.Term || Voters != other.Voters ||
         JointVoters != other.JointVoters || ConfigurationIndex != other.ConfigurationIndex ||

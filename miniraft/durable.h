@@ -32,9 +32,6 @@ TLegacyDiskStateMigrationInfo MigrateLegacyDiskState(
 // Linux: atomic hard-state + snapshot + suffix replacement, with file/directory
 // fsync. Snapshot sidecars are immutable between snapshots, so ordinary
 // updates append to the selected log generation and publish a small manifest.
-using TApplicationSnapshotGenerationResolver = std::function<
-    std::shared_ptr<const TSnapshotDataSource>(const TApplicationSnapshotGenerationReference&)>;
-
 class TDurableState : public IState {
 public:
     enum class EStage {

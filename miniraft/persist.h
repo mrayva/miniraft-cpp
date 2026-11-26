@@ -27,6 +27,9 @@ struct TDiskState : IState {
     TDiskState(const std::string& name, uint32_t id, TCommitHook commitHook = {});
     TDiskState(const std::string& name, uint32_t id, TCommitHook commitHook,
         bool reclaimUnselectedGenerationsOnRecovery);
+    TDiskState(const std::string& name, uint32_t id, TCommitHook commitHook,
+        bool reclaimUnselectedGenerationsOnRecovery,
+        TApplicationSnapshotGenerationResolver generationResolver);
     
     void RemoveLast() override;
     void Append(TMessageHolder<TLogEntry> entry) override;
@@ -128,6 +131,7 @@ private:
     std::string StatePath;
     std::string SnapshotFilePath;
     TCommitHook CommitHook;
+    TApplicationSnapshotGenerationResolver SnapshotGenerationResolver;
     std::vector<uint32_t> Voters;
     std::shared_ptr<const TSnapshot> Snapshot;
     std::optional<TApplicationSnapshotGenerationReference> SnapshotGenerationReference;

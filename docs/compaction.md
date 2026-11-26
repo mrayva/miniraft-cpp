@@ -20,11 +20,13 @@ entries generation is reclaimed. MRFTL003 and MRFTL004 stores remain readable;
 their old entries file moves into a versioned generation at the next suffix
 replacement or snapshot installation. MRFTL001 through MRFTL005 and 20-byte
 metadata remain readable. MRFTL006 can also persist an optional opaque
-application-generation reference in the same metadata publication;
-`TDiskState` still stores snapshot payload bytes in its sidecar.
-`TDurableState` callers that externalize payloads must configure the generation
-resolver during construction so recovery resolves the referenced immutable
-source before constructing Raft.
+application-generation reference in the same metadata publication. When a
+generation resolver is configured, either backend stores only snapshot
+metadata in the Raft sidecar for a referenced nonempty payload. The resolver
+must return the immutable source whose size and digest match the reference, and
+must be configured again on recovery so the payload can be resolved before
+constructing Raft. Without a resolver, the sidecar continues to contain the
+complete snapshot payload.
 The disk backend writes the encoded snapshot sidecar in 64 KiB ranges, avoiding
 an additional full-size encoded string. Recovery decodes the owned sidecar
 buffer in place, avoiding a second heap allocation for the application payload.

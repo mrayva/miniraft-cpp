@@ -3,13 +3,14 @@
 This design describes the staged work to remove the current 128 MiB
 complete-image limit. The application capture-source API, optional receive
 staging files, and an opt-in durable application-generation reference are
-implemented. `TDurableState` can now use a generation resolver to keep the
-application payload out of its snapshot sidecar while preserving the payload as
-a range source after restart. Raft atomically stores the reference with its
-snapshot boundary, commit index, membership-bearing snapshot and retained
-suffix. `TDiskState` still stores the complete sidecar payload, and all peers
-still transfer the complete image using the existing wire format. The current
-snapshot format, storage behavior and transfer limits are described in
+implemented. `TDurableState` and `TDiskState` can use a generation resolver to
+keep the application payload out of their snapshot sidecars while preserving
+the payload as a range source after restart. Each backend atomically stores the
+reference with its snapshot boundary and retained suffix. Recovery requires the
+resolver for a nonempty external payload and verifies its size and digest before
+exposing the snapshot. Peers still transfer the complete image using the
+existing wire format. The current snapshot format, storage behavior and
+transfer limits are described in
 [compaction and InstallSnapshot](compaction.md).
 
 ## Current incremental step
@@ -39,10 +40,11 @@ Existing applications retain the `SaveSnapshot()` path. On Linux, the SQL
 example backs up into a private temporary database with a bounded SQLite page
 cache and serves ranges from a read-only file descriptor. This avoids a
 full-size `sqlite3_serialize()` allocation and a second complete payload
-allocation during capture. `TDiskState` still copies ranges into its snapshot
-generation; `TDurableState` can instead publish only snapshot metadata when
-constructed with an application-generation resolver. Images remain capped at
-128 MiB. Non-Linux builds retain the in-memory serialized source.
+allocation during capture. Without a generation resolver, both disk backends
+store the complete snapshot payload in their snapshot generation. With a
+resolver, either backend can publish only snapshot metadata there for a
+generation-backed nonempty payload. Images remain capped at 128 MiB. Non-Linux
+builds retain the in-memory serialized source.
 
 `IStreamingSnapshotWriterRsm` is an alternative for applications that generate
 snapshot bytes incrementally. Raft supplies a sink that checks the

@@ -461,13 +461,20 @@ bool SyncDirectory(const std::string& path) {
 }
 
 TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitHook)
-    : TDiskState(name, id, std::move(commitHook), true)
+    : TDiskState(name, id, std::move(commitHook), true, {})
 { }
 
 TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitHook,
         bool reclaimUnselectedGenerationsOnRecovery)
+    : TDiskState(name, id, std::move(commitHook), reclaimUnselectedGenerationsOnRecovery, {})
+{ }
+
+TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitHook,
+        bool reclaimUnselectedGenerationsOnRecovery,
+        TApplicationSnapshotGenerationResolver generationResolver)
     : ReclaimUnselectedGenerationsOnRecovery(reclaimUnselectedGenerationsOnRecovery)
     , CommitHook(std::move(commitHook))
+    , SnapshotGenerationResolver(std::move(generationResolver))
 {
     const auto suffix = "." + std::to_string(id);
     EntriesBasePath = name + ".entries" + suffix;
@@ -531,9 +538,10 @@ TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitH
         if (SnapshotIndex) {
             if (!IsRegularFileNoFollow(SnapshotFilePath))
                 throw std::runtime_error("Missing or invalid Raft snapshot: " + SnapshotFilePath);
+            TSnapshot loadedSnapshot;
 #ifdef __linux__
             auto snapshotMap = std::make_shared<TSnapshotGenerationMap>(SnapshotFilePath);
-            Snapshot = std::make_shared<const TSnapshot>(DecodeSnapshotBacked(snapshotMap->Bytes(), snapshotMap));
+            loadedSnapshot = DecodeSnapshotBacked(snapshotMap->Bytes(), snapshotMap);
 #else
             std::ifstream snapshotFile(SnapshotFilePath, std::ios::binary);
             if (!snapshotFile) throw std::runtime_error("Cannot open Raft snapshot: " + SnapshotFilePath);
@@ -545,20 +553,32 @@ TDiskState::TDiskState(const std::string& name, uint32_t id, TCommitHook commitH
             snapshotFile.seekg(0);
             if (!snapshotFile.read(encodedSnapshot.data(), std::streamsize(snapshotSize)))
                 throw std::runtime_error("Cannot read Raft snapshot: " + SnapshotFilePath);
-            Snapshot = std::make_shared<const TSnapshot>(DecodeSnapshotOwned(std::move(encodedSnapshot)));
+            loadedSnapshot = DecodeSnapshotOwned(std::move(encodedSnapshot));
 #endif
-            if (Snapshot->Index != SnapshotIndex || Snapshot->Term != SnapshotTerm)
+            if (loadedSnapshot.Index != SnapshotIndex || loadedSnapshot.Term != SnapshotTerm)
                 throw std::runtime_error("Raft snapshot boundary disagrees with metadata: " + SnapshotFilePath);
+            if (SnapshotGenerationReference) {
+                const auto& reference = *SnapshotGenerationReference;
+                if (loadedSnapshot.DataSize() == 0 && reference.DataBytes > 0) {
+                    if (!SnapshotGenerationResolver)
+                        throw std::runtime_error(
+                            "Disk snapshot payload is external; a generation resolver is required");
+                    auto source = SnapshotGenerationResolver(reference);
+                    if (!source)
+                        throw std::runtime_error("Cannot resolve disk application snapshot generation");
+                    loadedSnapshot.DataSource = std::move(source);
+                }
+                ValidateApplicationSnapshotGenerationReference(reference, loadedSnapshot);
+            }
+            Snapshot = std::make_shared<const TSnapshot>(std::move(loadedSnapshot));
         } else if (SnapshotTerm) {
             throw std::runtime_error("Raft snapshot term has no snapshot boundary: " + StatePath);
         } else {
             SnapshotFilePath.clear();
         }
     }
-    if (SnapshotGenerationReference) {
-        if (!Snapshot) throw std::runtime_error("Application snapshot generation has no Raft snapshot");
-        ValidateApplicationSnapshotGenerationReference(*SnapshotGenerationReference, *Snapshot);
-    }
+    if (SnapshotGenerationReference && !Snapshot)
+        throw std::runtime_error("Application snapshot generation has no Raft snapshot");
     RecoveredStore = true;
     if (!CurrentTerm) throw std::runtime_error("Invalid Raft metadata term: " + StatePath);
 
@@ -974,10 +994,22 @@ void TDiskState::InstallValidatedSnapshot(std::shared_ptr<const TSnapshot> snaps
     const auto nextEntriesPath = EntryGenerationPath(nextGeneration);
     const auto nextIndexPath = GenerationPath(nextGeneration);
     const auto nextLastIndex = retainSuffix ? LastLogIndex : snapshot->Index;
+    std::optional<TSnapshot> metadataOnlySnapshot;
+    const TSnapshot* snapshotToPersist = snapshot.get();
+    if (SnapshotGenerationResolver && generation && generation->DataBytes > 0) {
+        auto source = SnapshotGenerationResolver(*generation);
+        if (!source)
+            throw std::runtime_error("Cannot resolve application snapshot generation before disk publication");
+        auto resolvedSnapshot = SnapshotMetadataOnly(*snapshot);
+        resolvedSnapshot.DataSource = std::move(source);
+        ValidateApplicationSnapshotGenerationReference(*generation, resolvedSnapshot);
+        metadataOnlySnapshot.emplace(SnapshotMetadataOnly(*snapshot));
+        snapshotToPersist = &*metadataOnlySnapshot;
+    }
     const auto suffixCount = WriteCompactedLogGeneration(nextEntriesPath, nextIndexPath,
         snapshot->Index + 1, nextLastIndex, nextLastTerm);
     const auto nextSnapshotPath = SnapshotPath(nextGeneration);
-    WriteSnapshotGenerationFile(nextSnapshotPath, *snapshot);
+    WriteSnapshotGenerationFile(nextSnapshotPath, *snapshotToPersist);
     if (CommitHook) CommitHook(ECommitStage::SnapshotImagePublished);
 
     Entries.close();
