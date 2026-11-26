@@ -815,6 +815,62 @@ void test_sql_compaction_at_raft_only_boundaries(void**) {
     }
 }
 
+void test_sql_generation_snapshot_recovers_with_raft_manifest(void**) {
+#ifdef __linux__
+    for (const bool durable : {false, true}) {
+        TDatabase file;
+        const auto raftPath = file.Path + "-raft";
+        auto makeState = [&](const TApplicationSnapshotGenerationResolver& resolver) -> std::shared_ptr<IState> {
+            if (durable)
+                return std::make_shared<TDurableState>(raftPath, 1, TDurableState::THook{}, resolver);
+            return std::make_shared<TDiskState>(raftPath, 1,
+                TDiskState::TCommitHook{}, true, resolver);
+        };
+        {
+            auto sql = std::make_shared<TSql>(file.Path, 1);
+            TApplicationSnapshotGenerationResolver resolver =
+                [sql](const TApplicationSnapshotGenerationReference& reference) {
+                    return sql->ResolveSnapshotGeneration(reference);
+                };
+            auto state = makeState(resolver);
+            state->BindVoters({1});
+            auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+            TRequestProcessor processor(raft, sql, {});
+            raft->ProcessTimeout({});
+            processor.ProcessCommitted();
+            assert_int_equal(sql->LastAppliedIndex, 1);
+
+            const auto snapshot = raft->CompactShared();
+            assert_int_equal(snapshot->Index, 1);
+            assert_true(snapshot->Data.empty());
+            assert_non_null(snapshot->DataSource.get());
+            const auto reference = state->GetApplicationSnapshotGenerationReference();
+            assert_true(reference.has_value());
+            assert_int_equal(reference->SnapshotIndex, 1);
+            assert_true(reference->DataBytes > 100);
+        }
+
+        // Simulate the application database lagging behind a committed Raft
+        // snapshot. Recovery must resolve the immutable app generation before
+        // the request processor starts serving the node.
+        assert_true(std::filesystem::remove(file.Path + ".1"));
+        {
+            auto sql = std::make_shared<TSql>(file.Path, 1);
+            TApplicationSnapshotGenerationResolver resolver =
+                [sql](const TApplicationSnapshotGenerationReference& reference) {
+                    return sql->ResolveSnapshotGeneration(reference);
+                };
+            auto state = makeState(resolver);
+            auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+            TRequestProcessor processor(raft, sql, {});
+            assert_int_equal(sql->LastAppliedIndex, 1);
+            assert_true(ReadText(*sql, "SELECT value FROM raft_metadata_ WHERE key='LastAppliedIndex'") ==
+                "value\n1\n");
+        }
+    }
+#endif
+}
+
 }
 int main() {
     const CMUnitTest tests[] = {
@@ -860,6 +916,7 @@ int main() {
         cmocka_unit_test(test_sql_read_value_limit_is_restored_before_writes),
         cmocka_unit_test(test_sql_and_raft_restart_do_not_reapply_committed_insert),
         cmocka_unit_test(test_sql_compaction_at_raft_only_boundaries),
+        cmocka_unit_test(test_sql_generation_snapshot_recovers_with_raft_manifest),
     };
     return cmocka_run_group_tests(tests, nullptr, nullptr);
 }

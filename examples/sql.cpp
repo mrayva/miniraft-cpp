@@ -183,10 +183,20 @@ int main(int argc, char** argv)
             std::cerr << "Host not found\n"; return 1;
         }
 
-        std::shared_ptr<IRsm> rsm = std::make_shared<TSql>("sql_file.db", myHost.Id);
+        auto sqlRsm = std::make_shared<TSql>("sql_file.db", myHost.Id);
+        std::shared_ptr<IRsm> rsm = sqlRsm;
+        TApplicationSnapshotGenerationResolver generationResolver;
+#ifdef __linux__
+        generationResolver =
+            [sqlRsm](const TApplicationSnapshotGenerationReference& reference) {
+                return sqlRsm->ResolveSnapshotGeneration(reference);
+            };
+#endif
         std::shared_ptr<IState> state = durable
-            ? std::static_pointer_cast<IState>(std::make_shared<TDurableState>("sql_state", myHost.Id))
-            : std::static_pointer_cast<IState>(std::make_shared<TDiskState>("sql_state", myHost.Id));
+            ? std::static_pointer_cast<IState>(std::make_shared<TDurableState>(
+                "sql_state", myHost.Id, TDurableState::THook{}, generationResolver))
+            : std::static_pointer_cast<IState>(std::make_shared<TDiskState>(
+                "sql_state", myHost.Id, TDiskState::TCommitHook{}, true, generationResolver));
         TRaft::TLogLimits logLimits;
         logLimits.SnapshotStagingDirectory = std::move(snapshotStagingDirectory);
         auto raft = std::make_shared<TRaft>(state, myHost.Id, nodes,

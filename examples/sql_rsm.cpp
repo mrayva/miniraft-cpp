@@ -1,5 +1,6 @@
 #include "sql_rsm.h"
 #include "payload_validation.h"
+#include <miniraft/idempotency.h>
 #include <array>
 #include <iostream>
 #include <climits>
@@ -8,6 +9,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <string_view>
 #include <system_error>
@@ -399,6 +401,22 @@ void ValidateSnapshotForTarget(sqlite3* snapshot, sqlite3* target, uint64_t inde
         throw TMessageError("SQL snapshot page size does not match the target database");
 }
 
+#ifdef __linux__
+TSnapshotDatabase OpenSqlSnapshotGenerationDatabase(const std::string& path) {
+    TSnapshotDatabase result;
+    sqlite3* raw = nullptr;
+    const int opened = sqlite3_open_v2(path.c_str(), &raw,
+        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nullptr);
+    result.Db.reset(raw);
+    if (opened != SQLITE_OK) throw TMessageError("Cannot open SQL snapshot generation database");
+    if (sqlite3_exec(result.Db.get(),
+            "PRAGMA cache_size=-2048; PRAGMA mmap_size=0; PRAGMA query_only=ON;",
+            nullptr, nullptr, nullptr) != SQLITE_OK)
+        throw TMessageError("Cannot bound SQL snapshot generation reads");
+    return result;
+}
+#endif
+
 #ifndef __linux__
 TSnapshotDatabase CopyDatabaseToMemory(sqlite3* source, uint64_t pageSize) {
     TSnapshotDatabase result;
@@ -446,7 +464,8 @@ private:
 #endif
 
 #ifdef __linux__
-class TSqlFileSnapshotSource final : public ISnapshotSource, public ISnapshotSourceHeapUsage {
+class TSqlFileSnapshotSource final : public ISnapshotSource, public TSnapshotDataSource,
+        public ISnapshotSourceHeapUsage, public ISnapshotDataHeapUsage {
 public:
     TSqlFileSnapshotSource(int fd, uint64_t size) : Fd(fd), Length(size) { }
     ~TSqlFileSnapshotSource() override { if (Fd >= 0) close(Fd); }
@@ -500,6 +519,110 @@ private:
     uint64_t Index;
     TSnapshotDatabase Image;
 };
+
+class TSqlStagedApplicationSnapshotGeneration final : public IStagedApplicationSnapshotGeneration {
+public:
+    TSqlStagedApplicationSnapshotGeneration(TApplicationSnapshotGenerationReference reference,
+            std::string directory, std::string temporaryPath, int file,
+            std::function<void()> activate)
+        : Ref(std::move(reference)), Directory(std::move(directory)),
+          TemporaryPath(std::move(temporaryPath)), File(file), ActivateFn(std::move(activate)) { }
+
+    ~TSqlStagedApplicationSnapshotGeneration() override {
+#ifdef __linux__
+        if (File >= 0) close(File);
+        if (!Published) (void)unlink(TemporaryPath.c_str());
+#endif
+    }
+
+    const TApplicationSnapshotGenerationReference& Reference() const override { return Ref; }
+
+    void Publish() override {
+#ifdef __linux__
+        if (Published || File < 0) throw std::logic_error("SQL snapshot generation already published");
+        int result;
+        do { result = fsync(File); } while (result != 0 && errno == EINTR);
+        if (result != 0) throw std::system_error(errno, std::generic_category(),
+            "Cannot sync SQL snapshot generation");
+        if (close(File) != 0) {
+            File = -1;
+            throw std::system_error(errno, std::generic_category(),
+                "Cannot close SQL snapshot generation");
+        }
+        File = -1;
+        const int directory = open(Directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (directory < 0)
+            throw std::system_error(errno, std::generic_category(), "Cannot open SQL snapshot directory");
+        const auto finalName = Ref.Id + ".sqlite";
+        const auto temporaryName = std::filesystem::path(TemporaryPath).filename().string();
+        if (linkat(directory, temporaryName.c_str(), directory, finalName.c_str(), 0) != 0) {
+            const auto error = errno;
+            close(directory);
+            throw std::system_error(error, std::generic_category(), "Cannot publish SQL snapshot generation");
+        }
+        if (unlinkat(directory, temporaryName.c_str(), 0) != 0) {
+            const auto error = errno;
+            close(directory);
+            throw std::system_error(error, std::generic_category(), "Cannot retire SQL snapshot staging file");
+        }
+        do { result = fsync(directory); } while (result != 0 && errno == EINTR);
+        const auto syncError = errno;
+        close(directory);
+        if (result != 0)
+            throw std::system_error(syncError, std::generic_category(), "Cannot sync SQL snapshot directory");
+        Published = true;
+#else
+        throw std::runtime_error("SQL snapshot generations currently require Linux");
+#endif
+    }
+
+    void Activate() override {
+        if (!Published) throw std::logic_error("SQL snapshot generation is not published");
+        ActivateFn();
+    }
+
+private:
+    TApplicationSnapshotGenerationReference Ref;
+    std::string Directory, TemporaryPath;
+    int File = -1;
+    std::function<void()> ActivateFn;
+    bool Published = false;
+};
+
+void ReclaimSqlSnapshotGenerations(const std::string& directory, std::string_view keepId) noexcept {
+#ifdef __linux__
+    try {
+        const auto keepName = std::string(keepId) + ".sqlite";
+        std::error_code error;
+        for (std::filesystem::directory_iterator it(directory, error), end;
+                !error && it != end; it.increment(error)) {
+            const auto name = it->path().filename().string();
+            if (!name.starts_with("generation-") || name == keepName) continue;
+            std::error_code statusError;
+            const auto status = it->symlink_status(statusError);
+            if (statusError || status.type() != std::filesystem::file_type::regular) continue;
+            std::filesystem::remove(it->path(), statusError);
+        }
+    } catch (...) { /* Unreferenced files are garbage; cleanup cannot affect the selected generation. */ }
+#else
+    (void)directory;
+    (void)keepId;
+#endif
+}
+
+void WriteSqlGenerationBytes(int fd, const char* bytes, size_t size) {
+    size_t offset = 0;
+    while (offset < size) {
+        const auto count = std::min<size_t>(size - offset,
+            size_t(std::numeric_limits<ssize_t>::max()));
+        const auto written = write(fd, bytes + offset, count);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0)
+            throw std::system_error(written < 0 ? errno : EIO, std::generic_category(),
+                "Cannot write SQL snapshot generation");
+        offset += size_t(written);
+    }
+}
 
 std::shared_ptr<const ISnapshotSource> CreateSqlSnapshotSource(sqlite3* db, uint64_t index,
         uint64_t maxImageBytes = MaxSqlSnapshotBytes) {
@@ -702,6 +825,27 @@ TSql::TSql(const std::string& path, int serverId, TSqlReadLimits readLimits)
     DisableReplicaLocalFunctions(Db);
     RequireExecute("CREATE TABLE IF NOT EXISTS raft_metadata_ (key TEXT PRIMARY KEY, value TEXT)");
     LastAppliedIndex = ReadAppliedIndex(Db).value_or(0);
+#ifdef __linux__
+    if (dbPath != ":memory:") {
+        SnapshotGenerationDirectory = dbPath + ".generations";
+        std::error_code error;
+        std::filesystem::create_directories(SnapshotGenerationDirectory, error);
+        const auto status = std::filesystem::symlink_status(SnapshotGenerationDirectory, error);
+        if (error || status.type() != std::filesystem::file_type::directory)
+            throw std::runtime_error("Cannot create SQL snapshot generation directory");
+    } else {
+        auto pattern = (std::filesystem::temp_directory_path() /
+            "miniraft-sql-generations-XXXXXX").string();
+        std::vector<char> writable(pattern.begin(), pattern.end());
+        writable.push_back('\0');
+        const auto* created = mkdtemp(writable.data());
+        if (!created)
+            throw std::system_error(errno, std::generic_category(),
+                "Cannot create temporary SQL snapshot generation directory");
+        SnapshotGenerationDirectory = created;
+        RemoveSnapshotGenerationDirectoryOnDestruction = true;
+    }
+#endif
     cleanup.release();
     std::cerr << "LastAppliedIndex: " << LastAppliedIndex << std::endl;
 }
@@ -712,6 +856,10 @@ TSql::~TSql()
         if (sqlite3_close(Db) != SQLITE_OK) {
             std::cerr << "Failed to close db, error:" << sqlite3_errmsg(Db) << std::endl;
         }
+    }
+    if (RemoveSnapshotGenerationDirectoryOnDestruction) {
+        std::error_code ignored;
+        std::filesystem::remove_all(SnapshotGenerationDirectory, ignored);
     }
 }
 
@@ -817,6 +965,163 @@ std::shared_ptr<const ISnapshotSource> TSql::OpenSnapshotSource(uint64_t index) 
         throw TMessageError("SQL snapshot source does not match the requested applied index");
     return CreateSqlSnapshotSource(Db, index, MaxSqlStreamedSnapshotBytes);
 }
+
+#ifdef __linux__
+std::unique_ptr<IStagedApplicationSnapshotGeneration> TSql::PrepareSnapshotGeneration(
+        const TSnapshot& snapshot) {
+#ifndef __linux__
+    (void)snapshot;
+    throw std::runtime_error("SQL snapshot generations currently require Linux");
+#else
+    if (SnapshotGenerationDirectory.empty())
+        throw std::runtime_error("SQL snapshot generations require a file-backed database");
+    if (!snapshot.Index || snapshot.Index > uint64_t(INT64_MAX))
+        throw TMessageError("SQL snapshot generation has an invalid index");
+    const auto dataBytes = snapshot.DataSize();
+    if (dataBytes < 100 || dataBytes > MaxSqlStreamedSnapshotBytes)
+        throw TMessageError("SQL snapshot generation has an invalid image size");
+
+    std::error_code directoryError;
+    std::filesystem::create_directories(SnapshotGenerationDirectory, directoryError);
+    if (directoryError) throw std::runtime_error("Cannot create SQL snapshot generation directory");
+    auto temporaryPath = (std::filesystem::path(SnapshotGenerationDirectory) /
+        "generation-XXXXXX").string();
+    std::vector<char> templatePath(temporaryPath.begin(), temporaryPath.end());
+    templatePath.push_back('\0');
+    const int file = mkstemp(templatePath.data());
+    if (file < 0)
+        throw std::system_error(errno, std::generic_category(), "Cannot create SQL snapshot generation");
+    temporaryPath.assign(templatePath.data());
+    const auto id = std::filesystem::path(temporaryPath).filename().string();
+    try {
+        TSha256DigestBuilder digest;
+        std::array<char, 64 * 1024> chunk{};
+        std::array<char, 100> header{};
+        size_t headerBytes = 0;
+        for (uint64_t offset = 0; offset < dataBytes;) {
+            const auto count = size_t(std::min<uint64_t>(chunk.size(), dataBytes - offset));
+            size_t copied = 0;
+            while (copied < count) {
+                const auto read = snapshot.ReadDataRange(offset + copied,
+                    std::span<char>(chunk.data() + copied, count - copied));
+                if (!read || read > count - copied)
+                    throw TMessageError("Cannot read SQL snapshot generation source");
+                copied += read;
+            }
+            digest.Update(std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(chunk.data()), count));
+            if (headerBytes < header.size()) {
+                const auto headerCount = std::min(count, header.size() - headerBytes);
+                memcpy(header.data() + headerBytes, chunk.data(), headerCount);
+                headerBytes += headerCount;
+            }
+            WriteSqlGenerationBytes(file, chunk.data(), count);
+            offset += count;
+        }
+        ValidateSnapshotImageHeader(std::string_view(header.data(), header.size()), dataBytes,
+            MaxSqlStreamedSnapshotBytes);
+
+        auto image = OpenSqlSnapshotGenerationDatabase(temporaryPath);
+        ValidateSnapshotForTarget(image.Db.get(), Db, snapshot.Index);
+
+        TApplicationSnapshotGenerationReference reference;
+        reference.Id = id;
+        reference.SnapshotIndex = snapshot.Index;
+        reference.DataBytes = dataBytes;
+        reference.DataSha256 = digest.Finish();
+        const bool restoreOnActivate = LastAppliedIndex != snapshot.Index;
+        auto activate = [this, reference, restoreOnActivate] {
+            if (restoreOnActivate) {
+                RestoreSnapshotGeneration(reference, reference.SnapshotIndex);
+            } else {
+                ActiveSnapshotGeneration = reference.Id;
+                ReclaimSqlSnapshotGenerations(SnapshotGenerationDirectory, ActiveSnapshotGeneration);
+            }
+        };
+        return std::make_unique<TSqlStagedApplicationSnapshotGeneration>(
+            std::move(reference), SnapshotGenerationDirectory, std::move(temporaryPath), file,
+            std::move(activate));
+    } catch (...) {
+        close(file);
+        (void)unlink(temporaryPath.c_str());
+        throw;
+    }
+#endif
+}
+
+std::shared_ptr<const TSnapshotDataSource> TSql::ResolveSnapshotGeneration(
+        const TApplicationSnapshotGenerationReference& reference) const {
+#ifndef __linux__
+    (void)reference;
+    throw std::runtime_error("SQL snapshot generations currently require Linux");
+#else
+    if (SnapshotGenerationDirectory.empty() || !reference.IsValid() ||
+        reference.DataBytes < 100 || reference.DataBytes > MaxSqlStreamedSnapshotBytes)
+        throw std::invalid_argument("Invalid SQL snapshot generation reference");
+    const int directory = open(SnapshotGenerationDirectory.c_str(),
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory < 0)
+        throw std::system_error(errno, std::generic_category(), "Cannot open SQL snapshot generation directory");
+    const auto filename = reference.Id + ".sqlite";
+    const int file = openat(directory, filename.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    const auto openError = errno;
+    close(directory);
+    if (file < 0)
+        throw std::system_error(openError, std::generic_category(), "Cannot open SQL snapshot generation");
+    struct stat info{};
+    if (fstat(file, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 100 ||
+        uint64_t(info.st_size) != reference.DataBytes) {
+        close(file);
+        throw std::runtime_error("Invalid SQL snapshot generation file");
+    }
+    return std::make_shared<TSqlFileSnapshotSource>(file, uint64_t(info.st_size));
+#endif
+}
+
+void TSql::ValidateSnapshotGeneration(
+        const TApplicationSnapshotGenerationReference& reference, uint64_t index) const {
+#ifndef __linux__
+    (void)reference;
+    (void)index;
+    throw std::runtime_error("SQL snapshot generations currently require Linux");
+#else
+    if (reference.SnapshotIndex != index)
+        throw TMessageError("SQL snapshot generation index mismatch");
+    auto source = ResolveSnapshotGeneration(reference);
+    TSnapshot snapshot;
+    snapshot.Index = index;
+    snapshot.DataSource = source;
+    ValidateApplicationSnapshotGenerationReference(reference, snapshot);
+    const auto path = (std::filesystem::path(SnapshotGenerationDirectory) /
+        (reference.Id + ".sqlite")).string();
+    auto image = OpenSqlSnapshotGenerationDatabase(path);
+    ValidateSnapshotForTarget(image.Db.get(), Db, index);
+#endif
+}
+
+void TSql::RestoreSnapshotGeneration(
+        const TApplicationSnapshotGenerationReference& reference, uint64_t index) {
+#ifndef __linux__
+    (void)reference;
+    (void)index;
+    throw std::runtime_error("SQL snapshot generations currently require Linux");
+#else
+    auto source = ResolveSnapshotGeneration(reference);
+    TSnapshot snapshot;
+    snapshot.Index = index;
+    snapshot.DataSource = source;
+    ValidateApplicationSnapshotGenerationReference(reference, snapshot);
+    const auto path = (std::filesystem::path(SnapshotGenerationDirectory) /
+        (reference.Id + ".sqlite")).string();
+    auto image = OpenSqlSnapshotGenerationDatabase(path);
+    ValidateSnapshotForTarget(image.Db.get(), Db, index);
+    TSqlSnapshotInstallation installation(Db, &LastAppliedIndex, index, std::move(image));
+    installation.Install();
+    ActiveSnapshotGeneration = reference.Id;
+    ReclaimSqlSnapshotGenerations(SnapshotGenerationDirectory, ActiveSnapshotGeneration);
+#endif
+}
+#endif // __linux__
 
 void TSql::ValidateSnapshot(std::string_view bytes, uint64_t index) const {
     auto image = OpenSnapshotDatabase(bytes);

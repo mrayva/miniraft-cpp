@@ -23,6 +23,16 @@ InstallSnapshot. Existing SQL and legacy Raft files remain in place, but old
 binaries cannot read the compacted store. There is no automatic format
 migration or mixed-version support.
 
+The SQL example also stores immutable application snapshots in
+`sql_file.db.<id>.generations`. It publishes the SQLite image before Raft
+publishes the snapshot metadata that references its local generation ID, byte
+length and SHA-256 digest. Both the durable and split-file Raft backends use
+that resolver, so their snapshot sidecars contain metadata rather than another
+copy of the SQLite payload. A receiving replica creates its own generation;
+the sender's local ID is never transferred. After publication and activation,
+SQL reclaims older generation files. An image published before a failed Raft
+publication can remain as an orphan until a later successful activation.
+
 ## Image and recovery contract
 
 On Linux, the application image is captured with SQLite's backup API into a
@@ -94,10 +104,11 @@ Restore uses SQLite's backup API to copy the validated staged database into
 the existing database connection. The application progress marker in memory moves
 only after the backup completes. A failed backup leaves the destination
 unchanged according to SQLite's backup transaction contract. Snapshot
-installation first publishes the Raft snapshot and retained suffix durably,
-then replaces the application database, then acknowledges installation. If
-the process stops between the first two steps, startup replaces any SQL
-checkpoint behind the durable Raft snapshot before request processing begins.
+installation first publishes the application generation, then the Raft
+snapshot and retained suffix durably, activates the referenced generation,
+and acknowledges installation. If the process stops between Raft publication
+and activation, startup verifies and restores the selected generation before
+request processing begins.
 
 This recovery only applies when the saved application index is below the
 snapshot boundary. An application at or beyond the boundary is preserved; an

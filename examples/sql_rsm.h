@@ -26,7 +26,11 @@ struct TSqlReadLimits {
 };
 
 class TSql: public IRsm, public IStreamingSnapshotRsm, public IStagedSnapshotRsm,
-        public IStreamingSnapshotInstallRsm {
+        public IStreamingSnapshotInstallRsm
+#ifdef __linux__
+        , public IApplicationSnapshotGenerationRsm
+#endif
+        {
 public:
     void Validate(TMessageHolder<TCommandRequest> message) const override;
     TSql(const std::string& path, int serverId, TSqlReadLimits readLimits = {});
@@ -45,6 +49,16 @@ public:
         std::string_view bytes, uint64_t index) override;
     std::unique_ptr<IStagedSnapshotInstallation> PrepareSnapshotInstallation(
         const TSnapshotDataSource& source, uint64_t index) override;
+#ifdef __linux__
+    std::unique_ptr<IStagedApplicationSnapshotGeneration> PrepareSnapshotGeneration(
+        const TSnapshot& snapshot) override;
+    void ValidateSnapshotGeneration(
+        const TApplicationSnapshotGenerationReference& reference, uint64_t index) const override;
+    void RestoreSnapshotGeneration(
+        const TApplicationSnapshotGenerationReference& reference, uint64_t index) override;
+    std::shared_ptr<const TSnapshotDataSource> ResolveSnapshotGeneration(
+        const TApplicationSnapshotGenerationReference& reference) const;
+#endif
     void ValidateSnapshot(std::string_view bytes, uint64_t index) const override;
     void LoadSnapshot(std::string_view bytes, uint64_t index) override;
     bool SupportsApplicationSnapshotInstall() const override { return true; }
@@ -57,6 +71,9 @@ private:
 
     TSqlReadLimits ReadLimits;
     std::string LastError;
+    std::string SnapshotGenerationDirectory;
+    std::string ActiveSnapshotGeneration;
+    bool RemoveSnapshotGenerationDirectoryOnDestruction = false;
     sqlite3* Db = nullptr;
 };
 

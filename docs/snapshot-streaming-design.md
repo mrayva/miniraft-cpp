@@ -120,8 +120,11 @@ materialized application image to a private temporary file and keeps a
 read-only SQLite connection open across those phases. It bounds SQLite's page
 cache, disables memory mapping, and avoids a second full-size padded heap copy
 and integrity scan during activation. Non-Linux builds retain in-memory
-deserialization. This staging file is temporary; it does not provide durable
-application generations or change crash recovery ordering.
+deserialization. The SQL example also implements
+`IApplicationSnapshotGenerationRsm`: it publishes an immutable node-local
+SQLite image before Raft publishes its reference, and restores that generation
+after recovery if activation was interrupted. Both durable backends receive
+the configured resolver and store only snapshot metadata in their sidecars.
 
 Full in-memory InstallSnapshot assemblies reserve their declared image size
 against the shared 256 MiB snapshot-heap category under the default process
