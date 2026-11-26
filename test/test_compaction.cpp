@@ -410,6 +410,24 @@ void test_snapshot_capture_preflights_application_size_bound(void**) {
     assert_int_equal(state->SnapshotIndex, 0);
     assert_int_equal(state->LastLogIndex, 1);
 }
+void test_snapshot_capture_respects_raft_image_limit(void**) {
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 1;
+    auto entry = NewHoldedMessage<TLogEntry>(); entry->Term = 1;
+    state->Append(entry);
+    state->CommitIndex = 1;
+
+    TRaft::TLogLimits limits{.MaxSnapshotImageBytes = 64};
+    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{}, std::vector<uint32_t>{}, limits);
+    auto application = std::make_shared<TBoundedSnapshotApplication>();
+    application->LastAppliedIndex = 1;
+    TRequestProcessor processor(raft, application, {});
+
+    Reject([&] { raft->Compact(); });
+    assert_int_equal(application->SaveCalls, 0);
+    assert_int_equal(state->SnapshotIndex, 0);
+    assert_int_equal(state->LastLogIndex, 1);
+}
 void test_snapshot_capture_reserves_declared_bound_before_materializing(void**) {
     auto makeState = [] {
         auto state = std::make_shared<TState>();
@@ -2132,6 +2150,53 @@ void test_snapshot_size_capability_respects_receiver_budgets(void**) {
     assert_non_null(stagedAppendResponse);
     assert_int_equal(TAppendEntriesResponse::DecodeSnapshotMaxBytesOrLegacy(
         stagedAppendResponse->Padding, TSnapshot::LegacyMaxBytes), stagingLimit);
+
+    constexpr uint64_t configuredLimit = 32 * 1024;
+    auto configuredState = std::make_shared<TState>();
+    configuredState->BindVoters({1, 2});
+    configuredState->CurrentTerm = 3;
+    configuredState->Commit();
+    TMessageHolder<TAppendEntriesResponse> configuredAppendResponse;
+    TMessageHolder<TInstallSnapshotResponse> configuredSnapshotResponse;
+    auto configuredPeer = std::make_shared<TEndpoint>([&](auto message) {
+        if (auto append = message.template Maybe<TAppendEntriesResponse>())
+            configuredAppendResponse = append.Cast();
+        if (auto snapshot = message.template Maybe<TInstallSnapshotResponse>())
+            configuredSnapshotResponse = snapshot.Cast();
+    });
+    auto configuredBudget = std::make_shared<TSnapshotInstallBudget>(64 * 1024);
+    TRaft::TLogLimits configuredLimits{.MaxSnapshotImageBytes = configuredLimit,
+        .SnapshotInstallBudget = configuredBudget};
+    auto configuredRaft = std::make_shared<TRaft>(configuredState, 2,
+        TNodeDict{{1, configuredPeer}}, std::vector<uint32_t>{}, configuredLimits);
+    auto configuredApplication = std::make_shared<TApplication>();
+    TRequestProcessor configuredProcessor(configuredRaft, configuredApplication, {});
+    auto configuredHeartbeat = NewHoldedMessage(
+        TMessageEx{.Src = 1, .Dst = 2, .Term = 3, .Seqno = 1},
+        TAppendEntriesRequest{.PrevLogIndex = 0, .PrevLogTerm = 0, .LeaderCommit = 0,
+            .LeaderId = 1, .Nentries = 0});
+    configuredRaft->Process({}, configuredHeartbeat);
+    assert_non_null(configuredAppendResponse);
+    assert_int_equal(TAppendEntriesResponse::DecodeSnapshotMaxBytesOrLegacy(
+        configuredAppendResponse->Padding, TSnapshot::LegacyMaxBytes), 0);
+
+    const TSnapshot configuredSnapshot{1, 1, {1, 2}, std::string(configuredLimit, 'p')};
+    const auto configuredImage = EncodeSnapshot(configuredSnapshot);
+    assert_true(configuredImage.size() > configuredLimit);
+    assert_true(configuredImage.size() <= TInstallSnapshotRequest::MaxChunkBytes);
+    auto configuredChunk = NewHoldedMessage<TInstallSnapshotRequest>(
+        sizeof(TInstallSnapshotRequest) + configuredImage.size());
+    configuredChunk->Src = 1; configuredChunk->Dst = 2; configuredChunk->Term = 3;
+    configuredChunk->Seqno = 1; configuredChunk->SnapshotIndex = configuredSnapshot.Index;
+    configuredChunk->SnapshotTerm = configuredSnapshot.Term; configuredChunk->Offset = 0;
+    configuredChunk->TotalBytes = configuredImage.size();
+    configuredChunk->LeaderId = 1; configuredChunk->Done = TInstallSnapshotRequest::DoneFlag;
+    memcpy(configuredChunk->Data, configuredImage.data(), configuredImage.size());
+    configuredRaft->Process({}, configuredChunk);
+    assert_non_null(configuredSnapshotResponse);
+    assert_false(configuredSnapshotResponse->Success);
+    assert_int_equal(configuredSnapshotResponse->NextOffset, 0);
+    assert_int_equal(configuredBudget->UsedBytes(), 0);
 }
 void test_snapshot_encoder_accepts_image_above_legacy_limit(void**) {
     TSnapshot snapshot;
@@ -5094,6 +5159,7 @@ int main() {
         cmocka_unit_test(test_kv_snapshot_precomputes_size_without_changing_encoding),
         cmocka_unit_test(test_example_kv_streaming_install_validates_before_atomic_publish),
         cmocka_unit_test(test_snapshot_capture_preflights_application_size_bound),
+        cmocka_unit_test(test_snapshot_capture_respects_raft_image_limit),
         cmocka_unit_test(test_snapshot_capture_reserves_declared_bound_before_materializing),
         cmocka_unit_test(test_unbounded_legacy_snapshot_precharges_before_callback),
         cmocka_unit_test(test_snapshot_capture_charges_retained_string_capacity),

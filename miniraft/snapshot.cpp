@@ -1040,7 +1040,9 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
 TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         std::shared_ptr<TSnapshotInstallBudget> heapBudget,
         std::shared_ptr<TSnapshotInstallBudget> stagingBudget,
-        std::string_view stagingDirectory) {
+        std::string_view stagingDirectory, uint64_t maxImageBytes) {
+    if (!maxImageBytes || maxImageBytes > TSnapshot::MaxBytes)
+        throw std::invalid_argument("Snapshot capture limit must be positive and within the format maximum");
     const auto index = rsm.LastAppliedIndex;
     if (!index || index > raft.GetVolatileState()->CommitIndex || index > raft.GetLastIndex())
         throw std::runtime_error("Snapshot requires applied committed progress");
@@ -1090,10 +1092,10 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
     CheckLocalLog(snapshot, raft, raft.Configuration->Committed);
     const auto metadataEncoding = PrepareSnapshotEncoding(snapshot);
     const auto metadataBytes = SnapshotEncodingSize(*metadataEncoding);
-    if (metadataBytes > TSnapshot::MaxBytes)
+    if (metadataBytes > maxImageBytes)
         throw std::runtime_error("Snapshot configuration metadata exceeds the Raft snapshot limit");
     const auto upperBound = rsm.SnapshotSizeUpperBound();
-    if (upperBound && *upperBound > TSnapshot::MaxBytes - metadataBytes)
+    if (upperBound && *upperBound > maxImageBytes - metadataBytes)
         throw std::runtime_error("Application snapshot size bound exceeds the Raft snapshot limit");
     std::shared_ptr<TSnapshotInstallBudget::TReservation> reservation;
     auto reserveCaptureBytes = [&](uint64_t bytes) {
@@ -1182,7 +1184,7 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
     const auto idempotentRsm = dynamic_cast<const IIdempotentRsm*>(&rsm);
     if (auto source = streamingRsm ? streamingRsm->OpenSnapshotSource(index) : nullptr) {
         const auto dataBytes = source->Size();
-        if (dataBytes > TSnapshot::MaxBytes - metadataBytes)
+        if (dataBytes > maxImageBytes - metadataBytes)
             throw std::runtime_error("Application snapshot source exceeds the Raft snapshot limit");
         if (upperBound && dataBytes > *upperBound)
             throw std::logic_error("Application snapshot source exceeded its declared size bound");
@@ -1220,7 +1222,7 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         if (!stagingDirectory.empty() && !stagingBudget)
             stagingBudget = TSnapshotInstallBudget::DefaultStagingBudget();
         TCaptureSink sink(heapBudget, stagingBudget, stagingDirectory,
-            TSnapshot::MaxBytes - metadataBytes, upperBound);
+            maxImageBytes - metadataBytes, upperBound);
         if (writerRsm) writerRsm->WriteSnapshot(index, sink);
         else idempotentRsm->WriteSnapshot(index, sink);
         sink.RethrowFailure();
@@ -1232,9 +1234,9 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         // cannot be charged incrementally. Reserve the declared bound when
         // available; otherwise reserve the largest payload this image may
         // retain before entering application code, then shrink to capacity.
-        reserveCaptureBytes(upperBound.value_or(TSnapshot::MaxBytes - metadataBytes));
+        reserveCaptureBytes(upperBound.value_or(maxImageBytes - metadataBytes));
         auto data = rsm.SaveSnapshot();
-        if (data.size() > TSnapshot::MaxBytes - metadataBytes)
+        if (data.size() > maxImageBytes - metadataBytes)
             throw std::runtime_error("Application snapshot exceeds the Raft snapshot limit");
         if (upperBound && data.size() > *upperBound)
             throw std::logic_error("Application snapshot exceeded its declared size bound");

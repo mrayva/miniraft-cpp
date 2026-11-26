@@ -170,6 +170,8 @@ files remain charged to the shared staging quota; durable storage's own snapshot
 files are governed by its storage and filesystem capacity. Partial transfers
 restart at offset zero after process restart. The wire format, 128 MiB limit and
 publication, application-installation and acknowledgement ordering stay the same.
+`TLogLimits::MaxSnapshotImageBytes` can lower the per-node image ceiling for
+capture and receive admission; it cannot raise the 128 MiB format maximum.
 
 After a full transfer's metadata is verified, intermediate payload chunks
 reuse that result while the sender is still the recognized leader in the
@@ -212,9 +214,13 @@ support source-backed local storage and require the startup resolver when the
 selected sidecar omits a nonempty payload. The negotiated wire format and
 receiver now keep metadata, payload, and checksum separate. Without configured
 file staging, the payload still resides wholly in heap memory, and transfers
-remain capped at 128 MiB. Removing that cap requires a versioned storage and
-application-install contract that can publish the validated manifest and
-payload source atomically while streaming payload bytes to durable storage.
+remain capped at 128 MiB. Operators can set
+`TLogLimits::MaxSnapshotImageBytes` below that cap to fit local memory and
+storage budgets; every member that may receive a snapshot must be configured
+to accept the images its peers produce. Removing the global cap requires a
+versioned storage and application-install contract that can publish the
+validated manifest and payload source atomically while streaming payload bytes
+to durable storage.
 
 ## Proposed lifecycle
 

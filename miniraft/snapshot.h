@@ -316,7 +316,8 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
 TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
     std::shared_ptr<TSnapshotInstallBudget> heapBudget,
     std::shared_ptr<TSnapshotInstallBudget> stagingBudget,
-    std::string_view stagingDirectory);
+    std::string_view stagingDirectory,
+    uint64_t maxImageBytes = TSnapshot::MaxBytes);
 // Startup only, with an application behind the snapshot and
 // a matching local boundary/log. This can recover an app left behind by a crash
 // after durable Raft snapshot publication.

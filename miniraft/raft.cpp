@@ -1254,6 +1254,8 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
     } else if (LogLimits.SnapshotStagingBudget == SnapshotInstallBudget) {
         throw std::invalid_argument("Snapshot staging and heap budgets must be separate");
     }
+    if (!LogLimits.MaxSnapshotImageBytes || LogLimits.MaxSnapshotImageBytes > TSnapshot::MaxBytes)
+        throw std::invalid_argument("Raft snapshot image limit must be positive and within the format maximum");
     if (!LogLimits.MaxUncommittedBytes || !LogLimits.MaxUncommittedEntries ||
         LogLimits.ReservedControlBytes < sizeof(TLogEntry) || !LogLimits.ReservedControlEntries ||
         LogLimits.ReservedControlBytes > LogLimits.MaxUncommittedBytes ||
@@ -1528,7 +1530,7 @@ uint64_t TRaft::LocalSnapshotSizeLimit() const {
     if (const auto processBudget = SnapshotInstallBudget->ProcessMemoryBudget())
         heapLimit = std::min(heapLimit,
             processBudget->LimitBytes(EProcessMemoryCategory::SnapshotHeap));
-    auto limit = std::min<uint64_t>(TSnapshot::MaxBytes, heapLimit);
+    auto limit = std::min<uint64_t>(LogLimits.MaxSnapshotImageBytes, heapLimit);
     if (!LogLimits.SnapshotStagingDirectory.empty()) {
         const auto stagingLimit = LogLimits.SnapshotStagingBudget
             ? LogLimits.SnapshotStagingBudget->LimitBytes() : heapLimit;
@@ -1543,7 +1545,7 @@ uint64_t TRaft::LocalSnapshotReceiveLimit(bool splitManifest) const {
         heapLimit = std::min(heapLimit,
             processBudget->LimitBytes(EProcessMemoryCategory::SnapshotHeap));
     if (LogLimits.SnapshotStagingDirectory.empty())
-        return std::min<uint64_t>(TSnapshot::MaxBytes, heapLimit);
+        return std::min<uint64_t>(LogLimits.MaxSnapshotImageBytes, heapLimit);
 
     const auto stagingLimit = LogLimits.SnapshotStagingBudget
         ? LogLimits.SnapshotStagingBudget->LimitBytes() : heapLimit;
@@ -1552,12 +1554,13 @@ uint64_t TRaft::LocalSnapshotReceiveLimit(bool splitManifest) const {
         (dynamic_cast<IStreamingSnapshotInstallRsm*>(application.get()) ||
          dynamic_cast<IIdempotentRsm*>(application.get()));
     if (!sourceBackedInstall)
-        return std::min<uint64_t>(TSnapshot::MaxBytes, std::min(heapLimit, stagingLimit));
+        return std::min<uint64_t>(LogLimits.MaxSnapshotImageBytes, std::min(heapLimit, stagingLimit));
     if (!splitManifest)
-        return std::min<uint64_t>(TSnapshot::MaxBytes, stagingLimit);
-    const auto combinedLimit = stagingLimit >= TSnapshot::MaxBytes - std::min(heapLimit, TSnapshot::MaxBytes)
-        ? TSnapshot::MaxBytes : heapLimit + stagingLimit;
-    return std::min<uint64_t>(TSnapshot::MaxBytes, combinedLimit);
+        return std::min<uint64_t>(LogLimits.MaxSnapshotImageBytes, stagingLimit);
+    const auto combinedLimit = stagingLimit >= LogLimits.MaxSnapshotImageBytes -
+            std::min(heapLimit, LogLimits.MaxSnapshotImageBytes)
+        ? LogLimits.MaxSnapshotImageBytes : heapLimit + stagingLimit;
+    return std::min<uint64_t>(LogLimits.MaxSnapshotImageBytes, combinedLimit);
 }
 
 void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntriesRequest> message) {
@@ -3122,7 +3125,7 @@ void TRaft::MaybeDistributeConfigurationBarrier(ITimeSource::Time now) {
         Configuration->HasUncommittedConfiguration()) return;
     const auto index = Configuration->Committed.ConfigurationIndex();
     const auto term = Configuration->Committed.ConfigurationTerm();
-    uint64_t maxSnapshotBytes = TSnapshot::MaxBytes;
+    uint64_t maxSnapshotBytes = LogLimits.MaxSnapshotImageBytes;
     for (auto voter : Voters) {
         if (voter == Id) continue;
         const auto ack = VolatileState->CommitAckIndex.find(voter);
@@ -3389,9 +3392,9 @@ std::shared_ptr<const TSnapshot> TRaft::CompactShared() {
         throw std::runtime_error("Compaction deferred while snapshot transfers pin multiple generations");
     auto captured = CaptureSnapshot(*this, *application, SnapshotInstallBudget,
         LogLimits.SnapshotStagingBudget ? LogLimits.SnapshotStagingBudget : SnapshotInstallBudget,
-        LogLimits.SnapshotStagingDirectory);
+        LogLimits.SnapshotStagingDirectory, LogLimits.MaxSnapshotImageBytes);
     auto snapshot = std::make_shared<const TSnapshot>(std::move(captured));
-    uint64_t maxSnapshotBytes = TSnapshot::MaxBytes;
+    uint64_t maxSnapshotBytes = LogLimits.MaxSnapshotImageBytes;
     if (membershipReadiness.IsLeader) {
         for (auto voter : Voters) {
             if (voter == Id) continue;
