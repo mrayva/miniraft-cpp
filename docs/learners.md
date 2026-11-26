@@ -105,8 +105,10 @@ count[4], sorted voter IDs[4 each], SnapshotIndex[8], SnapshotTerm[8], sidecar
 length[8], SHA-256 digest[32], log generation[8], log image length[8], log
 CRC[4], and an application-generation marker[4]. When present, it is followed
 by an opaque local generation ID bound to the snapshot index, byte count and
-SHA-256 digest. The Raft sidecar still carries the complete application
-payload. Optional MRFTS001
+SHA-256 digest. Without an application-generation resolver, the Raft sidecar
+carries the complete application payload. With a resolver, a nonempty payload
+is stored in the replica-local generation and the sidecar contains only
+snapshot metadata. Optional MRFTS001
 through MRFTS011 images are stored in an immutable sidecar referenced by the
 manifest. The CRC covers version magic
 plus payload. Recovery bounds and validates the voter list and commit
