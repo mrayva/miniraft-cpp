@@ -569,9 +569,9 @@ public:
         size_t ReservedControlEntries = 1;
         // Yield leadership after this long without a fresh voter quorum.
         std::chrono::milliseconds LeadershipExpiration = TTimeout::LeadershipExpiration;
-        // Shared by all Raft instances in a process by default. Supply one
-        // shared budget here to override the process-wide snapshot receive
-        // heap cap, including decoding of completed staging files.
+        // The default budget is shared by Raft instances in this process.
+        // A custom budget sets the Raft snapshot-local limit; process-root
+        // category limits still apply to its reservations.
         std::shared_ptr<TSnapshotInstallBudget> SnapshotInstallBudget;
         // On Linux, stage streamed captures, legacy captures, and
         // full incoming snapshot images in anonymous files in this directory.
@@ -579,8 +579,10 @@ public:
         // Share this separately from SnapshotInstallBudget to limit staged
         // file bytes. Defaults to a separate 256 MiB process-wide budget.
         std::shared_ptr<TSnapshotInstallBudget> SnapshotStagingBudget;
-        // Optional shared cap to use across transport buffers and snapshot heap.
-        // Pass the same root to TRaftServer when overriding the process default.
+        // Optional process root for accounted transport buffers and snapshot
+        // heap. Without one, Raft reuses the snapshot budget's root or the
+        // process default. Pass this same root to TRaftServer when overriding
+        // the default; configure its category limit to raise the snapshot cap.
         std::shared_ptr<TProcessMemoryBudget> ProcessMemoryBudget;
     };
 
@@ -679,6 +681,12 @@ public:
     // Highest barrier confirmed by a fresh majority in this leadership term.
     // Zero means no confirmation (including before a current-term commit).
     uint64_t CommitSeqno() const;
+    // Effective process root also used by the snapshot heap budget. Servers
+    // must use this root so tracked transport and snapshot allocations share
+    // one cap.
+    std::shared_ptr<TProcessMemoryBudget> ProcessMemoryBudget() const {
+        return LogLimits.ProcessMemoryBudget;
+    }
 
 // ut
     const auto& GetState() const {

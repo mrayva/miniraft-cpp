@@ -25,7 +25,9 @@ to verify catch-up progress under compaction during every chunk.
 
 This caps the number of distinct outgoing transfer generations, not total process
 heap usage. Incomplete incoming InstallSnapshot images reserve their declared
-sizes against a 256 MiB process-wide byte budget by default. Covered-boundary
+sizes against a 256 MiB snapshot-heap category by default. The tracked snapshot
+and `TRaftServer` transport categories share a 1 GiB process root by default;
+each category retains its own limit and reserved headroom. Covered-boundary
 probes use the same budget for the prefix they buffer, including both buffers
 when growing it. Callers can configure a shared `TSnapshotInstallBudget`.
 Optional Linux staging files have their own shared quota. Completed staged
@@ -41,8 +43,10 @@ payload size; the incremental snapshot writer charges each append before
 growing its in-memory image. A legacy `SaveSnapshot()` callback without a
 declared bound reserves the maximum accepted payload before it runs, then
 shrinks the lease to retained capacity. Callback allocations beyond that bound,
-current application/log state, detached snapshot copies, non-snapshot transport
-buffers and other allocations remain outside these limits;
+current application/log state, detached snapshot copies and other untracked
+allocations remain outside these limits. Accounted inbound and outbound server
+buffers use separate process categories under the same root; custom transport
+implementations can bypass those server accounting paths;
 disk-streamed snapshot transfer remains open. Voter membership changes
 are available through [live membership](configuration-entries.md), with leader
 removal supported by [leadership transfer](leadership-transfer.md). This alpha.43

@@ -1211,9 +1211,17 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
     , VolatileState(std::make_unique<TVolatileState>())
     , StateName(EState::FOLLOWER)
 {
-    if (LogLimits.ProcessMemoryBudget &&
-        SnapshotInstallBudget->ProcessMemoryBudget() != LogLimits.ProcessMemoryBudget)
+    auto processMemoryBudget = LogLimits.ProcessMemoryBudget;
+    if (!processMemoryBudget)
+        processMemoryBudget = SnapshotInstallBudget->ProcessMemoryBudget();
+    if (!processMemoryBudget)
+        processMemoryBudget = TProcessMemoryBudget::DefaultProcessBudget();
+    if (auto snapshotRoot = SnapshotInstallBudget->ProcessMemoryBudget();
+        snapshotRoot && snapshotRoot != processMemoryBudget)
         throw std::invalid_argument("Raft snapshot and transport budgets must share the process memory budget");
+    if (!SnapshotInstallBudget->BindProcessMemoryBudget(processMemoryBudget))
+        throw std::runtime_error("Existing snapshot reservations exceed the process memory budget");
+    LogLimits.ProcessMemoryBudget = std::move(processMemoryBudget);
     if (!node || !State) throw std::invalid_argument("Raft requires a positive ID and state");
 #ifndef __linux__
     if (!LogLimits.SnapshotStagingDirectory.empty())

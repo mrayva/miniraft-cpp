@@ -8,6 +8,13 @@ extern "C" {
 }
 
 namespace {
+struct TMinimalRsm : IRsm {
+    TMessageHolder<TMessage> Read(TMessageHolder<TCommandRequest>, uint64_t) override { return {}; }
+    TMessageHolder<TMessage> Write(TMessageHolder<TLogEntry>, uint64_t) override { return {}; }
+    TMessageHolder<TLogEntry> Prepare(TMessageHolder<TCommandRequest>) override { return {}; }
+    bool SupportsApplicationSnapshotInstall() const override { return true; }
+};
+
 // Immediate deterministic I/O: no sockets, sleeps, pollers or wall clock.
 struct TStream {
     std::vector<char> Bytes;
@@ -254,6 +261,25 @@ void test_process_memory_budget_is_shared_across_transport_and_snapshot(void**) 
     outbound.Release(1, 768);
     assert_int_equal(processBudget->UsedTotalBytes(), 0);
 }
+void test_server_rejects_process_root_different_from_raft_before_initializing(void**) {
+    auto raftRoot = std::make_shared<TProcessMemoryBudget>();
+    TRaft::TLogLimits limits;
+    limits.ProcessMemoryBudget = raftRoot;
+    auto raft = std::make_shared<TRaft>(std::make_shared<TState>(), 1,
+        TNodeDict{}, std::vector<uint32_t>{}, limits);
+    auto rsm = std::make_shared<TMinimalRsm>();
+    NNet::TPoll poller;
+
+    bool rejected = false;
+    try {
+        TRaftServer<NNet::TSocket> server(poller, NNet::TSocket{}, raft, rsm,
+            TNodeDict{}, std::make_shared<TTimeSource>());
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    assert_true(rejected);
+    assert_false(raft->CheckCompactionMembershipReadiness().LocalApplicationSnapshotInstallSupported);
+}
 void test_snapshot_resize_local_rejection_does_not_leak_process_charge(void**) {
     TProcessMemoryBudgetLimits limits;
     limits.MaxBytes = 4096;
@@ -275,6 +301,39 @@ void test_snapshot_resize_local_rejection_does_not_leak_process_charge(void**) {
 
     lease.reset();
     assert_int_equal(processBudget->UsedTotalBytes(), 0);
+}
+void test_snapshot_budget_binding_imports_existing_usage_atomically(void**) {
+    TProcessMemoryBudgetLimits limits;
+    limits.MaxBytes = 1024;
+    limits.MaxOutboundQueueBytes = 768;
+    limits.MaxInboundNetworkBytes = 768;
+    limits.MaxSnapshotHeapBytes = 768;
+    limits.ReservedOutboundQueueBytes = 128;
+    limits.ReservedInboundNetworkBytes = 128;
+    limits.ReservedSnapshotHeapBytes = 128;
+    auto processBudget = std::make_shared<TProcessMemoryBudget>(limits);
+
+    auto snapshots = std::make_shared<TSnapshotInstallBudget>(900);
+    auto existing = snapshots->TryReserveLease(128);
+    assert_true(bool(existing));
+    assert_true(snapshots->BindProcessMemoryBudget(processBudget));
+    assert_true(snapshots->ProcessMemoryBudget() == processBudget);
+    assert_int_equal(processBudget->UsedBytes(EProcessMemoryCategory::SnapshotHeap), 128);
+    assert_false(snapshots->BindProcessMemoryBudget(
+        std::make_shared<TProcessMemoryBudget>(limits)));
+
+    existing.reset();
+    assert_int_equal(snapshots->UsedBytes(), 0);
+    assert_int_equal(processBudget->UsedTotalBytes(), 0);
+
+    auto tooLarge = std::make_shared<TSnapshotInstallBudget>(900);
+    auto oversizedLease = tooLarge->TryReserveLease(769);
+    assert_true(bool(oversizedLease));
+    assert_false(tooLarge->BindProcessMemoryBudget(processBudget));
+    assert_false(bool(tooLarge->ProcessMemoryBudget()));
+    assert_int_equal(tooLarge->UsedBytes(), 769);
+    assert_int_equal(processBudget->UsedTotalBytes(), 0);
+    oversizedLease.reset();
 }
 void test_legacy_transport_roots_import_usage_when_bound_to_process_budget(void**) {
     TProcessMemoryBudgetLimits limits;
@@ -500,7 +559,9 @@ int main() {
         cmocka_unit_test(test_inbound_frame_budget_is_held_until_all_message_copies_are_released),
         cmocka_unit_test(test_inbound_budget_is_aggregated_across_servers),
         cmocka_unit_test(test_process_memory_budget_is_shared_across_transport_and_snapshot),
+        cmocka_unit_test(test_server_rejects_process_root_different_from_raft_before_initializing),
         cmocka_unit_test(test_snapshot_resize_local_rejection_does_not_leak_process_charge),
+        cmocka_unit_test(test_snapshot_budget_binding_imports_existing_usage_atomically),
         cmocka_unit_test(test_legacy_transport_roots_import_usage_when_bound_to_process_budget),
         cmocka_unit_test(test_failed_reader_cannot_resume_at_another_frame),
         cmocka_unit_test(test_inbound_connection_budget_releases_admission_on_disconnect),

@@ -132,7 +132,23 @@ public:
         return budget;
     }
 
-    std::shared_ptr<TProcessMemoryBudget> ProcessMemoryBudget() const { return ProcessBudget; }
+    std::shared_ptr<TProcessMemoryBudget> ProcessMemoryBudget() const {
+        std::lock_guard lock(Mutex);
+        return ProcessBudget;
+    }
+
+    // Attach legacy standalone budgets to the process root before they are
+    // published to Raft. Existing reservations are imported atomically.
+    bool BindProcessMemoryBudget(std::shared_ptr<TProcessMemoryBudget> processBudget) {
+        if (!processBudget) return false;
+        std::lock_guard lock(Mutex);
+        if (ProcessBudget) return ProcessBudget == processBudget;
+        if (!processBudget->TryReplace(EProcessMemoryCategory::SnapshotHeap,
+                0, 0, 0, Used))
+            return false;
+        ProcessBudget = std::move(processBudget);
+        return true;
+    }
 
     std::shared_ptr<TReservation> TryReserveLease(uint64_t bytes) {
         if (!bytes) return {};
@@ -200,7 +216,7 @@ private:
     }
 
     const uint64_t MaxBytes;
-    const std::shared_ptr<TProcessMemoryBudget> ProcessBudget;
+    std::shared_ptr<TProcessMemoryBudget> ProcessBudget;
     mutable std::mutex Mutex;
     uint64_t Used = 0;
 };

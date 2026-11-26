@@ -854,12 +854,18 @@ public:
         , TimeSource(ts ? ts : std::make_shared<TTimeSource>())
         , WorkerTimeSource(std::make_shared<TCachedTimeSource>(TimeSource))
         , ProcessMemoryBudget([&] {
-            if (processMemoryBudget) return processMemoryBudget;
+            std::shared_ptr<TProcessMemoryBudget> selected;
+            if (processMemoryBudget) selected = processMemoryBudget;
             if (processOutboundQueueBudget)
-                if (auto budget = processOutboundQueueBudget->ProcessMemoryBudget()) return budget;
-            if (processInboundMessageBudget)
-                if (auto budget = processInboundMessageBudget->ProcessMemoryBudget()) return budget;
-            return TProcessMemoryBudget::DefaultProcessBudget();
+                if (!selected) selected = processOutboundQueueBudget->ProcessMemoryBudget();
+            if (processInboundMessageBudget && !selected)
+                selected = processInboundMessageBudget->ProcessMemoryBudget();
+            if (!selected) selected = TProcessMemoryBudget::DefaultProcessBudget();
+            if (!Raft)
+                throw std::invalid_argument("Server requires a Raft instance");
+            if (Raft->ProcessMemoryBudget() != selected)
+                throw std::invalid_argument("Server and Raft must share the process memory budget");
+            return selected;
         }())
         , OutboundQueueBudget(std::make_shared<TOutboundQueueBudget>(outboundQueueLimits,
             processOutboundQueueBudget, processOutboundQueueBudget ? nullptr : ProcessMemoryBudget))

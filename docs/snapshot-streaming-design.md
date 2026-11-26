@@ -61,8 +61,9 @@ deserialization. This staging file is temporary; it does not provide durable
 application generations or change crash recovery ordering.
 
 Full in-memory InstallSnapshot assemblies reserve their declared image size
-against a shared 256 MiB process-wide heap budget by default. Raft instances can share a
-custom `TSnapshotInstallBudget` through `TLogLimits`. Covered-boundary probes
+against the shared 256 MiB snapshot-heap category under the default process
+memory root. Raft instances can share a custom `TSnapshotInstallBudget` through
+`TLogLimits`. Covered-boundary probes
 reserve only the metadata prefix, even when a chunk also carries payload bytes.
 Both the old and new buffers count while the prefix grows. A transfer that
 cannot reserve space receives a
@@ -83,8 +84,12 @@ made by validation/load callbacks remain outside this budget. For legacy
 invoking the callback, or the maximum accepted payload when no bound is
 available, then shrinks the lease to retained string capacity. Incremental
 snapshot writers extend the lease before each append even without a size bound.
-Other application-owned state, detached value copies and transport buffers
-remain outside this budget.
+Other application-owned state, detached value copies, callback allocations
+beyond declared bounds and untracked allocations remain outside the snapshot
+budget. `TRaftServer` accounts for inbound and outbound buffers in separate
+categories under the same default process root as the snapshot heap budget, so
+tracked usage competes under the shared total cap. Custom transports can bypass
+those server accounting paths.
 
 On Linux, set `TRaft::TLogLimits::SnapshotStagingDirectory` to stage full
 incoming images in a directory on a filesystem that supports anonymous

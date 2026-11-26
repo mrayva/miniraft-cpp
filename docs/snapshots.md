@@ -119,12 +119,18 @@ replicated joint-consensus membership are implemented. The current support
 matrix and operational constraints are in [capability matrix](capability-matrix.md).
 
 The remaining work includes disk-streamed or logical-object application
-snapshots and a shared heap budget across application state and transport.
+snapshots and allocator-wide accounting across application state and arbitrary
+callback allocations. Tracked Raft snapshot buffers and `TRaftServer` inbound
+and outbound buffers use separate categories under one shared process root by
+default. Application-owned state and untracked allocations remain outside that
+cap.
 Range-source capture retains the immutable source and conservatively charges
 its payload size; the incremental writer charges each append before growing its
-in-memory image. Retained Raft snapshot images are charged to the install heap
-budget. Legacy `SaveSnapshot()` callbacks without a size bound, application
-state and transport remain outside it. Partial incoming transfers are not persisted,
+in-memory image. Retained Raft snapshot images use the snapshot-heap category.
+`TRaftServer` inbound and outbound buffers use separate categories under the
+same process root by default, so tracked usage shares the total cap. Legacy
+`SaveSnapshot()` callback allocations beyond declared bounds, application state
+and other untracked allocations remain outside it. Partial incoming transfers are not persisted,
 so a follower restart begins again at offset zero. Cluster-wide endpoint
 discovery and rollout, plus automatic stale store recovery without an accepted
 membership-history anchor, also remain open. See the [streaming

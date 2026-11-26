@@ -236,14 +236,16 @@ its storage is upgraded. Application restore capability is negotiated, but
 applications still own correct, atomic image validation and restore behavior.
 Upgrade the voters before enabling the capability because older binaries
 cannot distinguish storage support from application restore support.
-Asynchronous/COW capture, disk-streamed
-transfer, process-wide heap quotas, cluster/store authentication, and
+Asynchronous/COW capture, disk-streamed transfer, allocator-wide heap
+accounting, cluster/store authentication, and
 independent review remain open. `TRaftServer` now applies configurable aggregate
 message and byte budgets to its real peer-node outbound queues (defaults: 4096
 messages and 256 MiB), in addition to the existing per-peer limits. It also
 applies a configurable 256 MiB aggregate inbound message-storage budget across
-decoded frame buffers and AppendEntries payload-holder arrays. These network
-budgets do not cap snapshot capture, state-machine memory, or total process heap.
+decoded frame buffers and AppendEntries payload-holder arrays. Tracked network
+buffers and snapshot heap reservations share the same process root by default,
+but the budgets do not account for arbitrary state-machine allocations or the
+entire process heap.
 The conservative backend still rewrites the entire snapshot and retained suffix
 on each update, and capture/publication runs synchronously on the event loop.
 

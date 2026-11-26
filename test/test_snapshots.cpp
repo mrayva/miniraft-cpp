@@ -55,6 +55,31 @@ void test_snapshot_heap_bytes_include_retained_string_capacity(void**) {
     assert_int_equal(snapshot.HeapBytes(), snapshot.Data.capacity());
     assert_true(snapshot.HeapBytes() > snapshot.DataSize());
 }
+
+void test_raft_binds_custom_snapshot_budget_to_effective_process_root(void**) {
+    auto snapshotBudget = std::make_shared<TSnapshotInstallBudget>();
+    TRaft::TLogLimits limits;
+    limits.SnapshotInstallBudget = snapshotBudget;
+    auto raft = std::make_shared<TRaft>(std::make_shared<TState>(), 1,
+        TNodeDict{}, std::vector<uint32_t>{}, limits);
+
+    assert_true(raft->ProcessMemoryBudget() == TProcessMemoryBudget::DefaultProcessBudget());
+    assert_true(snapshotBudget->ProcessMemoryBudget() == raft->ProcessMemoryBudget());
+
+    auto otherRoot = std::make_shared<TProcessMemoryBudget>();
+    auto boundSnapshotBudget = std::make_shared<TSnapshotInstallBudget>(
+        TSnapshotInstallBudget::DefaultMaxBytes, otherRoot);
+    limits.SnapshotInstallBudget = boundSnapshotBudget;
+    limits.ProcessMemoryBudget = TProcessMemoryBudget::DefaultProcessBudget();
+    bool rejected = false;
+    try {
+        (void)TRaft(std::make_shared<TState>(), 1, TNodeDict{},
+            std::vector<uint32_t>{}, limits);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    assert_true(rejected);
+}
 TSnapshot JointSample() {
     auto snapshot = Sample();
     snapshot.JointVoters = {3, 4, 5};
@@ -961,6 +986,7 @@ int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_crc32_ieee_golden_vector_and_incremental_updates),
         cmocka_unit_test(test_snapshot_heap_bytes_include_retained_string_capacity),
+        cmocka_unit_test(test_raft_binds_custom_snapshot_budget_to_effective_process_root),
         cmocka_unit_test(test_snapshot_codec_roundtrip_and_all_byte_corruption),
         cmocka_unit_test(test_snapshot_encoding_ranges_match_complete_wire_image),
         cmocka_unit_test(test_joint_snapshot_codec_roundtrip_and_corruption),
