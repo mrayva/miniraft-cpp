@@ -970,6 +970,48 @@ void test_streamed_snapshot_format_above_complete_image_limit_roundtrips(void**)
     assert_int_equal(loaded->ReadDataRange(loaded->DataSize() - 1, byte), 1);
     assert_int_equal(byte[0], 's');
 }
+void test_streamed_snapshot_hard_limit_includes_metadata_and_checksum(void**) {
+    struct TCountingSource final : TSnapshotDataSource {
+        uint64_t Bytes;
+        mutable uint64_t Reads = 0;
+        explicit TCountingSource(uint64_t bytes) : Bytes(bytes) { }
+        uint64_t Size() const override { return Bytes; }
+        size_t Read(uint64_t offset, std::span<char> destination) const override {
+            ++Reads;
+            if (offset >= Bytes || destination.empty()) return 0;
+            const auto count = size_t(std::min<uint64_t>(destination.size(), Bytes - offset));
+            memset(destination.data(), 'm', count);
+            return count;
+        }
+    };
+
+    TSnapshot snapshot;
+    snapshot.Index = 1;
+    snapshot.Term = 1;
+    snapshot.Voters = {1};
+    const auto emptyManifest = PrepareSnapshotTransferManifest(snapshot);
+    const auto maxPayload = TSnapshot::MaxStreamedBytes - emptyManifest.Metadata.size() - 4;
+    auto exactSource = std::make_shared<TCountingSource>(maxPayload);
+    snapshot.DataSource = exactSource;
+    const auto manifest = PrepareSnapshotTransferManifest(snapshot);
+    assert_int_equal(manifest.Metadata.size() + manifest.PayloadBytes + 4,
+        TSnapshot::MaxStreamedBytes);
+    assert_true(manifest.Metadata.substr(0, 8) == "MRFTS012");
+    auto decoded = DecodeSnapshotTransferManifest(manifest, exactSource);
+    assert_true(decoded.DataSize() == maxPayload);
+    assert_true(exactSource->Reads > 0);
+
+    auto tooLargeSource = std::make_shared<TCountingSource>(maxPayload + 1);
+    snapshot.DataSource = tooLargeSource;
+    Reject([&] { PrepareSnapshotTransferManifest(snapshot); });
+    assert_int_equal(tooLargeSource->Reads, 0);
+
+    auto oversizedManifest = manifest;
+    ++oversizedManifest.PayloadBytes;
+    const auto readsBeforeReject = exactSource->Reads;
+    Reject([&] { DecodeSnapshotTransferManifest(oversizedManifest, exactSource); });
+    assert_int_equal(exactSource->Reads, readsBeforeReject);
+}
 void test_disk_backends_recover_versioned_large_snapshots(void**) {
     struct TConstantSource final : TSnapshotDataSource {
         uint64_t Bytes;
@@ -1166,6 +1208,7 @@ int main() {
         cmocka_unit_test(test_unbound_durable_configuration_snapshot_recovery_fails_closed),
         cmocka_unit_test(test_joint_snapshot_export_and_durable_roundtrip_but_runtime_rejects),
         cmocka_unit_test(test_streamed_snapshot_format_above_complete_image_limit_roundtrips),
+        cmocka_unit_test(test_streamed_snapshot_hard_limit_includes_metadata_and_checksum),
         cmocka_unit_test(test_disk_backends_recover_versioned_large_snapshots),
         cmocka_unit_test(test_snapshot_store_rejects_oversized_files_and_temp_symlinks),
         cmocka_unit_test(test_snapshot_store_roundtrip_lock_and_corrupt_recovery),
