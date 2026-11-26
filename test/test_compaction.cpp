@@ -1426,6 +1426,17 @@ void test_compaction_lagging_follower_installs_snapshot_then_tail(void**) {
     }
     assert_false(cluster.Nodes[0]->GetState()->Get(1));
 }
+void test_outgoing_snapshot_chunk_holds_heap_budget_lease(void**) {
+    auto budget = TSnapshotInstallBudget::DefaultProcessBudget();
+    TCluster cluster;
+    cluster.Prepare();
+    const auto retainedBytes = budget->UsedBytes();
+    auto chunk = cluster.SendChunk();
+    assert_true(chunk->Len > sizeof(TInstallSnapshotRequest));
+    assert_int_equal(budget->UsedBytes(), retainedBytes + chunk->Len);
+    chunk = {};
+    assert_int_equal(budget->UsedBytes(), retainedBytes);
+}
 void test_simultaneous_startup_candidates_use_distinct_election_deadlines(void**) {
     TCluster cluster;
     for (auto& node : cluster.Nodes) node->ProcessTimeout(cluster.Now);
@@ -3832,6 +3843,7 @@ int main() {
         cmocka_unit_test(test_covered_snapshot_metadata_uses_shared_install_budget),
         cmocka_unit_test(test_snapshot_install_accepts_every_small_fixed_chunk_size),
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),
+        cmocka_unit_test(test_outgoing_snapshot_chunk_holds_heap_budget_lease),
         cmocka_unit_test(test_simultaneous_startup_candidates_use_distinct_election_deadlines),
         cmocka_unit_test(test_partial_transfer_restart_and_delayed_ack_are_safe),
         cmocka_unit_test(test_snapshot_partial_ack_cannot_skip_unsent_bytes),

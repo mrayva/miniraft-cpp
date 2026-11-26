@@ -33,11 +33,14 @@ images must reserve receive heap space before decoding.
 Retained snapshot payloads and outgoing pins share the install heap budget.
 Memory-backed snapshot strings are charged by retained capacity, so spare
 capacity from incremental string growth remains covered by the lease.
+Each live outgoing InstallSnapshot frame also holds a lease for its allocated
+message buffer until the last holder releases it, including through custom
+transports.
 Range-source capture retains its source and conservatively reserves its full
 payload size; the incremental snapshot writer charges each append before
 growing its in-memory image. Current application/log state, legacy unbounded
-`SaveSnapshot()` buffers, detached snapshot copies, transport buffers and other
-allocations remain outside these limits;
+`SaveSnapshot()` callback buffers, detached snapshot copies, non-snapshot
+transport buffers and other allocations remain outside these limits;
 disk-streamed snapshot transfer remains open. Voter membership changes
 are available through [live membership](configuration-entries.md), with leader
 removal supported by [leadership transfer](leadership-transfer.md). This alpha.43

@@ -3368,10 +3368,23 @@ TMessageHolder<TMessage> TRaft::CreateInstallSnapshot(uint32_t nodeId) {
         VolatileState->SnapshotRpcs.erase(nodeId);
         return {};
     }
+    const auto count = std::min<uint64_t>(TInstallSnapshotRequest::MaxChunkBytes, totalBytes - rpc.Offset);
+    const auto requestBytes = sizeof(TInstallSnapshotRequest) + size_t(count);
+    auto requestReservation = SnapshotInstallBudget->TryReserveLease(requestBytes);
+    if (!requestReservation) return {};
     if (capability != VolatileState->PeerCapabilities.end())
         capability->second.AppendAckSeqno = 0; // Require a fresh AppendEntries capability ACK afterward.
-    const auto count = std::min<uint64_t>(TInstallSnapshotRequest::MaxChunkBytes, totalBytes - rpc.Offset);
-    auto request = NewHoldedMessage<TInstallSnapshotRequest>(sizeof(TInstallSnapshotRequest) + count);
+    auto request = NewHoldedMessage<TInstallSnapshotRequest>(requestBytes);
+    // Carry the lease with the raw frame allocation so custom transports and
+    // built-in queues both keep the chunk charged until the message is released.
+    auto requestStorage = request.RawData;
+    auto* requestData = requestStorage.get();
+    request.RawData = std::shared_ptr<char[]>(requestData,
+        [requestStorage = std::move(requestStorage),
+         requestReservation = std::move(requestReservation)](char*) {
+            (void)requestStorage;
+            (void)requestReservation;
+        });
     request->Src = Id; request->Dst = nodeId; request->Term = State->CurrentTerm;
     // A retry sends the same immutable chunk. Keep its identity until a reply
     // consumes it, otherwise traffic faster than the RTT invalidates every ACK.
