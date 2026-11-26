@@ -140,6 +140,14 @@ categories under the same default process root as the snapshot heap budget, so
 tracked usage competes under the shared total cap. Custom transports can bypass
 those server accounting paths.
 
+For negotiated split transfers without file staging, a receiver whose RSM
+cannot install from a payload source advertises at most half of its snapshot
+heap limit. This reserves room for both the received payload and the
+materialized copy needed to validate or load it. Source-backed installers can
+advertise the full heap limit; staged transfers advertise limits derived from
+their staging and heap budgets. The advertised receive limit follows the
+manifest-transfer capability of each peer connection.
+
 On Linux, set `TRaft::TLogLimits::SnapshotStagingDirectory` to stage full
 incoming images in a directory on a filesystem that supports anonymous
 temporary files (`O_TMPFILE`). Durable KV servers expose the option as

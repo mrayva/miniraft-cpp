@@ -1544,15 +1544,23 @@ uint64_t TRaft::LocalSnapshotReceiveLimit(bool splitManifest) const {
     if (const auto processBudget = SnapshotInstallBudget->ProcessMemoryBudget())
         heapLimit = std::min(heapLimit,
             processBudget->LimitBytes(EProcessMemoryCategory::SnapshotHeap));
-    if (LogLimits.SnapshotStagingDirectory.empty())
-        return std::min<uint64_t>(LogLimits.MaxSnapshotImageBytes, heapLimit);
-
-    const auto stagingLimit = LogLimits.SnapshotStagingBudget
-        ? LogLimits.SnapshotStagingBudget->LimitBytes() : heapLimit;
     const auto application = SnapshotApplication.lock();
     const bool sourceBackedInstall = application &&
         (dynamic_cast<IStreamingSnapshotInstallRsm*>(application.get()) ||
          dynamic_cast<IIdempotentRsm*>(application.get()));
+    if (LogLimits.SnapshotStagingDirectory.empty()) {
+        auto limit = std::min<uint64_t>(LogLimits.MaxSnapshotImageBytes, heapLimit);
+        // A split transfer keeps its received payload alive while a legacy RSM
+        // validates or loads a materialized copy. Reserve room for both at
+        // admission, otherwise the final range can be accepted but can never
+        // complete under the same heap budget.
+        if (splitManifest && !sourceBackedInstall)
+            limit = std::min(limit, heapLimit / 2);
+        return limit;
+    }
+
+    const auto stagingLimit = LogLimits.SnapshotStagingBudget
+        ? LogLimits.SnapshotStagingBudget->LimitBytes() : heapLimit;
     if (!sourceBackedInstall)
         return std::min<uint64_t>(LogLimits.MaxSnapshotImageBytes, std::min(heapLimit, stagingLimit));
     if (!splitManifest)
@@ -1692,13 +1700,16 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
     }
 
     if (!success && message->PrevLogIndex < State->SnapshotIndex) matchIndex = State->SnapshotIndex;
+    const auto sourceNode = Nodes.find(message->Src);
+    const bool supportsSnapshotManifest = sourceNode != Nodes.end() && sourceNode->second &&
+        sourceNode->second->SupportsSnapshotTransferManifest();
     auto reply = NewHoldedMessage(
         TMessageEx {.Src = Id, .Dst = message->Src, .Term = State->CurrentTerm, .Seqno = message->Seqno},
         TAppendEntriesResponse {
             .MatchIndex = matchIndex,
             .Success = success,
             .Padding = LocalAppendCapabilityBits(*State, LocalIdempotentLogSupport,
-                LocalApplicationSnapshotInstallSupport, LocalSnapshotSizeLimit()),
+                LocalApplicationSnapshotInstallSupport, LocalSnapshotReceiveLimit(supportsSnapshotManifest)),
         });
 
     AdvanceCommitIndex(commitIndex);

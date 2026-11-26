@@ -2069,7 +2069,9 @@ void test_snapshot_size_negotiation_keeps_legacy_fallback_and_certifies_voter_li
 void test_snapshot_size_capability_respects_receiver_budgets(void**) {
     constexpr uint64_t unit = TAppendEntriesResponse::SnapshotSizeUnitBytes;
     constexpr uint64_t heapLimit = 64 * 1024 * 1024;
-    constexpr uint64_t advertisedLimit = (heapLimit / unit) * unit;
+    // A legacy RSM needs the received split payload and a second materialized
+    // copy during installation, so advertise only the budgeted half.
+    constexpr uint64_t advertisedLimit = ((heapLimit / 2) / unit) * unit;
     auto budget = std::make_shared<TSnapshotInstallBudget>(heapLimit);
     auto state = std::make_shared<TState>();
     state->BindVoters({1, 2});
@@ -2082,7 +2084,7 @@ void test_snapshot_size_capability_respects_receiver_budgets(void**) {
             appendResponse = append.Cast();
         if (auto snapshot = message.template Maybe<TInstallSnapshotResponse>())
             snapshotResponses.push_back(snapshot.Cast());
-    });
+    }, true);
     TRaft::TLogLimits limits{.SnapshotInstallBudget = budget};
     auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}},
         std::vector<uint32_t>{}, limits);
@@ -3058,7 +3060,7 @@ void test_snapshot_manifest_ranges_use_budgeted_heap_payload_without_file_stagin
     const TSnapshot snapshot{1, 1, {1, 2}, source.SaveSnapshot()};
     const auto manifest = PrepareSnapshotTransferManifest(snapshot);
     const auto totalBytes = manifest.Metadata.size() + manifest.PayloadBytes + 4;
-    auto budget = std::make_shared<TSnapshotInstallBudget>(totalBytes);
+    auto budget = std::make_shared<TSnapshotInstallBudget>(2 * totalBytes);
     std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
     auto peer = std::make_shared<TEndpoint>([&](auto message) {
         if (message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_RESPONSE))
@@ -3118,6 +3120,35 @@ void test_snapshot_manifest_ranges_use_budgeted_heap_payload_without_file_stagin
     assert_true(heapUsage->HeapBytes() > 0);
     assert_true(heapUsage->HeapBytes() < totalBytes);
     assert_int_equal(budget->UsedBytes(), heapUsage->HeapBytes());
+}
+void test_snapshot_manifest_without_streaming_installer_reserves_copy_headroom(void**) {
+    TKv source;
+    source.Write(source.Prepare(Command("key", std::string(4096, 'x'))), 1);
+    const TSnapshot snapshot{1, 1, {1, 2}, source.SaveSnapshot()};
+    const auto manifest = PrepareSnapshotTransferManifest(snapshot);
+    const auto totalBytes = manifest.Metadata.size() + manifest.PayloadBytes + 4;
+    auto budget = std::make_shared<TSnapshotInstallBudget>(2 * totalBytes - 1);
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) {
+        if (message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_RESPONSE))
+            responses.push_back(message.template Cast<TInstallSnapshotResponse>());
+    });
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 3;
+    TRaft::TLogLimits limits{.SnapshotInstallBudget = budget};
+    auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}}, std::vector<uint32_t>{}, limits);
+    auto application = std::make_shared<TApplication>();
+    TRequestProcessor processor(raft, application, {});
+
+    auto metadata = RangeChunk(snapshot, manifest, TInstallSnapshotRangeRequest::EPhase::Metadata,
+        0, manifest.Metadata, 1);
+    raft->Process({}, metadata);
+
+    assert_int_equal(responses.size(), 1);
+    assert_false(responses.back()->Success);
+    assert_int_equal(responses.back()->NextOffset, 0);
+    assert_int_equal(application->Loads, 0);
+    assert_int_equal(budget->UsedBytes(), 0);
 }
 void test_idle_snapshot_transfer_discards_partial_image_and_restarts(void**) {
     TCluster cluster({3}); // Learners must also reclaim stalled transfers.
@@ -5189,6 +5220,7 @@ int main() {
         cmocka_unit_test(test_snapshot_manifest_ranges_reject_gaps_conflicts_and_corruption),
         cmocka_unit_test(test_negotiated_snapshot_manifest_transfer_uses_distinct_wire_phases),
         cmocka_unit_test(test_snapshot_manifest_ranges_use_budgeted_heap_payload_without_file_staging),
+        cmocka_unit_test(test_snapshot_manifest_without_streaming_installer_reserves_copy_headroom),
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),
         cmocka_unit_test(test_outgoing_snapshot_chunk_holds_heap_budget_lease),
         cmocka_unit_test(test_simultaneous_startup_candidates_use_distinct_election_deadlines),
