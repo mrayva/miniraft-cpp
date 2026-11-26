@@ -2679,7 +2679,19 @@ TMessageHolder<TInstallSnapshotRangeRequest> RangeChunk(const TSnapshot& snapsho
     memcpy(message->Data, bytes.data(), bytes.size());
     return message;
 }
-void test_snapshot_manifest_ranges_install_through_legacy_stream_validation(void**) {
+void test_snapshot_manifest_ranges_install_with_separate_payload_staging(void**) {
+#ifdef __linux__
+    char directoryTemplate[] = "/tmp/miniraft-range-install-XXXXXX";
+    auto* createdDirectory = mkdtemp(directoryTemplate);
+    assert_non_null(createdDirectory);
+    struct TDirectoryCleanup {
+        std::filesystem::path Path;
+        ~TDirectoryCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(Path, ignored);
+        }
+    } cleanup{createdDirectory};
+#endif
     TKv source;
     const std::string value(40000, 'x');
     source.Write(source.Prepare(Command("a", value)), 1);
@@ -2694,7 +2706,12 @@ void test_snapshot_manifest_ranges_install_through_legacy_stream_validation(void
     });
     auto state = std::make_shared<TState>();
     state->CurrentTerm = 3;
-    auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}});
+    TRaft::TLogLimits limits;
+#ifdef __linux__
+    limits.SnapshotStagingDirectory = createdDirectory;
+#endif
+    auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}},
+        std::vector<uint32_t>{}, limits);
     auto app = std::make_shared<TApplication>();
     TRequestProcessor processor(raft, app, {});
 
@@ -2728,8 +2745,28 @@ void test_snapshot_manifest_ranges_install_through_legacy_stream_validation(void
     assert_int_equal(app->Loads, 1);
     assert_true(Read(*app, "a") == value);
     assert_true(*state->GetSnapshot() == snapshot);
+#ifdef __linux__
+    assert_true(state->GetSnapshot()->Data.empty());
+    assert_true(bool(state->GetSnapshot()->DataSource));
+    auto sourceUsage = dynamic_cast<const ISnapshotDataHeapUsage*>(
+        state->GetSnapshot()->DataSource.get());
+    assert_non_null(sourceUsage);
+    assert_int_equal(sourceUsage->HeapBytes(), 0);
+#endif
 }
 void test_snapshot_manifest_ranges_reject_gaps_conflicts_and_corruption(void**) {
+#ifdef __linux__
+    char directoryTemplate[] = "/tmp/miniraft-range-failures-XXXXXX";
+    auto* createdDirectory = mkdtemp(directoryTemplate);
+    assert_non_null(createdDirectory);
+    struct TDirectoryCleanup {
+        std::filesystem::path Path;
+        ~TDirectoryCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(Path, ignored);
+        }
+    } cleanup{createdDirectory};
+#endif
     TKv source;
     const std::string value(40000, 'x');
     source.Write(source.Prepare(Command("a", value)), 1);
@@ -2744,7 +2781,14 @@ void test_snapshot_manifest_ranges_reject_gaps_conflicts_and_corruption(void**) 
     });
     auto state = std::make_shared<TState>();
     state->CurrentTerm = 3;
-    auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}});
+    TRaft::TLogLimits limits;
+#ifdef __linux__
+    auto stagingBudget = std::make_shared<TSnapshotInstallBudget>(manifest.PayloadBytes * 2);
+    limits.SnapshotStagingDirectory = createdDirectory;
+    limits.SnapshotStagingBudget = stagingBudget;
+#endif
+    auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}},
+        std::vector<uint32_t>{}, limits);
     auto app = std::make_shared<TApplication>();
     TRequestProcessor processor(raft, app, {});
 
@@ -2795,6 +2839,9 @@ void test_snapshot_manifest_ranges_reject_gaps_conflicts_and_corruption(void**) 
     conflictingMetadata[0] ^= 1;
     auto conflict = send(TInstallSnapshotRangeRequest::EPhase::Metadata, 0, conflictingMetadata);
     assert_false(conflict->Success);
+#ifdef __linux__
+    assert_int_equal(stagingBudget->UsedBytes(), 0);
+#endif
     auto staleContinuation = send(TInstallSnapshotRangeRequest::EPhase::Payload,
         firstPayloadBytes, std::string_view(snapshot.Data).substr(firstPayloadBytes, 1));
     assert_false(staleContinuation->Success);
@@ -2808,6 +2855,9 @@ void test_snapshot_manifest_ranges_reject_gaps_conflicts_and_corruption(void**) 
     assert_false(corruptChecksum->Success);
     assert_false(corruptChecksum->Installed);
     assert_int_equal(app->Loads, 0);
+#ifdef __linux__
+    assert_int_equal(stagingBudget->UsedBytes(), 0);
+#endif
 
     sendMetadata();
     sendPayload(snapshot.Data);
@@ -2818,6 +2868,9 @@ void test_snapshot_manifest_ranges_reject_gaps_conflicts_and_corruption(void**) 
     assert_int_equal(app->Loads, 1);
     assert_true(Read(*app, "a") == value);
     assert_true(*state->GetSnapshot() == snapshot);
+#ifdef __linux__
+    assert_int_equal(stagingBudget->UsedBytes(), manifest.PayloadBytes);
+#endif
 }
 void test_negotiated_snapshot_manifest_transfer_uses_distinct_wire_phases(void**) {
     TCluster cluster({3}, 3, true);
@@ -4908,7 +4961,7 @@ int main() {
         cmocka_unit_test(test_snapshot_install_budget_releases_after_conflicting_duplicate),
         cmocka_unit_test(test_covered_snapshot_metadata_uses_shared_install_budget),
         cmocka_unit_test(test_snapshot_install_accepts_every_small_fixed_chunk_size),
-        cmocka_unit_test(test_snapshot_manifest_ranges_install_through_legacy_stream_validation),
+        cmocka_unit_test(test_snapshot_manifest_ranges_install_with_separate_payload_staging),
         cmocka_unit_test(test_snapshot_manifest_ranges_reject_gaps_conflicts_and_corruption),
         cmocka_unit_test(test_negotiated_snapshot_manifest_transfer_uses_distinct_wire_phases),
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),

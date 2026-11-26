@@ -609,8 +609,9 @@ public:
         // A custom budget sets the Raft snapshot-local limit; process-root
         // category limits still apply to its reservations.
         std::shared_ptr<TSnapshotInstallBudget> SnapshotInstallBudget;
-        // On Linux, stage streamed captures, legacy captures, and
-        // full incoming snapshot images in anonymous files in this directory.
+        // On Linux, stage streamed captures, legacy captures, complete legacy
+        // snapshot images, and negotiated snapshot payloads in anonymous files
+        // in this directory.
         std::string SnapshotStagingDirectory;
         // Share this separately from SnapshotInstallBudget to limit staged
         // file bytes. Defaults to a separate 256 MiB process-wide budget.
@@ -768,10 +769,18 @@ private:
         std::shared_ptr<TSnapshotInstallBudget>,
         std::shared_ptr<TSnapshotInstallBudget>, std::string_view);
     friend void RestoreSnapshot(const TSnapshot&, const TRaft&, IRsm&);
+    struct TSnapshotTransferIdentity {
+        uint32_t Version = TSnapshotTransferManifest::CurrentVersion;
+        uint64_t MetadataBytes = 0;
+        uint64_t PayloadBytes = 0;
+        uint32_t Checksum = 0;
+        bool operator==(const TSnapshotTransferIdentity&) const = default;
+    };
     void RestoreAppliedIndex(uint64_t index);
     void AdvanceCommitIndex(uint64_t index);
     void AdvanceLeaderCommit();
-    void OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnapshotRequest> message);
+    void OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnapshotRequest> message,
+        std::optional<TSnapshotTransferIdentity> transfer = std::nullopt);
     void OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnapshotResponse> message);
     void OnTimeoutNow(ITimeSource::Time now, TMessageHolder<TTimeoutNowRequest> message);
     void OnConfigurationBarrier(TMessageHolder<TConfigurationBarrierRequest> message);
@@ -864,6 +873,8 @@ private:
         size_t CoveredPrefixCapacity = 0;
         std::shared_ptr<TIncomingSnapshotFile> File;
         std::optional<TMetadataContext> ValidatedMetadata;
+        std::optional<TSnapshotTransferIdentity> Transfer;
+        std::shared_ptr<void> PayloadReservation;
         // Retain the first chunk's wire fence so later chunks cannot reveal a
         // joint snapshot after its magic was split across transport messages.
         bool JointElectionFenceLeader = false;

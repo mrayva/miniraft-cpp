@@ -1980,9 +1980,14 @@ TMessageHolder<TMessage> NormalizeSnapshotTransferRange(TMessageHolder<TMessage>
 
 void TRaft::Process(ITimeSource::Time now, TMessageHolder<TMessage> message, const std::shared_ptr<INode>& replyTo) {
     LastRaftTime = now;
+    std::optional<TSnapshotTransferIdentity> snapshotTransfer;
     if (message && message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_RANGE_REQUEST)) {
+        auto original = message;
         message = NormalizeSnapshotTransferRange(std::move(message));
         if (!message) return;
+        const auto range = original.Cast<TInstallSnapshotRangeRequest>();
+        snapshotTransfer = TSnapshotTransferIdentity{
+            range->ManifestVersion, range->MetadataBytes, range->PayloadBytes, range->Checksum};
     }
     if (!ValidateRpc(message)) return;
     if (message.IsEx()) {
@@ -1992,6 +1997,11 @@ void TRaft::Process(ITimeSource::Time now, TMessageHolder<TMessage> message, con
         const bool snapshotRequest = type == EMessageType::INSTALL_SNAPSHOT_REQUEST;
         if (!preVote && !snapshotRequest && messageEx->Term > State->CurrentTerm)
             AdvanceTerm(now, messageEx->Term);
+    }
+
+    if (snapshotTransfer) {
+        OnInstallSnapshot(now, message.Cast<TInstallSnapshotRequest>(), snapshotTransfer);
+        return;
     }
 
     switch (StateName) {
@@ -3611,7 +3621,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     VolatileState->RpcDue[response->Src] = ITimeSource::Time{};
 }
 
-void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnapshotRequest> request) {
+void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnapshotRequest> request,
+        std::optional<TSnapshotTransferIdentity> transfer) {
     auto reply = [&](bool success, bool installed, uint64_t offset) {
         (void)Nodes.at(request->Src)->TrySend(NewHoldedMessage(
             TMessageEx{.Src = Id, .Dst = request->Src, .Term = State->CurrentTerm, .Seqno = request->Seqno},
@@ -3645,7 +3656,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         // A covered image needs no application replacement, but its snapshot
         // boundary and fixed voter set must match before it can count as
         // replicated. Accumulate only the bounded metadata prefix.
-        const bool same = IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
+        const bool same = IncomingSnapshot && !IncomingSnapshot->Transfer &&
+            IncomingSnapshot->Term == request->Term &&
             IncomingSnapshot->Leader == request->LeaderId && IncomingSnapshot->Index == request->SnapshotIndex &&
             IncomingSnapshot->BoundaryTerm == request->SnapshotTerm && IncomingSnapshot->Total == request->TotalBytes;
         if (!same) {
@@ -3764,30 +3776,50 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     auto* streamingInstallApplication = dynamic_cast<IStreamingSnapshotInstallRsm*>(application.get());
     const bool supportsSourceBackedInstall = streamingInstallApplication ||
         dynamic_cast<IIdempotentRsm*>(application.get());
+    const bool stageManifestPayloadSeparately = transfer &&
+        !LogLimits.SnapshotStagingDirectory.empty();
+    const auto incomingTransfer = stageManifestPayloadSeparately
+        ? transfer : std::optional<TSnapshotTransferIdentity>{};
     const bool same = IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
         IncomingSnapshot->Leader == request->LeaderId && IncomingSnapshot->Index == request->SnapshotIndex &&
-        IncomingSnapshot->BoundaryTerm == request->SnapshotTerm && IncomingSnapshot->Total == request->TotalBytes;
+        IncomingSnapshot->BoundaryTerm == request->SnapshotTerm && IncomingSnapshot->Total == request->TotalBytes &&
+        IncomingSnapshot->Transfer == incomingTransfer;
     if (!same) {
         if (request->Offset != 0 || (IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
             IncomingSnapshot->Index > request->SnapshotIndex)) { reply(false, false, 0); return; }
         // Legacy installs materialize the complete image in heap memory.
-        if (!supportsSourceBackedInstall && request->TotalBytes > SnapshotInstallBudget->LimitBytes()) {
+        if (!stageManifestPayloadSeparately && !supportsSourceBackedInstall &&
+            request->TotalBytes > SnapshotInstallBudget->LimitBytes()) {
             reply(false, false, 0); return;
         }
         IncomingSnapshot.reset(); // Release a superseded image before reserving its replacement.
         const auto& receiveBudget = LogLimits.SnapshotStagingBudget ?
             LogLimits.SnapshotStagingBudget : SnapshotInstallBudget;
-        auto reservation = receiveBudget->TryReserve(request->TotalBytes);
-        if (!reservation) { reply(false, false, 0); return; }
         std::string image;
+        std::shared_ptr<void> reservation;
+        std::shared_ptr<void> payloadReservation;
         std::shared_ptr<TIncomingSnapshotFile> file;
         try {
-            if (!LogLimits.SnapshotStagingDirectory.empty()) {
-                file = std::make_shared<TIncomingSnapshotFile>(
-                    LogLimits.SnapshotStagingDirectory, size_t(request->TotalBytes));
+            if (stageManifestPayloadSeparately) {
+                reservation = SnapshotInstallBudget->TryReserve(transfer->MetadataBytes);
+                if (!reservation) { reply(false, false, 0); return; }
+                if (transfer->PayloadBytes) {
+                    payloadReservation = receiveBudget->TryReserve(transfer->PayloadBytes);
+                    if (!payloadReservation) { reply(false, false, 0); return; }
+                    file = std::make_shared<TIncomingSnapshotFile>(
+                        LogLimits.SnapshotStagingDirectory, size_t(transfer->PayloadBytes));
+                }
+                image.resize(size_t(transfer->MetadataBytes));
             } else {
-                // Allocate the declared image once to avoid geometric growth.
-                image.resize(size_t(request->TotalBytes));
+                reservation = receiveBudget->TryReserve(request->TotalBytes);
+                if (!reservation) { reply(false, false, 0); return; }
+                if (!LogLimits.SnapshotStagingDirectory.empty()) {
+                    file = std::make_shared<TIncomingSnapshotFile>(
+                        LogLimits.SnapshotStagingDirectory, size_t(request->TotalBytes));
+                } else {
+                    // Allocate the declared image once to avoid geometric growth.
+                    image.resize(size_t(request->TotalBytes));
+                }
             }
         } catch (const std::exception&) {
             reply(false, false, 0);
@@ -3796,31 +3828,81 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         IncomingSnapshot = TIncomingSnapshot{request->Term, request->SnapshotIndex, request->SnapshotTerm,
             request->TotalBytes, request->LeaderId, now, std::move(image), 0, true,
             std::move(reservation), {}, 0, std::move(file)};
+        IncomingSnapshot->Transfer = incomingTransfer;
+        IncomingSnapshot->PayloadReservation = std::move(payloadReservation);
         IncomingSnapshot->JointElectionFenceLeader = jointElectionFenceLeader;
     }
     auto& incoming = *IncomingSnapshot;
-    const char* bytes = incoming.File ? incoming.File->Data() : incoming.Bytes.data();
     const auto count = request->Len - sizeof(TInstallSnapshotRequest);
     auto& receivedBytes = IncomingSnapshot->ReceivedBytes;
     const bool advanced = request->Offset == receivedBytes;
     if (request->Offset > receivedBytes) { reply(false, false, 0); return; }
-    if (request->Offset < receivedBytes) {
-        if (count > receivedBytes - request->Offset ||
-            std::string_view(bytes + request->Offset, count) != std::string_view(request->Data, count)) {
-            IncomingSnapshot.reset(); reply(false, false, 0); return;
+    std::string_view receivedImage;
+    if (incoming.Transfer) {
+        const auto& identity = *incoming.Transfer;
+        const auto imageOffset = identity.MetadataBytes + identity.PayloadBytes;
+        auto matches = [&](uint64_t offset, std::string_view bytes) {
+            if (offset < identity.MetadataBytes) {
+                if (bytes.size() > identity.MetadataBytes - offset) return false;
+                return bytes.empty() || memcmp(incoming.Bytes.data() + size_t(offset),
+                    bytes.data(), bytes.size()) == 0;
+            }
+            if (offset < imageOffset) {
+                if (bytes.size() > imageOffset - offset || !incoming.File) return false;
+                return bytes.empty() || memcmp(incoming.File->Data() + size_t(offset - identity.MetadataBytes),
+                    bytes.data(), bytes.size()) == 0;
+            }
+            if (offset != imageOffset || bytes.size() != 4) return false;
+            char expected[4];
+            for (unsigned i = 0; i < 4; ++i) expected[i] = char(identity.Checksum >> (8 * i));
+            return memcmp(expected, bytes.data(), sizeof(expected)) == 0;
+        };
+        const std::string_view chunk(request->Data, count);
+        if (request->Offset < receivedBytes) {
+            if (count > receivedBytes - request->Offset || !matches(request->Offset, chunk)) {
+                IncomingSnapshot.reset(); reply(false, false, 0); return;
+            }
+        } else if (request->Offset < identity.MetadataBytes) {
+            if (count > identity.MetadataBytes - request->Offset) {
+                IncomingSnapshot.reset(); reply(false, false, 0); return;
+            }
+            memcpy(incoming.Bytes.data() + size_t(request->Offset), request->Data, count);
+            receivedBytes += count;
+        } else if (request->Offset < imageOffset) {
+            if (count > imageOffset - request->Offset || !incoming.File ||
+                !incoming.File->Write(size_t(request->Offset - identity.MetadataBytes), chunk)) {
+                IncomingSnapshot.reset(); reply(false, false, 0); return;
+            }
+            receivedBytes += count;
+        } else {
+            if (!matches(request->Offset, chunk)) {
+                IncomingSnapshot.reset(); reply(false, false, 0); return;
+            }
+            receivedBytes += count;
         }
+        if (advanced) IncomingSnapshot->LastProgress = now;
+        receivedImage = std::string_view(incoming.Bytes.data(),
+            size_t(std::min<uint64_t>(receivedBytes, identity.MetadataBytes)));
     } else {
-        if (incoming.File) {
-            if (!incoming.File->Write(size_t(receivedBytes), std::string_view(request->Data, count))) {
+        const char* bytes = incoming.File ? incoming.File->Data() : incoming.Bytes.data();
+        if (request->Offset < receivedBytes) {
+            if (count > receivedBytes - request->Offset ||
+                std::string_view(bytes + request->Offset, count) != std::string_view(request->Data, count)) {
                 IncomingSnapshot.reset(); reply(false, false, 0); return;
             }
         } else {
-            memcpy(incoming.Bytes.data() + receivedBytes, request->Data, count);
+            if (incoming.File) {
+                if (!incoming.File->Write(size_t(receivedBytes), std::string_view(request->Data, count))) {
+                    IncomingSnapshot.reset(); reply(false, false, 0); return;
+                }
+            } else {
+                memcpy(incoming.Bytes.data() + receivedBytes, request->Data, count);
+            }
+            receivedBytes += count;
         }
-        receivedBytes += count;
+        if (advanced) IncomingSnapshot->LastProgress = now;
+        receivedImage = std::string_view(bytes, size_t(receivedBytes));
     }
-    if (advanced) IncomingSnapshot->LastProgress = now;
-    const std::string_view receivedImage(bytes, size_t(receivedBytes));
     if (!IsSupportedSnapshotMagicPrefix(receivedImage)) {
         IncomingSnapshot.reset(); reply(false, false, 0); return;
     }
@@ -3879,19 +3961,32 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     TSnapshot snapshot;
     try {
         const bool sourceBackedInstall = incoming.File && supportsSourceBackedInstall;
-        installationReservation = sourceBackedInstall ? std::shared_ptr<void>{} :
-            incoming.File ? SnapshotInstallBudget->TryReserve(incoming.Total) :
-                std::move(incoming.ReceiveReservation);
+        if (!incoming.Transfer) {
+            installationReservation = sourceBackedInstall ? std::shared_ptr<void>{} :
+                incoming.File ? SnapshotInstallBudget->TryReserve(incoming.Total) :
+                    std::move(incoming.ReceiveReservation);
+        }
         // A full staged image can wait for transient heap contention. Leave
         // the final chunk unacknowledged so the leader retries it. Retries
         // do not move LastProgress, so a blocked image still expires.
-        if (!installationReservation && !sourceBackedInstall) return;
-        snapshot = sourceBackedInstall
-            ? DecodeSnapshotBacked(receivedImage, incoming.File)
-            : incoming.File ? DecodeSnapshot(receivedImage) :
-                DecodeSnapshotOwned(std::move(incoming.Bytes));
-        if (sourceBackedInstall)
-            incoming.File->RetainStagingReservation(std::move(incoming.ReceiveReservation));
+        if (!incoming.Transfer && !installationReservation && !sourceBackedInstall) return;
+        if (incoming.Transfer) {
+            TSnapshotTransferManifest manifest;
+            manifest.Version = incoming.Transfer->Version;
+            manifest.Metadata = std::move(incoming.Bytes);
+            manifest.PayloadBytes = incoming.Transfer->PayloadBytes;
+            manifest.Checksum = incoming.Transfer->Checksum;
+            snapshot = DecodeSnapshotTransferManifest(manifest, incoming.File);
+            if (incoming.File)
+                incoming.File->RetainStagingReservation(std::move(incoming.PayloadReservation));
+        } else {
+            snapshot = sourceBackedInstall
+                ? DecodeSnapshotBacked(receivedImage, incoming.File)
+                : incoming.File ? DecodeSnapshot(receivedImage) :
+                    DecodeSnapshotOwned(std::move(incoming.Bytes));
+            if (sourceBackedInstall)
+                incoming.File->RetainStagingReservation(std::move(incoming.ReceiveReservation));
+        }
         IncomingSnapshot.reset();
         auto inheritTrustedLineage = [&](const TConfigurationHistory& history) {
             if (snapshot.HasConfigurationMetadata() && history.IsJoint() &&

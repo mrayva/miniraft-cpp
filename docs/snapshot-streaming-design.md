@@ -199,8 +199,13 @@ can still materialize payloads. Generation-reference publication and sidecar
 externalization are implemented for both durable backends. Their recovery
 requires a configured generation resolver when the selected sidecar is
 metadata-only. Payload bytes still traverse the same bounded Raft stream; the
-new negotiated protocol separates them from the manifest on the wire, then the
-receiver assembles the encoded image in its current staging path.
+new negotiated protocol separates them from the manifest on the wire. On Linux,
+when `SnapshotStagingDirectory` is configured, the receiver now keeps manifest
+metadata in a bounded heap buffer and writes payload ranges directly to a
+separate anonymous file. It validates and decodes the manifest against that
+payload source without rebuilding the encoded image. Legacy snapshot RPCs and
+negotiated transfers without a staging directory retain the complete-image
+compatibility path.
 
 The generation reference is published atomically with the snapshot boundary,
 commit index, membership metadata and retained suffix. Both durable backends
@@ -261,12 +266,13 @@ generation interfaces now coexist with the existing string callbacks.
 Generation-aware applications publish immutable images before Raft publishes
 the corresponding reference, and activate them after that publication.
 Existing applications keep the current API; peers without size negotiation
-remain limited to 64 MiB. The negotiated range RPC is a compatibility adapter
-over the current encoded-image installer. The remaining storage change is to
-publish a received payload generation separately from Raft metadata and the
-retained suffix, atomically, so install no longer needs a complete encoded
-image. Never infer streaming support from the peer's ability to read the
-existing chunk RPC.
+remain limited to 64 MiB. The negotiated range RPC uses separate receiver
+staging only when a Linux staging directory is configured; other receivers
+keep the complete-image compatibility path. The remaining storage work is to
+extend separate-object staging to the default in-memory receiver and define a
+versioned durable payload-generation format whose size limit is independent of
+the current 128 MiB encoded-image cap. Never infer streaming support from the
+peer's ability to read the existing chunk RPC.
 
 Keep a configurable maximum image size, per-transfer temporary-disk quota,
 aggregate in-flight quota, and a cap on retained generations. A digest detects
