@@ -1241,6 +1241,117 @@ void test_versioned_disk_application_generation_replaces_snapshot_payload(void**
     }
 #endif
 }
+void test_split_application_snapshot_generation_crash_boundaries(void**) {
+#ifdef __linux__
+    char directoryTemplate[] = "/tmp/miniraft-split-generation-crash-XXXXXX";
+    auto* createdDirectory = mkdtemp(directoryTemplate);
+    assert_non_null(createdDirectory);
+    struct TDirectoryCleanup {
+        std::filesystem::path Path;
+        ~TDirectoryCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(Path, ignored);
+        }
+    } cleanup{createdDirectory};
+
+    const std::array stages{
+        TDiskState::ECommitStage::SnapshotImagePublished,
+        TDiskState::ECommitStage::LogFilesSynced,
+        TDiskState::ECommitStage::MetadataFileSynced,
+        TDiskState::ECommitStage::MetadataRenamed,
+        TDiskState::ECommitStage::DirectorySynced,
+    };
+    constexpr size_t PayloadBytes = 128 * 1024;
+    for (size_t attempt = 0; attempt < stages.size(); ++attempt) {
+        const auto root = std::filesystem::path(createdDirectory) / std::to_string(attempt);
+        assert_true(std::filesystem::create_directory(root));
+        const auto applicationDirectory = root / "application";
+        assert_true(std::filesystem::create_directory(applicationDirectory));
+        const auto name = (root / "raft").string();
+        auto resolver = [applicationDirectory](const TApplicationSnapshotGenerationReference& reference)
+                -> std::shared_ptr<const TSnapshotDataSource> {
+            std::ifstream input(applicationDirectory / reference.Id, std::ios::binary);
+            if (!input) return {};
+            std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+            return std::make_shared<TStringSnapshotDataSource>(std::move(bytes));
+        };
+
+        {
+            TDiskState seed(name, 1);
+            seed.CurrentTerm = 1;
+            seed.BindVoters({1});
+            auto entry = NewHoldedMessage<TLogEntry>();
+            entry->Term = 1;
+            seed.Append(entry);
+            seed.CommitIndex = 1;
+            seed.Commit();
+        }
+
+        const auto child = fork();
+        assert_true(child >= 0);
+        if (child == 0) {
+            try {
+                auto catalog = std::make_shared<TApplicationGenerationCatalog>();
+                catalog->Directory = applicationDirectory;
+                bool snapshotImagePublished = false;
+                auto state = std::make_shared<TDiskState>(name, 1,
+                    [target = stages[attempt], &snapshotImagePublished,
+                     catalog](TDiskState::ECommitStage stage) {
+                        if (stage == TDiskState::ECommitStage::SnapshotImagePublished) {
+                            snapshotImagePublished = true;
+                            if (target == stage && !catalog->LastPreparedId.empty()) _exit(91);
+                        } else if (snapshotImagePublished && target == stage &&
+                                !catalog->LastPreparedId.empty()) {
+                            _exit(91);
+                        }
+                    }, true, resolver);
+                auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+                auto application = std::make_shared<TGenerationAwareSnapshotApplication>(catalog);
+                application->Payload.assign(PayloadBytes, 'c');
+                application->LastAppliedIndex = 1;
+                TRequestProcessor processor(raft, application, {});
+                (void)raft->CompactShared();
+            } catch (...) { _exit(92); }
+            _exit(93);
+        }
+
+        int childStatus = 0;
+        assert_int_equal(waitpid(child, &childStatus, 0), child);
+        assert_true(WIFEXITED(childStatus));
+        assert_int_equal(WEXITSTATUS(childStatus), 91);
+
+        const bool metadataSelected = stages[attempt] == TDiskState::ECommitStage::MetadataRenamed ||
+            stages[attempt] == TDiskState::ECommitStage::DirectorySynced;
+        if (!metadataSelected) {
+            TDiskState recovered(name, 1);
+            assert_int_equal(recovered.SnapshotIndex, 0);
+            assert_int_equal(recovered.CommitIndex, 1);
+            assert_int_equal(recovered.LastLogIndex, 1);
+            assert_true(!recovered.GetApplicationSnapshotGenerationReference());
+            continue;
+        }
+
+        auto recovered = std::make_shared<TDiskState>(name, 1,
+            TDiskState::TCommitHook{}, true, resolver);
+        assert_int_equal(recovered->SnapshotIndex, 1);
+        assert_int_equal(recovered->CommitIndex, 1);
+        assert_int_equal(recovered->LastLogIndex, 1);
+        const auto reference = recovered->GetApplicationSnapshotGenerationReference();
+        assert_true(reference.has_value());
+        assert_int_equal(reference->DataBytes, PayloadBytes);
+        assert_int_equal(recovered->GetSnapshot()->DataSize(), PayloadBytes);
+
+        auto catalog = std::make_shared<TApplicationGenerationCatalog>();
+        catalog->Directory = applicationDirectory;
+        auto raft = std::make_shared<TRaft>(recovered, 1, TNodeDict{});
+        auto application = std::make_shared<TGenerationAwareSnapshotApplication>(catalog);
+        TRequestProcessor processor(raft, application, {});
+        assert_int_equal(application->LastAppliedIndex, reference->SnapshotIndex);
+        assert_true(catalog->ActiveId == reference->Id);
+        assert_true(catalog->Images.at(reference->Id) == std::string(PayloadBytes, 'c'));
+    }
+#endif
+}
 void test_remote_application_snapshot_generation_crash_boundaries(void**) {
 #ifdef __linux__
     char directoryTemplate[] = "/tmp/miniraft-remote-generation-crash-XXXXXX";
@@ -4658,6 +4769,7 @@ int main() {
         cmocka_unit_test(test_remote_snapshot_install_publishes_and_activates_local_generation),
         cmocka_unit_test(test_durable_application_generation_replaces_snapshot_sidecar_payload),
         cmocka_unit_test(test_versioned_disk_application_generation_replaces_snapshot_payload),
+        cmocka_unit_test(test_split_application_snapshot_generation_crash_boundaries),
         cmocka_unit_test(test_remote_application_snapshot_generation_crash_boundaries),
         cmocka_unit_test(test_range_snapshot_source_uses_disk_staging_quota),
         cmocka_unit_test(test_legacy_bounded_snapshot_uses_disk_staging_quota),

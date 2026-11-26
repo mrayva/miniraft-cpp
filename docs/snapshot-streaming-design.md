@@ -70,18 +70,17 @@ Applications that do not implement this optional interface keep the existing
 snapshot path.
 
 The durable backends persist this reference in MRFTD008 and MRFTL006 metadata;
-MRFTD001 through MRFTD007 and MRFTL001 through MRFTL005 remain readable. The
-snapshot payload remains in the `TDiskState` generation. For `TDurableState`,
-passing a generation resolver writes a valid metadata-only snapshot sidecar;
-the resolver is checked against the reference before publication and supplies
-the range source during recovery, before Raft construction. Without a resolver,
-the existing full-payload sidecar behavior remains. Every peer still receives
-the complete image in the existing InstallSnapshot format. This step reduces
-local `TDurableState` storage when applications opt in, but does not remove the
-128 MiB ceiling or introduce wire negotiation. Deterministic tests cover
-generation publication and activation crashes for both local compaction and
-remote installation; storage-size coverage confirms that the durable sidecar
-excludes a 1 MiB application payload.
+MRFTD001 through MRFTD007 and MRFTL001 through MRFTL005 remain readable. Either
+backend can be constructed with a generation resolver to write metadata-only
+snapshot sidecars for nonempty referenced payloads. The resolver is checked
+against the reference before publication and supplies the range source during
+recovery, before Raft construction. Without a resolver, the existing
+full-payload sidecar behavior remains. Every peer still receives the complete
+image in the existing InstallSnapshot format. This reduces local durable
+storage when applications opt in, but does not remove the 128 MiB ceiling or
+introduce wire negotiation. Deterministic tests cover generation publication
+and activation crashes for durable snapshot installation; split-backend crash
+tests cover recovery before and after metadata selection.
 
 `IStagedSnapshotRsm` lets an application validate and prepare an installation
 before Raft publishes the durable snapshot, then install that same prepared
@@ -184,18 +183,17 @@ buffer. This avoids the Raft heap copy but still keeps the complete received
 wire image on disk while it is the active in-memory snapshot. Current durable
 sidecars and Linux snapshot generations remain mapped and range-backed after
 restart; older embedded formats and RSMs without the streaming-install contract
-can still materialize payloads. The generation-reference lifecycle and
-`TDurableState` sidecar externalization are implemented. The legacy `TDiskState`
-backend still duplicates the complete application payload, and payload bytes
-are still sent over the existing wire protocol. `TDurableState` recovery
-requires a configured generation resolver when its selected sidecar is
-metadata-only.
+can still materialize payloads. Generation-reference publication and sidecar
+externalization are implemented for both durable backends. Their recovery
+requires a configured generation resolver when the selected sidecar is
+metadata-only. Payload bytes are still sent over the existing wire protocol.
 
 The generation reference is published atomically with the snapshot boundary,
-commit index, membership metadata and retained suffix. The remaining work is to
-apply source-backed storage and the corresponding startup resolver contract to
-`TDiskState`, then define a negotiated wire format that streams application
-generation bytes without embedding them in the Raft image.
+commit index, membership metadata and retained suffix. Both durable backends
+support source-backed local storage and require the startup resolver when the
+selected sidecar omits a nonempty payload. The remaining snapshot-streaming gap
+is a negotiated wire format that transfers application payload ranges without
+embedding them in the current complete-image encoding.
 
 ## Proposed lifecycle
 
