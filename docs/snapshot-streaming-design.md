@@ -199,24 +199,22 @@ can still materialize payloads. Generation-reference publication and sidecar
 externalization are implemented for both durable backends. Their recovery
 requires a configured generation resolver when the selected sidecar is
 metadata-only. Payload bytes still traverse the same bounded Raft stream; the
-new negotiated protocol separates them from the manifest on the wire. On Linux,
-when `SnapshotStagingDirectory` is configured, the receiver now keeps manifest
-metadata in a bounded heap buffer and writes payload ranges directly to a
-separate anonymous file. It validates and decodes the manifest against that
-payload source without rebuilding the encoded image. Legacy snapshot RPCs and
-negotiated transfers without a staging directory retain the complete-image
-compatibility path.
+new negotiated protocol separates them from the manifest on the wire. The
+receiver keeps metadata and payload as separate objects: on Linux, a configured
+`SnapshotStagingDirectory` puts payload ranges directly into an anonymous file;
+without one, it uses a separately budgeted heap buffer. Both paths decode
+against the payload source without rebuilding the full encoded image. Legacy
+snapshot RPCs retain the complete-image compatibility path.
 
 The generation reference is published atomically with the snapshot boundary,
 commit index, membership metadata and retained suffix. Both durable backends
 support source-backed local storage and require the startup resolver when the
-selected sidecar omits a nonempty payload. The negotiated wire format now
-transfers metadata, payload and checksum ranges separately. The remaining gap
-is direct receiver staging of those parts as separate objects. Current
-installation reconstructs the complete encoded image in heap or disk staging
-and remains capped at 128 MiB. Removing that cap needs a versioned storage and
+selected sidecar omits a nonempty payload. The negotiated wire format and
+receiver now keep metadata, payload, and checksum separate. Without configured
+file staging, the payload still resides wholly in heap memory, and transfers
+remain capped at 128 MiB. Removing that cap requires a versioned storage and
 application-install contract that can publish the validated manifest and
-payload source atomically without materializing their combined image.
+payload source atomically while streaming payload bytes to durable storage.
 
 ## Proposed lifecycle
 

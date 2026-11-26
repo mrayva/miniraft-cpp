@@ -611,7 +611,8 @@ public:
         std::shared_ptr<TSnapshotInstallBudget> SnapshotInstallBudget;
         // On Linux, stage streamed captures, legacy captures, complete legacy
         // snapshot images, and negotiated snapshot payloads in anonymous files
-        // in this directory.
+        // in this directory. Without a directory, negotiated transfers keep
+        // metadata and payload in separately accounted heap buffers.
         std::string SnapshotStagingDirectory;
         // Share this separately from SnapshotInstallBudget to limit staged
         // file bytes. Defaults to a separate 256 MiB process-wide budget.
@@ -856,6 +857,7 @@ private:
     uint64_t Seqno = 1; // zero is reserved for an unconfirmed read
     std::weak_ptr<IRsm> SnapshotApplication;
     class TIncomingSnapshotFile;
+    class TIncomingSnapshotMemoryPayload;
     struct TIncomingSnapshot {
         struct TMetadataContext {
             bool AllowFreshLearnerBootstrap;
@@ -878,6 +880,8 @@ private:
         // Retain the first chunk's wire fence so later chunks cannot reveal a
         // joint snapshot after its magic was split across transport messages.
         bool JointElectionFenceLeader = false;
+        std::string Payload;
+        std::shared_ptr<TSnapshotInstallBudget::TReservation> HeapReceiveReservation;
     };
     std::optional<TIncomingSnapshot> IncomingSnapshot;
     std::shared_ptr<const TSnapshotEncoding> EncodedSnapshot;

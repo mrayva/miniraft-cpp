@@ -2896,6 +2896,78 @@ void test_negotiated_snapshot_manifest_transfer_uses_distinct_wire_phases(void**
     assert_true(phases.contains(uint32_t(TInstallSnapshotRangeRequest::EPhase::Checksum)));
     assert_true(cluster.Nodes[2]->GetState()->SnapshotIndex == cluster.Nodes[0]->GetState()->SnapshotIndex);
     assert_true(Read(*cluster.Apps[2], "a") == std::string(60000, 'a'));
+    const auto installedSnapshot = cluster.Nodes[2]->GetState()->GetSnapshot();
+    assert_true(installedSnapshot && installedSnapshot->Data.empty() && installedSnapshot->DataSource);
+    const auto* heapUsage = dynamic_cast<const ISnapshotDataHeapUsage*>(installedSnapshot->DataSource.get());
+    assert_non_null(heapUsage);
+    assert_true(heapUsage->HeapBytes() > 0);
+}
+void test_snapshot_manifest_ranges_use_budgeted_heap_payload_without_file_staging(void**) {
+    TKv source;
+    source.Write(source.Prepare(Command("key", "heap-backed payload")), 1);
+    const TSnapshot snapshot{1, 1, {1, 2}, source.SaveSnapshot()};
+    const auto manifest = PrepareSnapshotTransferManifest(snapshot);
+    const auto totalBytes = manifest.Metadata.size() + manifest.PayloadBytes + 4;
+    auto budget = std::make_shared<TSnapshotInstallBudget>(totalBytes);
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) {
+        if (message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_RESPONSE))
+            responses.push_back(message.template Cast<TInstallSnapshotResponse>());
+    });
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 3;
+    TRaft::TLogLimits limits{.SnapshotInstallBudget = budget};
+    auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}}, std::vector<uint32_t>{}, limits);
+    auto app = std::make_shared<TApplication>();
+    TRequestProcessor processor(raft, app, {});
+    uint64_t sequence = 1;
+    auto send = [&](TInstallSnapshotRangeRequest::EPhase phase, uint64_t offset,
+            std::string_view bytes) {
+        raft->Process({}, RangeChunk(snapshot, manifest, phase, offset, bytes, sequence++));
+        assert_false(responses.empty());
+        return responses.back();
+    };
+    auto sendMetadata = [&] {
+        auto response = send(TInstallSnapshotRangeRequest::EPhase::Metadata, 0, manifest.Metadata);
+        assert_true(response->Success);
+        assert_false(response->Installed);
+        assert_int_equal(response->NextOffset, manifest.Metadata.size());
+    };
+    auto sendChecksum = [&] {
+        std::string checksum(4, '\0');
+        for (unsigned i = 0; i < 4; ++i) checksum[i] = char(manifest.Checksum >> (8 * i));
+        return send(TInstallSnapshotRangeRequest::EPhase::Checksum, 0, checksum);
+    };
+
+    sendMetadata();
+    assert_int_equal(budget->UsedBytes(), totalBytes);
+    auto firstPayload = send(TInstallSnapshotRangeRequest::EPhase::Payload, 0,
+        std::string_view(snapshot.Data).substr(0, 1));
+    assert_true(firstPayload->Success);
+    assert_int_equal(firstPayload->NextOffset, manifest.Metadata.size() + 1);
+    const char conflictingByte = char(snapshot.Data[0] ^ 1);
+    auto conflict = send(TInstallSnapshotRangeRequest::EPhase::Payload, 0,
+        std::string_view(&conflictingByte, 1));
+    assert_false(conflict->Success);
+    assert_int_equal(budget->UsedBytes(), 0);
+    assert_int_equal(app->Loads, 0);
+
+    sendMetadata();
+    auto payload = send(TInstallSnapshotRangeRequest::EPhase::Payload, 0, snapshot.Data);
+    assert_true(payload->Success);
+    assert_int_equal(payload->NextOffset, manifest.Metadata.size() + manifest.PayloadBytes);
+    auto installed = sendChecksum();
+    assert_true(installed->Success);
+    assert_true(installed->Installed);
+    assert_int_equal(app->Loads, 1);
+    assert_true(Read(*app, "key") == "heap-backed payload");
+    const auto installedSnapshot = state->GetSnapshot();
+    assert_true(installedSnapshot && installedSnapshot->Data.empty() && installedSnapshot->DataSource);
+    const auto* heapUsage = dynamic_cast<const ISnapshotDataHeapUsage*>(installedSnapshot->DataSource.get());
+    assert_non_null(heapUsage);
+    assert_true(heapUsage->HeapBytes() > 0);
+    assert_true(heapUsage->HeapBytes() < totalBytes);
+    assert_int_equal(budget->UsedBytes(), heapUsage->HeapBytes());
 }
 void test_idle_snapshot_transfer_discards_partial_image_and_restarts(void**) {
     TCluster cluster({3}); // Learners must also reclaim stalled transfers.
@@ -4964,6 +5036,7 @@ int main() {
         cmocka_unit_test(test_snapshot_manifest_ranges_install_with_separate_payload_staging),
         cmocka_unit_test(test_snapshot_manifest_ranges_reject_gaps_conflicts_and_corruption),
         cmocka_unit_test(test_negotiated_snapshot_manifest_transfer_uses_distinct_wire_phases),
+        cmocka_unit_test(test_snapshot_manifest_ranges_use_budgeted_heap_payload_without_file_staging),
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),
         cmocka_unit_test(test_outgoing_snapshot_chunk_holds_heap_budget_lease),
         cmocka_unit_test(test_simultaneous_startup_candidates_use_distinct_election_deadlines),

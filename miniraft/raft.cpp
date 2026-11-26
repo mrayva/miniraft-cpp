@@ -1043,6 +1043,25 @@ private:
 #endif
 };
 
+class TRaft::TIncomingSnapshotMemoryPayload final : public TSnapshotDataSource, public ISnapshotDataHeapUsage {
+public:
+    explicit TIncomingSnapshotMemoryPayload(std::string bytes)
+        : Bytes(std::move(bytes)) { }
+
+    uint64_t Size() const override { return Bytes.size(); }
+    uint64_t HeapBytes() const override { return Bytes.capacity(); }
+
+    size_t Read(uint64_t offset, std::span<char> destination) const override {
+        if (offset >= Bytes.size() || destination.empty()) return 0;
+        const auto count = size_t(std::min<uint64_t>(destination.size(), Bytes.size() - offset));
+        memcpy(destination.data(), Bytes.data() + size_t(offset), count);
+        return count;
+    }
+
+private:
+    std::string Bytes;
+};
+
 void TDummyRsm::Validate(TMessageHolder<TCommandRequest> message) const {
     if (!message || message->Len < sizeof(TCommandRequest) ||
         (!(message->Flags & TCommandRequest::EWrite) && message->Len < sizeof(TCommandRequest) + sizeof(int64_t)))
@@ -3776,9 +3795,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     auto* streamingInstallApplication = dynamic_cast<IStreamingSnapshotInstallRsm*>(application.get());
     const bool supportsSourceBackedInstall = streamingInstallApplication ||
         dynamic_cast<IIdempotentRsm*>(application.get());
-    const bool stageManifestPayloadSeparately = transfer &&
-        !LogLimits.SnapshotStagingDirectory.empty();
-    const auto incomingTransfer = stageManifestPayloadSeparately
+    const bool separateManifestParts = transfer.has_value();
+    const auto incomingTransfer = separateManifestParts
         ? transfer : std::optional<TSnapshotTransferIdentity>{};
     const bool same = IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
         IncomingSnapshot->Leader == request->LeaderId && IncomingSnapshot->Index == request->SnapshotIndex &&
@@ -3788,7 +3806,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         if (request->Offset != 0 || (IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
             IncomingSnapshot->Index > request->SnapshotIndex)) { reply(false, false, 0); return; }
         // Legacy installs materialize the complete image in heap memory.
-        if (!stageManifestPayloadSeparately && !supportsSourceBackedInstall &&
+        if (!separateManifestParts && !supportsSourceBackedInstall &&
             request->TotalBytes > SnapshotInstallBudget->LimitBytes()) {
             reply(false, false, 0); return;
         }
@@ -3796,18 +3814,26 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         const auto& receiveBudget = LogLimits.SnapshotStagingBudget ?
             LogLimits.SnapshotStagingBudget : SnapshotInstallBudget;
         std::string image;
+        std::string payload;
         std::shared_ptr<void> reservation;
         std::shared_ptr<void> payloadReservation;
+        std::shared_ptr<TSnapshotInstallBudget::TReservation> heapReservation;
         std::shared_ptr<TIncomingSnapshotFile> file;
         try {
-            if (stageManifestPayloadSeparately) {
-                reservation = SnapshotInstallBudget->TryReserve(transfer->MetadataBytes);
-                if (!reservation) { reply(false, false, 0); return; }
-                if (transfer->PayloadBytes) {
-                    payloadReservation = receiveBudget->TryReserve(transfer->PayloadBytes);
-                    if (!payloadReservation) { reply(false, false, 0); return; }
-                    file = std::make_shared<TIncomingSnapshotFile>(
-                        LogLimits.SnapshotStagingDirectory, size_t(transfer->PayloadBytes));
+            if (separateManifestParts) {
+                if (LogLimits.SnapshotStagingDirectory.empty()) {
+                    heapReservation = SnapshotInstallBudget->TryReserveLease(request->TotalBytes);
+                    if (!heapReservation) { reply(false, false, 0); return; }
+                    payload.resize(size_t(transfer->PayloadBytes));
+                } else {
+                    reservation = SnapshotInstallBudget->TryReserve(transfer->MetadataBytes);
+                    if (!reservation) { reply(false, false, 0); return; }
+                    if (transfer->PayloadBytes) {
+                        payloadReservation = receiveBudget->TryReserve(transfer->PayloadBytes);
+                        if (!payloadReservation) { reply(false, false, 0); return; }
+                        file = std::make_shared<TIncomingSnapshotFile>(
+                            LogLimits.SnapshotStagingDirectory, size_t(transfer->PayloadBytes));
+                    }
                 }
                 image.resize(size_t(transfer->MetadataBytes));
             } else {
@@ -3830,6 +3856,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             std::move(reservation), {}, 0, std::move(file)};
         IncomingSnapshot->Transfer = incomingTransfer;
         IncomingSnapshot->PayloadReservation = std::move(payloadReservation);
+        IncomingSnapshot->Payload = std::move(payload);
+        IncomingSnapshot->HeapReceiveReservation = std::move(heapReservation);
         IncomingSnapshot->JointElectionFenceLeader = jointElectionFenceLeader;
     }
     auto& incoming = *IncomingSnapshot;
@@ -3848,9 +3876,10 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
                     bytes.data(), bytes.size()) == 0;
             }
             if (offset < imageOffset) {
-                if (bytes.size() > imageOffset - offset || !incoming.File) return false;
-                return bytes.empty() || memcmp(incoming.File->Data() + size_t(offset - identity.MetadataBytes),
-                    bytes.data(), bytes.size()) == 0;
+                if (bytes.size() > imageOffset - offset) return false;
+                const auto payloadOffset = size_t(offset - identity.MetadataBytes);
+                const char* payload = incoming.File ? incoming.File->Data() : incoming.Payload.data();
+                return bytes.empty() || memcmp(payload + payloadOffset, bytes.data(), bytes.size()) == 0;
             }
             if (offset != imageOffset || bytes.size() != 4) return false;
             char expected[4];
@@ -3869,9 +3898,16 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             memcpy(incoming.Bytes.data() + size_t(request->Offset), request->Data, count);
             receivedBytes += count;
         } else if (request->Offset < imageOffset) {
-            if (count > imageOffset - request->Offset || !incoming.File ||
-                !incoming.File->Write(size_t(request->Offset - identity.MetadataBytes), chunk)) {
+            if (count > imageOffset - request->Offset) {
                 IncomingSnapshot.reset(); reply(false, false, 0); return;
+            }
+            const auto payloadOffset = size_t(request->Offset - identity.MetadataBytes);
+            if (incoming.File) {
+                if (!incoming.File->Write(payloadOffset, chunk)) {
+                    IncomingSnapshot.reset(); reply(false, false, 0); return;
+                }
+            } else {
+                memcpy(incoming.Payload.data() + payloadOffset, request->Data, count);
             }
             receivedBytes += count;
         } else {
@@ -3953,7 +3989,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         reply(true, false, receivedBytes);
         return;
     }
-    // Keep the heap allocation charged through validation and publication.
+    // Keep heap-backed payloads charged through validation and publication.
     // A staged file retains its separate disk reservation until we close it.
     std::shared_ptr<void> installationReservation;
     std::unique_ptr<IStagedSnapshotInstallation> stagedApplicationInstall;
@@ -3965,6 +4001,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             installationReservation = sourceBackedInstall ? std::shared_ptr<void>{} :
                 incoming.File ? SnapshotInstallBudget->TryReserve(incoming.Total) :
                     std::move(incoming.ReceiveReservation);
+        } else if (!incoming.File) {
+            installationReservation = std::move(incoming.HeapReceiveReservation);
         }
         // A full staged image can wait for transient heap contention. Leave
         // the final chunk unacknowledged so the leader retries it. Retries
@@ -3976,9 +4014,16 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             manifest.Metadata = std::move(incoming.Bytes);
             manifest.PayloadBytes = incoming.Transfer->PayloadBytes;
             manifest.Checksum = incoming.Transfer->Checksum;
-            snapshot = DecodeSnapshotTransferManifest(manifest, incoming.File);
+            std::shared_ptr<const TSnapshotDataSource> payload = incoming.File;
+            if (!incoming.File && manifest.PayloadBytes)
+                payload = std::make_shared<TIncomingSnapshotMemoryPayload>(std::move(incoming.Payload));
+            snapshot = DecodeSnapshotTransferManifest(manifest, std::move(payload));
             if (incoming.File)
                 incoming.File->RetainStagingReservation(std::move(incoming.PayloadReservation));
+            else if (!SnapshotInstallBudget->TryResize(
+                    std::static_pointer_cast<TSnapshotInstallBudget::TReservation>(installationReservation),
+                    snapshot.HeapBytes()))
+                throw std::runtime_error("Cannot retain snapshot payload within the heap budget");
         } else {
             snapshot = sourceBackedInstall
                 ? DecodeSnapshotBacked(receivedImage, incoming.File)
