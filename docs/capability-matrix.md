@@ -49,8 +49,10 @@ design notes. This is a capability summary, not a production-readiness claim.
   capture retains the source and charges its declared heap bound, defaulting to
   payload size; incremental snapshot writers extend their lease before appending.
   Retained payloads and live InstallSnapshot frame buffers share the install heap
-  budget. Legacy unbounded `SaveSnapshot()` callback buffers, application-owned
-  state and non-snapshot transport allocations remain outside it. The required
+  budget. Legacy `SaveSnapshot()` callbacks without a bound reserve the maximum
+  accepted payload before invocation and shrink the lease to retained capacity.
+  Callback allocations beyond that bound, application-owned state and
+  non-snapshot transport allocations remain outside it. The required
   staged-image and durable-manifest contract is outlined in [the streaming design](snapshot-streaming-design.md).
 - Automatic recovery when a stale store lacks an allowed history anchor, or
   its transition chain is disjoint from the sender's voter lineage.

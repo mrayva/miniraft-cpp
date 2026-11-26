@@ -38,9 +38,11 @@ message buffer until the last holder releases it, including through custom
 transports.
 Range-source capture retains its source and conservatively reserves its full
 payload size; the incremental snapshot writer charges each append before
-growing its in-memory image. Current application/log state, legacy unbounded
-`SaveSnapshot()` callback buffers, detached snapshot copies, non-snapshot
-transport buffers and other allocations remain outside these limits;
+growing its in-memory image. A legacy `SaveSnapshot()` callback without a
+declared bound reserves the maximum accepted payload before it runs, then
+shrinks the lease to retained capacity. Callback allocations beyond that bound,
+current application/log state, detached snapshot copies, non-snapshot transport
+buffers and other allocations remain outside these limits;
 disk-streamed snapshot transfer remains open. Voter membership changes
 are available through [live membership](configuration-entries.md), with leader
 removal supported by [leadership transfer](leadership-transfer.md). This alpha.43

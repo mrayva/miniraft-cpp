@@ -45,7 +45,10 @@ append. This path does not require a size bound and avoids constructing a
 separate `SaveSnapshot()` result, but still materializes one complete final
 image in memory. The KV example writes its sorted records directly to this
 sink, avoiding a second complete encoded buffer. Legacy `SaveSnapshot()`
-callbacks without a bound remain charged only after they return.
+callbacks without a bound reserve the maximum accepted payload before they run,
+then shrink the lease to retained capacity. This conservative reservation can
+reject capture when less than that amount is available; a declared size bound
+allows a smaller reservation, while the writer interface charges incrementally.
 
 `IStagedSnapshotRsm` lets an application validate and prepare an installation
 before Raft publishes the durable snapshot, then install that same prepared
@@ -74,15 +77,14 @@ reported heap bound, or its exact size for an unmarked source, and retains the
 source after checking it in bounded ranges. Internal file-backed snapshot
 sources report zero heap payload bytes. Fallback installation paths that
 materialize a source-backed image reserve an additional image-sized temporary
-lease during validation and load. Application allocations made by callbacks
-remain outside this budget. Legacy
-`SaveSnapshot()` capture reserves a declared upper bound before invoking the
-callback, then shrinks the lease to the captured size. Incremental snapshot
-writers extend the lease before each append even without a size bound. Legacy
-`SaveSnapshot()` implementations without a bound can only be charged after the
-callback returns.
-Application memory, detached value copies and transport buffers remain outside
-this budget.
+lease during validation and load. Application state and temporary allocations
+made by validation/load callbacks remain outside this budget. For legacy
+`SaveSnapshot()` capture, Raft reserves the declared upper bound before
+invoking the callback, or the maximum accepted payload when no bound is
+available, then shrinks the lease to retained string capacity. Incremental
+snapshot writers extend the lease before each append even without a size bound.
+Other application-owned state, detached value copies and transport buffers
+remain outside this budget.
 
 On Linux, set `TRaft::TLogLimits::SnapshotStagingDirectory` to stage full
 incoming images in a directory on a filesystem that supports anonymous

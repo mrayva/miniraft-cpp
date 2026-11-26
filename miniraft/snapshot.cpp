@@ -1116,7 +1116,11 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         else snapshot.DataSource = sink.TakeSource();
         reservation = sink.TakeReservation();
     } else {
-        if (upperBound) reserveCaptureBytes(*upperBound);
+        // Legacy SaveSnapshot returns one opaque string, so its allocation
+        // cannot be charged incrementally. Reserve the declared bound when
+        // available; otherwise reserve the largest payload this image may
+        // retain before entering application code, then shrink to capacity.
+        reserveCaptureBytes(upperBound.value_or(TSnapshot::MaxBytes - metadataBytes));
         auto data = rsm.SaveSnapshot();
         if (data.size() > TSnapshot::MaxBytes - metadataBytes)
             throw std::runtime_error("Application snapshot exceeds the Raft snapshot limit");
@@ -1126,7 +1130,8 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         if (stagingDirectory.empty()) {
             snapshot.Data = std::move(data);
         } else {
-            if (reservation && !heapBudget->TryResize(reservation, data.size()))
+            const auto retainedBytes = data.empty() ? uint64_t(0) : uint64_t(data.capacity());
+            if (reservation && !heapBudget->TryResize(reservation, retainedBytes))
                 throw std::runtime_error("Captured snapshot exceeds the available heap budget");
             if (!stagingBudget)
                 stagingBudget = heapBudget ? heapBudget : TSnapshotInstallBudget::DefaultProcessBudget();

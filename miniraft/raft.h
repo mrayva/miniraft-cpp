@@ -112,7 +112,7 @@ struct IRsm {
     // or IStreamingSnapshotWriterRsm output. Raft checks it against the
     // metadata-adjusted image limit. The writer sink can charge output
     // incrementally when no bound is available; legacy SaveSnapshot() capture
-    // without a bound can only be charged after the callback returns.
+    // without a bound reserves the maximum accepted payload before the callback.
     virtual std::optional<uint64_t> SnapshotSizeUpperBound() const { return std::nullopt; }
     virtual void ValidateSnapshot(std::string_view, uint64_t) const { throw std::logic_error("Application snapshots are unsupported"); }
     // Implementations must validate completely before atomically replacing state

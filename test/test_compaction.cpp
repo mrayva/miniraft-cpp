@@ -119,6 +119,15 @@ struct THeapBudgetObservingSnapshotApplication : TBoundedSnapshotApplication {
 struct TUnboundedSnapshotApplication : TBoundedSnapshotApplication {
     std::optional<uint64_t> SnapshotSizeUpperBound() const override { return std::nullopt; }
 };
+struct TBudgetObservingUnboundedSnapshotApplication : TUnboundedSnapshotApplication {
+    std::shared_ptr<TSnapshotInstallBudget> Budget;
+    mutable uint64_t BudgetBytesDuringSave = 0;
+    std::string SaveSnapshot() const override {
+        ++SaveCalls;
+        BudgetBytesDuringSave = Budget->UsedBytes();
+        return std::string(PayloadBytes, 's');
+    }
+};
 struct TStreamingWriterSnapshotApplication : TApplication {
     mutable size_t SaveCalls = 0;
     mutable size_t WriteCalls = 0;
@@ -348,9 +357,37 @@ void test_snapshot_capture_reserves_declared_bound_before_materializing(void**) 
     state.reset();
     assert_int_equal(budget->UsedBytes(), 0);
 }
+void test_unbounded_legacy_snapshot_precharges_before_callback(void**) {
+    auto state = std::make_shared<TState>();
+    auto entry = NewHoldedMessage<TLogEntry>();
+    entry->Term = 1;
+    state->Append(entry);
+    state->CommitIndex = 1;
+    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+    auto application = std::make_shared<TBudgetObservingUnboundedSnapshotApplication>();
+    application->LastAppliedIndex = 1;
+    TRequestProcessor processor(raft, application, {});
+
+    auto insufficientBudget = std::make_shared<TSnapshotInstallBudget>(1024);
+    application->Budget = insufficientBudget;
+    Reject([&] { CaptureSnapshot(*raft, *application, insufficientBudget); });
+    assert_int_equal(application->SaveCalls, 0);
+    assert_int_equal(insufficientBudget->UsedBytes(), 0);
+
+    auto budget = std::make_shared<TSnapshotInstallBudget>(TSnapshot::MaxBytes);
+    application->Budget = budget;
+    {
+        auto snapshot = CaptureSnapshot(*raft, *application, budget);
+        assert_int_equal(application->SaveCalls, 1);
+        assert_true(application->BudgetBytesDuringSave > TSnapshot::MaxBytes - 1024);
+        assert_int_equal(snapshot.DataSize(), application->PayloadBytes);
+        assert_int_equal(budget->UsedBytes(), snapshot.HeapBytes());
+    }
+    assert_int_equal(budget->UsedBytes(), 0);
+}
 void test_snapshot_capture_charges_retained_string_capacity(void**) {
     struct TOverallocatedSnapshotApplication : TBoundedSnapshotApplication {
-        std::optional<uint64_t> SnapshotSizeUpperBound() const override { return std::nullopt; }
+        std::optional<uint64_t> SnapshotSizeUpperBound() const override { return PayloadBytes; }
         std::string SaveSnapshot() const override {
             std::string bytes(PayloadBytes, 's');
             bytes.reserve(1024);
@@ -764,7 +801,7 @@ void test_legacy_unbounded_snapshot_uses_disk_staging_quota(void**) {
     };
 
     auto state = makeState();
-    auto heapBudget = std::make_shared<TSnapshotInstallBudget>(40);
+    auto heapBudget = std::make_shared<TSnapshotInstallBudget>(TSnapshot::MaxBytes);
     auto stagingBudget = std::make_shared<TSnapshotInstallBudget>(40);
     TRaft::TLogLimits limits;
     limits.SnapshotInstallBudget = heapBudget;
@@ -791,7 +828,7 @@ void test_legacy_unbounded_snapshot_uses_disk_staging_quota(void**) {
     assert_int_equal(stagingBudget->UsedBytes(), 0);
 
     auto rejectedState = makeState();
-    auto rejectedHeapBudget = std::make_shared<TSnapshotInstallBudget>(40);
+    auto rejectedHeapBudget = std::make_shared<TSnapshotInstallBudget>(TSnapshot::MaxBytes);
     auto rejectedStagingBudget = std::make_shared<TSnapshotInstallBudget>(39);
     limits.SnapshotInstallBudget = rejectedHeapBudget;
     limits.SnapshotStagingBudget = rejectedStagingBudget;
@@ -3820,6 +3857,7 @@ int main() {
         cmocka_unit_test(test_example_kv_streaming_install_validates_before_atomic_publish),
         cmocka_unit_test(test_snapshot_capture_preflights_application_size_bound),
         cmocka_unit_test(test_snapshot_capture_reserves_declared_bound_before_materializing),
+        cmocka_unit_test(test_unbounded_legacy_snapshot_precharges_before_callback),
         cmocka_unit_test(test_snapshot_capture_charges_retained_string_capacity),
         cmocka_unit_test(test_incremental_snapshot_capture_charges_each_growth_before_writing),
         cmocka_unit_test(test_snapshot_source_can_report_non_heap_payload_storage),
