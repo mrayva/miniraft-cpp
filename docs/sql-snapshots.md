@@ -36,8 +36,13 @@ the in-memory serialized source. Save requires a nonzero committed Raft applied
 index and no open transaction. Raft no-ops and configuration entries advance
 this index without changing SQL data. If the SQLite progress marker trails the
 Raft index or is absent, capture writes the exact boundary into the backup copy.
-The live database is unaffected. The SQL payload is capped below 128 MiB to
-leave room for the Raft snapshot header and maximum voter metadata. Before
+The live database is unaffected. String-based `SaveSnapshot()` and validation
+retain a payload cap below 128 MiB so complete-image compatibility snapshots
+leave room for the Raft header and maximum voter metadata. Range-readable
+capture and source-backed installation support SQL images above 128 MiB, up to
+the 256 MiB streamed-image ceiling with conservative metadata headroom. The
+actual encoded metadata and configured per-node limit still apply; the default
+per-node limit remains 128 MiB. Before
 SQLite opens the received image, SQL checks the format signature, rollback
 mode, page size, page alignment and the in-header page count when SQLite's
 header counters make it authoritative. On Linux, SQL writes the image to a

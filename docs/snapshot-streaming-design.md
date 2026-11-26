@@ -17,9 +17,11 @@ complete snapshot up to 256 MiB. Original formats, `EncodeSnapshot()`, the
 non-owning `DecodeSnapshot()` view and legacy chunk RPCs remain capped at 128
 MiB. The default per-node limit remains 128 MiB; configuring a
 higher limit is opt-in, and configured node limits may lower either path. The
-shipped KV and SQL RSMs also enforce their own application-payload limits at
-or below 128 MiB; another RSM must implement and budget its larger-image
-validation and restore path. The snapshot format, storage behavior and transfer limits are described in
+KV RSM and string-based SQL compatibility APIs remain capped at or below 128
+MiB. SQL's range-readable capture and source-backed install paths support larger
+images up to the streamed-image ceiling; another RSM must implement and budget
+its larger-image validation and restore path. The snapshot format, storage
+behavior and transfer limits are described in
 [compaction and InstallSnapshot](compaction.md).
 
 ## Current incremental step

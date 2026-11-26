@@ -24,6 +24,17 @@ public:
 private:
     std::shared_ptr<const std::string> Bytes;
 };
+class TSqlSnapshotDataSourceAdapter final : public TSnapshotDataSource {
+public:
+    explicit TSqlSnapshotDataSourceAdapter(std::shared_ptr<const ISnapshotSource> source)
+        : Source(std::move(source)) { }
+    uint64_t Size() const override { return Source->Size(); }
+    size_t Read(uint64_t offset, std::span<char> destination) const override {
+        return Source->Read(offset, destination);
+    }
+private:
+    std::shared_ptr<const ISnapshotSource> Source;
+};
 
 TMessageHolder<TReadSql> Query(const std::string& text) {
     auto message = NewHoldedMessage<TReadSql>(sizeof(TReadSql) + text.size());
@@ -330,6 +341,33 @@ void test_sql_streaming_install_uses_range_backed_snapshot_payload(void**) {
     assert_int_equal(target.LastAppliedIndex, 2);
     assert_true(ReadText(target, "SELECT value FROM t ORDER BY rowid") ==
         "value\noriginal\nsnapshot\n");
+}
+void test_sql_streaming_snapshot_capture_and_install_exceed_complete_image_limit(void**) {
+    TDatabase files;
+    {
+        TSql initial(files.Path, 1);
+        Apply(initial, "CREATE TABLE large_payload (data BLOB);", 1);
+    }
+    const auto payloadBytes = TSnapshot::MaxBytes + 1024;
+    files.External("INSERT INTO large_payload VALUES (zeroblob(" + std::to_string(payloadBytes) + "));");
+    TSql source(files.Path, 1), target(":memory:", 2);
+
+    const auto bound = source.SnapshotSizeUpperBound();
+    assert_true(bound.has_value());
+    assert_true(*bound > TSnapshot::MaxBytes);
+    auto image = source.OpenSnapshotSource(1);
+    assert_non_null(image.get());
+    assert_true(image->Size() > TSnapshot::MaxBytes);
+    assert_true(image->Size() <= TSnapshot::MaxStreamedBytes);
+    Reject([&] { (void)source.SaveSnapshot(); });
+
+    TSqlSnapshotDataSourceAdapter snapshotSource(image);
+    auto installation = target.PrepareSnapshotInstallation(snapshotSource, 1);
+    assert_int_equal(target.LastAppliedIndex, 0);
+    installation->Install();
+    assert_int_equal(target.LastAppliedIndex, 1);
+    assert_true(ReadText(target, "SELECT length(data) FROM large_payload").find(
+        std::to_string(payloadBytes)) != std::string::npos);
 }
 void test_sql_snapshot_truncation_rejects_before_replacement(void**) {
     TDatabase sourceFile, targetFile;
@@ -803,6 +841,7 @@ int main() {
         cmocka_unit_test(test_sql_snapshot_source_is_stable_and_matches_requested_index),
         cmocka_unit_test(test_sql_staged_snapshot_install_reuses_validated_image),
         cmocka_unit_test(test_sql_streaming_install_uses_range_backed_snapshot_payload),
+        cmocka_unit_test(test_sql_streaming_snapshot_capture_and_install_exceed_complete_image_limit),
         cmocka_unit_test(test_sql_snapshot_truncation_rejects_before_replacement),
         cmocka_unit_test(test_sql_snapshot_installation_busy_failure_preserves_database),
         cmocka_unit_test(test_sql_snapshot_includes_committed_wal_pages),

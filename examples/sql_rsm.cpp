@@ -106,7 +106,9 @@ struct TReadBudget {
     }
 };
 using TStatement = std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)>;
-constexpr size_t MaxSqlSnapshotBytes = TSnapshot::MaxBytes - 40 - 4 * TSnapshot::MaxVoters;
+constexpr size_t SqlSnapshotMetadataHeadroom = 40 + 4 * TSnapshot::MaxVoters;
+constexpr size_t MaxSqlSnapshotBytes = TSnapshot::MaxBytes - SqlSnapshotMetadataHeadroom;
+constexpr size_t MaxSqlStreamedSnapshotBytes = TSnapshot::MaxStreamedBytes - SqlSnapshotMetadataHeadroom;
 
 #ifdef __linux__
 class TSnapshotFileDescriptor {
@@ -156,8 +158,9 @@ struct TSnapshotDatabase {
     std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)> Db{nullptr, sqlite3_close_v2};
 };
 
-void ValidateSnapshotImageHeader(std::string_view header, uint64_t imageSize) {
-    if (imageSize < 100 || imageSize > MaxSqlSnapshotBytes || header.size() < 100)
+void ValidateSnapshotImageHeader(std::string_view header, uint64_t imageSize,
+        uint64_t maxImageBytes = MaxSqlSnapshotBytes) {
+    if (imageSize < 100 || imageSize > maxImageBytes || header.size() < 100)
         throw TMessageError("Invalid SQL snapshot size");
     if (header.substr(0, 16) != std::string_view("SQLite format 3\0", 16))
         throw TMessageError("Invalid SQL snapshot database header");
@@ -249,7 +252,8 @@ TSnapshotDatabase OpenSnapshotDatabase(const TSnapshotDataSource& source) {
             throw TMessageError("Cannot read SQL snapshot header");
         headerRead += count;
     }
-    ValidateSnapshotImageHeader(std::string_view(header.data(), header.size()), imageSize);
+    ValidateSnapshotImageHeader(std::string_view(header.data(), header.size()), imageSize,
+        MaxSqlStreamedSnapshotBytes);
 #ifdef __linux__
     TSnapshotDatabase result;
     result.TempDirectory = std::make_unique<TSqlSnapshotTempDirectory>();
@@ -373,9 +377,10 @@ uint64_t ReadPragmaInteger(sqlite3* db, const char* pragma) {
     return uint64_t(value);
 }
 
-uint64_t CheckedSnapshotBytes(sqlite3* db, uint64_t pageSize) {
+uint64_t CheckedSnapshotBytes(sqlite3* db, uint64_t pageSize,
+        uint64_t maxImageBytes = MaxSqlSnapshotBytes) {
     const auto pages = ReadPragmaInteger(db, "page_count");
-    if (pages > MaxSqlSnapshotBytes / pageSize)
+    if (pages > maxImageBytes / pageSize)
         throw TMessageError("SQL snapshot exceeds the maximum image size");
     return pages * pageSize;
 }
@@ -496,9 +501,10 @@ private:
     TSnapshotDatabase Image;
 };
 
-std::shared_ptr<const ISnapshotSource> CreateSqlSnapshotSource(sqlite3* db, uint64_t index) {
+std::shared_ptr<const ISnapshotSource> CreateSqlSnapshotSource(sqlite3* db, uint64_t index,
+        uint64_t maxImageBytes = MaxSqlSnapshotBytes) {
     const auto pageSize = CheckSnapshotCapture(db, index);
-    CheckedSnapshotBytes(db, pageSize);
+    CheckedSnapshotBytes(db, pageSize, maxImageBytes);
 #ifdef __linux__
     TSqlSnapshotTempDirectory temp;
     sqlite3* raw = nullptr;
@@ -534,7 +540,7 @@ std::shared_ptr<const ISnapshotSource> CreateSqlSnapshotSource(sqlite3* db, uint
             ReadAppliedIndex(checkpoint) != index)
             throw TMessageError("Cannot set SQL snapshot progress");
     }
-    const auto expectedSize = CheckedSnapshotBytes(checkpoint, pageSize);
+    const auto expectedSize = CheckedSnapshotBytes(checkpoint, pageSize, maxImageBytes);
     if (sqlite3_close(consistent.get()) != SQLITE_OK)
         throw TMessageError("Cannot close SQL snapshot staging database");
     consistent.release();
@@ -546,7 +552,7 @@ std::shared_ptr<const ISnapshotSource> CreateSqlSnapshotSource(sqlite3* db, uint
     if (fstat(image.Get(), &info) != 0)
         throw std::system_error(errno, std::generic_category(), "Cannot stat staged SQL snapshot image");
     if (!S_ISREG(info.st_mode) || info.st_size < 100 ||
-        uint64_t(info.st_size) > MaxSqlSnapshotBytes || uint64_t(info.st_size) != expectedSize)
+        uint64_t(info.st_size) > maxImageBytes || uint64_t(info.st_size) != expectedSize)
         throw TMessageError("Invalid staged SQL snapshot size");
 
     char header[100];
@@ -603,12 +609,12 @@ std::shared_ptr<const ISnapshotSource> CreateSqlSnapshotSource(sqlite3* db, uint
         if (sqlite3_exec(checkpoint, update.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK ||
             ReadAppliedIndex(checkpoint) != index)
             throw TMessageError("Cannot set SQL snapshot progress");
-        CheckedSnapshotBytes(checkpoint, pageSize);
+        CheckedSnapshotBytes(checkpoint, pageSize, maxImageBytes);
     }
     sqlite3_int64 size = 0;
     auto* bytes = sqlite3_serialize(checkpoint, "main", &size, 0);
     std::unique_ptr<unsigned char, decltype(&sqlite3_free)> image(bytes, sqlite3_free);
-    if (!bytes || size <= 0 || uint64_t(size) > MaxSqlSnapshotBytes)
+    if (!bytes || size <= 0 || uint64_t(size) > maxImageBytes)
         throw TMessageError("Cannot serialize SQL snapshot within the size limit");
     if (size < 100 ||
         !((static_cast<unsigned char>(bytes[18]) == 1 && static_cast<unsigned char>(bytes[19]) == 1) ||
@@ -786,7 +792,7 @@ TMessageHolder<TLogEntry> TSql::Prepare(TMessageHolder<TCommandRequest> command)
 
 std::optional<uint64_t> TSql::SnapshotSizeUpperBound() const {
     const auto pageSize = CheckSnapshotCapture(Db, LastAppliedIndex);
-    const auto bytes = CheckedSnapshotBytes(Db, pageSize);
+    const auto bytes = CheckedSnapshotBytes(Db, pageSize, MaxSqlStreamedSnapshotBytes);
     // Updating the marker in the checkpoint can grow its SQLite page count.
     if (ReadAppliedIndex(Db) != LastAppliedIndex) return std::nullopt;
     return bytes;
@@ -809,7 +815,7 @@ std::string TSql::SaveSnapshot() const {
 std::shared_ptr<const ISnapshotSource> TSql::OpenSnapshotSource(uint64_t index) const {
     if (index != LastAppliedIndex)
         throw TMessageError("SQL snapshot source does not match the requested applied index");
-    return CreateSqlSnapshotSource(Db, index);
+    return CreateSqlSnapshotSource(Db, index, MaxSqlStreamedSnapshotBytes);
 }
 
 void TSql::ValidateSnapshot(std::string_view bytes, uint64_t index) const {
