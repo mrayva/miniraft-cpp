@@ -21,6 +21,11 @@ void ValidateMessageHeader(uint32_t type, uint32_t length, const TMessageLimits&
         if (length > sizeof(TInstallSnapshotRequest) + TInstallSnapshotRequest::MaxChunkBytes)
             throw TMessageError("Snapshot chunk exceeds byte limit");
         fixed = false; break;
+    case EMessageType::INSTALL_SNAPSHOT_RANGE_REQUEST:
+        minimum = sizeof(TInstallSnapshotRangeRequest) + 1;
+        if (length > sizeof(TInstallSnapshotRangeRequest) + TInstallSnapshotRangeRequest::MaxChunkBytes)
+            throw TMessageError("Snapshot range exceeds byte limit");
+        fixed = false; break;
     case EMessageType::INSTALL_SNAPSHOT_RESPONSE: minimum = sizeof(TInstallSnapshotResponse); break;
     case EMessageType::TIMEOUT_NOW_REQUEST: minimum = sizeof(TTimeoutNowRequest); break;
     case EMessageType::CONFIGURATION_BARRIER_REQUEST: minimum = sizeof(TConfigurationBarrierRequest); break;

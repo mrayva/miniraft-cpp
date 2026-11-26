@@ -7,7 +7,8 @@ typename TNode<TSocket>::EQueueClass TNode<TSocket>::QueueClassFor(uint32_t type
     case EMessageType::REQUEST_VOTE_REQUEST:
     case EMessageType::PRE_VOTE_REQUEST: return EQueueClass::Vote;
     case EMessageType::APPEND_ENTRIES_REQUEST:
-    case EMessageType::INSTALL_SNAPSHOT_REQUEST: return EQueueClass::Replication;
+    case EMessageType::INSTALL_SNAPSHOT_REQUEST:
+    case EMessageType::INSTALL_SNAPSHOT_RANGE_REQUEST: return EQueueClass::Replication;
     case EMessageType::TIMEOUT_NOW_REQUEST: return EQueueClass::TimeoutNow;
     case EMessageType::CONFIGURATION_BARRIER_REQUEST: return EQueueClass::ConfigurationBarrier;
     default: return EQueueClass::Client;
@@ -309,7 +310,8 @@ NNet::TVoidSuspendedTask TNode<TSocket>::DoConnect() {
                     CapabilityNegotiationStarted = TimeSource->Now();
                     auto probe = NewHoldedMessage<TPeerCapabilitiesRequest>();
                     probe->Features = TPeerCapabilitiesRequest::ExtendedForwarding |
-                        TPeerCapabilitiesRequest::SessionizedForwarding;
+                        TPeerCapabilitiesRequest::SessionizedForwarding |
+                        TPeerCapabilitiesRequest::SnapshotTransferManifest;
                     probe->ConnectionId = ConnectionGeneration;
                     co_await TMessageWriter(Socket).Write(std::move(probe));
                 }

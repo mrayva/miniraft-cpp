@@ -2,15 +2,16 @@
 
 This design describes the staged work to remove the current 128 MiB
 complete-image limit. The application capture-source API, optional receive
-staging files, and an opt-in durable application-generation reference are
-implemented. `TDurableState` and `TDiskState` can use a generation resolver to
-keep the application payload out of their snapshot sidecars while preserving
-the payload as a range source after restart. Each backend atomically stores the
-reference with its snapshot boundary and retained suffix. Recovery requires the
-resolver for a nonempty external payload and verifies its size and digest before
-exposing the snapshot. Peers still transfer the complete image using the
-existing wire format. The current snapshot format, storage behavior and
-transfer limits are described in
+staging files, an opt-in durable application-generation reference, and a
+negotiated range-transfer wire path are implemented. `TDurableState` and
+`TDiskState` can use a generation resolver to keep the application payload out
+of their snapshot sidecars while preserving the payload as a range source after
+restart. Each backend atomically stores the reference with its snapshot
+boundary and retained suffix. Recovery requires the resolver for a nonempty
+external payload and verifies its size and digest before exposing the snapshot.
+The negotiated range path still assembles the complete encoded image at the
+receiver, so it does not remove the image limit. The current snapshot format,
+storage behavior and transfer limits are described in
 [compaction and InstallSnapshot](compaction.md).
 
 ## Current incremental step
@@ -58,14 +59,16 @@ then shrink the lease to retained capacity. This conservative reservation can
 reject capture when less than that amount is available; a declared size bound
 allows a smaller reservation, while the writer interface charges incrementally.
 
-`TSnapshotTransferManifest` now represents snapshot metadata, application
-payload length and the existing complete-image checksum separately. Its
-decoder validates the checksum over bounded payload reads and retains the
-supplied immutable source, without joining metadata and application bytes into
-a complete encoded image. This is codec groundwork only: the network sender
-and receiver still use the existing complete-image InstallSnapshot chunks, and
-the 128 MiB image limit remains. Peer negotiation and separate manifest/payload
-RPC phases are still required before transfers use this representation.
+`TSnapshotTransferManifest` represents snapshot metadata, application payload
+length and the existing complete-image checksum separately. Its decoder
+validates the checksum over bounded payload reads and retains the supplied
+immutable source without joining metadata and application bytes into a
+complete encoded image. Peers that negotiate `SnapshotTransferManifest` use
+`INSTALL_SNAPSHOT_RANGE_REQUEST` for distinct metadata, payload and checksum
+phases; peers without the feature retain the existing chunk RPC. The receiver
+maps each validated range into the existing encoded-image installer, preserving
+its membership checks, retry offsets, staging quotas and durable publication.
+It still stages the complete encoded image and enforces the 128 MiB limit.
 
 Applications can opt into `IApplicationSnapshotGenerationRsm`. The application
 stages an immutable generation bound to the exact snapshot index, byte count and
@@ -195,14 +198,20 @@ restart; older embedded formats and RSMs without the streaming-install contract
 can still materialize payloads. Generation-reference publication and sidecar
 externalization are implemented for both durable backends. Their recovery
 requires a configured generation resolver when the selected sidecar is
-metadata-only. Payload bytes are still sent over the existing wire protocol.
+metadata-only. Payload bytes still traverse the same bounded Raft stream; the
+new negotiated protocol separates them from the manifest on the wire, then the
+receiver assembles the encoded image in its current staging path.
 
 The generation reference is published atomically with the snapshot boundary,
 commit index, membership metadata and retained suffix. Both durable backends
 support source-backed local storage and require the startup resolver when the
-selected sidecar omits a nonempty payload. The remaining snapshot-streaming gap
-is a negotiated wire format that transfers application payload ranges without
-embedding them in the current complete-image encoding.
+selected sidecar omits a nonempty payload. The negotiated wire format now
+transfers metadata, payload and checksum ranges separately. The remaining gap
+is direct receiver staging of those parts as separate objects. Current
+installation reconstructs the complete encoded image in heap or disk staging
+and remains capped at 128 MiB. Removing that cap needs a versioned storage and
+application-install contract that can publish the validated manifest and
+payload source atomically without materializing their combined image.
 
 ## Proposed lifecycle
 
@@ -247,19 +256,17 @@ garbage; a referenced but missing image is a fatal storage error.
 
 ## API and compatibility direction
 
-Add an optional streaming application interface alongside the existing
-string-based callbacks. It should expose a snapshot source for capture and a
-staging writer for installation, with explicit `Publish`, `Activate` and
-`Abort` operations. Existing applications continue using the current API and
-128 MiB format. Peers without size negotiation remain limited to 64 MiB.
-Streaming applications opt in only when their storage can keep
-immutable generations durable across restart.
-
-The Raft storage interface needs a manifest plus generation reference instead
-of embedding application bytes. Keep membership lineage, snapshot boundary and
-retained-log publication in the same atomic Raft commit. Introduce a new
-versioned snapshot format and negotiate support before sending it; never infer
-streaming support from the peer's ability to read the existing chunk RPC.
+The optional capture-source, streaming-writer, staged-install and durable
+generation interfaces now coexist with the existing string callbacks.
+Generation-aware applications publish immutable images before Raft publishes
+the corresponding reference, and activate them after that publication.
+Existing applications keep the current API; peers without size negotiation
+remain limited to 64 MiB. The negotiated range RPC is a compatibility adapter
+over the current encoded-image installer. The remaining storage change is to
+publish a received payload generation separately from Raft metadata and the
+retained suffix, atomically, so install no longer needs a complete encoded
+image. Never infer streaming support from the peer's ability to read the
+existing chunk RPC.
 
 Keep a configurable maximum image size, per-transfer temporary-disk quota,
 aggregate in-flight quota, and a cap on retained generations. A digest detects
@@ -280,7 +287,9 @@ commitment.
   stage. No failure may acknowledge an uninstalled snapshot or expose partial
   application state.
 
-The existing complete-image path remains the compatibility baseline. Current
-crash tests cover pre-manifest orphan generations and post-manifest recovery
-before activation; the broader transfer, membership and quota schedules remain
-required before replacing the complete-image path on every supported backend.
+The existing complete-image receiver remains the compatibility baseline and
+fallback. Deterministic tests cover negotiated phase selection and range
+assembly in addition to pre-manifest orphan generations and post-manifest
+recovery before activation. The broader transfer, membership and quota
+schedules remain required before separate-object receiver publication replaces
+the complete-image path on every supported backend.

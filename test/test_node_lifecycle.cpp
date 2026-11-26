@@ -243,6 +243,7 @@ NNet::TVoidTask ExerciseSocketIODeadline(NNet::TSocket& socket, bool write,
 struct TCapabilitySocketState {
     TPoller* Owner = nullptr;
     size_t ProbeWrites = 0;
+    uint64_t ProbeFeatures = 0;
     size_t SessionForwardWrites = 0;
     size_t CommandWrites = 0;
 };
@@ -260,7 +261,10 @@ struct TCapabilitySocket {
     TPoller* Poller() { return State->Owner; }
     NNet::TValueTask<ssize_t> WriteSome(const void* data, size_t size) {
         const auto type = static_cast<const TMessage*>(data)->Type;
-        if (type == uint32_t(EMessageType::PEER_CAPABILITIES_REQUEST)) ++State->ProbeWrites;
+        if (type == uint32_t(EMessageType::PEER_CAPABILITIES_REQUEST)) {
+            ++State->ProbeWrites;
+            State->ProbeFeatures = static_cast<const TPeerCapabilitiesRequest*>(data)->Features;
+        }
         if (type == uint32_t(EMessageType::SESSION_FORWARDED_COMMAND_REQUEST))
             ++State->SessionForwardWrites;
         if (type == uint32_t(EMessageType::COMMAND_REQUEST)) ++State->CommandWrites;
@@ -289,6 +293,7 @@ void test_peer_capability_probe_and_legacy_fallback(void**) {
     assert_true(node.IsConnected());
     assert_true(node.IsCapabilityNegotiating());
     assert_int_equal(state->ProbeWrites, 1);
+    assert_true(state->ProbeFeatures & TPeerCapabilitiesRequest::SnapshotTransferManifest);
     auto response = NewHoldedMessage<TPeerCapabilitiesResponse>();
     response->Features = TPeerCapabilitiesRequest::ExtendedForwarding |
         TPeerCapabilitiesRequest::SessionizedForwarding;
@@ -296,20 +301,23 @@ void test_peer_capability_probe_and_legacy_fallback(void**) {
     assert_false(node.CompleteCapabilityNegotiation(response, node.GetConnectionGeneration()));
     assert_true(node.IsCapabilityNegotiating());
     response->ConnectionId = node.GetConnectionGeneration();
-    response->Features = uint64_t(1) << 2;
+    response->Features = uint64_t(1) << 3;
     assert_false(node.CompleteCapabilityNegotiation(response, node.GetConnectionGeneration()));
     assert_true(node.IsCapabilityNegotiating());
     response->Features = TPeerCapabilitiesRequest::ExtendedForwarding |
-        TPeerCapabilitiesRequest::SessionizedForwarding;
+        TPeerCapabilitiesRequest::SessionizedForwarding |
+        TPeerCapabilitiesRequest::SnapshotTransferManifest;
     response->ConnectionId = node.GetConnectionGeneration();
     assert_true(node.CompleteCapabilityNegotiation(response, node.GetConnectionGeneration()));
     assert_true(node.SupportsExtendedForwarding());
     assert_true(node.SupportsSessionizedForwarding());
+    assert_true(node.SupportsSnapshotTransferManifest());
 
     auto generation = node.GetConnectionGeneration();
     node.Disconnect(generation);
     assert_false(node.SupportsExtendedForwarding());
     assert_false(node.SupportsSessionizedForwarding());
+    assert_false(node.SupportsSnapshotTransferManifest());
     node.Drain(); poller.Tick();
     generation = node.GetConnectionGeneration();
     assert_true(node.IsCapabilityNegotiating());

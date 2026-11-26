@@ -31,6 +31,26 @@ void test_short_wrong_type_and_empty_casts_are_rejected(void**) {
         assert_true(rejected);
     }
 }
+void test_snapshot_range_frames_have_bounded_variable_payloads(void**) {
+    auto range = NewHoldedMessage<TInstallSnapshotRangeRequest>(sizeof(TInstallSnapshotRangeRequest) + 1);
+    range->Data[0] = 'x';
+    assert_true(range.IsEx());
+    ValidateMessageTree(TMessageHolder<TMessage>(range));
+
+    auto shortRange = range;
+    shortRange->Len = sizeof(TInstallSnapshotRangeRequest);
+    bool rejected = false;
+    try { ValidateMessageTree(TMessageHolder<TMessage>(shortRange)); }
+    catch (const TMessageError&) { rejected = true; }
+    assert_true(rejected);
+
+    rejected = false;
+    try {
+        ValidateMessageHeader(uint32_t(EMessageType::INSTALL_SNAPSHOT_RANGE_REQUEST),
+            sizeof(TInstallSnapshotRangeRequest) + TInstallSnapshotRangeRequest::MaxChunkBytes + 1);
+    } catch (const TMessageError&) { rejected = true; }
+    assert_true(rejected);
+}
 void test_idempotent_request_validation_is_strict_and_fail_closed(void**) {
     auto request = NewHoldedMessage<TIdempotentCommandRequest>(sizeof(TIdempotentCommandRequest) + 3);
     request->Epoch = 1;
@@ -216,6 +236,7 @@ int main() {
         cmocka_unit_test(test_memory_state_copies_do_not_share_mutable_log_entries),
         cmocka_unit_test(test_typed_allocations_reject_undersized_storage),
         cmocka_unit_test(test_short_wrong_type_and_empty_casts_are_rejected),
+        cmocka_unit_test(test_snapshot_range_frames_have_bounded_variable_payloads),
         cmocka_unit_test(test_idempotent_request_validation_is_strict_and_fail_closed),
         cmocka_unit_test(test_raft_batches_respect_budget_and_continue_replication),
         cmocka_unit_test(test_invalid_proposal_does_not_mutate_persistent_state),

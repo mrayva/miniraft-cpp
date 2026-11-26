@@ -32,6 +32,7 @@ struct INode {
     // False until the transport has positively negotiated the extended route.
     virtual bool SupportsExtendedForwarding() const { return false; }
     virtual bool SupportsSessionizedForwarding() const { return false; }
+    virtual bool SupportsSnapshotTransferManifest() const { return false; }
 };
 
 // Immutable, range-readable application snapshot data. A source must remain
@@ -490,6 +491,7 @@ struct TVolatileState {
         // Pinned for this transfer even if the local store compacts again.
         std::shared_ptr<const TSnapshot> Snapshot;
         std::shared_ptr<const TSnapshotEncoding> Encoding;
+        TSnapshotTransferManifest Manifest;
         // Seqno identifies the outstanding chunk across retries; zero means
         // its reply was consumed and the next send needs a fresh identity.
         uint64_t Offset = 0, Seqno = 0, SentEnd = 0;

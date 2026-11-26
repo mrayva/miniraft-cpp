@@ -296,6 +296,8 @@ struct TSnapshotTransferManifest {
 TSnapshotTransferManifest PrepareSnapshotTransferManifest(const TSnapshot& snapshot,
     size_t maxConfigurationTransitions = TSnapshot::MaxConfigurationTransitions,
     bool includeMembershipHistory = true);
+TSnapshotTransferManifest PrepareSnapshotTransferManifest(
+    const TSnapshot& snapshot, const TSnapshotEncoding& encoding);
 // Validates the manifest and payload ranges without joining them into a
 // complete encoded image. The returned snapshot retains the supplied source.
 TSnapshot DecodeSnapshotTransferManifest(const TSnapshotTransferManifest& manifest,

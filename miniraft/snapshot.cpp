@@ -758,10 +758,19 @@ TSnapshotTransferManifest PrepareSnapshotTransferManifest(const TSnapshot& snaps
         size_t maxConfigurationTransitions, bool includeMembershipHistory) {
     const auto encoding = PrepareSnapshotEncoding(
         snapshot, maxConfigurationTransitions, includeMembershipHistory);
+    return PrepareSnapshotTransferManifest(snapshot, *encoding);
+}
+
+TSnapshotTransferManifest PrepareSnapshotTransferManifest(
+        const TSnapshot& snapshot, const TSnapshotEncoding& encoding) {
+    const auto payloadBytes = snapshot.DataSize();
+    if (encoding.TotalBytes != encoding.Metadata.size() + payloadBytes + 4 ||
+        encoding.TotalBytes > TSnapshot::MaxBytes)
+        throw std::invalid_argument("Snapshot encoding does not match its transfer manifest");
     TSnapshotTransferManifest manifest;
-    manifest.Metadata = encoding->Metadata;
-    manifest.PayloadBytes = snapshot.DataSize();
-    manifest.Checksum = encoding->Checksum;
+    manifest.Metadata = encoding.Metadata;
+    manifest.PayloadBytes = payloadBytes;
+    manifest.Checksum = encoding.Checksum;
     return manifest;
 }
 

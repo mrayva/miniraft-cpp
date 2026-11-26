@@ -1907,8 +1907,83 @@ void TRaft::AdvanceTerm(ITimeSource::Time now, uint64_t term, bool preserveIncom
         VolatileState->ElectionDue = MakeElection(now);
 }
 
+namespace {
+TMessageHolder<TMessage> NormalizeSnapshotTransferRange(TMessageHolder<TMessage> message) {
+    if (!message || !message.HasValidExtent()) return {};
+    try {
+        ValidateMessageTree(message);
+    } catch (const TMessageError&) {
+        return {};
+    }
+    TInstallSnapshotRangeRequest* range = nullptr;
+    try {
+        range = message.Cast<TInstallSnapshotRangeRequest>().Mes;
+    } catch (const std::bad_cast&) {
+        return {};
+    }
+    const auto count = uint64_t(range->Len - sizeof(TInstallSnapshotRangeRequest));
+    if (range->ManifestVersion != TSnapshotTransferManifest::CurrentVersion ||
+        range->Reserved != 0 ||
+        (range->Flags & ~TInstallSnapshotRangeRequest::JointElectionFenceLeader) ||
+        range->MetadataBytes == 0 || range->PayloadBytes > TSnapshot::MaxBytes - 4 ||
+        range->MetadataBytes > TSnapshot::MaxBytes - 4 - range->PayloadBytes)
+        return {};
+    const auto totalBytes = range->MetadataBytes + range->PayloadBytes + 4;
+    if (totalBytes < 44 || totalBytes > TSnapshot::MaxBytes) return {};
+
+    uint64_t imageOffset = 0;
+    switch (TInstallSnapshotRangeRequest::EPhase(range->Phase)) {
+    case TInstallSnapshotRangeRequest::EPhase::Metadata:
+        if (range->Offset >= range->MetadataBytes ||
+            count > range->MetadataBytes - range->Offset)
+            return {};
+        imageOffset = range->Offset;
+        break;
+    case TInstallSnapshotRangeRequest::EPhase::Payload:
+        if (range->Offset >= range->PayloadBytes ||
+            count > range->PayloadBytes - range->Offset)
+            return {};
+        imageOffset = range->MetadataBytes + range->Offset;
+        break;
+    case TInstallSnapshotRangeRequest::EPhase::Checksum: {
+        if (range->Offset != 0 || count != 4) return {};
+        uint32_t transmittedChecksum = 0;
+        for (unsigned i = 0; i < 4; ++i)
+            transmittedChecksum |= uint32_t(uint8_t(range->Data[i])) << (8 * i);
+        if (transmittedChecksum != range->Checksum) return {};
+        imageOffset = range->MetadataBytes + range->PayloadBytes;
+        break;
+    }
+    default:
+        return {};
+    }
+
+    auto request = NewHoldedMessage<TInstallSnapshotRequest>(
+        sizeof(TInstallSnapshotRequest) + size_t(count));
+    request->Src = range->Src;
+    request->Dst = range->Dst;
+    request->Term = range->Term;
+    request->Seqno = range->Seqno;
+    request->SnapshotIndex = range->SnapshotIndex;
+    request->SnapshotTerm = range->SnapshotTerm;
+    request->TotalBytes = totalBytes;
+    request->Offset = imageOffset;
+    request->LeaderId = range->LeaderId;
+    request->Done = range->Flags;
+    if (TInstallSnapshotRangeRequest::EPhase(range->Phase) ==
+            TInstallSnapshotRangeRequest::EPhase::Checksum)
+        request->Done |= TInstallSnapshotRequest::DoneFlag;
+    memcpy(request->Data, range->Data, size_t(count));
+    return TMessageHolder<TMessage>(request);
+}
+}
+
 void TRaft::Process(ITimeSource::Time now, TMessageHolder<TMessage> message, const std::shared_ptr<INode>& replyTo) {
     LastRaftTime = now;
+    if (message && message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_RANGE_REQUEST)) {
+        message = NormalizeSnapshotTransferRange(std::move(message));
+        if (!message) return;
+    }
     if (!ValidateRpc(message)) return;
     if (message.IsEx()) {
         auto messageEx = message.Cast<TMessageEx>();
@@ -3377,6 +3452,7 @@ TMessageHolder<TMessage> TRaft::CreateInstallSnapshot(uint32_t nodeId) {
             encoding = EncodedSnapshot;
         }
         rpc = TVolatileState::TSnapshotRpc{snapshot, std::move(encoding)};
+        rpc.Manifest = PrepareSnapshotTransferManifest(*snapshot, *rpc.Encoding);
         rpc.LastProgress = LastRaftTime;
         VolatileState->PendingAppendRpcs[nodeId].clear();
     }
@@ -3389,15 +3465,92 @@ TMessageHolder<TMessage> TRaft::CreateInstallSnapshot(uint32_t nodeId) {
         VolatileState->SnapshotRpcs.erase(nodeId);
         return {};
     }
-    const auto count = std::min<uint64_t>(TInstallSnapshotRequest::MaxChunkBytes, totalBytes - rpc.Offset);
-    const auto requestBytes = sizeof(TInstallSnapshotRequest) + size_t(count);
+    if (rpc.Offset >= totalBytes) return {};
+    const auto node = Nodes.find(nodeId);
+    const bool useManifestProtocol = node != Nodes.end() && node->second &&
+        node->second->SupportsSnapshotTransferManifest();
+    const auto metadataBytes = uint64_t(rpc.Manifest.Metadata.size());
+    const auto payloadEnd = metadataBytes + rpc.Manifest.PayloadBytes;
+    auto phase = TInstallSnapshotRangeRequest::EPhase::Metadata;
+    uint64_t phaseOffset = rpc.Offset;
+    uint64_t count = 0;
+    if (useManifestProtocol) {
+        if (rpc.Offset < metadataBytes) {
+            phase = TInstallSnapshotRangeRequest::EPhase::Metadata;
+            phaseOffset = rpc.Offset;
+            count = std::min<uint64_t>(TInstallSnapshotRangeRequest::MaxChunkBytes,
+                metadataBytes - phaseOffset);
+        } else if (rpc.Offset < payloadEnd) {
+            phase = TInstallSnapshotRangeRequest::EPhase::Payload;
+            phaseOffset = rpc.Offset - metadataBytes;
+            count = std::min<uint64_t>(TInstallSnapshotRangeRequest::MaxChunkBytes,
+                rpc.Manifest.PayloadBytes - phaseOffset);
+        } else {
+            phase = TInstallSnapshotRangeRequest::EPhase::Checksum;
+            phaseOffset = rpc.Offset - payloadEnd;
+            count = std::min<uint64_t>(TInstallSnapshotRangeRequest::MaxChunkBytes, 4 - phaseOffset);
+        }
+    } else {
+        count = std::min<uint64_t>(TInstallSnapshotRequest::MaxChunkBytes, totalBytes - rpc.Offset);
+    }
+    if (!count) return {};
+    const auto headerBytes = useManifestProtocol
+        ? sizeof(TInstallSnapshotRangeRequest) : sizeof(TInstallSnapshotRequest);
+    const auto requestBytes = headerBytes + size_t(count);
     auto requestReservation = SnapshotInstallBudget->TryReserveLease(requestBytes);
     if (!requestReservation) return {};
     if (capability != VolatileState->PeerCapabilities.end())
         capability->second.AppendAckSeqno = 0; // Require a fresh AppendEntries capability ACK afterward.
+    // A retry sends the same immutable chunk. Keep its identity until a reply
+    // consumes it, otherwise traffic faster than the RTT invalidates every ACK.
+    // Snapshot ACKs never confirm read barriers, so reuse cannot confirm a read
+    // that arrived after the first transmission.
+    if (!rpc.Seqno) rpc.Seqno = NextSeqno();
+    rpc.SentEnd = rpc.Offset + count;
+    const bool jointElectionFenceLeader = JointConsensusActive(Configuration ? &*Configuration : nullptr) ||
+        snapshot->IsJoint() || snapshot->HasConfigurationLineage() ||
+        !snapshot->ConfigurationTransitions.empty();
+    if (useManifestProtocol) {
+        auto request = NewHoldedMessage<TInstallSnapshotRangeRequest>(requestBytes);
+        // Keep the request's byte budget alive through custom transports and
+        // built-in outbound queues alike.
+        auto requestStorage = request.RawData;
+        auto* requestData = requestStorage.get();
+        request.RawData = std::shared_ptr<char[]>(requestData,
+            [requestStorage = std::move(requestStorage),
+             requestReservation = std::move(requestReservation)](char*) {
+                (void)requestStorage;
+                (void)requestReservation;
+            });
+        request->Src = Id; request->Dst = nodeId; request->Term = State->CurrentTerm;
+        request->Seqno = rpc.Seqno;
+        request->SnapshotIndex = snapshot->Index; request->SnapshotTerm = snapshot->Term;
+        request->MetadataBytes = metadataBytes; request->PayloadBytes = rpc.Manifest.PayloadBytes;
+        request->Offset = phaseOffset; request->LeaderId = Id;
+        request->Phase = uint32_t(phase);
+        request->ManifestVersion = rpc.Manifest.Version;
+        request->Flags = jointElectionFenceLeader
+            ? TInstallSnapshotRangeRequest::JointElectionFenceLeader : 0u;
+        request->Checksum = rpc.Manifest.Checksum;
+        if (phase == TInstallSnapshotRangeRequest::EPhase::Metadata) {
+            memcpy(request->Data, rpc.Manifest.Metadata.data() + size_t(phaseOffset), size_t(count));
+        } else if (phase == TInstallSnapshotRangeRequest::EPhase::Payload) {
+            size_t copied = 0;
+            while (copied < count) {
+                const auto read = snapshot->ReadDataRange(phaseOffset + copied,
+                    std::span<char>(request->Data + copied, size_t(count - copied)));
+                if (!read || read > count - copied)
+                    throw std::runtime_error("Cannot read snapshot payload transfer range");
+                copied += read;
+            }
+        } else {
+            for (unsigned i = 0; i < 4; ++i)
+                request->Data[i] = char(rpc.Manifest.Checksum >> (8 * i));
+        }
+        return request;
+    }
+
     auto request = NewHoldedMessage<TInstallSnapshotRequest>(requestBytes);
-    // Carry the lease with the raw frame allocation so custom transports and
-    // built-in queues both keep the chunk charged until the message is released.
     auto requestStorage = request.RawData;
     auto* requestData = requestStorage.get();
     request.RawData = std::shared_ptr<char[]>(requestData,
@@ -3407,18 +3560,9 @@ TMessageHolder<TMessage> TRaft::CreateInstallSnapshot(uint32_t nodeId) {
             (void)requestReservation;
         });
     request->Src = Id; request->Dst = nodeId; request->Term = State->CurrentTerm;
-    // A retry sends the same immutable chunk. Keep its identity until a reply
-    // consumes it, otherwise traffic faster than the RTT invalidates every ACK.
-    // Snapshot ACKs never confirm read barriers, so reuse cannot confirm a read
-    // that arrived after the first transmission.
-    if (!rpc.Seqno) rpc.Seqno = NextSeqno();
     request->Seqno = rpc.Seqno;
     request->SnapshotIndex = snapshot->Index; request->SnapshotTerm = snapshot->Term;
     request->Offset = rpc.Offset; request->TotalBytes = totalBytes;
-    rpc.SentEnd = rpc.Offset + count;
-    const bool jointElectionFenceLeader = JointConsensusActive(Configuration ? &*Configuration : nullptr) ||
-        snapshot->IsJoint() || snapshot->HasConfigurationLineage() ||
-        !snapshot->ConfigurationTransitions.empty();
     request->Done = (rpc.SentEnd == totalBytes ? TInstallSnapshotRequest::DoneFlag : 0u) |
         (jointElectionFenceLeader ? TInstallSnapshotRequest::JointElectionFenceLeader : 0u);
     request->LeaderId = Id;

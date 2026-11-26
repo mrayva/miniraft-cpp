@@ -685,6 +685,10 @@ public:
         return Connected && !CapabilityNegotiating &&
             (PeerFeatures & TPeerCapabilitiesRequest::SessionizedForwarding);
     }
+    bool SupportsSnapshotTransferManifest() const override {
+        return Connected && !CapabilityNegotiating &&
+            (PeerFeatures & TPeerCapabilitiesRequest::SnapshotTransferManifest);
+    }
     bool IsCapabilityNegotiating() const { return CapabilityNegotiating; }
     bool ExpireCapabilityNegotiation(
             ITimeSource::Time now, ITimeSource::Time::duration timeout) {
@@ -712,7 +716,8 @@ public:
             response->Version > TPeerCapabilitiesRequest::CurrentVersion ||
             (!response->Version && response->Features) ||
             (response->Features & ~(TPeerCapabilitiesRequest::ExtendedForwarding |
-                TPeerCapabilitiesRequest::SessionizedForwarding)))
+                TPeerCapabilitiesRequest::SessionizedForwarding |
+                TPeerCapabilitiesRequest::SnapshotTransferManifest)))
             return false;
         PeerFeatures = response->Version == TPeerCapabilitiesRequest::CurrentVersion
             ? response->Features : 0;

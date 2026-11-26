@@ -33,9 +33,12 @@ template<class F> void Reject(F action) {
 }
 struct TEndpoint : INode {
     std::function<void(TMessageHolder<TMessage>)> SendTo;
-    explicit TEndpoint(std::function<void(TMessageHolder<TMessage>)> send) : SendTo(std::move(send)) {}
+    bool ManifestTransfer = false;
+    explicit TEndpoint(std::function<void(TMessageHolder<TMessage>)> send, bool manifestTransfer = false)
+        : SendTo(std::move(send)), ManifestTransfer(manifestTransfer) {}
     void Send(TMessageHolder<TMessage> message) override { SendTo(std::move(message)); }
     void Drain() override {}
+    bool SupportsSnapshotTransferManifest() const override { return ManifestTransfer; }
 };
 TMessageHolder<TWriteKv> Command(const std::string& key, const std::string& value) {
     auto message = NewHoldedMessage<TWriteKv>(sizeof(TWriteKv) + key.size() + value.size());
@@ -1798,15 +1801,18 @@ struct TCluster {
     std::deque<TMessageHolder<TMessage>> Packets;
     std::set<uint32_t> Isolated;
     std::vector<uint32_t> Learners;
-    explicit TCluster(std::vector<uint32_t> learners = {}, uint32_t nodeCount = 3)
+    bool ManifestTransfer = false;
+    explicit TCluster(std::vector<uint32_t> learners = {}, uint32_t nodeCount = 3,
+            bool manifestTransfer = false)
         : NodeCount(nodeCount), Nodes(nodeCount), Apps(nodeCount), Processors(nodeCount),
-          Learners(std::move(learners)) {
+          Learners(std::move(learners)), ManifestTransfer(manifestTransfer) {
         for (uint32_t id = 1; id <= NodeCount; ++id) Build(id, std::make_shared<TState>());
     }
     void Build(uint32_t id, std::shared_ptr<IState> state) {
         TNodeDict peers;
         for (uint32_t dst = 1; dst <= NodeCount; ++dst) if (dst != id)
-            peers[dst] = std::make_shared<TEndpoint>([this](auto message) { Packets.push_back(std::move(message)); });
+            peers[dst] = std::make_shared<TEndpoint>(
+                [this](auto message) { Packets.push_back(std::move(message)); }, ManifestTransfer);
         Processors[id - 1].reset();
         Nodes[id - 1] = std::make_shared<TRaft>(state, id, peers, Learners);
         Apps[id - 1] = std::make_shared<TApplication>();
@@ -2659,6 +2665,94 @@ TMessageHolder<TInstallSnapshotRequest> Chunk(const TSnapshot& snapshot, std::st
     message->Done = (offset + count == bytes.size() ? TInstallSnapshotRequest::DoneFlag : 0u) |
         (jointElectionFenceLeader ? TInstallSnapshotRequest::JointElectionFenceLeader : 0u);
     message->LeaderId = 1; memcpy(message->Data, bytes.data() + offset, count); return message;
+}
+TMessageHolder<TInstallSnapshotRangeRequest> RangeChunk(const TSnapshot& snapshot,
+        const TSnapshotTransferManifest& manifest, TInstallSnapshotRangeRequest::EPhase phase,
+        uint64_t offset, std::string_view bytes, uint64_t sequence) {
+    auto message = NewHoldedMessage<TInstallSnapshotRangeRequest>(
+        sizeof(TInstallSnapshotRangeRequest) + bytes.size());
+    message->Src = 1; message->Dst = 2; message->Term = 3; message->Seqno = sequence;
+    message->SnapshotIndex = snapshot.Index; message->SnapshotTerm = snapshot.Term;
+    message->MetadataBytes = manifest.Metadata.size(); message->PayloadBytes = manifest.PayloadBytes;
+    message->Offset = offset; message->LeaderId = 1; message->Phase = uint32_t(phase);
+    message->ManifestVersion = manifest.Version; message->Checksum = manifest.Checksum;
+    memcpy(message->Data, bytes.data(), bytes.size());
+    return message;
+}
+void test_snapshot_manifest_ranges_install_through_legacy_stream_validation(void**) {
+    TKv source;
+    const std::string value(40000, 'x');
+    source.Write(source.Prepare(Command("a", value)), 1);
+    source.Write(source.Prepare(Command("b", std::string(40000, 'y'))), 2);
+    source.Write(source.Prepare(Command("c", std::string(40000, 'z'))), 3);
+    const TSnapshot snapshot{3, 1, {1, 2}, source.SaveSnapshot()};
+    const auto manifest = PrepareSnapshotTransferManifest(snapshot);
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) {
+        if (message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_RESPONSE))
+            responses.push_back(message.template Cast<TInstallSnapshotResponse>());
+    });
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 3;
+    auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}});
+    auto app = std::make_shared<TApplication>();
+    TRequestProcessor processor(raft, app, {});
+
+    uint64_t sequence = 1;
+    uint64_t expectedImageOffset = 0;
+    auto transfer = [&](TInstallSnapshotRangeRequest::EPhase phase, std::string_view bytes) {
+        for (uint64_t offset = 0; offset < bytes.size();) {
+            const auto count = size_t(std::min<uint64_t>(TInstallSnapshotRangeRequest::MaxChunkBytes,
+                bytes.size() - offset));
+            auto request = RangeChunk(snapshot, manifest, phase, offset,
+                bytes.substr(size_t(offset), count), sequence++);
+            raft->Process({}, request);
+            assert_int_equal(responses.size(), size_t(sequence - 1));
+            assert_true(responses.back()->Success);
+            expectedImageOffset += count;
+            assert_int_equal(responses.back()->NextOffset, expectedImageOffset);
+            const bool final = expectedImageOffset == manifest.Metadata.size() +
+                manifest.PayloadBytes + 4;
+            assert_int_equal(responses.back()->Installed, final);
+            offset += count;
+        }
+    };
+
+    transfer(TInstallSnapshotRangeRequest::EPhase::Metadata, manifest.Metadata);
+    assert_int_equal(app->Loads, 0);
+    transfer(TInstallSnapshotRangeRequest::EPhase::Payload, snapshot.Data);
+    assert_int_equal(app->Loads, 0);
+    std::string checksum(4, '\0');
+    for (unsigned i = 0; i < 4; ++i) checksum[i] = char(manifest.Checksum >> (8 * i));
+    transfer(TInstallSnapshotRangeRequest::EPhase::Checksum, checksum);
+    assert_int_equal(app->Loads, 1);
+    assert_true(Read(*app, "a") == value);
+    assert_true(*state->GetSnapshot() == snapshot);
+}
+void test_negotiated_snapshot_manifest_transfer_uses_distinct_wire_phases(void**) {
+    TCluster cluster({3}, 3, true);
+    cluster.Prepare();
+    std::set<uint32_t> phases;
+    bool installed = false;
+    for (unsigned attempt = 0; attempt < 12 && !installed; ++attempt) {
+        cluster.Now += std::chrono::seconds(3);
+        cluster.Nodes[0]->ProcessTimeout(cluster.Now);
+        auto request = cluster.Take(1, 3, EMessageType::INSTALL_SNAPSHOT_RANGE_REQUEST)
+            .Cast<TInstallSnapshotRangeRequest>();
+        ValidateMessageTree(TMessageHolder<TMessage>(request));
+        phases.insert(request->Phase);
+        cluster.Deliver(request);
+        auto response = cluster.Take(3, 1, EMessageType::INSTALL_SNAPSHOT_RESPONSE)
+            .Cast<TInstallSnapshotResponse>();
+        installed = response->Installed;
+        cluster.Deliver(response);
+    }
+    assert_true(installed);
+    assert_true(phases.contains(uint32_t(TInstallSnapshotRangeRequest::EPhase::Metadata)));
+    assert_true(phases.contains(uint32_t(TInstallSnapshotRangeRequest::EPhase::Payload)));
+    assert_true(phases.contains(uint32_t(TInstallSnapshotRangeRequest::EPhase::Checksum)));
+    assert_true(cluster.Nodes[2]->GetState()->SnapshotIndex == cluster.Nodes[0]->GetState()->SnapshotIndex);
+    assert_true(Read(*cluster.Apps[2], "a") == std::string(60000, 'a'));
 }
 void test_idle_snapshot_transfer_discards_partial_image_and_restarts(void**) {
     TCluster cluster({3}); // Learners must also reclaim stalled transfers.
@@ -4724,6 +4818,8 @@ int main() {
         cmocka_unit_test(test_snapshot_install_budget_releases_after_conflicting_duplicate),
         cmocka_unit_test(test_covered_snapshot_metadata_uses_shared_install_budget),
         cmocka_unit_test(test_snapshot_install_accepts_every_small_fixed_chunk_size),
+        cmocka_unit_test(test_snapshot_manifest_ranges_install_through_legacy_stream_validation),
+        cmocka_unit_test(test_negotiated_snapshot_manifest_transfer_uses_distinct_wire_phases),
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),
         cmocka_unit_test(test_outgoing_snapshot_chunk_holds_heap_budget_lease),
         cmocka_unit_test(test_simultaneous_startup_candidates_use_distinct_election_deadlines),

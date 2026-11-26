@@ -44,6 +44,7 @@ enum class EMessageType : uint32_t {
     SESSION_FORWARDED_COMMAND_RESPONSE = 20,
     IDEMPOTENT_COMMAND_REQUEST = 21,
     IDEMPOTENT_COMMAND_RESPONSE = 22,
+    INSTALL_SNAPSHOT_RANGE_REQUEST = 23,
 };
 
 struct TMessage {
@@ -208,6 +209,21 @@ struct TInstallSnapshotRequest: public TMessageEx {
     char Data[0];
 };
 static_assert(sizeof(TInstallSnapshotRequest) == sizeof(TMessageEx) + 40);
+// Negotiated snapshot transfer protocol. Each request carries a bounded range
+// from exactly one manifest, payload, or checksum phase. Offset is local to the
+// selected phase; receivers map it into the legacy encoded-image stream after
+// validating the manifest fields.
+struct TInstallSnapshotRangeRequest: public TMessageEx {
+    static constexpr EMessageType MessageType = EMessageType::INSTALL_SNAPSHOT_RANGE_REQUEST;
+    static constexpr uint32_t MaxChunkBytes = TInstallSnapshotRequest::MaxChunkBytes;
+    static constexpr uint32_t JointElectionFenceLeader = TInstallSnapshotRequest::JointElectionFenceLeader;
+    enum class EPhase : uint32_t { Metadata = 1, Payload = 2, Checksum = 3 };
+    uint64_t SnapshotIndex = 0, SnapshotTerm = 0;
+    uint64_t MetadataBytes = 0, PayloadBytes = 0, Offset = 0;
+    uint32_t LeaderId = 0, Phase = 0, ManifestVersion = 0, Flags = 0, Checksum = 0, Reserved = 0;
+    char Data[0];
+};
+static_assert(sizeof(TInstallSnapshotRangeRequest) == sizeof(TMessageEx) + 64);
 struct TInstallSnapshotResponse: public TMessageEx {
     static constexpr EMessageType MessageType = EMessageType::INSTALL_SNAPSHOT_RESPONSE;
     uint64_t SnapshotIndex = 0, NextOffset = 0;
@@ -375,6 +391,7 @@ struct TPeerCapabilitiesRequest: public TMessage {
     static constexpr uint32_t CurrentVersion = 1;
     static constexpr uint64_t ExtendedForwarding = uint64_t(1) << 0;
     static constexpr uint64_t SessionizedForwarding = uint64_t(1) << 1;
+    static constexpr uint64_t SnapshotTransferManifest = uint64_t(1) << 2;
     uint32_t MinVersion = CurrentVersion;
     uint32_t MaxVersion = CurrentVersion;
     uint64_t Features = 0;
@@ -487,7 +504,8 @@ struct TMessageHolder {
     bool IsEx() const {
         return HasValidExtent() && Mes->Len >= sizeof(TMessageEx) &&
             ((2 <= Mes->Type && Mes->Type <= 7) ||
-             (10 <= Mes->Type && Mes->Type <= 14));
+             (10 <= Mes->Type && Mes->Type <= 14) ||
+             Mes->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_RANGE_REQUEST));
     }
 
     template<typename U>
