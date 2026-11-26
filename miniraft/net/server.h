@@ -277,8 +277,8 @@ struct TInboundMessageBudgetLimits {
 };
 
 // Bounds serialized frame storage and AppendEntries payload-holder arrays while
-// the decoded messages remain alive. This is a network-buffer quota, not a
-// process-wide allocator limit.
+// the decoded messages remain alive. Per-server limits can reserve against a
+// process-wide inbound-network aggregate; this is not a general allocator cap.
 class TInboundMessageBudget : public std::enable_shared_from_this<TInboundMessageBudget> {
     class TConnectionReservation {
     public:
@@ -300,10 +300,21 @@ class TInboundMessageBudget : public std::enable_shared_from_this<TInboundMessag
     };
 
 public:
-    explicit TInboundMessageBudget(TInboundMessageBudgetLimits limits = {})
-        : Limits(limits) {
+    explicit TInboundMessageBudget(TInboundMessageBudgetLimits limits = {},
+            std::shared_ptr<TInboundMessageBudget> aggregate = {})
+        : Limits(limits)
+        , Aggregate(std::move(aggregate)) {
         if (Limits.ConnectionIdleTimeout.count() < 0)
             throw std::invalid_argument("Inbound connection idle timeout cannot be negative");
+        if (Aggregate && Aggregate->Aggregate)
+            throw std::invalid_argument("Inbound message aggregate must be a root budget");
+    }
+
+    static std::shared_ptr<TInboundMessageBudget> DefaultProcessBudget() {
+        static auto budget = std::make_shared<TInboundMessageBudget>(
+            TInboundMessageBudgetLimits{512ULL * 1024 * 1024, SIZE_MAX,
+                std::chrono::seconds(60)});
+        return budget;
     }
 
     std::shared_ptr<void> TryReserveConnection() {
@@ -326,12 +337,7 @@ public:
 
     std::shared_ptr<void> TryReserve(uint64_t bytes) {
         if (!bytes) return {};
-        {
-            std::lock_guard lock(Mutex);
-            if (UsedBytes > Limits.MaxBytes || bytes > Limits.MaxBytes - UsedBytes)
-                return {};
-            UsedBytes += bytes;
-        }
+        if (!TryReserveBytes(bytes)) return {};
         try {
             return std::make_shared<TReservation>(shared_from_this(), bytes);
         } catch (...) {
@@ -341,6 +347,15 @@ public:
     }
 
 private:
+    bool TryReserveBytes(uint64_t bytes) {
+        std::lock_guard lock(Mutex);
+        if (UsedBytes > Limits.MaxBytes || bytes > Limits.MaxBytes - UsedBytes)
+            return false;
+        if (Aggregate && !Aggregate->TryReserveBytes(bytes)) return false;
+        UsedBytes += bytes;
+        return true;
+    }
+
     void ReleaseConnection() noexcept {
         std::lock_guard lock(Mutex);
         if (!ActiveConnections) std::terminate();
@@ -351,9 +366,11 @@ private:
         std::lock_guard lock(Mutex);
         if (bytes > UsedBytes) std::terminate();
         UsedBytes -= bytes;
+        if (Aggregate) Aggregate->Release(bytes);
     }
 
     const TInboundMessageBudgetLimits Limits;
+    const std::shared_ptr<TInboundMessageBudget> Aggregate;
     std::mutex Mutex;
     uint64_t UsedBytes = 0;
     size_t ActiveConnections = 0;
@@ -743,7 +760,7 @@ public:
     // derive identity from credentials, not from the message's claimed Src.
     using TPeerIdentityResolver = std::function<std::optional<uint32_t>(const TSocket&)>;
 
-    // Passing a root process budget overrides the shared 512 MiB default.
+    // Root budgets override the shared 512 MiB outbound and inbound defaults.
     TRaftServer(
         typename TSocket::TPoller& poller,
         TSocket socket,
@@ -755,7 +772,8 @@ public:
         TOutboundQueueLimits outboundQueueLimits = {},
         TInboundMessageBudgetLimits inboundMessageBudgetLimits = {},
         TPeerIdentityResolver peerIdentityResolver = {},
-        std::shared_ptr<TOutboundQueueBudget> processOutboundQueueBudget = {})
+        std::shared_ptr<TOutboundQueueBudget> processOutboundQueueBudget = {},
+        std::shared_ptr<TInboundMessageBudget> processInboundMessageBudget = {})
         : Poller(poller)
         , Socket(std::move(socket))
         , Raft(raft)
@@ -764,7 +782,9 @@ public:
         , OutboundQueueBudget(std::make_shared<TOutboundQueueBudget>(outboundQueueLimits,
             processOutboundQueueBudget ? std::move(processOutboundQueueBudget)
                 : TOutboundQueueBudget::DefaultProcessBudget()))
-        , InboundMessageBudget(std::make_shared<TInboundMessageBudget>(inboundMessageBudgetLimits))
+        , InboundMessageBudget(std::make_shared<TInboundMessageBudget>(inboundMessageBudgetLimits,
+            processInboundMessageBudget ? std::move(processInboundMessageBudget)
+                : TInboundMessageBudget::DefaultProcessBudget()))
         , RequestProcessor(std::make_shared<TRequestProcessor>(raft, rsm, nodes,
             admissionLimits, WorkerTimeSource))
         , ResolvePeerIdentity(std::move(peerIdentityResolver))

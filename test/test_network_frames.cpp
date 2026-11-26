@@ -191,6 +191,31 @@ void test_inbound_frame_budget_is_held_until_all_message_copies_are_released(voi
     auto recoveredMessage = recoveredTask.await_resume();
     assert_int_equal(recoveredMessage.Cast<TRequestVoteRequest>()->CandidateId, 1);
 }
+void test_inbound_budget_is_aggregated_across_servers(void**) {
+    auto processBudget = std::make_shared<TInboundMessageBudget>(
+        TInboundMessageBudgetLimits{1024, SIZE_MAX, std::chrono::milliseconds::zero()});
+    const TInboundMessageBudgetLimits localLimits{
+        1024, 1, std::chrono::milliseconds::zero()};
+    auto firstServerBudget = std::make_shared<TInboundMessageBudget>(localLimits, processBudget);
+    auto secondServerBudget = std::make_shared<TInboundMessageBudget>(localLimits, processBudget);
+
+    // Connection admission remains local to each server.
+    auto firstConnection = firstServerBudget->TryReserveConnection();
+    auto secondConnection = secondServerBudget->TryReserveConnection();
+    assert_true(bool(firstConnection));
+    assert_true(bool(secondConnection));
+    firstConnection.reset();
+    secondConnection.reset();
+
+    auto retainedFrame = firstServerBudget->TryReserve(700);
+    assert_true(bool(retainedFrame));
+    firstServerBudget.reset();
+    assert_false(bool(secondServerBudget->TryReserve(400)));
+
+    retainedFrame.reset();
+    auto recoveredFrame = secondServerBudget->TryReserve(400);
+    assert_true(bool(recoveredFrame));
+}
 void test_inbound_connection_budget_releases_admission_on_disconnect(void**) {
     auto budget = std::make_shared<TInboundMessageBudget>(
         TInboundMessageBudgetLimits{.MaxBytes = 1024, .MaxConnections = 1});
@@ -378,6 +403,8 @@ int main() {
         cmocka_unit_test(test_all_truncated_bodies_are_rejected),
         cmocka_unit_test(test_count_and_minimum_batch_budget_are_checked_before_children),
         cmocka_unit_test(test_aggregate_budget_is_shared_between_entries),
+        cmocka_unit_test(test_inbound_frame_budget_is_held_until_all_message_copies_are_released),
+        cmocka_unit_test(test_inbound_budget_is_aggregated_across_servers),
         cmocka_unit_test(test_failed_reader_cannot_resume_at_another_frame),
         cmocka_unit_test(test_inbound_connection_budget_releases_admission_on_disconnect),
         cmocka_unit_test(test_idle_inbound_connection_expiry_uses_activity_deadline),
