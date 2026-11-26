@@ -857,6 +857,17 @@ void test_sql_generation_snapshot_recovers_with_raft_manifest(void**) {
             orphan->Publish();
             assert_false(*orphanedGeneration == *reference);
 
+            // Do not reclaim any generation if the manifest-selected image
+            // cannot be validated during startup reconciliation.
+            auto invalidSelectedReference = *reference;
+            invalidSelectedReference.DataSha256[0] ^= 1;
+            bool invalidSelectedWasRejected = false;
+            try { sql->ReconcileSnapshotGenerations(invalidSelectedReference); }
+            catch (const std::exception&) { invalidSelectedWasRejected = true; }
+            assert_true(invalidSelectedWasRejected);
+            auto preservedOrphan = sql->ResolveSnapshotGeneration(*orphanedGeneration);
+            assert_int_equal(preservedOrphan->Size(), orphanedGeneration->DataBytes);
+
             // A fresh Raft store has no selected generation, so startup must
             // reclaim published images left behind by an earlier attempt.
             TDatabase freshFile;
