@@ -49,6 +49,12 @@ void Apply(TKv& kv, const std::string& key, const std::string& value, uint64_t i
     kv.Write(kv.Prepare(Command(key, value)), index);
 }
 TSnapshot Sample() { return {2, 1, {1, 2, 3}, std::string("a\0b", 3)}; }
+void test_snapshot_heap_bytes_include_retained_string_capacity(void**) {
+    auto snapshot = Sample();
+    snapshot.Data.reserve(1024);
+    assert_int_equal(snapshot.HeapBytes(), snapshot.Data.capacity());
+    assert_true(snapshot.HeapBytes() > snapshot.DataSize());
+}
 TSnapshot JointSample() {
     auto snapshot = Sample();
     snapshot.JointVoters = {3, 4, 5};
@@ -954,6 +960,7 @@ void test_durable_kv_restart_restores_checkpoint_and_replays_only_tail(void**) {
 int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_crc32_ieee_golden_vector_and_incremental_updates),
+        cmocka_unit_test(test_snapshot_heap_bytes_include_retained_string_capacity),
         cmocka_unit_test(test_snapshot_codec_roundtrip_and_all_byte_corruption),
         cmocka_unit_test(test_snapshot_encoding_ranges_match_complete_wire_image),
         cmocka_unit_test(test_joint_snapshot_codec_roundtrip_and_corruption),

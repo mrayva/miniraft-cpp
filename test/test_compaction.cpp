@@ -348,6 +348,37 @@ void test_snapshot_capture_reserves_declared_bound_before_materializing(void**) 
     state.reset();
     assert_int_equal(budget->UsedBytes(), 0);
 }
+void test_snapshot_capture_charges_retained_string_capacity(void**) {
+    struct TOverallocatedSnapshotApplication : TBoundedSnapshotApplication {
+        std::optional<uint64_t> SnapshotSizeUpperBound() const override { return std::nullopt; }
+        std::string SaveSnapshot() const override {
+            std::string bytes(PayloadBytes, 's');
+            bytes.reserve(1024);
+            return bytes;
+        }
+    };
+    auto state = std::make_shared<TState>();
+    auto entry = NewHoldedMessage<TLogEntry>();
+    entry->Term = 1;
+    state->Append(entry);
+    state->CommitIndex = 1;
+    auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
+    auto application = std::make_shared<TOverallocatedSnapshotApplication>();
+    application->LastAppliedIndex = 1;
+    TRequestProcessor processor(raft, application, {});
+
+    auto tooSmallBudget = std::make_shared<TSnapshotInstallBudget>(512);
+    Reject([&] { CaptureSnapshot(*raft, *application, tooSmallBudget); });
+    assert_int_equal(tooSmallBudget->UsedBytes(), 0);
+
+    auto budget = std::make_shared<TSnapshotInstallBudget>(1024);
+    auto snapshot = CaptureSnapshot(*raft, *application, budget);
+    assert_int_equal(snapshot.DataSize(), 40);
+    assert_true(snapshot.HeapBytes() >= 1024);
+    assert_int_equal(budget->UsedBytes(), snapshot.HeapBytes());
+    snapshot.HeapReservation.reset();
+    assert_int_equal(budget->UsedBytes(), 0);
+}
 void test_example_kv_streaming_install_validates_before_atomic_publish(void**) {
     TStreamingKv source;
     source.Write(source.Prepare(Command("alpha", "one")), 1);
@@ -407,7 +438,7 @@ void test_incremental_snapshot_capture_charges_each_growth_before_writing(void**
     assert_int_equal(rejectedState->SnapshotIndex, 0);
 
     auto state = makeState();
-    auto budget = std::make_shared<TSnapshotInstallBudget>(40);
+    auto budget = std::make_shared<TSnapshotInstallBudget>(1024);
     TRaft::TLogLimits limits;
     limits.SnapshotInstallBudget = budget;
     auto app = std::make_shared<TStreamingWriterSnapshotApplication>();
@@ -422,7 +453,8 @@ void test_incremental_snapshot_capture_charges_each_growth_before_writing(void**
     assert_int_equal(app->WriteCalls, 1);
     assert_int_equal(app->SaveCalls, 0);
     assert_true(snapshot->MaterializeData() == app->Payload);
-    assert_int_equal(budget->UsedBytes(), 40);
+    assert_int_equal(budget->UsedBytes(), snapshot->HeapBytes());
+    assert_true(snapshot->HeapBytes() >= snapshot->DataSize());
     snapshot.reset();
     state.reset();
     assert_int_equal(budget->UsedBytes(), 0);
@@ -984,7 +1016,7 @@ void test_shared_compaction_reuses_storage_snapshot_image(void**) {
     const auto snapshot = cluster.Nodes[0]->CompactShared();
     const auto stored = cluster.Nodes[0]->GetState()->GetSnapshot();
     assert_true(snapshot == stored);
-    assert_int_equal(budget->UsedBytes(), usedBefore + snapshot->DataSize());
+    assert_int_equal(budget->UsedBytes(), usedBefore + snapshot->HeapBytes());
     assert_int_equal(snapshot->Index, cluster.Apps[0]->LastAppliedIndex);
     assert_true(Read(*cluster.Apps[0], "key") == "value");
 }
@@ -3777,6 +3809,7 @@ int main() {
         cmocka_unit_test(test_example_kv_streaming_install_validates_before_atomic_publish),
         cmocka_unit_test(test_snapshot_capture_preflights_application_size_bound),
         cmocka_unit_test(test_snapshot_capture_reserves_declared_bound_before_materializing),
+        cmocka_unit_test(test_snapshot_capture_charges_retained_string_capacity),
         cmocka_unit_test(test_incremental_snapshot_capture_charges_each_growth_before_writing),
         cmocka_unit_test(test_snapshot_source_can_report_non_heap_payload_storage),
         cmocka_unit_test(test_recovered_snapshot_retains_heap_budget_lease),

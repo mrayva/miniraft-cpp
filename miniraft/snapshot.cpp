@@ -549,7 +549,7 @@ size_t TSnapshot::DataSize() const {
 }
 
 uint64_t TSnapshot::HeapBytes() const {
-    if (!DataSource) return Data.size();
+    if (!DataSource) return Data.empty() ? 0 : Data.capacity();
     if (!Data.empty()) throw std::logic_error("Snapshot cannot own and source the payload at once");
     const auto accounted = dynamic_cast<const ISnapshotDataHeapUsage*>(DataSource.get());
     return accounted ? accounted->HeapBytes() : DataSource->Size();
@@ -1031,16 +1031,28 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
                 throw std::logic_error("Application snapshot exceeded its declared size bound");
             if (File) {
                 File->Append(bytes, StagingBudget);
-            } else if (Budget && nextBytes > currentBytes) {
-                if (!Lease) {
-                    Lease = Budget->TryReserveLease(nextBytes);
-                    if (!Lease)
-                        throw std::runtime_error("Snapshot capture exceeds the available heap budget");
-                } else if (!Budget->TryResize(Lease, nextBytes)) {
+            } else if (Budget && nextBytes > ReservedBytes) {
+                if (!Lease) Lease = Budget->TryReserveLease(nextBytes);
+                else if (!Budget->TryResize(Lease, nextBytes))
                     throw std::runtime_error("Snapshot capture exceeds the available heap budget");
+                if (!Lease)
+                    throw std::runtime_error("Snapshot capture exceeds the available heap budget");
+                ReservedBytes = nextBytes;
+            }
+            if (!File && !bytes.empty()) {
+                Data.append(bytes.data(), bytes.size());
+                if (Budget) {
+                    const auto retainedBytes = uint64_t(Data.capacity());
+                    if (retainedBytes != ReservedBytes) {
+                        if (!Lease) Lease = Budget->TryReserveLease(retainedBytes);
+                        else if (!Budget->TryResize(Lease, retainedBytes))
+                            throw std::runtime_error("Snapshot capture exceeds the available heap budget");
+                        if (!Lease)
+                            throw std::runtime_error("Snapshot capture exceeds the available heap budget");
+                        ReservedBytes = retainedBytes;
+                    }
                 }
             }
-            if (!File && !bytes.empty()) Data.append(bytes.data(), bytes.size());
         }
 
         std::shared_ptr<TSnapshotInstallBudget> Budget;
@@ -1049,6 +1061,7 @@ TSnapshot CaptureSnapshot(const TRaft& raft, const IRsm& rsm,
         std::optional<uint64_t> UpperBound;
         std::string Data;
         std::shared_ptr<TSnapshotInstallBudget::TReservation> Lease;
+        uint64_t ReservedBytes = 0;
         std::shared_ptr<TSnapshotCaptureFile> File;
         std::exception_ptr Failure;
     };

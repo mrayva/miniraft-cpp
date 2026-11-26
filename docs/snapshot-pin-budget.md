@@ -31,6 +31,8 @@ when growing it. Callers can configure a shared `TSnapshotInstallBudget`.
 Optional Linux staging files have their own shared quota. Completed staged
 images must reserve receive heap space before decoding.
 Retained snapshot payloads and outgoing pins share the install heap budget.
+Memory-backed snapshot strings are charged by retained capacity, so spare
+capacity from incremental string growth remains covered by the lease.
 Range-source capture retains its source and conservatively reserves its full
 payload size; the incremental snapshot writer charges each append before
 growing its in-memory image. Current application/log state, legacy unbounded
