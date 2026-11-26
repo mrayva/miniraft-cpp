@@ -2729,6 +2729,96 @@ void test_snapshot_manifest_ranges_install_through_legacy_stream_validation(void
     assert_true(Read(*app, "a") == value);
     assert_true(*state->GetSnapshot() == snapshot);
 }
+void test_snapshot_manifest_ranges_reject_gaps_conflicts_and_corruption(void**) {
+    TKv source;
+    const std::string value(40000, 'x');
+    source.Write(source.Prepare(Command("a", value)), 1);
+    source.Write(source.Prepare(Command("b", std::string(40000, 'y'))), 2);
+    source.Write(source.Prepare(Command("c", std::string(40000, 'z'))), 3);
+    const TSnapshot snapshot{3, 1, {1, 2}, source.SaveSnapshot()};
+    const auto manifest = PrepareSnapshotTransferManifest(snapshot);
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) {
+        if (message->Type == uint32_t(EMessageType::INSTALL_SNAPSHOT_RESPONSE))
+            responses.push_back(message.template Cast<TInstallSnapshotResponse>());
+    });
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 3;
+    auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}});
+    auto app = std::make_shared<TApplication>();
+    TRequestProcessor processor(raft, app, {});
+
+    uint64_t sequence = 1;
+    auto send = [&](TInstallSnapshotRangeRequest::EPhase phase, uint64_t offset,
+            std::string_view bytes) {
+        const auto expectedResponses = responses.size() + 1;
+        raft->Process({}, RangeChunk(snapshot, manifest, phase, offset, bytes, sequence++));
+        assert_int_equal(responses.size(), expectedResponses);
+        return responses.back();
+    };
+    auto sendPayload = [&](std::string_view payload) {
+        for (uint64_t offset = 0; offset < payload.size();) {
+            const auto count = size_t(std::min<uint64_t>(TInstallSnapshotRangeRequest::MaxChunkBytes,
+                payload.size() - offset));
+            auto response = send(TInstallSnapshotRangeRequest::EPhase::Payload, offset,
+                payload.substr(size_t(offset), count));
+            assert_true(response->Success);
+            assert_int_equal(response->NextOffset, manifest.Metadata.size() + offset + count);
+            offset += count;
+        }
+    };
+    auto sendChecksum = [&] {
+        std::string checksum(4, '\0');
+        for (unsigned i = 0; i < 4; ++i) checksum[i] = char(manifest.Checksum >> (8 * i));
+        return send(TInstallSnapshotRangeRequest::EPhase::Checksum, 0, checksum);
+    };
+    auto sendMetadata = [&] {
+        auto response = send(TInstallSnapshotRangeRequest::EPhase::Metadata, 0, manifest.Metadata);
+        assert_true(response->Success);
+        assert_false(response->Installed);
+        assert_int_equal(response->NextOffset, manifest.Metadata.size());
+    };
+
+    sendMetadata();
+    auto gap = send(TInstallSnapshotRangeRequest::EPhase::Payload, 1, "x");
+    assert_false(gap->Success);
+    assert_int_equal(app->Loads, 0);
+
+    const auto firstPayloadBytes = size_t(std::min<uint64_t>(
+        TInstallSnapshotRangeRequest::MaxChunkBytes, manifest.PayloadBytes));
+    auto accepted = send(TInstallSnapshotRangeRequest::EPhase::Payload, 0,
+        std::string_view(snapshot.Data).substr(0, firstPayloadBytes));
+    assert_true(accepted->Success);
+    assert_int_equal(accepted->NextOffset, manifest.Metadata.size() + firstPayloadBytes);
+
+    auto conflictingMetadata = manifest.Metadata;
+    conflictingMetadata[0] ^= 1;
+    auto conflict = send(TInstallSnapshotRangeRequest::EPhase::Metadata, 0, conflictingMetadata);
+    assert_false(conflict->Success);
+    auto staleContinuation = send(TInstallSnapshotRangeRequest::EPhase::Payload,
+        firstPayloadBytes, std::string_view(snapshot.Data).substr(firstPayloadBytes, 1));
+    assert_false(staleContinuation->Success);
+    assert_int_equal(app->Loads, 0);
+
+    sendMetadata();
+    auto corruptedPayload = snapshot.Data;
+    corruptedPayload[0] ^= 1;
+    sendPayload(corruptedPayload);
+    auto corruptChecksum = sendChecksum();
+    assert_false(corruptChecksum->Success);
+    assert_false(corruptChecksum->Installed);
+    assert_int_equal(app->Loads, 0);
+
+    sendMetadata();
+    sendPayload(snapshot.Data);
+    auto installed = sendChecksum();
+    assert_true(installed->Success);
+    assert_true(installed->Installed);
+    assert_int_equal(installed->NextOffset, manifest.Metadata.size() + manifest.PayloadBytes + 4);
+    assert_int_equal(app->Loads, 1);
+    assert_true(Read(*app, "a") == value);
+    assert_true(*state->GetSnapshot() == snapshot);
+}
 void test_negotiated_snapshot_manifest_transfer_uses_distinct_wire_phases(void**) {
     TCluster cluster({3}, 3, true);
     cluster.Prepare();
@@ -4819,6 +4909,7 @@ int main() {
         cmocka_unit_test(test_covered_snapshot_metadata_uses_shared_install_budget),
         cmocka_unit_test(test_snapshot_install_accepts_every_small_fixed_chunk_size),
         cmocka_unit_test(test_snapshot_manifest_ranges_install_through_legacy_stream_validation),
+        cmocka_unit_test(test_snapshot_manifest_ranges_reject_gaps_conflicts_and_corruption),
         cmocka_unit_test(test_negotiated_snapshot_manifest_transfer_uses_distinct_wire_phases),
         cmocka_unit_test(test_compaction_lagging_follower_installs_snapshot_then_tail),
         cmocka_unit_test(test_outgoing_snapshot_chunk_holds_heap_budget_lease),
