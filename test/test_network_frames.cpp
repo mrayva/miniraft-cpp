@@ -276,6 +276,40 @@ void test_snapshot_resize_local_rejection_does_not_leak_process_charge(void**) {
     lease.reset();
     assert_int_equal(processBudget->UsedTotalBytes(), 0);
 }
+void test_legacy_transport_roots_import_usage_when_bound_to_process_budget(void**) {
+    TProcessMemoryBudgetLimits limits;
+    limits.MaxBytes = 1024;
+    limits.MaxOutboundQueueBytes = 768;
+    limits.MaxInboundNetworkBytes = 768;
+    limits.MaxSnapshotHeapBytes = 768;
+    limits.ReservedOutboundQueueBytes = 128;
+    limits.ReservedInboundNetworkBytes = 128;
+    limits.ReservedSnapshotHeapBytes = 128;
+    limits.MaxOutboundQueueMessages = 4;
+    auto processBudget = std::make_shared<TProcessMemoryBudget>(limits);
+
+    auto outboundRoot = std::make_shared<TOutboundQueueBudget>(TOutboundQueueLimits{8, 900});
+    assert_true(outboundRoot->TryReplace(0, 0, 2, 100));
+    assert_true(outboundRoot->BindProcessMemoryBudget(processBudget));
+    assert_int_equal(processBudget->UsedBytes(EProcessMemoryCategory::OutboundQueue), 100);
+    outboundRoot->Release(2, 100);
+    assert_int_equal(processBudget->UsedTotalBytes(), 0);
+
+    auto inboundRoot = std::make_shared<TInboundMessageBudget>(
+        TInboundMessageBudgetLimits{900, SIZE_MAX, std::chrono::milliseconds::zero()});
+    auto existingFrame = inboundRoot->TryReserve(128);
+    assert_true(bool(existingFrame));
+    assert_true(inboundRoot->BindProcessMemoryBudget(processBudget));
+    assert_int_equal(processBudget->UsedBytes(EProcessMemoryCategory::InboundNetwork), 128);
+    existingFrame.reset();
+    assert_int_equal(processBudget->UsedTotalBytes(), 0);
+
+    auto oversizedRoot = std::make_shared<TOutboundQueueBudget>(TOutboundQueueLimits{8, 900});
+    assert_true(oversizedRoot->TryReplace(0, 0, 1, 769));
+    assert_false(oversizedRoot->BindProcessMemoryBudget(processBudget));
+    assert_false(bool(oversizedRoot->ProcessMemoryBudget()));
+    assert_int_equal(processBudget->UsedTotalBytes(), 0);
+}
 void test_inbound_connection_budget_releases_admission_on_disconnect(void**) {
     auto budget = std::make_shared<TInboundMessageBudget>(
         TInboundMessageBudgetLimits{.MaxBytes = 1024, .MaxConnections = 1});
@@ -467,6 +501,7 @@ int main() {
         cmocka_unit_test(test_inbound_budget_is_aggregated_across_servers),
         cmocka_unit_test(test_process_memory_budget_is_shared_across_transport_and_snapshot),
         cmocka_unit_test(test_snapshot_resize_local_rejection_does_not_leak_process_charge),
+        cmocka_unit_test(test_legacy_transport_roots_import_usage_when_bound_to_process_budget),
         cmocka_unit_test(test_failed_reader_cannot_resume_at_another_frame),
         cmocka_unit_test(test_inbound_connection_budget_releases_admission_on_disconnect),
         cmocka_unit_test(test_idle_inbound_connection_expiry_uses_activity_deadline),

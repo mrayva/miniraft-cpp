@@ -247,8 +247,25 @@ public:
     }
 
     std::shared_ptr<TProcessMemoryBudget> ProcessMemoryBudget() const {
+        std::lock_guard lock(Mutex);
         if (ProcessBudget) return ProcessBudget;
         return Aggregate ? Aggregate->ProcessMemoryBudget() : nullptr;
+    }
+
+    // Root budgets can be attached after construction for compatibility with
+    // callers that created their aggregate before process-wide accounting was
+    // available. Existing reservations are imported as one atomic replacement.
+    bool BindProcessMemoryBudget(std::shared_ptr<TProcessMemoryBudget> processBudget) {
+        if (!processBudget) return false;
+        std::lock_guard lock(Mutex);
+        if (Aggregate)
+            throw std::logic_error("Only an outbound queue root can bind a process budget");
+        if (ProcessBudget) return ProcessBudget == processBudget;
+        if (!processBudget->TryReplace(EProcessMemoryCategory::OutboundQueue,
+                0, 0, UsedMessages, UsedBytes))
+            return false;
+        ProcessBudget = std::move(processBudget);
+        return true;
     }
 
     bool TryReplace(size_t oldMessages, uint64_t oldBytes,
@@ -287,8 +304,8 @@ public:
 private:
     const TOutboundQueueLimits Limits;
     const std::shared_ptr<TOutboundQueueBudget> Aggregate;
-    const std::shared_ptr<TProcessMemoryBudget> ProcessBudget;
-    std::mutex Mutex;
+    std::shared_ptr<TProcessMemoryBudget> ProcessBudget;
+    mutable std::mutex Mutex;
     size_t UsedMessages = 0;
     uint64_t UsedBytes = 0;
 };
@@ -347,8 +364,22 @@ public:
     }
 
     std::shared_ptr<TProcessMemoryBudget> ProcessMemoryBudget() const {
+        std::lock_guard lock(Mutex);
         if (ProcessBudget) return ProcessBudget;
         return Aggregate ? Aggregate->ProcessMemoryBudget() : nullptr;
+    }
+
+    bool BindProcessMemoryBudget(std::shared_ptr<TProcessMemoryBudget> processBudget) {
+        if (!processBudget) return false;
+        std::lock_guard lock(Mutex);
+        if (Aggregate)
+            throw std::logic_error("Only an inbound message root can bind a process budget");
+        if (ProcessBudget) return ProcessBudget == processBudget;
+        if (!processBudget->TryReplace(EProcessMemoryCategory::InboundNetwork,
+                0, 0, 0, UsedBytes))
+            return false;
+        ProcessBudget = std::move(processBudget);
+        return true;
     }
 
     std::shared_ptr<void> TryReserveConnection() {
@@ -410,8 +441,8 @@ private:
 
     const TInboundMessageBudgetLimits Limits;
     const std::shared_ptr<TInboundMessageBudget> Aggregate;
-    const std::shared_ptr<TProcessMemoryBudget> ProcessBudget;
-    std::mutex Mutex;
+    std::shared_ptr<TProcessMemoryBudget> ProcessBudget;
+    mutable std::mutex Mutex;
     uint64_t UsedBytes = 0;
     size_t ActiveConnections = 0;
 };
@@ -801,8 +832,8 @@ public:
     using TPeerIdentityResolver = std::function<std::optional<uint32_t>(const TSocket&)>;
 
     // A shared process-memory root ties transport and snapshot heap buffers to
-    // one cap. Legacy domain aggregate roots without that root remain valid and
-    // keep their independent category limit.
+    // one cap. Legacy domain aggregate roots are attached to that root before
+    // serving, including importing any reservations they already hold.
     TRaftServer(
         typename TSocket::TPoller& poller,
         TSocket socket,
@@ -839,14 +870,10 @@ public:
         , ResolvePeerIdentity(std::move(peerIdentityResolver))
         , RaftWorker(RaftAccessMutex)
     {
-        const auto outboundMemoryBudget = processOutboundQueueBudget
-            ? processOutboundQueueBudget->ProcessMemoryBudget() : nullptr;
-        const auto inboundMemoryBudget = processInboundMessageBudget
-            ? processInboundMessageBudget->ProcessMemoryBudget() : nullptr;
-        if ((outboundMemoryBudget && outboundMemoryBudget != ProcessMemoryBudget) ||
-            (inboundMemoryBudget && inboundMemoryBudget != ProcessMemoryBudget) ||
-            (processMemoryBudget && processOutboundQueueBudget && !outboundMemoryBudget) ||
-            (processMemoryBudget && processInboundMessageBudget && !inboundMemoryBudget))
+        if ((processOutboundQueueBudget &&
+                !processOutboundQueueBudget->BindProcessMemoryBudget(ProcessMemoryBudget)) ||
+            (processInboundMessageBudget &&
+                !processInboundMessageBudget->BindProcessMemoryBudget(ProcessMemoryBudget)))
             throw std::invalid_argument("Server budget roots must share its process memory budget");
         try {
             for (const auto& [id, node] : nodes) {
