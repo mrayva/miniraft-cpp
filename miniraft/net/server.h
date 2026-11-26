@@ -206,12 +206,34 @@ struct TOutboundQueueLimits {
 };
 
 // Shared by a server's peer nodes so per-peer limits cannot multiply without
-// bound as the cluster grows. A replacement reserves its new usage atomically
-// with releasing the superseded message usage.
+// bound as the cluster grows. A local budget can also reserve against a
+// process-wide aggregate. Aggregates must be root budgets (without an aggregate
+// of their own). A replacement reserves its new usage atomically with releasing
+// the superseded message usage.
 class TOutboundQueueBudget {
 public:
-    explicit TOutboundQueueBudget(TOutboundQueueLimits limits = {})
-        : Limits(limits) { }
+    explicit TOutboundQueueBudget(TOutboundQueueLimits limits = {},
+            std::shared_ptr<TOutboundQueueBudget> aggregate = {})
+        : Limits(limits)
+        , Aggregate(std::move(aggregate)) {
+        if (Aggregate && Aggregate->Aggregate)
+            throw std::invalid_argument("Outbound queue aggregate must be a root budget");
+    }
+
+    ~TOutboundQueueBudget() {
+        if (Aggregate) {
+            std::lock_guard lock(Mutex);
+            Aggregate->Release(UsedMessages, UsedBytes);
+        }
+    }
+
+    static std::shared_ptr<TOutboundQueueBudget> DefaultProcessBudget() {
+        // Leave room for several servers at their existing per-server defaults
+        // while preventing an unbounded multiplication across server instances.
+        static auto budget = std::make_shared<TOutboundQueueBudget>(
+            TOutboundQueueLimits{16 * 1024, 512ULL * 1024 * 1024});
+        return budget;
+    }
 
     bool TryReplace(size_t oldMessages, uint64_t oldBytes,
             size_t newMessages, uint64_t newBytes) {
@@ -224,6 +246,9 @@ public:
             newMessages > Limits.MaxMessages - retainedMessages ||
             newBytes > Limits.MaxBytes - retainedBytes)
             return false;
+        if (Aggregate && !Aggregate->TryReplace(
+                oldMessages, oldBytes, newMessages, newBytes))
+            return false;
         UsedMessages = retainedMessages + newMessages;
         UsedBytes = retainedBytes + newBytes;
         return true;
@@ -232,12 +257,14 @@ public:
     void Release(size_t messages, uint64_t bytes) noexcept {
         std::lock_guard lock(Mutex);
         if (messages > UsedMessages || bytes > UsedBytes) std::terminate();
+        if (Aggregate) Aggregate->Release(messages, bytes);
         UsedMessages -= messages;
         UsedBytes -= bytes;
     }
 
 private:
     const TOutboundQueueLimits Limits;
+    const std::shared_ptr<TOutboundQueueBudget> Aggregate;
     std::mutex Mutex;
     size_t UsedMessages = 0;
     uint64_t UsedBytes = 0;
@@ -510,7 +537,7 @@ public:
         if (Drainer && Drainer.done()) { Drainer.destroy(); Drainer = {}; }
         if (Connector && Connector.done()) { Connector.destroy(); Connector = {}; }
         std::lock_guard lock(QueueMutex);
-        if (auto budget = QueueBudget.lock())
+        if (const auto& budget = QueueBudget)
             budget->Release(PendingMessageCountLocked(), PendingMessageBytesLocked());
     }
 
@@ -527,7 +554,7 @@ public:
     bool AttachQueueBudget(const std::shared_ptr<TOutboundQueueBudget>& budget) {
         if (!budget) throw std::invalid_argument("Outbound queue budget is null");
         std::lock_guard lock(QueueMutex);
-        const auto attachedBudget = QueueBudget.lock();
+        const auto& attachedBudget = QueueBudget;
         if (attachedBudget == budget) return false;
         if (attachedBudget) throw std::logic_error("Node already has an outbound queue budget");
         if (!budget->TryReplace(0, 0, PendingMessageCountLocked(), PendingMessageBytesLocked()))
@@ -537,7 +564,7 @@ public:
     }
     void DetachQueueBudget(const std::shared_ptr<TOutboundQueueBudget>& budget) noexcept {
         std::lock_guard lock(QueueMutex);
-        const auto attachedBudget = QueueBudget.lock();
+        const auto& attachedBudget = QueueBudget;
         if (!budget || attachedBudget != budget) return;
         attachedBudget->Release(PendingMessageCountLocked(), PendingMessageBytesLocked());
         QueueBudget.reset();
@@ -703,7 +730,9 @@ private:
     // Includes messages in Messages and in the active writer batch.
     size_t PendingDataMessages = 0, PendingRaftMessages = 0;
     uint64_t PendingDataBytes = 0, PendingRaftBytes = 0;
-    std::weak_ptr<TOutboundQueueBudget> QueueBudget;
+    // Keep the budget alive with its retained queue memory; otherwise an
+    // external peer node could outlive its server and escape the process cap.
+    std::shared_ptr<TOutboundQueueBudget> QueueBudget;
 };
 
 template<typename TSocket>
@@ -714,6 +743,7 @@ public:
     // derive identity from credentials, not from the message's claimed Src.
     using TPeerIdentityResolver = std::function<std::optional<uint32_t>(const TSocket&)>;
 
+    // Passing a root process budget overrides the shared 512 MiB default.
     TRaftServer(
         typename TSocket::TPoller& poller,
         TSocket socket,
@@ -724,13 +754,16 @@ public:
         TRequestProcessor::TAdmissionLimits admissionLimits = {},
         TOutboundQueueLimits outboundQueueLimits = {},
         TInboundMessageBudgetLimits inboundMessageBudgetLimits = {},
-        TPeerIdentityResolver peerIdentityResolver = {})
+        TPeerIdentityResolver peerIdentityResolver = {},
+        std::shared_ptr<TOutboundQueueBudget> processOutboundQueueBudget = {})
         : Poller(poller)
         , Socket(std::move(socket))
         , Raft(raft)
         , TimeSource(ts ? ts : std::make_shared<TTimeSource>())
         , WorkerTimeSource(std::make_shared<TCachedTimeSource>(TimeSource))
-        , OutboundQueueBudget(std::make_shared<TOutboundQueueBudget>(outboundQueueLimits))
+        , OutboundQueueBudget(std::make_shared<TOutboundQueueBudget>(outboundQueueLimits,
+            processOutboundQueueBudget ? std::move(processOutboundQueueBudget)
+                : TOutboundQueueBudget::DefaultProcessBudget()))
         , InboundMessageBudget(std::make_shared<TInboundMessageBudget>(inboundMessageBudgetLimits))
         , RequestProcessor(std::make_shared<TRequestProcessor>(raft, rsm, nodes,
             admissionLimits, WorkerTimeSource))

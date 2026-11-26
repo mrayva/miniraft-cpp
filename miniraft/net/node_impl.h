@@ -57,7 +57,7 @@ void TNode<TSocket>::RecountPendingMessagesLocked() {
     }
     const auto oldMessages = PendingMessageCountLocked();
     const auto oldBytes = PendingMessageBytesLocked();
-    const auto budget = QueueBudget.lock();
+    const auto& budget = QueueBudget;
     if (budget && !budget->TryReplace(oldMessages, oldBytes,
             dataMessages + raftMessages, dataBytes + raftBytes))
         throw std::logic_error("Recount exceeds aggregate outbound queue budget");
@@ -77,7 +77,7 @@ void TNode<TSocket>::CompletePendingMessage(EQueueClass queueClass, uint64_t byt
     auto& count = queueClass == EQueueClass::Client ? PendingDataMessages : PendingRaftMessages;
     auto& totalBytes = queueClass == EQueueClass::Client ? PendingDataBytes : PendingRaftBytes;
     if (!count || totalBytes < bytes) throw std::logic_error("Outbound queue accounting underflow");
-    const auto budget = QueueBudget.lock();
+    const auto& budget = QueueBudget;
     if (budget && !budget->TryReplace(PendingMessageCountLocked(), PendingMessageBytesLocked(),
             PendingMessageCountLocked() - 1, PendingMessageBytesLocked() - bytes))
         throw std::logic_error("Completion exceeds aggregate outbound queue budget");
@@ -136,7 +136,7 @@ bool TNode<TSocket>::TrySend(TMessageHolder<TMessage> message) {
 
     // Append first so allocation failure leaves the previously queued retry intact.
     Messages.emplace_back(std::move(message));
-    if (const auto budget = QueueBudget.lock()) {
+    if (const auto& budget = QueueBudget) {
         try {
             if (!budget->TryReplace(oldTotalMessages, oldTotalBytes,
                     newTotalMessages, newTotalBytes)) {
@@ -195,7 +195,7 @@ void TNode<TSocket>::Retire() {
         throw std::logic_error("Socket type does not support safe peer retirement");
     std::lock_guard lock(QueueMutex);
     if (Retired) return;
-    if (const auto budget = QueueBudget.lock())
+    if (const auto& budget = QueueBudget)
         if (!budget->TryReplace(PendingMessageCountLocked(), PendingMessageBytesLocked(), 0, 0))
             throw std::logic_error("Failed to release retired node's aggregate outbound queue usage");
     Retired = true;

@@ -382,6 +382,24 @@ void test_node_send_queue_bounds_data_and_coalesces_raft_retries(void**) {
     assert_true(aggregateSecond.TrySend(NewHoldedMessage<TCommandResponse>()));
     aggregateSecond.Retire();
 
+    // Independent server-local limits also reserve from one process budget.
+    auto processBudget = std::make_shared<TOutboundQueueBudget>(TOutboundQueueLimits{4, 1024});
+    auto firstServerBudget = std::make_shared<TOutboundQueueBudget>(
+        TOutboundQueueLimits{4, 1024}, processBudget);
+    auto secondServerBudget = std::make_shared<TOutboundQueueBudget>(
+        TOutboundQueueLimits{4, 1024}, processBudget);
+    auto processFirst = makeNode();
+    auto processSecond = makeNode();
+    assert_true(processFirst.AttachQueueBudget(firstServerBudget));
+    assert_true(processSecond.AttachQueueBudget(secondServerBudget));
+    assert_true(processFirst.TrySend(NewHoldedMessage<TCommandResponse>(700)));
+    // A node retains its reservation even if the server-local owner goes away.
+    firstServerBudget.reset();
+    assert_false(processSecond.TrySend(NewHoldedMessage<TCommandResponse>(700)));
+    processFirst.Retire();
+    assert_true(processSecond.TrySend(NewHoldedMessage<TCommandResponse>(700)));
+    processSecond.Retire();
+
     auto measuredReply = NewHoldedMessage<TCommandResponse>();
     auto byteBudget = std::make_shared<TOutboundQueueBudget>(
         TOutboundQueueLimits{2, measuredReply->Len});
