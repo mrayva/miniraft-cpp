@@ -197,6 +197,9 @@ int main(int argc, char** argv)
                 "sql_state", myHost.Id, TDurableState::THook{}, generationResolver))
             : std::static_pointer_cast<IState>(std::make_shared<TDiskState>(
                 "sql_state", myHost.Id, TDiskState::TCommitHook{}, true, generationResolver));
+#ifdef __linux__
+        sqlRsm->ReconcileSnapshotGenerations(state->GetApplicationSnapshotGenerationReference());
+#endif
         TRaft::TLogLimits logLimits;
         logLimits.SnapshotStagingDirectory = std::move(snapshotStagingDirectory);
         auto raft = std::make_shared<TRaft>(state, myHost.Id, nodes,

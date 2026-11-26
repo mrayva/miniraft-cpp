@@ -820,6 +820,7 @@ void test_sql_generation_snapshot_recovers_with_raft_manifest(void**) {
     for (const bool durable : {false, true}) {
         TDatabase file;
         const auto raftPath = file.Path + "-raft";
+        std::optional<TApplicationSnapshotGenerationReference> orphanedGeneration;
         auto makeState = [&](const TApplicationSnapshotGenerationResolver& resolver) -> std::shared_ptr<IState> {
             if (durable)
                 return std::make_shared<TDurableState>(raftPath, 1, TDurableState::THook{}, resolver);
@@ -848,6 +849,13 @@ void test_sql_generation_snapshot_recovers_with_raft_manifest(void**) {
             assert_true(reference.has_value());
             assert_int_equal(reference->SnapshotIndex, 1);
             assert_true(reference->DataBytes > 100);
+
+            // Simulate a crash after the app image is durable but before a
+            // Raft manifest can select it.
+            auto orphan = sql->PrepareSnapshotGeneration(*snapshot);
+            orphanedGeneration = orphan->Reference();
+            orphan->Publish();
+            assert_false(*orphanedGeneration == *reference);
         }
 
         // Simulate the application database lagging behind a committed Raft
@@ -861,6 +869,11 @@ void test_sql_generation_snapshot_recovers_with_raft_manifest(void**) {
                     return sql->ResolveSnapshotGeneration(reference);
                 };
             auto state = makeState(resolver);
+            sql->ReconcileSnapshotGenerations(state->GetApplicationSnapshotGenerationReference());
+            bool orphanWasReclaimed = false;
+            try { (void)sql->ResolveSnapshotGeneration(*orphanedGeneration); }
+            catch (const std::exception&) { orphanWasReclaimed = true; }
+            assert_true(orphanWasReclaimed);
             auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{});
             TRequestProcessor processor(raft, sql, {});
             assert_int_equal(sql->LastAppliedIndex, 1);

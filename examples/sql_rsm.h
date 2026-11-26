@@ -56,6 +56,8 @@ public:
         const TApplicationSnapshotGenerationReference& reference, uint64_t index) const override;
     void RestoreSnapshotGeneration(
         const TApplicationSnapshotGenerationReference& reference, uint64_t index) override;
+    void ReconcileSnapshotGenerations(
+        std::optional<TApplicationSnapshotGenerationReference> selected);
     std::shared_ptr<const TSnapshotDataSource> ResolveSnapshotGeneration(
         const TApplicationSnapshotGenerationReference& reference) const;
 #endif

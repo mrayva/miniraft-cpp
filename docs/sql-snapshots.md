@@ -30,8 +30,10 @@ length and SHA-256 digest. Both the durable and split-file Raft backends use
 that resolver, so their snapshot sidecars contain metadata rather than another
 copy of the SQLite payload. A receiving replica creates its own generation;
 the sender's local ID is never transferred. After publication and activation,
-SQL reclaims older generation files. An image published before a failed Raft
-publication can remain as an orphan until a later successful activation.
+SQL reclaims older generation files. Startup compares the generation directory
+with the reference recovered from Raft and removes unselected images. A
+generation published before a failed Raft publication remains an orphan until
+the next activation or restart.
 
 ## Image and recovery contract
 

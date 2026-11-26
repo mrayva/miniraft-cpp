@@ -1121,6 +1121,26 @@ void TSql::RestoreSnapshotGeneration(
     ReclaimSqlSnapshotGenerations(SnapshotGenerationDirectory, ActiveSnapshotGeneration);
 #endif
 }
+
+void TSql::ReconcileSnapshotGenerations(
+        std::optional<TApplicationSnapshotGenerationReference> selected) {
+#ifndef __linux__
+    (void)selected;
+    throw std::runtime_error("SQL snapshot generations currently require Linux");
+#else
+    if (selected) {
+        auto source = ResolveSnapshotGeneration(*selected);
+        TSnapshot snapshot;
+        snapshot.Index = selected->SnapshotIndex;
+        snapshot.DataSource = std::move(source);
+        ValidateApplicationSnapshotGenerationReference(*selected, snapshot);
+        ActiveSnapshotGeneration = selected->Id;
+    } else {
+        ActiveSnapshotGeneration.clear();
+    }
+    ReclaimSqlSnapshotGenerations(SnapshotGenerationDirectory, ActiveSnapshotGeneration);
+#endif
+}
 #endif // __linux__
 
 void TSql::ValidateSnapshot(std::string_view bytes, uint64_t index) const {
