@@ -26,8 +26,8 @@
 namespace {
 
 uint32_t LocalAppendCapabilityBits(const IState& state, bool idempotentLogSupport,
-        bool applicationSnapshotInstallSupport) {
-    return TAppendEntriesResponse::EncodeSnapshotMaxBytes(uint32_t(TSnapshot::MaxBytes)) |
+        bool applicationSnapshotInstallSupport, uint64_t maxSnapshotBytes) {
+    return TAppendEntriesResponse::EncodeSnapshotMaxBytes(uint32_t(maxSnapshotBytes)) |
         TAppendEntriesResponse::SupportsConfigurationBarrier |
         TAppendEntriesResponse::SupportsSnapshotHistory256 |
         TAppendEntriesResponse::SupportsSnapshotHistory1024 |
@@ -1523,6 +1523,43 @@ void TRaft::OnPreVote(TMessageHolder<TPreVoteResponse> message) {
     }
 }
 
+uint64_t TRaft::LocalSnapshotSizeLimit() const {
+    auto heapLimit = SnapshotInstallBudget->LimitBytes();
+    if (const auto processBudget = SnapshotInstallBudget->ProcessMemoryBudget())
+        heapLimit = std::min(heapLimit,
+            processBudget->LimitBytes(EProcessMemoryCategory::SnapshotHeap));
+    auto limit = std::min<uint64_t>(TSnapshot::MaxBytes, heapLimit);
+    if (!LogLimits.SnapshotStagingDirectory.empty()) {
+        const auto stagingLimit = LogLimits.SnapshotStagingBudget
+            ? LogLimits.SnapshotStagingBudget->LimitBytes() : heapLimit;
+        limit = std::min(limit, stagingLimit);
+    }
+    return limit;
+}
+
+uint64_t TRaft::LocalSnapshotReceiveLimit(bool splitManifest) const {
+    auto heapLimit = SnapshotInstallBudget->LimitBytes();
+    if (const auto processBudget = SnapshotInstallBudget->ProcessMemoryBudget())
+        heapLimit = std::min(heapLimit,
+            processBudget->LimitBytes(EProcessMemoryCategory::SnapshotHeap));
+    if (LogLimits.SnapshotStagingDirectory.empty())
+        return std::min<uint64_t>(TSnapshot::MaxBytes, heapLimit);
+
+    const auto stagingLimit = LogLimits.SnapshotStagingBudget
+        ? LogLimits.SnapshotStagingBudget->LimitBytes() : heapLimit;
+    const auto application = SnapshotApplication.lock();
+    const bool sourceBackedInstall = application &&
+        (dynamic_cast<IStreamingSnapshotInstallRsm*>(application.get()) ||
+         dynamic_cast<IIdempotentRsm*>(application.get()));
+    if (!sourceBackedInstall)
+        return std::min<uint64_t>(TSnapshot::MaxBytes, std::min(heapLimit, stagingLimit));
+    if (!splitManifest)
+        return std::min<uint64_t>(TSnapshot::MaxBytes, stagingLimit);
+    const auto combinedLimit = stagingLimit >= TSnapshot::MaxBytes - std::min(heapLimit, TSnapshot::MaxBytes)
+        ? TSnapshot::MaxBytes : heapLimit + stagingLimit;
+    return std::min<uint64_t>(TSnapshot::MaxBytes, combinedLimit);
+}
+
 void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntriesRequest> message) {
     if (message->Term < State->CurrentTerm) {
         auto reply = NewHoldedMessage(
@@ -1536,7 +1573,7 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
                 .MatchIndex = 0,
                 .Success = false,
                 .Padding = LocalAppendCapabilityBits(*State, LocalIdempotentLogSupport,
-                    LocalApplicationSnapshotInstallSupport),
+                    LocalApplicationSnapshotInstallSupport, LocalSnapshotSizeLimit()),
             });
         (void)Nodes[reply->Dst]->TrySend(std::move(reply));
         return;
@@ -1658,7 +1695,7 @@ void TRaft::OnAppendEntries(ITimeSource::Time now, TMessageHolder<TAppendEntries
             .MatchIndex = matchIndex,
             .Success = success,
             .Padding = LocalAppendCapabilityBits(*State, LocalIdempotentLogSupport,
-                LocalApplicationSnapshotInstallSupport),
+                LocalApplicationSnapshotInstallSupport, LocalSnapshotSizeLimit()),
         });
 
     AdvanceCommitIndex(commitIndex);
@@ -3033,7 +3070,7 @@ void TRaft::OnConfigurationBarrier(TMessageHolder<TConfigurationBarrierRequest> 
         : uint64_t(TSnapshot::LegacyMaxBytes);
     const bool accepted =
         (request->Padding & TAppendEntriesResponse::SupportsApplicationSnapshotInstall) &&
-        LocalApplicationSnapshotInstallSupport && certifiedSnapshotLimit <= TSnapshot::MaxBytes &&
+        LocalApplicationSnapshotInstallSupport && certifiedSnapshotLimit <= LocalSnapshotSizeLimit() &&
         StateName == EState::FOLLOWER && IsVoter(request->LeaderId) &&
         VolatileState->LeaderId == request->LeaderId && Configuration &&
         !Configuration->HasUncommittedConfiguration() &&
@@ -3108,6 +3145,7 @@ void TRaft::MaybeDistributeConfigurationBarrier(ITimeSource::Time now) {
         VolatileState->ConfigurationBarrierAckIndex.clear();
         VolatileState->ConfigurationBarrierAckDue.clear();
     }
+    if (maxSnapshotBytes < TAppendEntriesResponse::SnapshotSizeUnitBytes) return;
 
     VolatileState->CompactionSafeConfigurationIndex = std::max(
         VolatileState->CompactionSafeConfigurationIndex, index);
@@ -3788,6 +3826,10 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         IncomingSnapshot.reset();
         if (probe.Supported) acceptLeaderContact();
         reply(probe.Supported, probe.Supported, probe.Supported ? request->TotalBytes : 0);
+        return;
+    }
+    if (request->TotalBytes > LocalSnapshotReceiveLimit(transfer.has_value())) {
+        reply(false, false, 0);
         return;
     }
     auto application = SnapshotApplication.lock();

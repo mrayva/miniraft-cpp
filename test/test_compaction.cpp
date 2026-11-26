@@ -1980,7 +1980,7 @@ void test_snapshot_size_negotiation_keeps_legacy_fallback_and_certifies_voter_li
     assert_int_equal(TAppendEntriesResponse::DecodeSnapshotMaxBytesOrLegacy(legacyPadding, legacyLimit),
         legacyLimit);
     assert_int_equal(TAppendEntriesResponse::DecodeSnapshotMaxBytesOrLegacy(
-        emptyNegotiatedPadding, legacyLimit), legacyLimit);
+        emptyNegotiatedPadding, legacyLimit), 0);
     assert_int_equal(TAppendEntriesResponse::DecodeSnapshotMaxBytesOrLegacy(currentPadding, legacyLimit),
         currentLimit);
     assert_int_equal(TAppendEntriesResponse::DecodeSnapshotMaxBytesOrLegacy(
@@ -2047,6 +2047,91 @@ void test_snapshot_size_negotiation_keeps_legacy_fallback_and_certifies_voter_li
     cluster.Deliver(currentPeerBarrier);
     assert_int_equal(cluster.Nodes[1]->GetVolatileState()->CompactionSafeMaxSnapshotBytes, legacyLimit);
     assert_int_equal(cluster.Nodes[2]->GetVolatileState()->CompactionSafeMaxSnapshotBytes, legacyLimit);
+}
+void test_snapshot_size_capability_respects_receiver_budgets(void**) {
+    constexpr uint64_t unit = TAppendEntriesResponse::SnapshotSizeUnitBytes;
+    constexpr uint64_t heapLimit = 64 * 1024 * 1024;
+    constexpr uint64_t advertisedLimit = (heapLimit / unit) * unit;
+    auto budget = std::make_shared<TSnapshotInstallBudget>(heapLimit);
+    auto state = std::make_shared<TState>();
+    state->BindVoters({1, 2});
+    state->CurrentTerm = 3;
+    state->Commit();
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> snapshotResponses;
+    TMessageHolder<TAppendEntriesResponse> appendResponse;
+    auto peer = std::make_shared<TEndpoint>([&](auto message) {
+        if (auto append = message.template Maybe<TAppendEntriesResponse>())
+            appendResponse = append.Cast();
+        if (auto snapshot = message.template Maybe<TInstallSnapshotResponse>())
+            snapshotResponses.push_back(snapshot.Cast());
+    });
+    TRaft::TLogLimits limits{.SnapshotInstallBudget = budget};
+    auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}},
+        std::vector<uint32_t>{}, limits);
+    auto application = std::make_shared<TApplication>();
+    TRequestProcessor processor(raft, application, {});
+
+    auto heartbeat = NewHoldedMessage(
+        TMessageEx{.Src = 1, .Dst = 2, .Term = 3, .Seqno = 1},
+        TAppendEntriesRequest{.PrevLogIndex = 0, .PrevLogTerm = 0, .LeaderCommit = 0,
+            .LeaderId = 1, .Nentries = 0});
+    raft->Process({}, heartbeat);
+    assert_non_null(appendResponse);
+    assert_int_equal(TAppendEntriesResponse::DecodeSnapshotMaxBytesOrLegacy(
+        appendResponse->Padding, TSnapshot::LegacyMaxBytes), advertisedLimit);
+
+    const TSnapshot snapshot{1, 1, {1, 2}, {}};
+    TSnapshotTransferManifest manifest;
+    manifest.Version = TSnapshotTransferManifest::CurrentVersion;
+    manifest.Metadata.assign(44, 'x');
+    manifest.PayloadBytes = advertisedLimit - manifest.Metadata.size() + 1;
+    auto tooLarge = NewHoldedMessage<TInstallSnapshotRangeRequest>(
+        sizeof(TInstallSnapshotRangeRequest) + manifest.Metadata.size());
+    tooLarge->Src = 1;
+    tooLarge->Dst = 2;
+    tooLarge->Term = 3;
+    tooLarge->Seqno = 2;
+    tooLarge->SnapshotIndex = snapshot.Index;
+    tooLarge->SnapshotTerm = snapshot.Term;
+    tooLarge->MetadataBytes = manifest.Metadata.size();
+    tooLarge->PayloadBytes = manifest.PayloadBytes;
+    tooLarge->Offset = 0;
+    tooLarge->LeaderId = 1;
+    tooLarge->Phase = uint32_t(TInstallSnapshotRangeRequest::EPhase::Metadata);
+    tooLarge->ManifestVersion = manifest.Version;
+    tooLarge->Checksum = manifest.Checksum;
+    memcpy(tooLarge->Data, manifest.Metadata.data(), manifest.Metadata.size());
+    raft->Process({}, tooLarge);
+    assert_int_equal(snapshotResponses.size(), 1);
+    assert_false(snapshotResponses.back()->Success);
+    assert_int_equal(snapshotResponses.back()->NextOffset, 0);
+    assert_int_equal(budget->UsedBytes(), 0);
+
+    constexpr uint64_t stagingLimit = 16 * 1024 * 1024;
+    auto stagedState = std::make_shared<TState>();
+    stagedState->BindVoters({1, 2});
+    stagedState->CurrentTerm = 3;
+    stagedState->Commit();
+    TMessageHolder<TAppendEntriesResponse> stagedAppendResponse;
+    auto stagedPeer = std::make_shared<TEndpoint>([&](auto message) {
+        if (auto append = message.template Maybe<TAppendEntriesResponse>())
+            stagedAppendResponse = append.Cast();
+    });
+    TRaft::TLogLimits stagedLimits{.SnapshotInstallBudget = std::make_shared<TSnapshotInstallBudget>(heapLimit),
+        .SnapshotStagingDirectory = "/tmp",
+        .SnapshotStagingBudget = std::make_shared<TSnapshotInstallBudget>(stagingLimit)};
+    auto stagedRaft = std::make_shared<TRaft>(stagedState, 2, TNodeDict{{1, stagedPeer}},
+        std::vector<uint32_t>{}, stagedLimits);
+    auto stagedApplication = std::make_shared<TStreamingInstallApplication>();
+    TRequestProcessor stagedProcessor(stagedRaft, stagedApplication, {});
+    auto stagedHeartbeat = NewHoldedMessage(
+        TMessageEx{.Src = 1, .Dst = 2, .Term = 3, .Seqno = 1},
+        TAppendEntriesRequest{.PrevLogIndex = 0, .PrevLogTerm = 0, .LeaderCommit = 0,
+            .LeaderId = 1, .Nentries = 0});
+    stagedRaft->Process({}, stagedHeartbeat);
+    assert_non_null(stagedAppendResponse);
+    assert_int_equal(TAppendEntriesResponse::DecodeSnapshotMaxBytesOrLegacy(
+        stagedAppendResponse->Padding, TSnapshot::LegacyMaxBytes), stagingLimit);
 }
 void test_snapshot_encoder_accepts_image_above_legacy_limit(void**) {
     TSnapshot snapshot;
@@ -5022,6 +5107,7 @@ int main() {
         cmocka_unit_test(test_zero_index_follower_compaction_waits_for_capability_barrier),
         cmocka_unit_test(test_restarted_follower_reacquires_compaction_certificate_without_new_term),
         cmocka_unit_test(test_snapshot_size_negotiation_keeps_legacy_fallback_and_certifies_voter_limit),
+        cmocka_unit_test(test_snapshot_size_capability_respects_receiver_budgets),
         cmocka_unit_test(test_snapshot_encoder_accepts_image_above_legacy_limit),
         cmocka_unit_test(test_stale_peer_capability_cannot_authorize_snapshot_or_barrier),
         cmocka_unit_test(test_single_voter_compacts_snapshot_above_legacy_limit),

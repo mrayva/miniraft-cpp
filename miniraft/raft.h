@@ -607,7 +607,9 @@ public:
         std::chrono::milliseconds LeadershipExpiration = TTimeout::LeadershipExpiration;
         // The default budget is shared by Raft instances in this process.
         // A custom budget sets the Raft snapshot-local limit; process-root
-        // category limits still apply to its reservations.
+        // category limits still apply to its reservations. The advertised
+        // receive limit uses this budget and any staging quota according to
+        // whether the application can install from a source-backed snapshot.
         std::shared_ptr<TSnapshotInstallBudget> SnapshotInstallBudget;
         // On Linux, stage streamed captures, legacy captures, complete legacy
         // snapshot images, and negotiated snapshot payloads in anonymous files
@@ -782,6 +784,8 @@ private:
     void AdvanceLeaderCommit();
     void OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnapshotRequest> message,
         std::optional<TSnapshotTransferIdentity> transfer = std::nullopt);
+    uint64_t LocalSnapshotSizeLimit() const;
+    uint64_t LocalSnapshotReceiveLimit(bool splitManifest) const;
     void OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnapshotResponse> message);
     void OnTimeoutNow(ITimeSource::Time now, TMessageHolder<TTimeoutNowRequest> message);
     void OnConfigurationBarrier(TMessageHolder<TConfigurationBarrierRequest> message);

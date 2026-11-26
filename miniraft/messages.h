@@ -150,7 +150,8 @@ struct TAppendEntriesResponse: public TMessageEx {
     // never apply session-control entries as ordinary application commands.
     static constexpr uint32_t SupportsIdempotencyControlEntries = 1u << 8;
     // Padding's upper bits carry the receiver's maximum snapshot image size in
-    // 64 KiB units. A missing bit identifies a legacy peer with the 64 MiB cap.
+    // 64 KiB units. A missing bit identifies a legacy peer with the 64 MiB cap;
+    // a present bit with a zero size advertises that no image can be accepted.
     static constexpr uint32_t SupportsSnapshotSizeNegotiation = 1u << 9;
     // Marks peers that reject old-format vote requests while a joint
     // configuration is active. Old readers may decode it as a larger limit,
@@ -175,8 +176,7 @@ struct TAppendEntriesResponse: public TMessageEx {
     static constexpr uint64_t DecodeSnapshotMaxBytesOrLegacy(
             uint32_t padding, uint64_t legacyMaxBytes) {
         const auto decoded = DecodeSnapshotMaxBytes(padding);
-        return (padding & SupportsSnapshotSizeNegotiation) && decoded
-            ? decoded : legacyMaxBytes;
+        return (padding & SupportsSnapshotSizeNegotiation) ? decoded : legacyMaxBytes;
     }
     static constexpr uint32_t EncodeConfigurationBarrierSnapshotLimit(
             uint64_t maxBytes, uint64_t legacyMaxBytes,
