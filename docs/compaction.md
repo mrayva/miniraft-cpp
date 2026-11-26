@@ -267,7 +267,11 @@ buffers and snapshot heap reservations share the same process root by default,
 but the budgets do not account for arbitrary state-machine allocations or the
 entire process heap.
 The conservative backend still rewrites the entire snapshot and retained suffix
-on each update, and capture/publication runs synchronously on the event loop.
+on each update. TRaft::CompactShared() remains synchronous. Call it through
+TRaftServer::RunSerializedRaftTask() from a poller coroutine to keep network
+I/O and timers running; stateful Raft callbacks still wait behind the snapshot
+work, and direct calls from the poller can block it. Asynchronous capture and
+incremental suffix publication remain open.
 
 A deterministic Linux subprocess test exits from the application `LoadSnapshot`
 callback immediately after a remote snapshot has been durably installed. Restart

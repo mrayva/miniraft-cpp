@@ -76,7 +76,7 @@ NNet::TVoidTask CompactLoop(TPoller& poller, TRaftServer<TSocket>& server,
     while (true) {
         co_await poller.Sleep(std::chrono::seconds(1));
         try {
-            const auto index = server.WithSerializedRaft([&](TRaft& raft) {
+            const auto index = co_await server.RunSerializedRaftTask([&](TRaft& raft) {
                 if (rsm->LastAppliedIndex <= saved || rsm->LastAppliedIndex - saved < interval)
                     return uint64_t(0);
                 return raft.CompactShared()->Index;

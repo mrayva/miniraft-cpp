@@ -20,10 +20,13 @@ On Linux, start a KV server with its existing fixed node list and add:
 
 Use the complete, identical voter-ID configuration on each node as before.
 `--snapshots N` requires a positive interval and `--server --durable`; it is off
-by default. A one-second polling coroutine captures a checkpoint after at least
-N additional applied log indices, including internal no-ops. Creation, encoding
-and publication execute synchronously on the serialized event loop. Large maps
-and slow storage can pause processing; asynchronous/COW capture is future work.
+by default. A one-second polling coroutine schedules a checkpoint after at
+least N additional applied log indices, including internal no-ops, on the
+serialized Raft worker. Network I/O and poller timers continue while the worker
+captures and publishes; other stateful Raft work waits behind that callback.
+Core compaction remains synchronous, so direct calls from a poller still block
+it. Splitting capture and publication into asynchronous phases remains future
+work.
 
 The server writes `state.snapshot.<id>` beside `state.durable.<id>`, with separate
 `.lock` and `.tmp` paths. Startup restores an existing checkpoint before creating

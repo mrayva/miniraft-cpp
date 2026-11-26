@@ -978,6 +978,30 @@ public:
         }
     }
 
+    // Schedule potentially blocking stateful work away from the poller. The
+    // callback runs in FIFO order with other Raft work; network I/O and timers
+    // continue, but Raft callbacks wait until it returns. Call from a poller
+    // coroutine and do not use poller APIs inside the callback.
+    template<typename TFunction>
+    auto RunSerializedRaftTask(TFunction&& function)
+            -> NNet::TValueTask<std::invoke_result_t<std::decay_t<TFunction>&, TRaft&>> {
+        using TResult = std::invoke_result_t<std::decay_t<TFunction>&, TRaft&>;
+        static_assert(!std::is_reference_v<TResult>,
+            "Serialized Raft worker callbacks must not return references");
+        auto callable = std::make_shared<std::decay_t<TFunction>>(
+            std::forward<TFunction>(function));
+        if constexpr (std::is_void_v<TResult>) {
+            co_await RunOnRaftWorker([this, callable]() mutable {
+                std::invoke(*callable, *Raft);
+            });
+            co_return;
+        } else {
+            co_return co_await RunOnRaftWorker([this, callable]() mutable -> TResult {
+                return std::invoke(*callable, *Raft);
+            });
+        }
+    }
+
     // Register local endpoints on any role so every replica can validate and
     // communicate with future voters. This does not change quorum membership.
     // Calls must be serialized with the poller loop and Raft work.

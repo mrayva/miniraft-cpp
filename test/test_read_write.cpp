@@ -324,6 +324,83 @@ void test_server_poller_progresses_while_worker_callback_is_blocked(void**) {
     assert_true(timerFired);
     assert_true(callbackStillBlocked);
 }
+
+void test_serialized_raft_task_keeps_poller_timers_running(void**) {
+    using namespace std::chrono_literals;
+    struct TGate {
+        std::mutex Mutex;
+        std::condition_variable Condition;
+        bool Entered = false;
+        bool Released = false;
+        bool ReceivedRaft = false;
+    };
+
+    NNet::TLoop<NNet::TPoll> loop;
+    loop.Poller().SetMaxDuration(1ms);
+    auto timeSource = std::make_shared<TTimeSource>();
+    NNet::TSocket listener(NNet::TAddress{"127.0.0.1", 0}, loop.Poller());
+    listener.Bind();
+    listener.Listen();
+    auto gate = std::make_shared<TGate>();
+    auto raft = std::make_shared<TRaft>(std::make_shared<TState>(), 1, TNodeDict{});
+    TRaftServer<NNet::TSocket> server(
+        loop.Poller(), std::move(listener), raft, std::make_shared<TDummyRsm>(), TNodeDict{}, timeSource);
+    server.Serve();
+
+    bool taskCompleted = false;
+    auto taskBody = [&]() -> NNet::TVoidTask {
+        co_await server.RunSerializedRaftTask([&](TRaft& serializedRaft) {
+            std::unique_lock lock(gate->Mutex);
+            gate->ReceivedRaft = &serializedRaft == raft.get();
+            gate->Entered = true;
+            gate->Condition.notify_all();
+            gate->Condition.wait(lock, [&] { return gate->Released; });
+        });
+        taskCompleted = true;
+    };
+    auto task = taskBody();
+    (void)task;
+
+    const auto gateEntered = [&] {
+        std::lock_guard lock(gate->Mutex);
+        return gate->Entered;
+    };
+    const auto deadline = NNet::TClock::now() + 3s;
+    while (!gateEntered() && NNet::TClock::now() < deadline) loop.Step();
+
+    bool timerFired = false;
+    if (gateEntered()) {
+        auto timerBody = [&]() -> NNet::TVoidTask {
+            co_await loop.Poller().Sleep(10ms);
+            timerFired = true;
+        };
+        auto timer = timerBody();
+        (void)timer;
+        const auto timerDeadline = NNet::TClock::now() + 1s;
+        while (!timerFired && NNet::TClock::now() < timerDeadline) loop.Step();
+    }
+    const bool callbackStillBlocked = [&] {
+        std::lock_guard lock(gate->Mutex);
+        return gate->Entered && !gate->Released;
+    }();
+    {
+        std::lock_guard lock(gate->Mutex);
+        gate->Released = true;
+    }
+    gate->Condition.notify_all();
+
+    const auto taskDeadline = NNet::TClock::now() + 3s;
+    while (!taskCompleted && NNet::TClock::now() < taskDeadline) loop.Step();
+    bool stopped = false;
+    StopServerAndMark(server, stopped);
+    const auto stopDeadline = NNet::TClock::now() + 3s;
+    while (!stopped && NNet::TClock::now() < stopDeadline) loop.Step();
+    assert_true(stopped);
+    assert_true(taskCompleted);
+    assert_true(gate->ReceivedRaft);
+    assert_true(timerFired);
+    assert_true(callbackStillBlocked);
+}
 #endif
 
 void test_node_send_queue_bounds_data_and_coalesces_raft_retries(void**) {
@@ -1519,6 +1596,7 @@ int main() {
 #ifdef __linux__
         cmocka_unit_test(test_idempotent_client_times_out_and_retries_same_operation),
         cmocka_unit_test(test_server_poller_progresses_while_worker_callback_is_blocked),
+        cmocka_unit_test(test_serialized_raft_task_keeps_poller_timers_running),
         cmocka_unit_test(test_server_transitions_membership_and_installs_joint_snapshot_over_socket_transport),
         cmocka_unit_test(test_serving_server_retires_demoted_joint_voter_reader),
 #endif
