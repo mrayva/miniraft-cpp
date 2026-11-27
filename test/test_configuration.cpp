@@ -2854,6 +2854,7 @@ void run_live_membership_failure_scenario(uint32_t scenario,
     std::array<std::shared_ptr<TRequestProcessor>, 7> processors{};
     std::array<std::array<std::shared_ptr<TEndpoint>, 7>, 7> endpoints{};
     ITimeSource::Time now{};
+    uint32_t leaderId = 1;
     bool isolateNewMajority = false;
     bool isolateSnapshotReceiver = false;
     bool holdSnapshotChunks = false;
@@ -3077,14 +3078,18 @@ void run_live_membership_failure_scenario(uint32_t scenario,
         (rafts[1]->GetVolatileState()->MatchIndex.at(4) < states[1]->LastLogIndex ||
          rafts[1]->GetVolatileState()->CommitAckIndex.at(4) < rafts[1]->GetVolatileState()->CommitIndex); ++i)
         tick(1);
-    rafts[1]->TransferLeadership(4, now);
-    assert_true(rafts[1]->CurrentStateName() == EState::FOLLOWER);
-    snapshotSenderId = 4;
-    for (unsigned i = 0; i < 4 && rafts[4]->CurrentStateName() != EState::LEADER; ++i) tick(4);
-    assert_true(rafts[4]->CurrentStateName() == EState::LEADER);
-    for (unsigned i = 0; i < 8 && rafts[4]->GetVolatileState()->CommitIndex < states[4]->LastLogIndex; ++i)
-        tick(4); // Commit the new leader's current-term entry under both majorities.
-    assert_true(rafts[4]->GetVolatileState()->CommitIndex > jointIndex);
+    if (!std::binary_search(newVoters.begin(), newVoters.end(), leaderId)) {
+        rafts[leaderId]->TransferLeadership(4, now);
+        assert_true(rafts[leaderId]->CurrentStateName() == EState::FOLLOWER);
+        leaderId = 4;
+        for (unsigned i = 0; i < 4 && rafts[leaderId]->CurrentStateName() != EState::LEADER; ++i)
+            tick(leaderId);
+        assert_true(rafts[leaderId]->CurrentStateName() == EState::LEADER);
+    }
+    snapshotSenderId = leaderId;
+    for (unsigned i = 0; i < 8 && rafts[leaderId]->GetVolatileState()->CommitIndex < states[leaderId]->LastLogIndex; ++i)
+        tick(leaderId); // Commit the current-term entry under both majorities.
+    assert_true(rafts[leaderId]->GetVolatileState()->CommitIndex > jointIndex);
 
     snapshotSenderId = 1;
     expectSnapshotRestartRetry = true;
@@ -3093,12 +3098,12 @@ void run_live_membership_failure_scenario(uint32_t scenario,
     assert_true(sawOutOfOrderSnapshotRejection);
     assert_int_equal(states[6]->SnapshotIndex, 0);
 
-    snapshotSenderId = 4;
+    snapshotSenderId = leaderId;
     expectSnapshotRestartRetry = false;
     awaitingOutOfOrderSnapshotReply = false;
     heldSnapshotChunks.clear(); // Discard undelivered chunks from the new leader's first attempt.
     duplicateSnapshotChunkTo6 = scenario == 1;
-    for (unsigned i = 0; i < 48 && states[6]->SnapshotIndex < jointSnapshotIndex; ++i) tick(4);
+    for (unsigned i = 0; i < 48 && states[6]->SnapshotIndex < jointSnapshotIndex; ++i) tick(leaderId);
     assert_int_equal(states[6]->SnapshotIndex, jointSnapshotIndex);
     assert_true(rafts[6]->GetVoterIds() == jointVoters);
     assert_true(rafts[6]->IsVoter(6));
@@ -3113,14 +3118,14 @@ void run_live_membership_failure_scenario(uint32_t scenario,
     }
 
     reorderStableAppendTo6 = scenario == 1;
-    const auto stableIndex = rafts[4]->FinalizeConfiguration();
-    for (unsigned i = 0; i < 8 && rafts[4]->GetVolatileState()->CommitIndex < stableIndex; ++i) tick(4);
-    assert_int_equal(rafts[4]->GetVolatileState()->CommitIndex, stableIndex);
+    const auto stableIndex = rafts[leaderId]->FinalizeConfiguration();
+    for (unsigned i = 0; i < 8 && rafts[leaderId]->GetVolatileState()->CommitIndex < stableIndex; ++i) tick(leaderId);
+    assert_int_equal(rafts[leaderId]->GetVolatileState()->CommitIndex, stableIndex);
     for (unsigned i = 0; i < 8; ++i) {
         bool propagated = true;
         for (uint32_t id = 1; id <= 6; ++id) propagated = propagated && states[id]->CommitIndex >= stableIndex;
         if (propagated) break;
-        tick(4);
+        tick(leaderId);
     }
     for (uint32_t id = 1; id <= 6; ++id) {
         assert_true(rafts[id]->GetVoterIds() == newVoters);
@@ -3154,7 +3159,7 @@ void run_live_membership_failure_scenario(uint32_t scenario,
         for (auto voter : newVoters)
             safe = safe && rafts[voter]->GetVolatileState()->CompactionSafeConfigurationIndex >= stableIndex;
         if (safe) break;
-        tick(4);
+        tick(leaderId);
     }
     for (auto voter : newVoters)
         assert_true(rafts[voter]->GetVolatileState()->CompactionSafeConfigurationIndex >= stableIndex);
@@ -3163,14 +3168,14 @@ void run_live_membership_failure_scenario(uint32_t scenario,
     // leader. Its application image spans multiple chunks so restart loses a
     // real partial transfer rather than a complete one-chunk snapshot.
     isolateSnapshotReceiver = true;
-    const auto tailBeforeSnapshot = rafts[4]->Append(Ordinary(states[4]->CurrentTerm));
-    for (unsigned i = 0; i < 8 && rafts[4]->GetVolatileState()->CommitIndex < tailBeforeSnapshot; ++i)
-        tick(4);
-    assert_int_equal(rafts[4]->GetVolatileState()->CommitIndex, tailBeforeSnapshot);
-    for (unsigned i = 0; i < 8 && states[5]->CommitIndex < tailBeforeSnapshot; ++i) tick(4);
+    const auto tailBeforeSnapshot = rafts[leaderId]->Append(Ordinary(states[leaderId]->CurrentTerm));
+    for (unsigned i = 0; i < 8 && rafts[leaderId]->GetVolatileState()->CommitIndex < tailBeforeSnapshot; ++i)
+        tick(leaderId);
+    assert_int_equal(rafts[leaderId]->GetVolatileState()->CommitIndex, tailBeforeSnapshot);
+    for (unsigned i = 0; i < 8 && states[5]->CommitIndex < tailBeforeSnapshot; ++i) tick(leaderId);
     assert_int_equal(states[5]->CommitIndex, tailBeforeSnapshot);
     assert_int_equal(states[6]->CommitIndex, stableIndex);
-    const auto snapshot = rafts[4]->Compact();
+    const auto snapshot = rafts[leaderId]->Compact();
     const auto snapshotIndex = snapshot.Index;
     assert_true(snapshot.StableConfiguration);
     assert_true(snapshot.Voters == newVoters);
@@ -3184,11 +3189,11 @@ void run_live_membership_failure_scenario(uint32_t scenario,
     const auto replacementSnapshotLeaderId = newVoters.front() == 4
         ? newVoters[1] : newVoters.front();
     for (unsigned i = 0; i < 8 &&
-        states[replacementSnapshotLeaderId]->CommitIndex < tailBeforeSnapshot; ++i) tick(4);
+        states[replacementSnapshotLeaderId]->CommitIndex < tailBeforeSnapshot; ++i) tick(leaderId);
     assert_int_equal(states[replacementSnapshotLeaderId]->CommitIndex, tailBeforeSnapshot);
     for (unsigned i = 0; i < 8 &&
         !rafts[replacementSnapshotLeaderId]->CheckCompactionMembershipReadiness().Ready(); ++i)
-        tick(4);
+        tick(leaderId);
     assert_true(rafts[replacementSnapshotLeaderId]->CheckCompactionMembershipReadiness().Ready());
     const auto replacementSnapshot = rafts[replacementSnapshotLeaderId]->Compact();
     assert_int_equal(replacementSnapshot.Index, snapshotIndex);
@@ -3197,7 +3202,7 @@ void run_live_membership_failure_scenario(uint32_t scenario,
 
     holdSnapshotChunks = true;
     isolateSnapshotReceiver = false;
-    for (unsigned i = 0; i < 8 && heldSnapshotChunks.empty(); ++i) tick(4);
+    for (unsigned i = 0; i < 8 && heldSnapshotChunks.empty(); ++i) tick(leaderId);
     assert_false(heldSnapshotChunks.empty());
     auto partialChunk = std::move(heldSnapshotChunks.front());
     heldSnapshotChunks.erase(heldSnapshotChunks.begin());
@@ -3207,9 +3212,9 @@ void run_live_membership_failure_scenario(uint32_t scenario,
     assert_int_equal(states[6]->SnapshotIndex, jointSnapshotIndex);
     assert_int_equal(applications[6]->LastAppliedIndex, stableIndex);
 
-    // Hold a later chunk from the old leader so it can be replayed after the
-    // replacement leader wins an election and the restarted follower resets.
-    for (unsigned i = 0; i < 8 && heldSnapshotChunks.empty(); ++i) tick(4);
+    // Hold a later chunk so it can be replayed after the follower restarts;
+    // if leadership changes during the restart, it must also be rejected stale.
+    for (unsigned i = 0; i < 8 && heldSnapshotChunks.empty(); ++i) tick(leaderId);
     assert_false(heldSnapshotChunks.empty());
     auto staleStableChunk = std::move(heldSnapshotChunks.front());
     heldSnapshotChunks.erase(heldSnapshotChunks.begin());
@@ -3237,24 +3242,26 @@ void run_live_membership_failure_scenario(uint32_t scenario,
     assert_int_equal(applications[6]->LastAppliedIndex, stableIndex);
     sawOutOfOrderSnapshotRejection = false;
     duplicatedSnapshotChunk = false;
-    const auto oldSnapshotLeaderTerm = states[4]->CurrentTerm;
+    const auto previousSnapshotLeaderTerm = states[leaderId]->CurrentTerm;
     snapshotSenderId = replacementSnapshotLeaderId;
     for (unsigned i = 0; i < 16 &&
         rafts[replacementSnapshotLeaderId]->CurrentStateName() != EState::LEADER; ++i)
         tick(replacementSnapshotLeaderId);
     assert_true(rafts[replacementSnapshotLeaderId]->CurrentStateName() == EState::LEADER);
-    assert_true(rafts[4]->CurrentStateName() == EState::FOLLOWER);
-    assert_true(states[replacementSnapshotLeaderId]->CurrentTerm > oldSnapshotLeaderTerm);
+    if (replacementSnapshotLeaderId != leaderId) {
+        assert_true(rafts[leaderId]->CurrentStateName() == EState::FOLLOWER);
+        assert_true(states[replacementSnapshotLeaderId]->CurrentTerm > previousSnapshotLeaderTerm);
+    }
     for (unsigned i = 0; i < 8 &&
         rafts[replacementSnapshotLeaderId]->GetVolatileState()->CommitIndex <
             states[replacementSnapshotLeaderId]->LastLogIndex; ++i)
         tick(replacementSnapshotLeaderId);
     assert_true(rafts[replacementSnapshotLeaderId]->GetVolatileState()->CommitIndex > stableIndex);
 
-    snapshotSenderId = 4;
+    snapshotSenderId = leaderId;
     expectSnapshotRestartRetry = true;
     holdSnapshotChunks = false;
-    endpoints[4][6]->Route(std::move(staleStableChunk));
+    endpoints[leaderId][6]->Route(std::move(staleStableChunk));
     assert_true(sawOutOfOrderSnapshotRejection);
     assert_int_equal(states[6]->SnapshotIndex, jointSnapshotIndex);
 
@@ -3333,6 +3340,18 @@ void test_live_membership_fault_scenarios_transfer_finalize_and_restart(void**) 
     // set has only its leader. Joint commitment must still wait for the old
     // majority before the transition can take effect.
     run_live_membership_failure_scenario(2, {4, 5, 6}, {2, 3});
+
+    // Exercise both remaining one-member overlaps between the original voter
+    // set {1, 2, 3} and a promoted set that keeps voters 4 and 6. The first
+    // partition leaves the new majority available but withholds the old one;
+    // the second leaves the old majority available but withholds the new one.
+    const std::array<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>, 2> schedules{{
+        {{1, 4, 6}, {2, 3}},
+        {{3, 4, 6}, {4, 6}},
+    }};
+    for (size_t i = 0; i < schedules.size(); ++i)
+        run_live_membership_failure_scenario(uint32_t(i + 3),
+            schedules[i].first, schedules[i].second);
 #endif
 }
 void test_live_disjoint_joint_entry_waits_for_old_majority_over_network(void**) {

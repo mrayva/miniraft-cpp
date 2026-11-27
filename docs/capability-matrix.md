@@ -78,7 +78,12 @@ design notes. This is a capability summary, not a production-readiness claim.
 The membership, compaction, transfer and legacy disk-publication paths have deterministic regression
 coverage described in their design notes. Joint-election tests also enumerate
 every reply ordering for overlapping and disjoint voter sets, checking each
-delivery prefix before both majorities are present. Durable-state tests stop a
+delivery prefix before both majorities are present. The live-membership fault
+harness also enumerates five voter-set and partition schedules, including
+disjoint and overlapping changes, unavailable old or new majorities, and a
+transition that retains the current leader. Those scenarios exercise transfer,
+finalization, joint and stable snapshot installation, and follower restart.
+Durable-state tests stop a
 child process at each ordinary-publication and snapshot-install publication
 hook, and inject `RLIMIT_FSIZE` write errors during append and snapshot
 installation; recovery checks that only manifest-selected state survives and
