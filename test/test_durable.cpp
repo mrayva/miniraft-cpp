@@ -580,6 +580,66 @@ void test_crash_at_every_publication_boundary(void**) {
     }
 }
 
+void test_snapshot_install_crash_at_every_publication_boundary(void**) {
+    const std::array<std::pair<TStage, bool>, 16> crashStages{{
+        {TStage::SnapshotTempCreated, false},
+        {TStage::SnapshotWritten, false},
+        {TStage::SnapshotFileSynced, false},
+        {TStage::SnapshotRenamed, false},
+        {TStage::SnapshotDirectorySynced, false},
+        {TStage::LogTempCreated, false},
+        {TStage::LogWritten, false},
+        {TStage::LogFileSynced, false},
+        {TStage::LogRenamed, false},
+        {TStage::LogDirectorySynced, false},
+        {TStage::TempCreated, false},
+        {TStage::PayloadStarted, false},
+        {TStage::Written, false},
+        {TStage::FileSynced, false},
+        {TStage::Renamed, true},
+        {TStage::DirectorySynced, true},
+    }};
+    const TSnapshot installed{2, 2, {1, 2}, "installed checkpoint"};
+    for (const auto& [stage, updated] : crashStages) {
+        TFiles files;
+        files.Seed();
+        const auto child = fork();
+        assert_true(child >= 0);
+        if (child == 0) {
+            try {
+                bool armed = false;
+                TDurableState state(files.Name, 1, [&](auto point) {
+                    if (armed && point == stage) _exit(90);
+                });
+                armed = true;
+                state.InstallSnapshot(installed);
+            } catch (...) { _exit(2); }
+            _exit(3);
+        }
+        Wait(child, 90);
+
+        TDurableState recovered(files.Name, 1);
+        const auto imageBase = files.Image().string();
+        assert_int_equal(recovered.CurrentTerm, 3);
+        assert_int_equal(recovered.VotedFor, 2);
+        assert_int_equal(recovered.LastLogIndex, 2);
+        if (updated) {
+            assert_true(recovered.GetSnapshot() && *recovered.GetSnapshot() == installed);
+            assert_int_equal(recovered.SnapshotIndex, 2);
+            assert_int_equal(recovered.CommitIndex, 2);
+        } else {
+            assert_false(bool(recovered.GetSnapshot()));
+            assert_int_equal(recovered.CommitIndex, 0);
+            assert_string_equal(Data(recovered, 1).c_str(), "first");
+            assert_string_equal(Data(recovered, 2).c_str(), "second");
+            assert_false(fs::exists(imageBase + ".snapshot.2.2"));
+            assert_false(fs::exists(imageBase + ".snapshot.2.2.tmp"));
+            assert_false(fs::exists(imageBase + ".log.2"));
+            assert_false(fs::exists(imageBase + ".log.2.tmp"));
+        }
+    }
+}
+
 void test_crash_before_manifest_publication_discards_unpublished_log_changes(void**) {
     const auto generationStages = {TStage::LogTempCreated, TStage::LogWritten, TStage::LogFileSynced,
         TStage::LogRenamed, TStage::LogDirectorySynced};
@@ -1967,6 +2027,7 @@ void test_reference_kv_idempotency_replays_from_durable_snapshot_and_log(void**)
 int main() {
     const CMUnitTest tests[] = {
         cmocka_unit_test(test_crash_at_every_publication_boundary),
+        cmocka_unit_test(test_snapshot_install_crash_at_every_publication_boundary),
         cmocka_unit_test(test_crash_before_manifest_publication_discards_unpublished_log_changes),
         cmocka_unit_test(test_acknowledged_updates_survive_immediate_exit),
         cmocka_unit_test(test_follower_persists_commit_before_ack_and_recovers_it),
