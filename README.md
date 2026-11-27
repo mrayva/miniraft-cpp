@@ -73,8 +73,10 @@ and strong-read traffic from starving delayed snapshot acknowledgements, and
 prevents stale reader failures from destroying newer reconnect attempts.
 The [snapshot pinning follow-up](docs/snapshot-pinning.md) lets an active transfer
 finish while the leader continues compacting newer application state, and avoids
-the dependency's unsafe connect-deadline path. TCP connect failure timing follows
-the OS; a safe bounded application deadline remains open.
+restarting a transfer when newer snapshots are published. Peer reconnects use a
+five-second deadline when the socket adapter supports deadline-aware connect;
+the `coroio` adapter cancels the timed-out connect and its poller event. Custom
+adapters that expose only `Connect()` still rely on OS connection-failure timing.
 The [proposal admission follow-up](docs/proposal-admission.md) restricts direct
 Append calls to leaders, preventing nonleaders from creating conflicting commands
 at the same log index and term.

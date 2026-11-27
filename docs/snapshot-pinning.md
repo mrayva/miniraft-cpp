@@ -34,24 +34,20 @@ installs the newer image and replicates a committed tail. Existing tests cover
 timeouts, read traffic, duplicate/stale replies, receiver restart, leader change,
 corruption, atomic durable publication and strong-read isolation.
 
-Sanitizer CI also exposed a second reconnect deadline race after alpha.18's
-generation checks. The dependency's finite-deadline connect registers both I/O
-and timer wakeups. After timeout, a late I/O event can resume the retry sleep;
-that sleep's timer may remain queued even after the connector finishes. Destroying
-the completed connector then leaves a timer pointing to freed memory. Preserving
-active connectors alone cannot prevent this case.
+Sanitizer CI exposed a reconnect deadline race: a timed-out connection could
+leave its write-readiness event queued, allowing a late readiness notification to
+resume a connector after the retry path had begun. MiniRaft now uses a
+five-second deadline for adapters that support `Connect(deadline)`. The updated
+`coroio` connect awaiter cancels the pending connect on timeout, and the poller
+removes the write event and clears already-queued readiness copies before the
+connector resumes its retry sleep. A deterministic lifecycle regression makes
+timeout win after readiness has been queued, then verifies draining that ready
+queue cannot resume the expired connector. A separate socket regression checks
+that a refused connection reports its actual socket error.
 
-MiniRaft now calls the dependency's default connect operation, which registers no
-connect deadline timer. TCP connection failure timing follows the operating
-system, so a failed or blackholed connection may take longer than the former
-100 ms application deadline. A safe bounded application-level connect deadline,
-including cancellation of both wakeup sources, remains open. The coroio dependency
-is unchanged. This is a targeted avoidance of the unsafe deadline path, not a
-general asynchronous cancellation or shutdown implementation.
-
-A deterministic lifecycle regression models a second deadline wakeup surviving
-completion and disconnect; it reproduced the ASan use-after-free with the former
-finite-deadline call and passes with the default connect operation.
+Adapters that expose only `Connect()` still rely on OS connection-failure timing.
+This is a bounded timeout for connect, not a general asynchronous cancellation
+or shutdown contract.
 
 Validation: 228 unit tests and three CLI tests across 18 CTest targets under
 ASan/UBSan, plus 12 Release core targets. Self-review checked image ownership,
