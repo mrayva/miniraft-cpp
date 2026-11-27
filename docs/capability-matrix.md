@@ -83,10 +83,11 @@ harness also enumerates five voter-set and partition schedules, including
 disjoint and overlapping changes, unavailable old or new majorities, and a
 transition that retains the current leader. Those scenarios exercise transfer,
 finalization, joint and stable snapshot installation, and follower restart.
-Durable-state tests stop a
-child process at each ordinary-publication and snapshot-install publication
-hook, and inject `RLIMIT_FSIZE` write errors during append and snapshot
-installation; recovery checks that only manifest-selected state survives and
-incomplete snapshot files are reclaimed. These tests do not establish hardware
-power-loss behavior or cover every filesystem failure. They also do not
-authenticate peers or replace independent review.
+Durable-state tests stop a child process at each ordinary-publication and
+snapshot-install publication hook, and inject `RLIMIT_FSIZE` write errors during
+append and snapshot installation. `TDiskState` tests inject partial writes into
+both compacted-log generation and snapshot-image generation before metadata
+publication. Recovery checks that only manifest-selected state survives and
+incomplete files are reclaimed. These tests do not establish hardware power-loss
+behavior or cover every filesystem failure. They also do not authenticate peers
+or replace independent review.

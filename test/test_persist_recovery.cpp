@@ -1483,6 +1483,50 @@ void test_disk_snapshot_write_failure_preserves_previous_generation(void**) {
     assert_false(fs::exists(partialSnapshotPath));
 }
 
+void test_disk_compacted_log_write_failure_preserves_previous_generation(void**) {
+    TFiles files;
+    files.Seed();
+    const auto child = fork();
+    assert_true(child >= 0);
+    if (child == 0) {
+        std::set_terminate([] { _exit(73); });
+        try {
+            TDiskState state(files.Name, 1);
+            struct rlimit limit{};
+            if (getrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(76);
+            limit.rlim_cur = 1;
+            if (setrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(77);
+            std::signal(SIGXFSZ, SIG_IGN);
+            state.InstallSnapshot(TSnapshot{1, 2, {1, 2}, "durable image"});
+        } catch (...) { _exit(74); }
+        _exit(75);
+    }
+
+    int status = 0;
+    assert_int_equal(waitpid(child, &status, 0), child);
+    assert_true(WIFEXITED(status));
+    assert_int_equal(WEXITSTATUS(status), 73);
+
+    const auto partialEntriesPath = files.Name + ".entries.1.g1.tmp";
+    assert_true(fs::exists(partialEntriesPath));
+    assert_int_equal(fs::file_size(partialEntriesPath), 1);
+    assert_false(fs::exists(files.Name + ".entries.1.g1"));
+    assert_false(fs::exists(files.Name + ".index.1.g1"));
+    assert_false(fs::exists(files.Name + ".state.1.snapshot.g1"));
+
+    TDiskState recovered(files.Name, 1);
+    assert_true(!recovered.GetSnapshot());
+    assert_int_equal(recovered.SnapshotIndex, 0);
+    assert_int_equal(recovered.LastLogIndex, 2);
+    assert_int_equal(recovered.LastLogTerm, 5);
+    assert_int_equal(recovered.Get(1)->Term, 2);
+    assert_int_equal(recovered.Get(2)->Term, 5);
+    assert_int_equal(recovered.CurrentTerm, 7);
+    assert_int_equal(recovered.VotedFor, 2);
+    assert_false(fs::exists(partialEntriesPath));
+    assert_false(fs::exists(files.Name + ".index.1.g1.tmp"));
+}
+
 void test_live_storage_failure_is_fatal(void**) {
     TFiles files;
     files.Seed();
@@ -1573,6 +1617,7 @@ int main() {
         cmocka_unit_test(test_crash_during_metadata_publication_recovers_complete_log_prefix),
         cmocka_unit_test(test_trusted_voter_binding_is_atomic_at_each_metadata_stage),
         cmocka_unit_test(test_disk_snapshot_write_failure_preserves_previous_generation),
+        cmocka_unit_test(test_disk_compacted_log_write_failure_preserves_previous_generation),
         cmocka_unit_test(test_live_storage_failure_is_fatal),
         cmocka_unit_test(test_live_invalid_log_term_is_fatal),
 #endif
