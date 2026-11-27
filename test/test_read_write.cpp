@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 #include <filesystem>
+#include <fstream>
 
 #include <miniraft/configuration.h>
 #include <miniraft/durable.h>
@@ -26,6 +27,8 @@
 #include <unistd.h>
 #include "../coroio/tests/server.crt"
 #include "../coroio/tests/server.key"
+#include "../coroio/tests/mutual-auth.crt"
+#include "../coroio/tests/mutual-auth.key"
 #endif
 
 #include <stdarg.h>
@@ -46,7 +49,8 @@ TMessageHolder<TLogEntry> MakeEntry(const char* text) {
     return mes;
 }
 
-NNet::TVoidTask StopServerAndMark(TRaftServer<NNet::TSocket>& server, bool& stopped) {
+template<typename TSocket>
+NNet::TVoidTask StopServerAndMark(TRaftServer<TSocket>& server, bool& stopped) {
     co_await server.Stop();
     stopped = true;
 }
@@ -404,6 +408,7 @@ void test_serialized_raft_task_keeps_poller_timers_running(void**) {
 
 void test_server_binds_peer_rpc_source_to_authenticated_identity(void**) {
     using namespace std::chrono_literals;
+    using TTlsSocket = NNet::TRetirableSslSocket<NNet::TSocket>;
     struct TRecordingPeer final : INode {
         std::atomic<uint32_t> PreVoteResponses{0};
 
@@ -415,6 +420,34 @@ void test_server_binds_peer_rpc_source_to_authenticated_identity(void**) {
         void Drain() override { }
     };
 
+    const auto tempDir = std::filesystem::temp_directory_path() /
+        ("miniraft-peer-mtls-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    assert_true(std::filesystem::create_directory(tempDir));
+    struct TDirectoryCleanup {
+        std::filesystem::path Path;
+        ~TDirectoryCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(Path, ignored);
+        }
+    } cleanup{tempDir};
+    const auto certPath = tempDir / "identity.pem";
+    const auto keyPath = tempDir / "identity.key";
+    {
+        std::ofstream cert(certPath, std::ios::binary);
+        std::ofstream key(keyPath, std::ios::binary);
+        assert_true(cert.good() && key.good());
+        cert << testMutualAuthCert;
+        key << testMutualAuthKey;
+        assert_true(cert.good() && key.good());
+    }
+    const auto certFile = certPath.string();
+    const auto keyFile = keyPath.string();
+    auto clientContext = std::make_shared<NNet::TSslContext>(
+        NNet::TSslContext::MutualTlsClient(certFile.c_str(), certFile.c_str(), keyFile.c_str()));
+    auto serverContext = std::make_shared<NNet::TSslContext>(
+        NNet::TSslContext::MutualTlsServer(certFile.c_str(), keyFile.c_str(), certFile.c_str()));
+
     NNet::TLoop<NNet::TPoll> loop;
     loop.Poller().SetMaxDuration(1ms);
     auto timeSource = std::make_shared<TTimeSource>();
@@ -423,20 +456,27 @@ void test_server_binds_peer_rpc_source_to_authenticated_identity(void**) {
     TNodeDict peers{{2, peerTwo}, {3, peerThree}};
     auto raft = std::make_shared<TRaft>(std::make_shared<TState>(), 1, peers);
 
-    NNet::TSocket listener(NNet::TAddress{"127.0.0.1", 0}, loop.Poller());
-    listener.Bind();
-    listener.Listen();
+    NNet::TSocket rawListener(NNet::TAddress{"127.0.0.1", 0}, loop.Poller());
+    rawListener.Bind();
+    rawListener.Listen();
     sockaddr_in bound{};
     socklen_t boundSize = sizeof(bound);
-    assert_int_equal(::getsockname(listener.Fd(), reinterpret_cast<sockaddr*>(&bound), &boundSize), 0);
+    assert_int_equal(::getsockname(rawListener.Fd(), reinterpret_cast<sockaddr*>(&bound), &boundSize), 0);
     const NNet::TAddress address(reinterpret_cast<sockaddr*>(&bound), boundSize);
 
     std::atomic<uint32_t> identityResolutions{0};
-    auto resolver = [&](const NNet::TSocket&) -> std::optional<uint32_t> {
+    auto resolver = [&](const TTlsSocket& socket) -> std::optional<uint32_t> {
         identityResolutions.fetch_add(1, std::memory_order_relaxed);
-        return uint32_t{2}; // Test transport credentials authenticate this connection as peer 2.
+        auto certificate = socket.GetPeerCertificate();
+        if (!certificate) return std::nullopt;
+        char commonName[16]{};
+        const auto nameSize = X509_NAME_get_text_by_NID(
+            X509_get_subject_name(certificate.get()), NID_commonName,
+            commonName, sizeof(commonName));
+        if (nameSize != 1 || commonName[0] != '2') return std::nullopt;
+        return uint32_t{2};
     };
-    TRaftServer<NNet::TSocket> server(loop.Poller(), std::move(listener), raft,
+    TRaftServer<TTlsSocket> server(loop.Poller(), TTlsSocket(std::move(rawListener), *serverContext), raft,
         std::make_shared<TDummyRsm>(), peers, timeSource,
         TRequestProcessor::TAdmissionLimits{}, TOutboundQueueLimits{},
         TInboundMessageBudgetLimits{}, resolver);
@@ -453,15 +493,10 @@ void test_server_binds_peer_rpc_source_to_authenticated_identity(void**) {
         request->Padding = 0;
         return request;
     };
-    const auto sendRequest = [](NNet::TSocket& socket,
+    const auto sendRequest = [](TTlsSocket& socket,
             TMessageHolder<TMessage> request) -> NNet::TFuture<void> {
-        co_await socket.Connect();
+        co_await socket.Connect(NNet::TClock::now() + 3s);
         co_await TMessageWriter(socket).Write(std::move(request));
-    };
-    const auto readBeforeDeadline = [](NNet::TSocket& socket,
-            NNet::TTime deadline) -> NNet::TFuture<ssize_t> {
-        char byte = 0;
-        co_return co_await socket.ReadSome(&byte, 1, deadline);
     };
     const auto drive = [&](const auto& task, std::chrono::milliseconds timeout = 3s) {
         const auto deadline = NNet::TClock::now() + timeout;
@@ -471,24 +506,26 @@ void test_server_binds_peer_rpc_source_to_authenticated_identity(void**) {
 
     // The connection is authenticated as peer 2, so a valid RPC claiming peer
     // 3 must be rejected before Raft routes it to peer 3's response endpoint.
-    NNet::TSocket spoofed(address, loop.Poller());
+    TTlsSocket spoofed(NNet::TSocket(address, loop.Poller()), *clientContext);
     auto spoofedSend = sendRequest(spoofed, makePreVote(3));
     drive(spoofedSend);
     spoofedSend.await_resume();
-    auto observeSpoofedClose = readBeforeDeadline(spoofed, NNet::TClock::now() + 2s);
-    drive(observeSpoofedClose);
-    ssize_t spoofedRead = -1;
-    try {
-        spoofedRead = observeSpoofedClose.await_resume();
-    } catch (const std::system_error&) {
-        // A timeout means the mismatched RPC was not rejected by the server.
-    }
-    assert_int_equal(spoofedRead, 0);
-    assert_true(peerThree->PreVoteResponses.load(std::memory_order_relaxed) == 0);
+    const auto spoofedDeadline = NNet::TClock::now() + 2s;
+    while (identityResolutions.load(std::memory_order_relaxed) < 1 &&
+            NNet::TClock::now() < spoofedDeadline)
+        loop.Step();
+    assert_true(identityResolutions.load(std::memory_order_relaxed) == 1);
+    const auto spoofedResponseDeadline = NNet::TClock::now() + 2s;
+    while (peerThree->PreVoteResponses.load(std::memory_order_relaxed) == 0 &&
+            NNet::TClock::now() < spoofedResponseDeadline)
+        loop.Step();
+    const bool spoofedRequestWasRejected =
+        peerThree->PreVoteResponses.load(std::memory_order_relaxed) == 0;
+    spoofed.Close();
+    assert_true(spoofedRequestWasRejected);
 
-    // The same authenticated identity can send an RPC whose claimed source is
-    // bound to it; the response proves the frame reached the Raft worker.
-    NNet::TSocket authenticated(address, loop.Poller());
+    // The certificate maps to node 2, so a matching claimed source reaches Raft.
+    TTlsSocket authenticated(NNet::TSocket(address, loop.Poller()), *clientContext);
     auto authenticatedSend = sendRequest(authenticated, makePreVote(2));
     drive(authenticatedSend);
     authenticatedSend.await_resume();
@@ -502,6 +539,28 @@ void test_server_binds_peer_rpc_source_to_authenticated_identity(void**) {
         identityResolutions.load(std::memory_order_relaxed) == 2;
 
     authenticated.Close();
+
+    // A TLS client without a certificate must be disconnected before any Raft
+    // response is produced. TLS 1.3 may let the client finish its side of the
+    // handshake before the server processes the missing-certificate alert, so
+    // observe the server's close instead of assuming Connect itself fails.
+    auto unauthenticatedContext = std::make_shared<NNet::TSslContext>(NNet::TSslContext::Client());
+    TTlsSocket unauthenticated(NNet::TSocket(address, loop.Poller()), *unauthenticatedContext);
+    bool missingCertificateRejected = false;
+    auto unauthenticatedExchange = [&](TTlsSocket& socket, bool& rejected) -> NNet::TFuture<void> {
+        try {
+            co_await socket.Connect(NNet::TClock::now() + 3s);
+            co_await TMessageWriter(socket).Write(makePreVote(2));
+            char response = 0;
+            const auto read = co_await socket.ReadSome(&response, sizeof(response));
+            rejected = read == 0;
+        } catch (const std::exception&) {
+            rejected = true;
+        }
+    }(unauthenticated, missingCertificateRejected);
+    drive(unauthenticatedExchange);
+    unauthenticatedExchange.await_resume();
+
     bool stopped = false;
     StopServerAndMark(server, stopped);
     const auto stopDeadline = NNet::TClock::now() + 3s;
@@ -509,6 +568,8 @@ void test_server_binds_peer_rpc_source_to_authenticated_identity(void**) {
     assert_true(stopped);
     assert_true(matchingRequestReachedRaft);
     assert_true(resolverSawBothConnections);
+    assert_true(missingCertificateRejected);
+    assert_true(identityResolutions.load(std::memory_order_relaxed) == 2);
 }
 #endif
 
