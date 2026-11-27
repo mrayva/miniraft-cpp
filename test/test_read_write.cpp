@@ -401,6 +401,115 @@ void test_serialized_raft_task_keeps_poller_timers_running(void**) {
     assert_true(timerFired);
     assert_true(callbackStillBlocked);
 }
+
+void test_server_binds_peer_rpc_source_to_authenticated_identity(void**) {
+    using namespace std::chrono_literals;
+    struct TRecordingPeer final : INode {
+        std::atomic<uint32_t> PreVoteResponses{0};
+
+        void Send(TMessageHolder<TMessage> message) override {
+            if (message && message->Type == uint32_t(EMessageType::PRE_VOTE_RESPONSE))
+                PreVoteResponses.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        void Drain() override { }
+    };
+
+    NNet::TLoop<NNet::TPoll> loop;
+    loop.Poller().SetMaxDuration(1ms);
+    auto timeSource = std::make_shared<TTimeSource>();
+    auto peerTwo = std::make_shared<TRecordingPeer>();
+    auto peerThree = std::make_shared<TRecordingPeer>();
+    TNodeDict peers{{2, peerTwo}, {3, peerThree}};
+    auto raft = std::make_shared<TRaft>(std::make_shared<TState>(), 1, peers);
+
+    NNet::TSocket listener(NNet::TAddress{"127.0.0.1", 0}, loop.Poller());
+    listener.Bind();
+    listener.Listen();
+    sockaddr_in bound{};
+    socklen_t boundSize = sizeof(bound);
+    assert_int_equal(::getsockname(listener.Fd(), reinterpret_cast<sockaddr*>(&bound), &boundSize), 0);
+    const NNet::TAddress address(reinterpret_cast<sockaddr*>(&bound), boundSize);
+
+    std::atomic<uint32_t> identityResolutions{0};
+    auto resolver = [&](const NNet::TSocket&) -> std::optional<uint32_t> {
+        identityResolutions.fetch_add(1, std::memory_order_relaxed);
+        return uint32_t{2}; // Test transport credentials authenticate this connection as peer 2.
+    };
+    TRaftServer<NNet::TSocket> server(loop.Poller(), std::move(listener), raft,
+        std::make_shared<TDummyRsm>(), peers, timeSource,
+        TRequestProcessor::TAdmissionLimits{}, TOutboundQueueLimits{},
+        TInboundMessageBudgetLimits{}, resolver);
+    server.Serve();
+
+    const auto makePreVote = [](uint32_t claimedSource) {
+        auto request = NewHoldedMessage(
+            TMessageEx{.Src = claimedSource, .Dst = 1, .Term = 0, .Seqno = 1},
+            TPreVoteRequest{});
+        request->ProspectiveTerm = 1;
+        request->LastLogIndex = 0;
+        request->LastLogTerm = 0;
+        request->CandidateId = claimedSource;
+        request->Padding = 0;
+        return request;
+    };
+    const auto sendRequest = [](NNet::TSocket& socket,
+            TMessageHolder<TMessage> request) -> NNet::TFuture<void> {
+        co_await socket.Connect();
+        co_await TMessageWriter(socket).Write(std::move(request));
+    };
+    const auto readBeforeDeadline = [](NNet::TSocket& socket,
+            NNet::TTime deadline) -> NNet::TFuture<ssize_t> {
+        char byte = 0;
+        co_return co_await socket.ReadSome(&byte, 1, deadline);
+    };
+    const auto drive = [&](const auto& task, std::chrono::milliseconds timeout = 3s) {
+        const auto deadline = NNet::TClock::now() + timeout;
+        while (!task.done() && NNet::TClock::now() < deadline) loop.Step();
+        assert_true(task.done());
+    };
+
+    // The connection is authenticated as peer 2, so a valid RPC claiming peer
+    // 3 must be rejected before Raft routes it to peer 3's response endpoint.
+    NNet::TSocket spoofed(address, loop.Poller());
+    auto spoofedSend = sendRequest(spoofed, makePreVote(3));
+    drive(spoofedSend);
+    spoofedSend.await_resume();
+    auto observeSpoofedClose = readBeforeDeadline(spoofed, NNet::TClock::now() + 2s);
+    drive(observeSpoofedClose);
+    ssize_t spoofedRead = -1;
+    try {
+        spoofedRead = observeSpoofedClose.await_resume();
+    } catch (const std::system_error&) {
+        // A timeout means the mismatched RPC was not rejected by the server.
+    }
+    assert_int_equal(spoofedRead, 0);
+    assert_true(peerThree->PreVoteResponses.load(std::memory_order_relaxed) == 0);
+
+    // The same authenticated identity can send an RPC whose claimed source is
+    // bound to it; the response proves the frame reached the Raft worker.
+    NNet::TSocket authenticated(address, loop.Poller());
+    auto authenticatedSend = sendRequest(authenticated, makePreVote(2));
+    drive(authenticatedSend);
+    authenticatedSend.await_resume();
+    const auto responseDeadline = NNet::TClock::now() + 2s;
+    while (!peerTwo->PreVoteResponses.load(std::memory_order_relaxed) &&
+            NNet::TClock::now() < responseDeadline)
+        loop.Step();
+    const auto matchingRequestReachedRaft =
+        peerTwo->PreVoteResponses.load(std::memory_order_relaxed) == 1;
+    const auto resolverSawBothConnections =
+        identityResolutions.load(std::memory_order_relaxed) == 2;
+
+    authenticated.Close();
+    bool stopped = false;
+    StopServerAndMark(server, stopped);
+    const auto stopDeadline = NNet::TClock::now() + 3s;
+    while (!stopped && NNet::TClock::now() < stopDeadline) loop.Step();
+    assert_true(stopped);
+    assert_true(matchingRequestReachedRaft);
+    assert_true(resolverSawBothConnections);
+}
 #endif
 
 void test_node_send_queue_bounds_data_and_coalesces_raft_retries(void**) {
@@ -1597,6 +1706,7 @@ int main() {
         cmocka_unit_test(test_idempotent_client_times_out_and_retries_same_operation),
         cmocka_unit_test(test_server_poller_progresses_while_worker_callback_is_blocked),
         cmocka_unit_test(test_serialized_raft_task_keeps_poller_timers_running),
+        cmocka_unit_test(test_server_binds_peer_rpc_source_to_authenticated_identity),
         cmocka_unit_test(test_server_transitions_membership_and_installs_joint_snapshot_over_socket_transport),
         cmocka_unit_test(test_serving_server_retires_demoted_joint_voter_reader),
 #endif
