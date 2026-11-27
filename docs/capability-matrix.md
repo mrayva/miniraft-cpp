@@ -87,7 +87,9 @@ Durable-state tests stop a child process at each ordinary-publication and
 snapshot-install publication hook, and inject `RLIMIT_FSIZE` write errors during
 append and snapshot installation. `TDiskState` tests inject partial writes into
 compacted-log generation, snapshot-image generation, and metadata publication,
-and fail metadata rename after syncing its temporary image. Recovery checks that
-only manifest-selected state survives and incomplete files are reclaimed. These
-tests do not establish hardware power-loss behavior or cover every filesystem
-failure. They also do not authenticate peers or replace independent review.
+and fail metadata rename after syncing its temporary image. A post-rename
+directory-sync failure also verifies restart loads the fully published image
+after the directory path is restored. Recovery checks that only manifest-selected
+state survives and incomplete files are reclaimed. These tests do not establish
+hardware power-loss behavior or cover every filesystem failure. They also do not
+authenticate peers or replace independent review.
