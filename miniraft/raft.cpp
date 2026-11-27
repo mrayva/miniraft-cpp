@@ -996,6 +996,16 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
 
 } // namespace
 
+namespace {
+using ESnapshotTransferIoOperation = TRaft::TLogLimits::ESnapshotTransferIoOperation;
+
+bool FailSnapshotTransferIo(
+        const std::function<bool(ESnapshotTransferIoOperation)>& hook,
+        ESnapshotTransferIoOperation operation) {
+    return hook && hook(operation);
+}
+} // namespace
+
 #ifdef __linux__
 namespace {
 struct TIncomingSnapshotStageRecord {
@@ -1056,17 +1066,10 @@ bool SyncStage(int fd) {
 }
 
 using ESnapshotTransferStage = TRaft::TLogLimits::ESnapshotTransferStage;
-using ESnapshotTransferIoOperation = TRaft::TLogLimits::ESnapshotTransferIoOperation;
 
 void NotifySnapshotTransferStage(
         const std::function<void(ESnapshotTransferStage)>& hook, ESnapshotTransferStage stage) {
     if (hook) hook(stage);
-}
-
-bool FailSnapshotTransferIo(
-        const std::function<bool(ESnapshotTransferIoOperation)>& hook,
-        ESnapshotTransferIoOperation operation) {
-    return hook && hook(operation);
 }
 
 bool WriteIncomingSnapshotStageRecord(const std::string& directory, uint32_t id,
@@ -2329,9 +2332,9 @@ void TRaft::AccountDormantSnapshotStage(ITimeSource::Time now) noexcept {
 }
 
 bool TRaft::PersistIncomingSnapshot() noexcept {
-#ifdef __linux__
     if (!IncomingSnapshot || !IncomingSnapshot->DurableStaging || !IncomingSnapshot->Transfer)
         return true;
+#ifdef __linux__
     try {
         const auto& incoming = *IncomingSnapshot;
         const auto& transfer = *incoming.Transfer;
@@ -4392,6 +4395,13 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     const bool supportsSourceBackedInstall = streamingInstallApplication ||
         dynamic_cast<IIdempotentRsm*>(application.get());
     const bool separateManifestParts = transfer.has_value();
+    const bool useFileBackedStaging = [&] {
+#ifdef __linux__
+        return !LogLimits.SnapshotStagingDirectory.empty();
+#else
+        return false;
+#endif
+    }();
     const auto incomingTransfer = separateManifestParts
         ? transfer : std::optional<TSnapshotTransferIdentity>{};
     const bool same = IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
@@ -4434,7 +4444,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         std::shared_ptr<TIncomingSnapshotFile> file;
         try {
             if (separateManifestParts) {
-                if (LogLimits.SnapshotStagingDirectory.empty()) {
+                if (!useFileBackedStaging) {
                     heapReservation = SnapshotInstallBudget->TryReserveLease(request->TotalBytes);
                     if (!heapReservation) { reply(false, false, 0); return; }
                     payload.resize(size_t(transfer->PayloadBytes));
@@ -4461,7 +4471,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             } else {
                 reservation = receiveBudget->TryReserve(request->TotalBytes);
                 if (!reservation) { reply(false, false, 0); return; }
-                if (!LogLimits.SnapshotStagingDirectory.empty()) {
+                if (useFileBackedStaging) {
                     file = std::make_shared<TIncomingSnapshotFile>(
                         LogLimits.SnapshotStagingDirectory, size_t(request->TotalBytes));
                 } else {

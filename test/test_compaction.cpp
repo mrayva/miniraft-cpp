@@ -215,6 +215,7 @@ struct TStreamingWriterInstallApplication : TStreamingWriterSnapshotApplication,
         return std::make_unique<TNoopInstallation>();
     }
 };
+#ifdef __linux__
 struct TApplicationGenerationCatalog {
     std::filesystem::path Directory;
     std::unordered_map<std::string, std::string> Images;
@@ -318,6 +319,7 @@ struct TGenerationAwareSnapshotApplication : TStreamingWriterInstallApplication,
         Catalog->Events.push_back("restore");
     }
 };
+#endif
 struct TRejectingSnapshotApplication : TApplication {
     void ValidateSnapshot(std::string_view, uint64_t) const override {
         throw std::runtime_error("Injected application snapshot validation failure");
@@ -1800,9 +1802,10 @@ void test_snapshot_materialization_reserves_temporary_heap_bytes(void**) {
     THeapBudgetObservingSnapshotApplication accepted;
     accepted.Budget = budget;
     auto installation = PrepareApplicationSnapshotInstallation(accepted, snapshot);
-    assert_false(bool(installation));
+    assert_true(bool(installation));
     assert_int_equal(accepted.ValidationHeapBytes, 80);
-    assert_int_equal(budget->UsedBytes(), 40);
+    assert_int_equal(budget->UsedBytes(), 80);
+    assert_false(bool(budget->TryReserve(1)));
     InstallApplicationSnapshot(accepted, snapshot, std::move(installation));
     assert_int_equal(accepted.LoadHeapBytes, 80);
     assert_int_equal(accepted.LastAppliedIndex, snapshot.Index);
@@ -2185,6 +2188,7 @@ void test_snapshot_size_capability_respects_receiver_budgets(void**) {
     assert_int_equal(snapshotResponses.back()->NextOffset, 0);
     assert_int_equal(budget->UsedBytes(), 0);
 
+#ifdef __linux__
     constexpr uint64_t stagingLimit = 16 * 1024 * 1024;
     auto stagedState = std::make_shared<TState>();
     stagedState->BindVoters({1, 2});
@@ -2210,6 +2214,7 @@ void test_snapshot_size_capability_respects_receiver_budgets(void**) {
     assert_non_null(stagedAppendResponse);
     assert_int_equal(TAppendEntriesResponse::DecodeSnapshotMaxBytesOrLegacy(
         stagedAppendResponse->Padding, TSnapshot::LegacyMaxBytes), stagingLimit);
+#endif
 
     constexpr uint64_t configuredLimit = 32 * 1024;
     auto configuredState = std::make_shared<TState>();

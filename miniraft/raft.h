@@ -139,6 +139,27 @@ struct IRsm {
     uint64_t LastAppliedIndex = 0;
 };
 
+// Keeps a validated source-backed image alive when an RSM does not provide a
+// staged installer. The retained lease prevents a second allocation and
+// budget reservation after Raft has published the snapshot.
+class TMaterializedSnapshotInstallation final : public IStagedSnapshotInstallation {
+public:
+    TMaterializedSnapshotInstallation(IRsm& application, std::string bytes, uint64_t index,
+            std::shared_ptr<TSnapshotInstallBudget::TReservation> reservation)
+        : Application(application)
+        , Bytes(std::move(bytes))
+        , Index(index)
+        , Reservation(std::move(reservation)) { }
+
+    void Install() override { Application.LoadSnapshot(Bytes, Index); }
+
+private:
+    IRsm& Application;
+    std::string Bytes;
+    uint64_t Index;
+    std::shared_ptr<TSnapshotInstallBudget::TReservation> Reservation;
+};
+
 // Optional durable application snapshot-generation lifecycle. Preparation
 // validates/stages an immutable generation without changing active state.
 // Publish must make the generation durable before Raft publishes a reference;
@@ -389,8 +410,11 @@ inline std::unique_ptr<IStagedSnapshotInstallation> PrepareApplicationSnapshotIn
             if (!materializationReservation)
                 throw std::runtime_error("Snapshot materialization exceeds the available heap budget");
         }
-        const auto bytes = snapshot.MaterializeData();
-        return PrepareApplicationSnapshotInstallation(rsm, bytes, snapshot.Index);
+        auto bytes = snapshot.MaterializeData();
+        auto installation = PrepareApplicationSnapshotInstallation(rsm, bytes, snapshot.Index);
+        if (installation) return installation;
+        return std::make_unique<TMaterializedSnapshotInstallation>(rsm,
+            std::move(bytes), snapshot.Index, std::move(materializationReservation));
     }
     return PrepareApplicationSnapshotInstallation(rsm, snapshot.Data, snapshot.Index);
 }
