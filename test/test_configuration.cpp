@@ -3329,6 +3329,10 @@ void test_live_membership_fault_scenarios_transfer_finalize_and_restart(void**) 
 #ifdef __linux__
     run_live_membership_failure_scenario(0, {4, 5, 6}, {5, 6});
     run_live_membership_failure_scenario(1, {2, 4, 6}, {4, 6});
+    // Keep a majority of the new disjoint voter set reachable while the old
+    // set has only its leader. Joint commitment must still wait for the old
+    // majority before the transition can take effect.
+    run_live_membership_failure_scenario(2, {4, 5, 6}, {2, 3});
 #endif
 }
 void test_live_disjoint_joint_entry_waits_for_old_majority_over_network(void**) {
