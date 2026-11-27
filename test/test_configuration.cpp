@@ -3749,6 +3749,10 @@ void test_old_side_leader_can_transfer_after_joint_snapshot_with_pending_stable_
     target->Process(start + std::chrono::seconds(1) + std::chrono::milliseconds(2), *timeoutNow);
     assert_true(target->CurrentStateName() == EState::CANDIDATE);
     assert_int_equal(targetState->CurrentTerm, 6);
+    // The former leader has transferred and now crashes before the new leader
+    // commits the inherited stable successor.
+    leader.reset();
+    leaderState.reset();
 
     auto grantTargetVote = [&](uint32_t voter, const std::shared_ptr<TEndpoint>& endpoint) {
         const auto request = std::find_if(endpoint->Messages.rbegin(), endpoint->Messages.rend(), [](const auto& item) {
@@ -3796,6 +3800,36 @@ void test_old_side_leader_can_transfer_after_joint_snapshot_with_pending_stable_
     assert_int_equal(targetState->CommitIndex, targetState->LastLogIndex);
     assert_true(targetState->CommitIndex > jointSnapshot.Index);
     assert_true(target->GetVoterIds() == joint.NewVoters);
+
+    // Restart the crashed old-side voter from its durable joint snapshot and
+    // pending stable entry. Catch it up from the new leader, including the
+    // commit metadata that finalizes the stable voter set.
+    auto recoveredState = std::make_shared<TDurableState>(name, 3);
+    assert_int_equal(recoveredState->CommitIndex, jointSnapshot.Index);
+    assert_int_equal(recoveredState->LastLogIndex, stable.PreviousIndex + 2);
+    auto recovered = std::make_shared<TRaft>(recoveredState, 3, leaderPeers);
+    assert_true(recovered->GetConfigurationState().Committed.IsJoint());
+    auto recoveryNow = start + std::chrono::seconds(2);
+    for (unsigned attempt = 0; attempt < 8 && recoveredState->CommitIndex < targetState->CommitIndex; ++attempt) {
+        recoveryNow += std::chrono::seconds(1);
+        target->ProcessTimeout(recoveryNow);
+        const auto append = std::find_if(targetToLeader->Messages.rbegin(), targetToLeader->Messages.rend(),
+            [](const auto& item) { return item->Type == uint32_t(EMessageType::APPEND_ENTRIES_REQUEST); });
+        assert_true(append != targetToLeader->Messages.rend());
+        const auto seqno = append->Cast<TMessageEx>()->Seqno;
+        recovered->Process(recoveryNow, *append);
+        const auto response = std::find_if(toTarget->Messages.rbegin(), toTarget->Messages.rend(),
+            [&](auto& item) {
+                return item->Type == uint32_t(EMessageType::APPEND_ENTRIES_RESPONSE) &&
+                    item.template Cast<TMessageEx>()->Seqno == seqno;
+            });
+        assert_true(response != toTarget->Messages.rend());
+        target->Process(recoveryNow, *response);
+    }
+    assert_true(recoveredState->CommitIndex >= targetState->CommitIndex);
+    assert_true(recovered->GetVoterIds() == joint.NewVoters);
+    assert_false(recovered->GetConfigurationState().Committed.IsJoint());
+    assert_true(recoveredState->GetBoundVoters() == originalVoters);
     std::error_code ignored; std::filesystem::remove_all(dir, ignored);
 #endif
 }
