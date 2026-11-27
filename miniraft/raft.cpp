@@ -12,6 +12,7 @@
 #ifdef __linux__
 #include <cerrno>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -74,6 +75,57 @@ uint64_t AllocateForwardingSession() {
     }
     throw std::overflow_error("Forwarding session IDs exhausted");
 }
+
+#ifdef __linux__
+struct TSnapshotStagingNamespaceLease {
+    explicit TSnapshotStagingNamespaceLease(int fd) : Fd(fd) { }
+    ~TSnapshotStagingNamespaceLease() { if (Fd >= 0) close(Fd); }
+    TSnapshotStagingNamespaceLease(const TSnapshotStagingNamespaceLease&) = delete;
+    TSnapshotStagingNamespaceLease& operator=(const TSnapshotStagingNamespaceLease&) = delete;
+    int Fd;
+};
+
+std::shared_ptr<void> AcquireSnapshotStagingNamespace(
+        const std::string& directory, std::string_view nameSpace, uint32_t nodeId) {
+    const int directoryFd = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directoryFd < 0)
+        throw std::system_error(errno, std::generic_category(), "open snapshot staging directory");
+
+    const auto lockName = "miniraft-incoming-v2-" + std::string(nameSpace) + "-" +
+        std::to_string(nodeId) + ".lock";
+    const int lockFd = openat(directoryFd, lockName.c_str(),
+        O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
+    const int openError = errno;
+    close(directoryFd);
+    if (lockFd < 0)
+        throw std::system_error(openError, std::generic_category(), "open snapshot staging namespace lock");
+
+    struct stat info{};
+    if (fstat(lockFd, &info) != 0) {
+        const int error = errno;
+        close(lockFd);
+        throw std::system_error(error, std::generic_category(), "stat snapshot staging namespace lock");
+    }
+    if (!S_ISREG(info.st_mode) || info.st_uid != geteuid() || info.st_nlink != 1 ||
+        (info.st_mode & 0077)) {
+        close(lockFd);
+        throw std::runtime_error("Invalid snapshot staging namespace lock file");
+    }
+    if (flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
+        const int error = errno;
+        close(lockFd);
+        if (error == EWOULDBLOCK || error == EAGAIN)
+            throw std::invalid_argument("Snapshot staging namespace is already in use for this node");
+        throw std::system_error(error, std::generic_category(), "lock snapshot staging namespace");
+    }
+    try {
+        return std::make_shared<TSnapshotStagingNamespaceLease>(lockFd);
+    } catch (...) {
+        close(lockFd);
+        throw;
+    }
+}
+#endif
 
 TMessageHolder<TIdempotentCommandResponse> MakeIdempotentResponse(
         const TIdempotentOperationIdentity& identity, uint32_t cookie, uint64_t index,
@@ -4439,7 +4491,18 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         }
         bool restored = false;
 #ifdef __linux__
-        if (!IncomingSnapshot && separateManifestParts && SupportsDurableSnapshotTransferResume()) {
+        const bool durableStaging = separateManifestParts && SupportsDurableSnapshotTransferResume();
+        if (durableStaging && !SnapshotStagingNamespaceLease) {
+            try {
+                SnapshotStagingNamespaceLease = AcquireSnapshotStagingNamespace(
+                    LogLimits.SnapshotStagingDirectory,
+                    LogLimits.SnapshotStagingNamespace, Id);
+            } catch (...) {
+                reply(false, false, 0);
+                return;
+            }
+        }
+        if (!IncomingSnapshot && durableStaging) {
             const auto status = RestoreIncomingSnapshot(now, *request.Mes, *transfer,
                 jointElectionFenceLeader);
             if (status == EIncomingSnapshotRestore::OverBudget) {

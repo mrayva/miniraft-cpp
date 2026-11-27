@@ -166,7 +166,14 @@ def main():
             # Node 3 has no periodic snapshotting: its compacted image necessarily
             # came from the InstallSnapshot RPC, not a local checkpoint timer.
             assert not (directories[2] / "state.snapshot.3").exists()
-            assert not any(staging_dir.iterdir()), "temporary snapshot files must stay anonymous"
+            if learner_mode:
+                # Durable manifest staging leaves its lock sentinel for safe
+                # reuse after restart; completed transfer files must be gone.
+                assert list(staging_dir.iterdir()) == [
+                    staging_dir / "miniraft-incoming-v2-smoke-learner-3.lock"
+                ]
+            else:
+                assert not any(staging_dir.iterdir()), "temporary snapshot files must stay anonymous"
             wait_for(lambda: call(0, b"tail", b"after install")[0] > last[0], 15)
             wait_for(lambda: call(2, b"tail")[1] == b"after install", 15)
             processes[2].terminate()

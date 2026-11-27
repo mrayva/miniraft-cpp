@@ -182,6 +182,12 @@ mapping for duplicate, metadata and checksum checks. Staged files reserve their
 declared sizes against a separate 256 MiB process-wide quota. Older unnamespaced
 cursor and payload files are ignored; remove them after all older binaries that
 use the directory have stopped.
+The first durable manifest transfer creates a persistent lock file for the
+group namespace and local node ID. Raft holds an exclusive lock until that
+instance is destroyed, even after the transfer files are cleaned up. Keep the
+lock files in place and do not run concurrent instances with the same group
+namespace and node ID against one directory; separate group namespaces can
+share a directory.
 Embedders can share a custom quota through `TLogLimits::SnapshotStagingBudget`.
 The staging quota lease covers an in-flight or persisted dormant assembly. On
 startup, Raft reacquires that lease before restoring the saved cursor; if the

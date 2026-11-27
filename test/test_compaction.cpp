@@ -4774,6 +4774,66 @@ void test_snapshot_staging_namespace_validation(void**) {
     rejects("", "group-a");
 }
 
+void test_snapshot_staging_namespace_rejects_concurrent_same_node_reuse(void**) {
+    TFiles files;
+    TKv source;
+    const TSnapshot snapshot{1, 1, {1, 2}, source.SaveSnapshot()};
+    const auto manifest = PrepareSnapshotTransferManifest(snapshot);
+    const auto metadataChunk = [&] (uint64_t sequence) {
+        return RangeChunk(snapshot, manifest, TInstallSnapshotRangeRequest::EPhase::Metadata,
+            0, std::string_view(manifest.Metadata).substr(0, 8), sequence);
+    };
+    auto budget = std::make_shared<TSnapshotInstallBudget>();
+    auto makeLimits = [&](std::string nameSpace) {
+        TRaft::TLogLimits limits;
+        limits.SnapshotInstallBudget = std::make_shared<TSnapshotInstallBudget>();
+        limits.SnapshotStagingDirectory = files.Directory.string();
+        limits.SnapshotStagingNamespace = std::move(nameSpace);
+        limits.SnapshotStagingBudget = budget;
+        return limits;
+    };
+    auto deliver = [&](std::string nameSpace, const std::shared_ptr<TState>& state,
+            uint64_t sequence, TMessageHolder<TInstallSnapshotResponse>& response) {
+        auto peer = std::make_shared<TEndpoint>([&](auto message) {
+            if (auto reply = message.template Maybe<TInstallSnapshotResponse>())
+                response = reply.Cast();
+        });
+        TNodeDict peers{{1, peer}};
+        auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{},
+            makeLimits(std::move(nameSpace)));
+        auto app = std::make_shared<TApplication>();
+        TRequestProcessor processor(raft, app, peers);
+        raft->Process({}, metadataChunk(sequence));
+        return raft;
+    };
+
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 3;
+    TMessageHolder<TInstallSnapshotResponse> firstResponse;
+    auto first = deliver("shared", state, 1, firstResponse);
+    assert_true(firstResponse->Success);
+    assert_false(firstResponse->Installed);
+
+    TMessageHolder<TInstallSnapshotResponse> conflictResponse;
+    auto conflicting = deliver("shared", std::make_shared<TState>(), 2, conflictResponse);
+    assert_non_null(conflictResponse);
+    assert_false(conflictResponse->Success);
+    conflicting.reset();
+
+    TMessageHolder<TInstallSnapshotResponse> otherGroupResponse;
+    auto otherGroup = deliver("other", std::make_shared<TState>(), 3, otherGroupResponse);
+    assert_true(otherGroupResponse->Success);
+    otherGroup.reset();
+    first.reset();
+
+    TMessageHolder<TInstallSnapshotResponse> restartResponse;
+    auto restarted = deliver("shared", state, 4, restartResponse);
+    assert_true(restartResponse->Success);
+    assert_false(restartResponse->Installed);
+    assert_int_equal(restartResponse->NextOffset, 8);
+    restarted.reset();
+}
+
 void test_file_staged_snapshot_install_accepts_every_small_fixed_chunk_size(void**) {
     TFiles files;
     auto budget = std::make_shared<TSnapshotInstallBudget>();
@@ -4987,7 +5047,9 @@ void test_manifest_snapshot_transfer_resumes_after_receiver_restart(void**) {
     assert_int_equal(state->SnapshotIndex, snapshot.Index);
     assert_int_equal(app->Loads, 1);
     assert_true(Read(*app, "restart") == std::string(60000, 'r'));
-    assert_true(std::filesystem::is_empty(files.Directory));
+    assert_true(std::filesystem::exists(files.Directory / "miniraft-incoming-v2-resume-test-2.lock"));
+    assert_false(std::filesystem::exists(files.Directory / "miniraft-incoming-v2-resume-test-2.state"));
+    assert_false(std::filesystem::exists(files.Directory / "miniraft-incoming-v2-resume-test-2.payload"));
 }
 
 void test_manifest_snapshot_restart_rejects_cursor_bound_to_another_leader(void**) {
@@ -5102,7 +5164,9 @@ void test_durable_manifest_stage_is_accounted_and_expires_after_receiver_restart
     assert_true(std::filesystem::exists(files.Directory / "miniraft-incoming-v2-expiry-test-2.state"));
     raft->ProcessTimeout(start + TTimeout::SnapshotTransferIdle);
     assert_int_equal(diskBudget->UsedBytes(), 0);
-    assert_true(std::filesystem::is_empty(files.Directory));
+    assert_true(std::filesystem::exists(files.Directory / "miniraft-incoming-v2-expiry-test-2.lock"));
+    assert_false(std::filesystem::exists(files.Directory / "miniraft-incoming-v2-expiry-test-2.state"));
+    assert_false(std::filesystem::exists(files.Directory / "miniraft-incoming-v2-expiry-test-2.payload"));
 }
 
 #ifdef __linux__
@@ -5966,6 +6030,7 @@ int main() {
         cmocka_unit_test(test_memory_snapshot_boundary_retains_matching_suffix_and_replaces_conflict),
 #ifdef __linux__
         cmocka_unit_test(test_snapshot_staging_namespace_validation),
+        cmocka_unit_test(test_snapshot_staging_namespace_rejects_concurrent_same_node_reuse),
         cmocka_unit_test(test_file_staged_snapshot_install_accepts_every_small_fixed_chunk_size),
         cmocka_unit_test(test_snapshot_staging_namespaces_isolate_groups_sharing_directory),
         cmocka_unit_test(test_manifest_snapshot_transfer_resumes_after_receiver_restart),

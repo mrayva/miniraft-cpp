@@ -676,12 +676,15 @@ public:
         // snapshot images, and negotiated snapshot payloads in files in this
         // directory. Partial negotiated transfers are synced with an atomic
         // cursor record so they can resume after receiver restart. Use a stable,
-        // unique namespace for each Raft group sharing this directory. Without
-        // a directory, negotiated transfers use separately budgeted heap buffers.
+        // unique namespace for each Raft group sharing this directory. Durable
+        // manifest staging takes an exclusive per-node lock on first use; the
+        // lock file remains after transfer cleanup for safe restart/reacquisition.
+        // Without a directory, negotiated transfers use separately budgeted heap buffers.
         std::string SnapshotStagingDirectory;
         // Stable group identity used to isolate resumable transfer files. It is
         // required with SnapshotStagingDirectory and accepts 1-64 ASCII letters,
-        // digits, underscores, or hyphens.
+        // digits, underscores, or hyphens. Do not run concurrent Raft instances
+        // with the same group namespace and local node ID against one directory.
         std::string SnapshotStagingNamespace;
         // Share this separately from SnapshotInstallBudget to limit staged
         // file bytes. Defaults to a separate 256 MiB process-wide budget.
@@ -931,6 +934,9 @@ private:
     std::shared_ptr<IState> State;
     TLogLimits LogLimits;
     std::shared_ptr<TSnapshotInstallBudget> SnapshotInstallBudget;
+    // Keeps this node's durable staging files exclusive across Raft instances
+    // and processes that share a staging directory.
+    std::shared_ptr<void> SnapshotStagingNamespaceLease;
     struct TUncommittedLogEntry { uint64_t Index; uint32_t Bytes; };
     std::deque<TUncommittedLogEntry> UncommittedLog;
     uint64_t UncommittedLogBytes = 0;
