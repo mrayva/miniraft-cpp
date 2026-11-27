@@ -405,7 +405,8 @@ static void ReloadPeerConfig(const std::string& path, uint32_t localId,
 void usage(const char* prog) {
     std::cerr << prog << " --client|--server --id myid "
         "(--node ip:port:id [--node ip:port:id ...] [--learner id ...] | --peer-config path) "
-        "[--persist|--durable] [--snapshots entries] [--snapshot-staging-dir path] "
+        "[--persist|--durable] [--snapshots entries] "
+        "[--snapshot-staging-dir path --snapshot-staging-namespace group] "
         "[--idempotent [--client-state path]] [--stale] [--consistent]\n";
     exit(0);
 }
@@ -460,6 +461,11 @@ int main(int argc, char** argv) {
                 std::cerr << "--snapshot-staging-dir requires one directory\n"; return 1;
             }
             logLimits.SnapshotStagingDirectory = argv[++i];
+        } else if (!strcmp(argv[i], "--snapshot-staging-namespace")) {
+            if (!logLimits.SnapshotStagingNamespace.empty() || i + 1 >= argc || !argv[i + 1][0]) {
+                std::cerr << "--snapshot-staging-namespace requires one stable group name\n"; return 1;
+            }
+            logLimits.SnapshotStagingNamespace = argv[++i];
         } else if (!strcmp(argv[i], "--snapshots")) {
             if (i + 1 >= argc) { std::cerr << "--snapshots requires a positive entry interval\n"; return 1; }
             const std::string_view value(argv[++i]);
@@ -502,13 +508,16 @@ int main(int argc, char** argv) {
     if (!logLimits.SnapshotStagingDirectory.empty()) {
 #ifdef __linux__
         std::error_code error;
-        if (!server || !durable || !std::filesystem::is_directory(logLimits.SnapshotStagingDirectory, error)) {
-            std::cerr << "--snapshot-staging-dir requires --server --durable and an existing directory\n";
+        if (logLimits.SnapshotStagingNamespace.empty() || !server || !durable ||
+            !std::filesystem::is_directory(logLimits.SnapshotStagingDirectory, error)) {
+            std::cerr << "--snapshot-staging-dir requires --server --durable, a group namespace, and an existing directory\n";
             return 1;
         }
 #else
         std::cerr << "--snapshot-staging-dir requires Linux\n"; return 1;
 #endif
+    } else if (!logLimits.SnapshotStagingNamespace.empty()) {
+        std::cerr << "--snapshot-staging-namespace requires --snapshot-staging-dir\n"; return 1;
     }
     if (!learners.empty() && (!server || !durable)) {
         std::cerr << "--learner requires --server --durable\n"; return 1;

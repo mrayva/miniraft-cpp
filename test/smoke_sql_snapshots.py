@@ -24,7 +24,8 @@ def main():
         with log_path.open("w+") as log:
             def start(periodic):
                 extra = ["--snapshots", "1"] if periodic else []
-                extra += ["--snapshot-staging-dir", str(staging)]
+                extra += ["--snapshot-staging-dir", str(staging),
+                          "--snapshot-staging-namespace", "smoke-sql"]
                 return subprocess.Popen([*args, *extra], cwd=root, stdout=log, stderr=log, preexec_fn=no_core)
 
             def stop(child):

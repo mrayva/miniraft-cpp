@@ -46,7 +46,8 @@ def main():
             if learner_mode:
                 args += ["--peer-config", str(learner_config if use_role else voter_config)]
                 if index == 2:
-                    args += ["--snapshot-staging-dir", str(staging_dir)]
+                    args += ["--snapshot-staging-dir", str(staging_dir),
+                             "--snapshot-staging-namespace", "smoke-learner"]
             else:
                 for endpoint in endpoints:
                     args += ["--node", endpoint]

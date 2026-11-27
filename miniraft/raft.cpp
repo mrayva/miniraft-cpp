@@ -1019,10 +1019,11 @@ struct TIncomingSnapshotStageRecord {
 
 constexpr size_t IncomingSnapshotStageHeaderBytes = 92;
 
-std::string IncomingSnapshotStagePath(const std::string& directory, uint32_t id,
-        std::string_view suffix) {
+std::string IncomingSnapshotStagePath(const std::string& directory, std::string_view nameSpace,
+        uint32_t id, std::string_view suffix) {
     return directory + (directory.ends_with('/') ? "" : "/") +
-        "miniraft-incoming-" + std::to_string(id) + std::string(suffix);
+        "miniraft-incoming-v2-" + std::string(nameSpace) + "-" +
+        std::to_string(id) + std::string(suffix);
 }
 
 void AppendStageU32(std::string& bytes, uint32_t value) {
@@ -1072,7 +1073,8 @@ void NotifySnapshotTransferStage(
     if (hook) hook(stage);
 }
 
-bool WriteIncomingSnapshotStageRecord(const std::string& directory, uint32_t id,
+bool WriteIncomingSnapshotStageRecord(const std::string& directory, std::string_view nameSpace,
+        uint32_t id,
         const TIncomingSnapshotStageRecord& record,
         const std::function<void(ESnapshotTransferStage)>& hook,
         const std::function<bool(ESnapshotTransferIoOperation)>& failIo) {
@@ -1095,8 +1097,8 @@ bool WriteIncomingSnapshotStageRecord(const std::string& directory, uint32_t id,
     AppendStageU32(bytes, record.JointElectionFenceLeader ? 1u : 0u);
     AppendStageU64(bytes, record.MetadataPrefixBytes);
 
-    const auto statePath = IncomingSnapshotStagePath(directory, id, ".state");
-    const auto tempPath = IncomingSnapshotStagePath(directory, id, ".state.tmp");
+    const auto statePath = IncomingSnapshotStagePath(directory, nameSpace, id, ".state");
+    const auto tempPath = IncomingSnapshotStagePath(directory, nameSpace, id, ".state.tmp");
     if (FailSnapshotTransferIo(failIo, ESnapshotTransferIoOperation::CursorTempCreate))
         return false;
     const auto tempFd = open(tempPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC |
@@ -1144,8 +1146,8 @@ bool WriteIncomingSnapshotStageRecord(const std::string& directory, uint32_t id,
 }
 
 std::optional<TIncomingSnapshotStageRecord> ReadIncomingSnapshotStageRecord(
-        const std::string& directory, uint32_t id) {
-    const auto path = IncomingSnapshotStagePath(directory, id, ".state");
+        const std::string& directory, std::string_view nameSpace, uint32_t id) {
+    const auto path = IncomingSnapshotStagePath(directory, nameSpace, id, ".state");
     const auto fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) return {};
     struct TFdGuard {
@@ -1197,10 +1199,10 @@ std::optional<TIncomingSnapshotStageRecord> ReadIncomingSnapshotStageRecord(
     return record;
 }
 
-bool ReadIncomingSnapshotMetadataPrefix(const std::string& directory, uint32_t id,
-        std::span<char> destination) {
+bool ReadIncomingSnapshotMetadataPrefix(const std::string& directory, std::string_view nameSpace,
+        uint32_t id, std::span<char> destination) {
     if (destination.empty()) return true;
-    const auto path = IncomingSnapshotStagePath(directory, id, ".state");
+    const auto path = IncomingSnapshotStagePath(directory, nameSpace, id, ".state");
     const auto fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) return false;
     struct TFdGuard {
@@ -1222,9 +1224,10 @@ bool ReadIncomingSnapshotMetadataPrefix(const std::string& directory, uint32_t i
     return true;
 }
 
-bool IncomingSnapshotPayloadHasSize(const std::string& directory, uint32_t id, uint64_t size) {
+bool IncomingSnapshotPayloadHasSize(const std::string& directory, std::string_view nameSpace,
+        uint32_t id, uint64_t size) {
     if (!size) return true;
-    const auto path = IncomingSnapshotStagePath(directory, id, ".payload");
+    const auto path = IncomingSnapshotStagePath(directory, nameSpace, id, ".payload");
     const auto fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) return false;
     struct TFdGuard {
@@ -1236,9 +1239,10 @@ bool IncomingSnapshotPayloadHasSize(const std::string& directory, uint32_t id, u
         info.st_size >= 0 && uint64_t(info.st_size) == size;
 }
 
-void RemoveIncomingSnapshotStage(const std::string& directory, uint32_t id) noexcept {
+void RemoveIncomingSnapshotStage(const std::string& directory, std::string_view nameSpace,
+        uint32_t id) noexcept {
     for (const auto suffix : {".state.tmp", ".state", ".payload"})
-        (void)unlink(IncomingSnapshotStagePath(directory, id, suffix).c_str());
+        (void)unlink(IncomingSnapshotStagePath(directory, nameSpace, id, suffix).c_str());
     const auto fd = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd >= 0) {
         (void)SyncStage(fd);
@@ -1566,12 +1570,24 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
         throw std::invalid_argument("Snapshot file staging requires Linux");
 #endif
     if (LogLimits.SnapshotStagingDirectory.empty()) {
+        if (!LogLimits.SnapshotStagingNamespace.empty())
+            throw std::invalid_argument("Snapshot staging namespace requires a staging directory");
         if (LogLimits.SnapshotStagingBudget)
             throw std::invalid_argument("Snapshot staging budget requires a staging directory");
-    } else if (!LogLimits.SnapshotStagingBudget) {
-        LogLimits.SnapshotStagingBudget = TSnapshotInstallBudget::DefaultStagingBudget();
-    } else if (LogLimits.SnapshotStagingBudget == SnapshotInstallBudget) {
-        throw std::invalid_argument("Snapshot staging and heap budgets must be separate");
+    } else {
+        const auto& nameSpace = LogLimits.SnapshotStagingNamespace;
+        const bool safeNamespace = !nameSpace.empty() && nameSpace.size() <= 64 &&
+            std::all_of(nameSpace.begin(), nameSpace.end(), [](unsigned char c) {
+                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '_' || c == '-';
+            });
+        if (!safeNamespace)
+            throw std::invalid_argument("Snapshot staging requires a stable 1-64 character namespace");
+        if (!LogLimits.SnapshotStagingBudget) {
+            LogLimits.SnapshotStagingBudget = TSnapshotInstallBudget::DefaultStagingBudget();
+        } else if (LogLimits.SnapshotStagingBudget == SnapshotInstallBudget) {
+            throw std::invalid_argument("Snapshot staging and heap budgets must be separate");
+        }
     }
     if (!LogLimits.MaxSnapshotImageBytes ||
         LogLimits.MaxSnapshotImageBytes > TSnapshot::MaxStreamedBytes)
@@ -2284,7 +2300,8 @@ bool TRaft::SupportsDurableSnapshotTransferResume() const noexcept {
 void TRaft::DiscardIncomingSnapshot() noexcept {
 #ifdef __linux__
     if (!LogLimits.SnapshotStagingDirectory.empty())
-        RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+        RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory,
+            LogLimits.SnapshotStagingNamespace, Id);
 #endif
     IncomingSnapshot.reset();
     DurableStageLastProgress.reset();
@@ -2297,12 +2314,15 @@ void TRaft::AccountDormantSnapshotStage(ITimeSource::Time now) noexcept {
     if (IncomingSnapshot || DurableStageLastProgress ||
         !SupportsDurableSnapshotTransferResume()) return;
     try {
-        auto record = ReadIncomingSnapshotStageRecord(LogLimits.SnapshotStagingDirectory, Id);
+        auto record = ReadIncomingSnapshotStageRecord(LogLimits.SnapshotStagingDirectory,
+            LogLimits.SnapshotStagingNamespace, Id);
         if (!record || record->ReceiverId != Id || !record->ReceivedBytes ||
             record->ReceivedBytes >= record->Total ||
-            !IncomingSnapshotPayloadHasSize(LogLimits.SnapshotStagingDirectory, Id,
+            !IncomingSnapshotPayloadHasSize(LogLimits.SnapshotStagingDirectory,
+                LogLimits.SnapshotStagingNamespace, Id,
                 record->PayloadBytes)) {
-            RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+            RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory,
+                LogLimits.SnapshotStagingNamespace, Id);
             return;
         }
         const auto& receiveBudget = LogLimits.SnapshotStagingBudget
@@ -2313,7 +2333,8 @@ void TRaft::AccountDormantSnapshotStage(ITimeSource::Time now) noexcept {
             if (!reservation) {
                 // Do not retain an unaccounted persistent payload when this
                 // Raft instance cannot reacquire its staging quota.
-                RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+                RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory,
+                    LogLimits.SnapshotStagingNamespace, Id);
                 return;
             }
         }
@@ -2321,7 +2342,8 @@ void TRaft::AccountDormantSnapshotStage(ITimeSource::Time now) noexcept {
         DormantSnapshotStageReservationBytes = record->PayloadBytes;
         DurableStageLastProgress = now;
     } catch (...) {
-        RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+        RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory,
+            LogLimits.SnapshotStagingNamespace, Id);
         DormantSnapshotStageReservation.reset();
         DormantSnapshotStageReservationBytes = 0;
         DurableStageLastProgress.reset();
@@ -2364,7 +2386,7 @@ bool TRaft::PersistIncomingSnapshot() noexcept {
             .MetadataPrefix = std::string_view(incoming.Bytes.data(), prefixBytes),
         };
         if (!WriteIncomingSnapshotStageRecord(
-                LogLimits.SnapshotStagingDirectory, Id, record,
+                LogLimits.SnapshotStagingDirectory, LogLimits.SnapshotStagingNamespace, Id, record,
                 LogLimits.SnapshotTransferStageHook,
                 LogLimits.SnapshotTransferIoFailureHook)) return false;
         DurableStageLastProgress = incoming.LastProgress;
@@ -2385,9 +2407,11 @@ TRaft::EIncomingSnapshotRestore TRaft::RestoreIncomingSnapshot(ITimeSource::Time
         return EIncomingSnapshotRestore::Missing;
     auto metadataReservation = SnapshotInstallBudget->TryReserve(transfer.MetadataBytes);
     if (!metadataReservation) return EIncomingSnapshotRestore::OverBudget;
-    auto record = ReadIncomingSnapshotStageRecord(LogLimits.SnapshotStagingDirectory, Id);
+    auto record = ReadIncomingSnapshotStageRecord(LogLimits.SnapshotStagingDirectory,
+        LogLimits.SnapshotStagingNamespace, Id);
     if (!record) {
-        RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+        RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory,
+            LogLimits.SnapshotStagingNamespace, Id);
         return EIncomingSnapshotRestore::Missing;
     }
     if (record->ReceiverId != Id || record->LeaderId != request.LeaderId ||
@@ -2397,7 +2421,8 @@ TRaft::EIncomingSnapshotRestore TRaft::RestoreIncomingSnapshot(ITimeSource::Time
         record->PayloadBytes != transfer.PayloadBytes || record->Checksum != transfer.Checksum ||
         record->ReceivedBytes == 0 || record->ReceivedBytes >= record->Total ||
         jointElectionFenceLeader != record->JointElectionFenceLeader) {
-        RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+        RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory,
+            LogLimits.SnapshotStagingNamespace, Id);
         return EIncomingSnapshotRestore::Invalid;
     }
 
@@ -2421,19 +2446,20 @@ TRaft::EIncomingSnapshotRestore TRaft::RestoreIncomingSnapshot(ITimeSource::Time
     try {
         metadata.resize(size_t(transfer.MetadataBytes));
         if (record->MetadataPrefixBytes && !ReadIncomingSnapshotMetadataPrefix(
-                LogLimits.SnapshotStagingDirectory, Id,
+                LogLimits.SnapshotStagingDirectory, LogLimits.SnapshotStagingNamespace, Id,
                 std::span<char>(metadata.data(), size_t(record->MetadataPrefixBytes))))
             throw std::runtime_error("Cannot read persistent snapshot metadata prefix");
         if (transfer.PayloadBytes) {
             const auto path = IncomingSnapshotStagePath(
-                LogLimits.SnapshotStagingDirectory, Id, ".payload");
+                LogLimits.SnapshotStagingDirectory, LogLimits.SnapshotStagingNamespace, Id, ".payload");
             file = std::make_shared<TIncomingSnapshotFile>(path,
                 size_t(transfer.PayloadBytes), true);
         }
     } catch (const std::bad_alloc&) {
         return EIncomingSnapshotRestore::OverBudget;
     } catch (...) {
-        RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+        RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory,
+            LogLimits.SnapshotStagingNamespace, Id);
         return EIncomingSnapshotRestore::Invalid;
     }
 
@@ -4432,7 +4458,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             DiscardIncomingSnapshot(); // Release the superseded assembly before reserving its replacement.
 #ifdef __linux__
             if (separateManifestParts && !SupportsDurableSnapshotTransferResume())
-                RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+                RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory,
+                    LogLimits.SnapshotStagingNamespace, Id);
 #endif
         const auto& receiveBudget = LogLimits.SnapshotStagingBudget ?
             LogLimits.SnapshotStagingBudget : SnapshotInstallBudget;
@@ -4457,7 +4484,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
 #ifdef __linux__
                         if (SupportsDurableSnapshotTransferResume()) {
                             file = std::make_shared<TIncomingSnapshotFile>(
-                                IncomingSnapshotStagePath(LogLimits.SnapshotStagingDirectory, Id, ".payload"),
+                                IncomingSnapshotStagePath(LogLimits.SnapshotStagingDirectory,
+                                    LogLimits.SnapshotStagingNamespace, Id, ".payload"),
                                 size_t(transfer->PayloadBytes), false);
                         } else
 #endif
@@ -4482,7 +4510,8 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         } catch (const std::exception&) {
 #ifdef __linux__
             if (separateManifestParts && SupportsDurableSnapshotTransferResume())
-                RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+                RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory,
+                    LogLimits.SnapshotStagingNamespace, Id);
 #endif
             reply(false, false, 0);
             return;

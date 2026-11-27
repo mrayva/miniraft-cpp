@@ -89,7 +89,7 @@ NNet::TVoidTask CompactLoop(TPoller& poller, TRaftServer<TSocket>& server,
 }
 
 void usage(const char* prog) {
-    std::cerr << prog << "--client|--server --id myid --node ip:port:id [--node ip:port:id ...] [--durable] [--snapshots entries] [--snapshot-staging-dir path]" << "\n";
+    std::cerr << prog << "--client|--server --id myid --node ip:port:id [--node ip:port:id ...] [--durable] [--snapshots entries] [--snapshot-staging-dir path --snapshot-staging-namespace group]" << "\n";
     exit(0);
 }
 
@@ -104,6 +104,7 @@ int main(int argc, char** argv)
     bool durable = false;
     uint64_t snapshotInterval = 0;
     std::string snapshotStagingDirectory;
+    std::string snapshotStagingNamespace;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--server")) {
             server = true;
@@ -135,6 +136,11 @@ int main(int argc, char** argv)
                 std::cerr << "--snapshot-staging-dir requires one directory\n"; return 1;
             }
             snapshotStagingDirectory = argv[++i];
+        } else if (!strcmp(argv[i], "--snapshot-staging-namespace")) {
+            if (!snapshotStagingNamespace.empty() || i + 1 >= argc || !argv[i + 1][0]) {
+                std::cerr << "--snapshot-staging-namespace requires one stable group name\n"; return 1;
+            }
+            snapshotStagingNamespace = argv[++i];
         } else if (!strcmp(argv[i], "--help")) {
             usage(argv[0]);
         }
@@ -150,13 +156,16 @@ int main(int argc, char** argv)
     if (!snapshotStagingDirectory.empty()) {
 #ifdef __linux__
         std::error_code error;
-        if (!server || !durable || !std::filesystem::is_directory(snapshotStagingDirectory, error)) {
-            std::cerr << "--snapshot-staging-dir requires --server --durable and an existing directory\n";
+        if (snapshotStagingNamespace.empty() || !server || !durable ||
+            !std::filesystem::is_directory(snapshotStagingDirectory, error)) {
+            std::cerr << "--snapshot-staging-dir requires --server --durable, a group namespace, and an existing directory\n";
             return 1;
         }
 #else
         std::cerr << "--snapshot-staging-dir requires Linux\n"; return 1;
 #endif
+    } else if (!snapshotStagingNamespace.empty()) {
+        std::cerr << "--snapshot-staging-namespace requires --snapshot-staging-dir\n"; return 1;
     }
 
     using TPoller = NNet::TDefaultPoller;
@@ -202,6 +211,7 @@ int main(int argc, char** argv)
 #endif
         TRaft::TLogLimits logLimits;
         logLimits.SnapshotStagingDirectory = std::move(snapshotStagingDirectory);
+        logLimits.SnapshotStagingNamespace = std::move(snapshotStagingNamespace);
         auto raft = std::make_shared<TRaft>(state, myHost.Id, nodes,
             std::vector<uint32_t>{}, std::move(logLimits));
         const auto savedSnapshot = state->SnapshotIndex;

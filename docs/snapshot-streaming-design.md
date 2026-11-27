@@ -166,16 +166,22 @@ their staging and heap budgets. The advertised receive limit follows the
 manifest-transfer capability of each peer connection.
 
 On Linux, set `TRaft::TLogLimits::SnapshotStagingDirectory` to stage incoming
-images in a directory on a local filesystem. Durable KV servers expose the
-option as `--snapshot-staging-dir PATH`. Legacy whole-image receives and capture
-may use anonymous temporary files (`O_TMPFILE`); negotiated manifest transfers
-use a per-node named payload file and an atomically replaced transfer-state
-record. Each accepted range is synced before the cursor record is published and
-synced, so the receiver never acknowledges a prefix that is ahead of durable
-data. Use a disk-backed directory to avoid placing the receive buffer in the
-process heap or on a RAM-backed filesystem. Raft reads staged bytes through a
-read-only mapping for duplicate, metadata and checksum checks. Staged files
-reserve their declared sizes against a separate 256 MiB process-wide quota.
+images in a directory on a local filesystem. Set
+`TRaft::TLogLimits::SnapshotStagingNamespace` to a stable group name as well.
+The namespace must contain 1-64 ASCII letters, digits, underscores, or hyphens,
+remain unchanged across restarts, and be unique for each Raft group sharing the
+directory. Durable KV and SQL servers expose these options as
+`--snapshot-staging-dir PATH --snapshot-staging-namespace GROUP`. Legacy
+whole-image receives and capture may use anonymous temporary files (`O_TMPFILE`);
+negotiated manifest transfers use namespaced payload and cursor files. Each
+accepted range is synced before the cursor record is published and synced, so
+the receiver never acknowledges a prefix that is ahead of durable data. Use a
+disk-backed directory to avoid placing the receive buffer in the process heap
+or on a RAM-backed filesystem. Raft reads staged bytes through a read-only
+mapping for duplicate, metadata and checksum checks. Staged files reserve their
+declared sizes against a separate 256 MiB process-wide quota. Older unnamespaced
+cursor and payload files are ignored; remove them after all older binaries that
+use the directory have stopped.
 Embedders can share a custom quota through `TLogLimits::SnapshotStagingBudget`.
 The staging quota lease covers an in-flight or persisted dormant assembly. On
 startup, Raft reacquires that lease before restoring the saved cursor; if the
@@ -255,9 +261,10 @@ requires a configured generation resolver when the selected sidecar is
 metadata-only. Payload bytes still traverse the same bounded Raft stream; the
 new negotiated protocol separates them from the manifest on the wire. The
 receiver keeps metadata and payload as separate objects: on Linux, a configured
-`SnapshotStagingDirectory` puts manifest payload ranges directly into a named
-per-node staging file and persists the acknowledged cursor; legacy receive
-staging continues to use anonymous files. Without a staging directory, manifest
+`SnapshotStagingDirectory` and `SnapshotStagingNamespace` put manifest payload
+ranges directly into namespaced per-node staging files and persist the
+acknowledged cursor; legacy receive staging continues to use anonymous files.
+Without a staging directory, manifest
 transfers use a separately budgeted heap buffer. Both manifest paths decode
 against the payload source without rebuilding the full encoded image. Legacy
 snapshot RPCs retain the complete-image compatibility path and its 128 MiB cap.

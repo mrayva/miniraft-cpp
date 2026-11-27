@@ -77,10 +77,12 @@ requires the target database page size to match before Raft publishes the
 snapshot durably. Invalid or incompatible images do not replace the live
 database.
 
-When `--snapshot-staging-dir PATH` is configured, a SQL server can install a
-received snapshot from a range-backed view of the staged InstallSnapshot file.
-The option requires `--server --durable`, Linux, an existing directory, and a
-filesystem that supports `O_TMPFILE`.
+When `--snapshot-staging-dir PATH --snapshot-staging-namespace GROUP` are
+configured, a SQL server can install a received snapshot from a range-backed
+view of the staged InstallSnapshot file. The options require `--server
+--durable`, Linux, an existing directory, and a filesystem that supports
+`O_TMPFILE`. Use a stable namespace unique to each Raft group sharing the
+directory.
 Raft validates the full image without copying its SQL payload into
 `TSnapshot::Data`; SQL reads bounded ranges into its private SQLite staging
 file. The active Raft snapshot keeps the anonymous receive file open so later

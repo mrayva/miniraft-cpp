@@ -703,6 +703,7 @@ void test_incremental_snapshot_capture_uses_disk_staging_quota(void**) {
     limits.SnapshotInstallBudget = heapBudget;
     limits.SnapshotStagingBudget = stagingBudget;
     limits.SnapshotStagingDirectory = createdDirectory;
+    limits.SnapshotStagingNamespace = "test-compaction";
     auto app = std::make_shared<TStreamingWriterInstallApplication>();
     app->LastAppliedIndex = 1;
     {
@@ -765,6 +766,7 @@ void test_disk_staged_capture_becomes_durable_snapshot_across_restart(void**) {
     limits.SnapshotInstallBudget = heapBudget;
     limits.SnapshotStagingBudget = stagingBudget;
     limits.SnapshotStagingDirectory = createdDirectory;
+    limits.SnapshotStagingNamespace = "test-compaction";
     auto app = std::make_shared<TStreamingWriterInstallApplication>();
     app->LastAppliedIndex = 1;
     std::shared_ptr<const TSnapshot> captured;
@@ -1565,6 +1567,7 @@ void test_range_snapshot_source_uses_disk_staging_quota(void**) {
     limits.SnapshotInstallBudget = heapBudget;
     limits.SnapshotStagingBudget = stagingBudget;
     limits.SnapshotStagingDirectory = createdDirectory;
+    limits.SnapshotStagingNamespace = "test-compaction";
     auto app = std::make_shared<TLargeSourceSnapshotApplication>();
     app->Bytes = 40;
     app->LastAppliedIndex = 1;
@@ -1630,6 +1633,7 @@ void test_legacy_bounded_snapshot_uses_disk_staging_quota(void**) {
     limits.SnapshotInstallBudget = heapBudget;
     limits.SnapshotStagingBudget = stagingBudget;
     limits.SnapshotStagingDirectory = createdDirectory;
+    limits.SnapshotStagingNamespace = "test-compaction";
     auto app = std::make_shared<TBoundedSnapshotApplication>();
     app->LastAppliedIndex = 1;
     std::shared_ptr<const TSnapshot> snapshot;
@@ -1696,6 +1700,7 @@ void test_legacy_unbounded_snapshot_uses_disk_staging_quota(void**) {
     limits.SnapshotInstallBudget = heapBudget;
     limits.SnapshotStagingBudget = stagingBudget;
     limits.SnapshotStagingDirectory = createdDirectory;
+    limits.SnapshotStagingNamespace = "test-compaction";
     auto app = std::make_shared<TUnboundedSnapshotApplication>();
     app->LastAppliedIndex = 1;
     std::shared_ptr<const TSnapshot> snapshot;
@@ -1875,6 +1880,7 @@ struct TCluster {
         TRaft::TLogLimits limits;
         limits.MaxSnapshotImageBytes = MaxSnapshotImageBytes;
         limits.SnapshotStagingDirectory = SnapshotStagingDirectory;
+        if (!SnapshotStagingDirectory.empty()) limits.SnapshotStagingNamespace = "test-cluster";
         Nodes[id - 1] = std::make_shared<TRaft>(state, id, peers, Learners, limits);
         Apps[id - 1] = std::make_shared<TApplication>();
         Processors[id - 1] = std::make_unique<TRequestProcessor>(Nodes[id - 1], Apps[id - 1], peers);
@@ -2201,6 +2207,7 @@ void test_snapshot_size_capability_respects_receiver_budgets(void**) {
     });
     TRaft::TLogLimits stagedLimits{.SnapshotInstallBudget = std::make_shared<TSnapshotInstallBudget>(heapLimit),
         .SnapshotStagingDirectory = "/tmp",
+        .SnapshotStagingNamespace = "snapshot-budget-test",
         .SnapshotStagingBudget = std::make_shared<TSnapshotInstallBudget>(stagingLimit)};
     auto stagedRaft = std::make_shared<TRaft>(stagedState, 2, TNodeDict{{1, stagedPeer}},
         std::vector<uint32_t>{}, stagedLimits);
@@ -2970,6 +2977,7 @@ void test_snapshot_manifest_ranges_install_with_separate_payload_staging(void**)
     TRaft::TLogLimits limits;
 #ifdef __linux__
     limits.SnapshotStagingDirectory = createdDirectory;
+    limits.SnapshotStagingNamespace = "test-compaction";
 #endif
     auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}},
         std::vector<uint32_t>{}, limits);
@@ -3046,6 +3054,7 @@ void test_snapshot_manifest_ranges_reject_gaps_conflicts_and_corruption(void**) 
 #ifdef __linux__
     auto stagingBudget = std::make_shared<TSnapshotInstallBudget>(manifest.PayloadBytes * 2);
     limits.SnapshotStagingDirectory = createdDirectory;
+    limits.SnapshotStagingNamespace = "test-compaction";
     limits.SnapshotStagingBudget = stagingBudget;
 #endif
     auto raft = std::make_shared<TRaft>(state, 2, TNodeDict{{1, peer}},
@@ -4749,15 +4758,136 @@ struct TFiles {
     }
     ~TFiles() { std::error_code ignored; std::filesystem::remove_all(Directory, ignored); }
 };
+void test_snapshot_staging_namespace_validation(void**) {
+    auto rejects = [](std::string directory, std::string nameSpace) {
+        TRaft::TLogLimits limits;
+        limits.SnapshotStagingDirectory = std::move(directory);
+        limits.SnapshotStagingNamespace = std::move(nameSpace);
+        Reject([&] {
+            (void)std::make_shared<TRaft>(std::make_shared<TState>(), 1,
+                TNodeDict{}, std::vector<uint32_t>{}, limits);
+        });
+    };
+    rejects("/tmp", "");
+    rejects("/tmp", "../other-group");
+    rejects("/tmp", std::string(65, 'x'));
+    rejects("", "group-a");
+}
+
 void test_file_staged_snapshot_install_accepts_every_small_fixed_chunk_size(void**) {
     TFiles files;
     auto budget = std::make_shared<TSnapshotInstallBudget>();
     auto stagingBudget = std::make_shared<TSnapshotInstallBudget>();
     CheckSnapshotInstallChunkSizes({.SnapshotInstallBudget = budget,
-        .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingBudget = stagingBudget});
+        .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingNamespace = "test-chunks",
+        .SnapshotStagingBudget = stagingBudget});
     assert_int_equal(budget->UsedBytes(), 0);
     assert_int_equal(stagingBudget->UsedBytes(), 0);
     assert_true(std::filesystem::is_empty(files.Directory));
+}
+
+void test_snapshot_staging_namespaces_isolate_groups_sharing_directory(void**) {
+    TFiles files;
+    TKv sourceA;
+    sourceA.Write(sourceA.Prepare(Command("group-a", std::string(60000, 'a'))), 1);
+    const TSnapshot snapshotA{1, 1, {1, 2}, sourceA.SaveSnapshot()};
+    const auto manifestA = PrepareSnapshotTransferManifest(snapshotA);
+    TKv sourceB;
+    sourceB.Write(sourceB.Prepare(Command("group-b", std::string(60000, 'b'))), 1);
+    const TSnapshot snapshotB{1, 1, {1, 2}, sourceB.SaveSnapshot()};
+    const auto manifestB = PrepareSnapshotTransferManifest(snapshotB);
+
+    auto diskBudget = std::make_shared<TSnapshotInstallBudget>(
+        manifestA.PayloadBytes + manifestB.PayloadBytes);
+    auto makeLimits = [&](std::string nameSpace) {
+        TRaft::TLogLimits limits;
+        limits.SnapshotInstallBudget = std::make_shared<TSnapshotInstallBudget>();
+        limits.SnapshotStagingDirectory = files.Directory.string();
+        limits.SnapshotStagingNamespace = std::move(nameSpace);
+        limits.SnapshotStagingBudget = diskBudget;
+        return limits;
+    };
+    auto sendFirstChunk = [&](const TSnapshot& snapshot, const TSnapshotTransferManifest& manifest,
+            const std::string& nameSpace, const std::shared_ptr<TState>& state) {
+        std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
+        auto peer = std::make_shared<TEndpoint>([&](auto message) {
+            if (auto response = message.template Maybe<TInstallSnapshotResponse>())
+                responses.push_back(response.Cast());
+        });
+        TNodeDict peers{{1, peer}};
+        auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{}, makeLimits(nameSpace));
+        auto app = std::make_shared<TApplication>();
+        TRequestProcessor processor(raft, app, peers);
+        raft->Process({}, RangeChunk(snapshot, manifest,
+            TInstallSnapshotRangeRequest::EPhase::Metadata, 0,
+            std::string_view(manifest.Metadata).substr(0, 8), 1));
+        assert_int_equal(responses.size(), 1);
+        assert_true(responses.back()->Success);
+        assert_false(responses.back()->Installed);
+        assert_int_equal(responses.back()->NextOffset, 8);
+    };
+
+    auto stateA = std::make_shared<TState>();
+    stateA->CurrentTerm = 3;
+    auto stateB = std::make_shared<TState>();
+    stateB->CurrentTerm = 3;
+    const std::filesystem::path alphaState = files.Directory / "miniraft-incoming-v2-group-a-2.state";
+    const std::filesystem::path alphaPayload = files.Directory / "miniraft-incoming-v2-group-a-2.payload";
+    const std::filesystem::path betaState = files.Directory / "miniraft-incoming-v2-group-b-2.state";
+    const std::filesystem::path betaPayload = files.Directory / "miniraft-incoming-v2-group-b-2.payload";
+
+    sendFirstChunk(snapshotA, manifestA, "group-a", stateA);
+    sendFirstChunk(snapshotB, manifestB, "group-b", stateB);
+    assert_true(std::filesystem::exists(alphaState));
+    assert_true(std::filesystem::exists(alphaPayload));
+    assert_true(std::filesystem::exists(betaState));
+    assert_true(std::filesystem::exists(betaPayload));
+    assert_int_equal(std::filesystem::file_size(alphaPayload), manifestA.PayloadBytes);
+    assert_int_equal(std::filesystem::file_size(betaPayload), manifestB.PayloadBytes);
+
+    // Expiring group A's dormant transfer must remove only its namespaced files.
+    {
+        std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
+        auto peer = std::make_shared<TEndpoint>([&](auto message) {
+            if (auto response = message.template Maybe<TInstallSnapshotResponse>())
+                responses.push_back(response.Cast());
+        });
+        TNodeDict peers{{1, peer}};
+        auto raft = std::make_shared<TRaft>(stateA, 2, peers, std::vector<uint32_t>{}, makeLimits("group-a"));
+        auto app = std::make_shared<TApplication>();
+        TRequestProcessor processor(raft, app, peers);
+        const ITimeSource::Time start{};
+        raft->ProcessTimeout(start);
+        assert_int_equal(diskBudget->UsedBytes(), manifestA.PayloadBytes);
+        raft->ProcessTimeout(start + TTimeout::SnapshotTransferIdle);
+        assert_int_equal(diskBudget->UsedBytes(), 0);
+    }
+    assert_false(std::filesystem::exists(alphaState));
+    assert_false(std::filesystem::exists(alphaPayload));
+    assert_true(std::filesystem::exists(betaState));
+    assert_true(std::filesystem::exists(betaPayload));
+
+    // Group B still restores its acknowledged cursor after group A expires.
+    {
+        std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
+        auto peer = std::make_shared<TEndpoint>([&](auto message) {
+            if (auto response = message.template Maybe<TInstallSnapshotResponse>())
+                responses.push_back(response.Cast());
+        });
+        TNodeDict peers{{1, peer}};
+        auto raft = std::make_shared<TRaft>(stateB, 2, peers, std::vector<uint32_t>{}, makeLimits("group-b"));
+        auto app = std::make_shared<TApplication>();
+        TRequestProcessor processor(raft, app, peers);
+        raft->Process({}, RangeChunk(snapshotB, manifestB,
+            TInstallSnapshotRangeRequest::EPhase::Metadata, 0,
+            std::string_view(manifestB.Metadata).substr(0, 8), 2));
+        assert_int_equal(responses.size(), 1);
+        assert_true(responses.back()->Success);
+        assert_false(responses.back()->Installed);
+        assert_int_equal(responses.back()->NextOffset, 8);
+        assert_int_equal(diskBudget->UsedBytes(), manifestB.PayloadBytes);
+    }
+    assert_int_equal(diskBudget->UsedBytes(), 0);
 }
 
 void test_manifest_snapshot_transfer_resumes_after_receiver_restart(void**) {
@@ -4770,7 +4900,8 @@ void test_manifest_snapshot_transfer_resumes_after_receiver_restart(void**) {
     auto diskBudget = std::make_shared<TSnapshotInstallBudget>(2 * manifest.PayloadBytes);
     auto heapBudget = std::make_shared<TSnapshotInstallBudget>();
     TRaft::TLogLimits limits{.SnapshotInstallBudget = heapBudget,
-        .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingBudget = diskBudget};
+        .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingNamespace = "resume-test",
+        .SnapshotStagingBudget = diskBudget};
     std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
     auto makePeer = [&] {
         return std::make_shared<TEndpoint>([&](auto message) {
@@ -4795,8 +4926,8 @@ void test_manifest_snapshot_transfer_resumes_after_receiver_restart(void**) {
         assert_true(responses.back()->Success);
         assert_false(responses.back()->Installed);
         assert_int_equal(responses.back()->NextOffset, 8);
-        assert_true(std::filesystem::exists(files.Directory / "miniraft-incoming-2.state"));
-        assert_true(std::filesystem::exists(files.Directory / "miniraft-incoming-2.payload"));
+        assert_true(std::filesystem::exists(files.Directory / "miniraft-incoming-v2-resume-test-2.state"));
+        assert_true(std::filesystem::exists(files.Directory / "miniraft-incoming-v2-resume-test-2.payload"));
     }
     assert_int_equal(diskBudget->UsedBytes(), 0);
 
@@ -4869,7 +5000,8 @@ void test_manifest_snapshot_restart_rejects_cursor_bound_to_another_leader(void*
     auto diskBudget = std::make_shared<TSnapshotInstallBudget>(2 * manifest.PayloadBytes);
     auto heapBudget = std::make_shared<TSnapshotInstallBudget>();
     TRaft::TLogLimits limits{.SnapshotInstallBudget = heapBudget,
-        .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingBudget = diskBudget};
+        .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingNamespace = "reject-test",
+        .SnapshotStagingBudget = diskBudget};
     std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
     auto makePeer = [&] {
         return std::make_shared<TEndpoint>([&](auto message) {
@@ -4900,7 +5032,7 @@ void test_manifest_snapshot_restart_rejects_cursor_bound_to_another_leader(void*
     }
     assert_int_equal(diskBudget->UsedBytes(), 0);
     {
-        std::fstream cursor(files.Directory / "miniraft-incoming-2.state",
+        std::fstream cursor(files.Directory / "miniraft-incoming-v2-reject-test-2.state",
             std::ios::in | std::ios::out | std::ios::binary);
         assert_true(cursor.is_open());
         cursor.seekp(12);
@@ -4931,7 +5063,8 @@ void test_durable_manifest_stage_is_accounted_and_expires_after_receiver_restart
     auto diskBudget = std::make_shared<TSnapshotInstallBudget>(2 * manifest.PayloadBytes);
     auto heapBudget = std::make_shared<TSnapshotInstallBudget>();
     TRaft::TLogLimits limits{.SnapshotInstallBudget = heapBudget,
-        .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingBudget = diskBudget};
+        .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingNamespace = "expiry-test",
+        .SnapshotStagingBudget = diskBudget};
     std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
     auto makePeer = [&] {
         return std::make_shared<TEndpoint>([&](auto message) {
@@ -4955,7 +5088,7 @@ void test_durable_manifest_stage_is_accounted_and_expires_after_receiver_restart
         assert_true(responses.back()->Success);
     }
     assert_int_equal(diskBudget->UsedBytes(), 0);
-    assert_true(std::filesystem::exists(files.Directory / "miniraft-incoming-2.state"));
+    assert_true(std::filesystem::exists(files.Directory / "miniraft-incoming-v2-expiry-test-2.state"));
 
     responses.clear();
     auto peer = makePeer();
@@ -4966,7 +5099,7 @@ void test_durable_manifest_stage_is_accounted_and_expires_after_receiver_restart
     const ITimeSource::Time start{};
     raft->ProcessTimeout(start);
     assert_int_equal(diskBudget->UsedBytes(), manifest.PayloadBytes);
-    assert_true(std::filesystem::exists(files.Directory / "miniraft-incoming-2.state"));
+    assert_true(std::filesystem::exists(files.Directory / "miniraft-incoming-v2-expiry-test-2.state"));
     raft->ProcessTimeout(start + TTimeout::SnapshotTransferIdle);
     assert_int_equal(diskBudget->UsedBytes(), 0);
     assert_true(std::filesystem::is_empty(files.Directory));
@@ -4990,7 +5123,8 @@ void test_manifest_snapshot_cursor_crash_boundaries_never_ack_unsynced_progress(
         auto diskBudget = std::make_shared<TSnapshotInstallBudget>(2 * manifest.PayloadBytes);
         auto heapBudget = std::make_shared<TSnapshotInstallBudget>();
         TRaft::TLogLimits limits{.SnapshotInstallBudget = heapBudget,
-            .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingBudget = diskBudget};
+            .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingNamespace = "crash-test",
+            .SnapshotStagingBudget = diskBudget};
         const auto metadataChunk = RangeChunk(snapshot, manifest,
             TInstallSnapshotRangeRequest::EPhase::Metadata, 0, manifest.Metadata, 1);
         const auto payloadChunk = RangeChunk(snapshot, manifest,
@@ -5082,7 +5216,8 @@ void test_manifest_snapshot_io_failures_do_not_ack_unpublished_cursor(void**) {
         auto diskBudget = std::make_shared<TSnapshotInstallBudget>(2 * manifest.PayloadBytes);
         auto heapBudget = std::make_shared<TSnapshotInstallBudget>();
         TRaft::TLogLimits limits{.SnapshotInstallBudget = heapBudget,
-            .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingBudget = diskBudget};
+            .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingNamespace = "io-failure-test",
+            .SnapshotStagingBudget = diskBudget};
         const auto metadataChunk = RangeChunk(snapshot, manifest,
             TInstallSnapshotRangeRequest::EPhase::Metadata, 0, manifest.Metadata, 1);
         constexpr size_t PayloadChunkBytes = 64;
@@ -5166,7 +5301,8 @@ void test_file_staging_failure_releases_snapshot_reservation(void**) {
     auto app = std::make_shared<TApplication>();
     TNodeDict peers{{1, peer}};
     auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{},
-        TRaft::TLogLimits{.SnapshotStagingDirectory = files.Name, .SnapshotStagingBudget = budget});
+        TRaft::TLogLimits{.SnapshotStagingDirectory = files.Name,
+            .SnapshotStagingNamespace = "legacy-staging-test", .SnapshotStagingBudget = budget});
     TRequestProcessor processor(raft, app, peers);
     TKv source;
     const TSnapshot snapshot{1, 1, {1, 2}, source.SaveSnapshot()};
@@ -5205,6 +5341,7 @@ void test_file_staging_failure_releases_snapshot_reservation(void**) {
     TNodeDict rejectingPeers{{1, peer}};
     auto rejectingRaft = std::make_shared<TRaft>(rejectedState, 2, rejectingPeers,
         std::vector<uint32_t>{}, TRaft::TLogLimits{.SnapshotStagingDirectory = files.Name,
+            .SnapshotStagingNamespace = "legacy-staging-test",
             .SnapshotStagingBudget = budget});
     TRequestProcessor rejectingProcessor(rejectingRaft, rejectingApp, rejectingPeers);
     constexpr uint32_t FirstChunkBytes = 8;
@@ -5244,7 +5381,8 @@ void test_file_staged_streaming_install_retains_source_quota(void**) {
         TNodeDict peers{{1, peer}};
         auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{},
             TRaft::TLogLimits{.SnapshotInstallBudget = heapBudget,
-                .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingBudget = stagingBudget});
+                .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingNamespace = "streaming-test",
+                .SnapshotStagingBudget = stagingBudget});
         auto app = std::make_shared<TStreamingInstallApplication>();
         app->ExpectedImage = applicationImage;
         TRequestProcessor processor(raft, app, peers);
@@ -5297,6 +5435,7 @@ void test_file_staging_and_decode_use_separate_shared_budgets(void**) {
         TRaft::TLogLimits limits{.SnapshotInstallBudget = heap};
         if (staged) {
             limits.SnapshotStagingDirectory = files.Directory.string();
+            limits.SnapshotStagingNamespace = "source-test";
             limits.SnapshotStagingBudget = disk;
         }
         auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{}, limits);
@@ -5826,7 +5965,9 @@ int main() {
         cmocka_unit_test(test_memory_storage_rejects_index_exhaustion),
         cmocka_unit_test(test_memory_snapshot_boundary_retains_matching_suffix_and_replaces_conflict),
 #ifdef __linux__
+        cmocka_unit_test(test_snapshot_staging_namespace_validation),
         cmocka_unit_test(test_file_staged_snapshot_install_accepts_every_small_fixed_chunk_size),
+        cmocka_unit_test(test_snapshot_staging_namespaces_isolate_groups_sharing_directory),
         cmocka_unit_test(test_manifest_snapshot_transfer_resumes_after_receiver_restart),
         cmocka_unit_test(test_manifest_snapshot_restart_rejects_cursor_bound_to_another_leader),
         cmocka_unit_test(test_durable_manifest_stage_is_accounted_and_expires_after_receiver_restart),

@@ -666,9 +666,14 @@ public:
         // On Linux, stage streamed captures, legacy captures, complete legacy
         // snapshot images, and negotiated snapshot payloads in files in this
         // directory. Partial negotiated transfers are synced with an atomic
-        // cursor record so they can resume after receiver restart. Without a
-        // directory, negotiated transfers use separately budgeted heap buffers.
+        // cursor record so they can resume after receiver restart. Use a stable,
+        // unique namespace for each Raft group sharing this directory. Without
+        // a directory, negotiated transfers use separately budgeted heap buffers.
         std::string SnapshotStagingDirectory;
+        // Stable group identity used to isolate resumable transfer files. It is
+        // required with SnapshotStagingDirectory and accepts 1-64 ASCII letters,
+        // digits, underscores, or hyphens.
+        std::string SnapshotStagingNamespace;
         // Share this separately from SnapshotInstallBudget to limit staged
         // file bytes. Defaults to a separate 256 MiB process-wide budget.
         std::shared_ptr<TSnapshotInstallBudget> SnapshotStagingBudget;

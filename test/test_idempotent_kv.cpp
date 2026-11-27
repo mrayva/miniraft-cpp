@@ -239,6 +239,7 @@ void test_disk_staged_idempotent_install_uses_source_decoder(void**) {
     limits.SnapshotInstallBudget = heapBudget;
     limits.SnapshotStagingBudget = stagingBudget;
     limits.SnapshotStagingDirectory = createdDirectory;
+    limits.SnapshotStagingNamespace = "idempotent-test";
     auto peer = std::make_shared<TEndpoint>();
     TNodeDict peers{{1, peer}};
     auto application = std::make_shared<TIdempotentKvRsm>();
@@ -327,6 +328,7 @@ void test_idempotent_snapshot_capture_uses_staging_budget(void**) {
     limits.SnapshotInstallBudget = heapBudget;
     limits.SnapshotStagingBudget = stagingBudget;
     limits.SnapshotStagingDirectory = createdDirectory;
+    limits.SnapshotStagingNamespace = "idempotent-test";
     std::shared_ptr<const TSnapshot> snapshot;
     {
         auto raft = std::make_shared<TRaft>(state, 1, TNodeDict{},
