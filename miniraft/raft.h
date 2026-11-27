@@ -4,6 +4,7 @@
 #include <optional>
 #include <queue>
 #include <deque>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -605,6 +606,14 @@ public:
     // stable successor. Repeated uncommitted terms may consume the finite
     // control reserve and require operator recovery to restore progress.
     struct TLogLimits {
+        enum class ESnapshotTransferStage {
+            PayloadSynced,
+            CursorTempCreated,
+            CursorTempWritten,
+            CursorTempSynced,
+            CursorRenamed,
+            CursorDirectorySynced,
+        };
         uint64_t MaxUncommittedBytes = 256ull * 1024 * 1024;
         size_t MaxUncommittedEntries = 65536;
         // Keep one entry's worth of room for a leader's current-term no-op.
@@ -636,6 +645,9 @@ public:
         // Per-node snapshot image ceiling. A value above MaxBytes enables the
         // versioned streamed-image formats up to MaxStreamedBytes.
         uint64_t MaxSnapshotImageBytes = TSnapshot::MaxBytes;
+        // Optional deterministic crash-test hook for durable manifest cursor
+        // publication. Leave empty in normal deployments.
+        std::function<void(ESnapshotTransferStage)> SnapshotTransferStageHook;
     };
 
     // Nodes contains every configured replication peer; learners may include

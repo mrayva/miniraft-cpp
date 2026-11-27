@@ -342,6 +342,9 @@ commitment.
   application activation; recovery must choose the last committed generation.
 - Drop, duplicate, reorder, truncate and conflict chunks; verify offsets,
   digests, quotas and idle cleanup.
+- Crash a receiver after payload sync and at each transfer-cursor create,
+  write, sync, rename and directory-sync boundary; recovery must not acknowledge
+  a cursor ahead of its durable payload and journal.
 - Change leadership during transfer and compact a newer image while old
   transfers remain pinned.
 - Install across stable and joint membership boundaries, including restart,

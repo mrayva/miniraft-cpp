@@ -5,6 +5,7 @@
 #include "../examples/kv.h"
 #include "../examples/kv_messages.h"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cerrno>
 #include <cstdlib>
@@ -4966,6 +4967,102 @@ void test_durable_manifest_stage_is_accounted_and_expires_after_receiver_restart
     assert_true(std::filesystem::is_empty(files.Directory));
 }
 
+#ifdef __linux__
+void test_manifest_snapshot_cursor_crash_boundaries_never_ack_unsynced_progress(void**) {
+    using TStage = TRaft::TLogLimits::ESnapshotTransferStage;
+    const std::array stages{TStage::PayloadSynced, TStage::CursorTempCreated,
+        TStage::CursorTempWritten, TStage::CursorTempSynced,
+        TStage::CursorRenamed, TStage::CursorDirectorySynced};
+    for (const auto stage : stages) {
+        TFiles files;
+        TKv source;
+        source.Write(source.Prepare(Command("crash", std::string(60000, 'c'))), 1);
+        source.Write(source.Prepare(Command("second", std::string(60000, 'd'))), 2);
+        const TSnapshot snapshot{2, 1, {1, 2}, source.SaveSnapshot()};
+        const auto manifest = PrepareSnapshotTransferManifest(snapshot);
+        assert_true(manifest.Metadata.size() < TInstallSnapshotRangeRequest::MaxChunkBytes);
+        constexpr size_t PayloadChunkBytes = 64;
+        auto diskBudget = std::make_shared<TSnapshotInstallBudget>(2 * manifest.PayloadBytes);
+        auto heapBudget = std::make_shared<TSnapshotInstallBudget>();
+        TRaft::TLogLimits limits{.SnapshotInstallBudget = heapBudget,
+            .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingBudget = diskBudget};
+        const auto metadataChunk = RangeChunk(snapshot, manifest,
+            TInstallSnapshotRangeRequest::EPhase::Metadata, 0, manifest.Metadata, 1);
+        const auto payloadChunk = RangeChunk(snapshot, manifest,
+            TInstallSnapshotRangeRequest::EPhase::Payload, 0,
+            std::string_view(snapshot.Data).substr(0, PayloadChunkBytes), 2);
+        auto state = std::make_shared<TState>();
+        state->CurrentTerm = 3;
+        {
+            std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
+            auto peer = std::make_shared<TEndpoint>([&](auto message) {
+                if (auto response = message.template Maybe<TInstallSnapshotResponse>())
+                    responses.push_back(response.Cast());
+            });
+            TNodeDict peers{{1, peer}};
+            auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{}, limits);
+            auto app = std::make_shared<TApplication>();
+            TRequestProcessor processor(raft, app, peers);
+            raft->Process({}, metadataChunk);
+            assert_int_equal(responses.size(), 1);
+            assert_true(responses.back()->Success);
+            assert_int_equal(responses.back()->NextOffset, manifest.Metadata.size());
+        }
+
+        const auto child = fork();
+        assert_true(child >= 0);
+        if (child == 0) {
+            bool inject = false;
+            auto childLimits = limits;
+            childLimits.SnapshotTransferStageHook = [&](auto point) {
+                if (inject && point == stage) _exit(90);
+            };
+            auto childState = std::make_shared<TState>();
+            childState->CurrentTerm = 3;
+            std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
+            auto peer = std::make_shared<TEndpoint>([&](auto message) {
+                if (auto response = message.template Maybe<TInstallSnapshotResponse>())
+                    responses.push_back(response.Cast());
+            });
+            TNodeDict peers{{1, peer}};
+            auto raft = std::make_shared<TRaft>(childState, 2, peers,
+                std::vector<uint32_t>{}, childLimits);
+            auto app = std::make_shared<TApplication>();
+            TRequestProcessor processor(raft, app, peers);
+            raft->Process({}, metadataChunk); // Reopen the prior durable cursor.
+            if (responses.size() != 1 || !responses.back()->Success ||
+                responses.back()->NextOffset != manifest.Metadata.size()) _exit(91);
+            inject = true;
+            raft->Process({}, payloadChunk);
+            _exit(92); // The selected publication stage must have terminated us.
+        }
+        int status = 0;
+        assert_int_equal(waitpid(child, &status, 0), child);
+        assert_true(WIFEXITED(status));
+        assert_int_equal(WEXITSTATUS(status), 90);
+
+        const bool cursorPublished = stage == TStage::CursorRenamed ||
+            stage == TStage::CursorDirectorySynced;
+        const auto expectedOffset = uint64_t(manifest.Metadata.size()) +
+            (cursorPublished ? PayloadChunkBytes : 0);
+        std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
+        auto peer = std::make_shared<TEndpoint>([&](auto message) {
+            if (auto response = message.template Maybe<TInstallSnapshotResponse>())
+                responses.push_back(response.Cast());
+        });
+        TNodeDict peers{{1, peer}};
+        auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{}, limits);
+        auto app = std::make_shared<TApplication>();
+        TRequestProcessor processor(raft, app, peers);
+        raft->Process({}, metadataChunk);
+        assert_int_equal(responses.size(), 1);
+        assert_true(responses.back()->Success);
+        assert_false(responses.back()->Installed);
+        assert_int_equal(responses.back()->NextOffset, expectedOffset);
+    }
+}
+#endif
+
 void test_file_staging_failure_releases_snapshot_reservation(void**) {
     TFiles files;
     auto budget = std::make_shared<TSnapshotInstallBudget>();
@@ -5641,6 +5738,7 @@ int main() {
         cmocka_unit_test(test_manifest_snapshot_transfer_resumes_after_receiver_restart),
         cmocka_unit_test(test_manifest_snapshot_restart_rejects_cursor_bound_to_another_leader),
         cmocka_unit_test(test_durable_manifest_stage_is_accounted_and_expires_after_receiver_restart),
+        cmocka_unit_test(test_manifest_snapshot_cursor_crash_boundaries_never_ack_unsynced_progress),
         cmocka_unit_test(test_incremental_snapshot_capture_uses_disk_staging_quota),
         cmocka_unit_test(test_disk_staged_capture_becomes_durable_snapshot_across_restart),
         cmocka_unit_test(test_durable_application_snapshot_generation_is_published_before_raft_and_restored),

@@ -1055,8 +1055,16 @@ bool SyncStage(int fd) {
     return result == 0;
 }
 
+using ESnapshotTransferStage = TRaft::TLogLimits::ESnapshotTransferStage;
+
+void NotifySnapshotTransferStage(
+        const std::function<void(ESnapshotTransferStage)>& hook, ESnapshotTransferStage stage) {
+    if (hook) hook(stage);
+}
+
 bool WriteIncomingSnapshotStageRecord(const std::string& directory, uint32_t id,
-        const TIncomingSnapshotStageRecord& record) {
+        const TIncomingSnapshotStageRecord& record,
+        const std::function<void(ESnapshotTransferStage)>& hook) {
     if (record.MetadataPrefix.size() != record.MetadataPrefixBytes ||
         record.MetadataPrefixBytes > record.MetadataBytes ||
         record.ReceivedBytes > record.Total)
@@ -1086,20 +1094,31 @@ bool WriteIncomingSnapshotStageRecord(const std::string& directory, uint32_t id,
         ~TFdGuard() { if (Fd >= 0) close(Fd); }
     } temp{tempFd};
     struct stat info;
-    if (fstat(temp.Fd, &info) != 0 || !S_ISREG(info.st_mode) ||
-        !WriteStageAll(temp.Fd, bytes) ||
-        !WriteStageAll(temp.Fd, record.MetadataPrefix) || !SyncStage(temp.Fd)) {
+    if (fstat(temp.Fd, &info) != 0 || !S_ISREG(info.st_mode)) {
         unlink(tempPath.c_str());
         return false;
     }
+    NotifySnapshotTransferStage(hook, ESnapshotTransferStage::CursorTempCreated);
+    if (!WriteStageAll(temp.Fd, bytes) || !WriteStageAll(temp.Fd, record.MetadataPrefix)) {
+        unlink(tempPath.c_str());
+        return false;
+    }
+    NotifySnapshotTransferStage(hook, ESnapshotTransferStage::CursorTempWritten);
+    if (!SyncStage(temp.Fd)) {
+        unlink(tempPath.c_str());
+        return false;
+    }
+    NotifySnapshotTransferStage(hook, ESnapshotTransferStage::CursorTempSynced);
     if (rename(tempPath.c_str(), statePath.c_str()) != 0) {
         unlink(tempPath.c_str());
         return false;
     }
+    NotifySnapshotTransferStage(hook, ESnapshotTransferStage::CursorRenamed);
     const auto directoryFd = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (directoryFd < 0) return false;
     const bool synced = SyncStage(directoryFd);
     close(directoryFd);
+    if (synced) NotifySnapshotTransferStage(hook, ESnapshotTransferStage::CursorDirectorySynced);
     return synced;
 }
 
@@ -2298,7 +2317,11 @@ bool TRaft::PersistIncomingSnapshot() noexcept {
     try {
         const auto& incoming = *IncomingSnapshot;
         const auto& transfer = *incoming.Transfer;
-        if (incoming.File && !incoming.File->Sync()) return false;
+        if (incoming.File) {
+            if (!incoming.File->Sync()) return false;
+            NotifySnapshotTransferStage(LogLimits.SnapshotTransferStageHook,
+                ESnapshotTransferStage::PayloadSynced);
+        }
         const auto prefixBytes = size_t(std::min<uint64_t>(incoming.ReceivedBytes,
             transfer.MetadataBytes));
         if (prefixBytes > incoming.Bytes.size()) return false;
@@ -2319,7 +2342,8 @@ bool TRaft::PersistIncomingSnapshot() noexcept {
             .MetadataPrefix = std::string_view(incoming.Bytes.data(), prefixBytes),
         };
         if (!WriteIncomingSnapshotStageRecord(
-                LogLimits.SnapshotStagingDirectory, Id, record)) return false;
+                LogLimits.SnapshotStagingDirectory, Id, record,
+                LogLimits.SnapshotTransferStageHook)) return false;
         DurableStageLastProgress = incoming.LastProgress;
         return true;
     } catch (...) {
