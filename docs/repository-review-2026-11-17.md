@@ -193,6 +193,40 @@ capacity changes before proposing.
   TLS adapter now forwards deadline accept and close, and retains the accepted
   socket handle so shutdown can interrupt client TLS reads.
 
+## Status reconciliation — 2026-11-27
+
+This review records a historical baseline; some entries above were superseded
+by later work and should not be treated as current gaps. The authoritative
+current capability and limit summary is the [capability matrix](capability-matrix.md).
+In particular:
+
+- Snapshots are no longer limited to 64 MiB complete in-memory images. The
+  versioned streaming path supports up to 256 MiB subject to configured limits
+  and budgets, with a 128 MiB default per-node limit. File-backed capture,
+  manifest transfer and durable resume are available on Linux; complete-image
+  compatibility APIs remain capped. Application snapshot-generation references
+  publish atomically with Raft snapshot metadata. See
+  [snapshot streaming](snapshot-streaming-design.md).
+- Joint voter changes, stable finalization, and joint/stable snapshot install
+  with matching committed history are implemented. Anchored recovery across
+  committed transitions is bounded to 1,024 transitions. A stale store without
+  a trusted anchor, with disjoint history, or outside that window still needs a
+  fresh learner baseline or independently verified recovery history. The
+  all-active-voter compaction barrier remains intentional; remove an offline
+  voter through joint consensus before compacting under the reduced set.
+- The optional replicated idempotency protocol and `TRaftServer::Stop()` have
+  been added since this review. Ordinary `TCommandRequest` writes remain
+  at-least-once, and custom socket adapters still need explicit cancellation and
+  retirement support.
+
+Current production gaps include hardware power-cut and filesystem fault
+coverage, synchronous durable I/O that can block the event loop, required peer
+identity authentication (the resolver is opt-in), cluster-wide endpoint
+rollout, and broader generated partition/crash schedules, fuzzing and workload
+testing. Legacy split stores still require independently trusted voter and
+commit baselines. No
+independent reviewer approval is claimed.
+
 ## Comparison with NuRaft
 
 NuRaft's current README documents core replication, snapshots, dynamic
@@ -220,9 +254,10 @@ Sources consulted:
 - https://github.com/eBay/NuRaft/blob/master/docs/snapshot_transmission.md
 - https://github.com/eBay/NuRaft/blob/master/docs/streaming_mode.md
 
-Recommended order: fix endpoint parsing; bound transport and client admission;
-then address WAL performance, large snapshots, membership administration and
-generated failure testing. Authentication and shutdown are necessary before
-exposing this as a general production service. No new consensus safety
-violation was established in this review; no independent reviewer approval is
-claimed.
+The review originally prioritized endpoint parsing and bounded transport/client
+admission; those items are closed. Current
+priority work is independent persistence/fault validation, broader generated
+membership and snapshot schedules, authenticated peer identity and operational
+rollout support, followed by asynchronous durable I/O and workload testing.
+No new consensus safety violation was established in the original review; no
+independent reviewer approval is claimed.
