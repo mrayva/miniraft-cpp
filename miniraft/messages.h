@@ -395,6 +395,9 @@ struct TPeerCapabilitiesRequest: public TMessage {
     // Allows a sender to accept a receiver's retained prefix offset when a
     // transfer is restarted from byte zero after losing its volatile cursor.
     static constexpr uint64_t SnapshotTransferResume = uint64_t(1) << 3;
+    // Receiver has a configured Linux staging directory and persists partial
+    // manifest transfers across its own process restart.
+    static constexpr uint64_t SnapshotTransferDurableResume = uint64_t(1) << 4;
     uint32_t MinVersion = CurrentVersion;
     uint32_t MaxVersion = CurrentVersion;
     uint64_t Features = 0;

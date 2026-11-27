@@ -7,11 +7,13 @@
 #include <algorithm>
 #include <iterator>
 #include <atomic>
+#include <system_error>
 
 #ifdef __linux__
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -994,6 +996,218 @@ TSnapshotMetadataProbe ProbeSnapshotMetadata(std::string_view prefix, uint64_t t
 
 } // namespace
 
+#ifdef __linux__
+namespace {
+struct TIncomingSnapshotStageRecord {
+    uint32_t ReceiverId = 0, LeaderId = 0, Version = 0, Checksum = 0;
+    uint64_t Term = 0, Index = 0, BoundaryTerm = 0, Total = 0;
+    uint64_t MetadataBytes = 0, PayloadBytes = 0, ReceivedBytes = 0;
+    uint64_t MetadataPrefixBytes = 0;
+    bool JointElectionFenceLeader = false;
+    std::string_view MetadataPrefix;
+};
+
+constexpr size_t IncomingSnapshotStageHeaderBytes = 92;
+
+std::string IncomingSnapshotStagePath(const std::string& directory, uint32_t id,
+        std::string_view suffix) {
+    return directory + (directory.ends_with('/') ? "" : "/") +
+        "miniraft-incoming-" + std::to_string(id) + std::string(suffix);
+}
+
+void AppendStageU32(std::string& bytes, uint32_t value) {
+    for (unsigned i = 0; i < 4; ++i) bytes.push_back(char(value >> (8 * i)));
+}
+
+void AppendStageU64(std::string& bytes, uint64_t value) {
+    for (unsigned i = 0; i < 8; ++i) bytes.push_back(char(value >> (8 * i)));
+}
+
+bool ReadStageU32(std::string_view bytes, size_t& offset, uint32_t& value) {
+    if (offset > bytes.size() || bytes.size() - offset < 4) return false;
+    value = 0;
+    for (unsigned i = 0; i < 4; ++i)
+        value |= uint32_t(uint8_t(bytes[offset++])) << (8 * i);
+    return true;
+}
+
+bool ReadStageU64(std::string_view bytes, size_t& offset, uint64_t& value) {
+    if (offset > bytes.size() || bytes.size() - offset < 8) return false;
+    value = 0;
+    for (unsigned i = 0; i < 8; ++i)
+        value |= uint64_t(uint8_t(bytes[offset++])) << (8 * i);
+    return true;
+}
+
+bool WriteStageAll(int fd, std::string_view bytes) {
+    while (!bytes.empty()) {
+        const auto written = write(fd, bytes.data(), bytes.size());
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) return false;
+        bytes.remove_prefix(size_t(written));
+    }
+    return true;
+}
+
+bool SyncStage(int fd) {
+    int result;
+    do { result = fsync(fd); } while (result < 0 && errno == EINTR);
+    return result == 0;
+}
+
+bool WriteIncomingSnapshotStageRecord(const std::string& directory, uint32_t id,
+        const TIncomingSnapshotStageRecord& record) {
+    if (record.MetadataPrefix.size() != record.MetadataPrefixBytes ||
+        record.MetadataPrefixBytes > record.MetadataBytes ||
+        record.ReceivedBytes > record.Total)
+        return false;
+    std::string bytes("MRFSTG01", 8);
+    AppendStageU32(bytes, record.ReceiverId);
+    AppendStageU32(bytes, record.LeaderId);
+    AppendStageU32(bytes, record.Version);
+    AppendStageU32(bytes, record.Checksum);
+    AppendStageU64(bytes, record.Term);
+    AppendStageU64(bytes, record.Index);
+    AppendStageU64(bytes, record.BoundaryTerm);
+    AppendStageU64(bytes, record.Total);
+    AppendStageU64(bytes, record.MetadataBytes);
+    AppendStageU64(bytes, record.PayloadBytes);
+    AppendStageU64(bytes, record.ReceivedBytes);
+    AppendStageU32(bytes, record.JointElectionFenceLeader ? 1u : 0u);
+    AppendStageU64(bytes, record.MetadataPrefixBytes);
+
+    const auto statePath = IncomingSnapshotStagePath(directory, id, ".state");
+    const auto tempPath = IncomingSnapshotStagePath(directory, id, ".state.tmp");
+    const auto tempFd = open(tempPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC |
+        O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
+    if (tempFd < 0) return false;
+    struct TFdGuard {
+        int Fd;
+        ~TFdGuard() { if (Fd >= 0) close(Fd); }
+    } temp{tempFd};
+    struct stat info;
+    if (fstat(temp.Fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+        !WriteStageAll(temp.Fd, bytes) ||
+        !WriteStageAll(temp.Fd, record.MetadataPrefix) || !SyncStage(temp.Fd)) {
+        unlink(tempPath.c_str());
+        return false;
+    }
+    if (rename(tempPath.c_str(), statePath.c_str()) != 0) {
+        unlink(tempPath.c_str());
+        return false;
+    }
+    const auto directoryFd = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directoryFd < 0) return false;
+    const bool synced = SyncStage(directoryFd);
+    close(directoryFd);
+    return synced;
+}
+
+std::optional<TIncomingSnapshotStageRecord> ReadIncomingSnapshotStageRecord(
+        const std::string& directory, uint32_t id) {
+    const auto path = IncomingSnapshotStagePath(directory, id, ".state");
+    const auto fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return {};
+    struct TFdGuard {
+        int Fd;
+        ~TFdGuard() { if (Fd >= 0) close(Fd); }
+    } file{fd};
+    struct stat info;
+    if (fstat(file.Fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+        info.st_size < off_t(IncomingSnapshotStageHeaderBytes) ||
+        uint64_t(info.st_size) > TSnapshot::MaxStreamedBytes + 128)
+        return {};
+    char header[IncomingSnapshotStageHeaderBytes];
+    size_t readBytes = 0;
+    while (readBytes < sizeof(header)) {
+        const auto count = read(file.Fd, header + readBytes, sizeof(header) - readBytes);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return {};
+        readBytes += size_t(count);
+    }
+    const std::string_view bytes(header, sizeof(header));
+    if (bytes.substr(0, 8) != "MRFSTG01") return {};
+    size_t offset = 8;
+    TIncomingSnapshotStageRecord record;
+    uint32_t jointFence = 0;
+    if (!ReadStageU32(bytes, offset, record.ReceiverId) ||
+        !ReadStageU32(bytes, offset, record.LeaderId) ||
+        !ReadStageU32(bytes, offset, record.Version) ||
+        !ReadStageU32(bytes, offset, record.Checksum) ||
+        !ReadStageU64(bytes, offset, record.Term) ||
+        !ReadStageU64(bytes, offset, record.Index) ||
+        !ReadStageU64(bytes, offset, record.BoundaryTerm) ||
+        !ReadStageU64(bytes, offset, record.Total) ||
+        !ReadStageU64(bytes, offset, record.MetadataBytes) ||
+        !ReadStageU64(bytes, offset, record.PayloadBytes) ||
+        !ReadStageU64(bytes, offset, record.ReceivedBytes) ||
+        !ReadStageU32(bytes, offset, jointFence) ||
+        !ReadStageU64(bytes, offset, record.MetadataPrefixBytes) ||
+        jointFence > 1 || record.MetadataPrefixBytes > record.MetadataBytes ||
+        offset != IncomingSnapshotStageHeaderBytes ||
+        uint64_t(info.st_size) != IncomingSnapshotStageHeaderBytes + record.MetadataPrefixBytes)
+        return {};
+    record.JointElectionFenceLeader = jointFence != 0;
+    if (record.MetadataBytes > TSnapshot::MaxStreamedBytes ||
+        record.PayloadBytes > TSnapshot::MaxStreamedBytes - record.MetadataBytes ||
+        record.Total != record.MetadataBytes + record.PayloadBytes + 4 ||
+        record.ReceivedBytes > record.Total ||
+        record.MetadataPrefixBytes != std::min(record.ReceivedBytes, record.MetadataBytes))
+        return {};
+    return record;
+}
+
+bool ReadIncomingSnapshotMetadataPrefix(const std::string& directory, uint32_t id,
+        std::span<char> destination) {
+    if (destination.empty()) return true;
+    const auto path = IncomingSnapshotStagePath(directory, id, ".state");
+    const auto fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return false;
+    struct TFdGuard {
+        int Fd;
+        ~TFdGuard() { if (Fd >= 0) close(Fd); }
+    } file{fd};
+    struct stat info;
+    if (fstat(file.Fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+        uint64_t(info.st_size) != IncomingSnapshotStageHeaderBytes + destination.size())
+        return false;
+    size_t readBytes = 0;
+    while (readBytes < destination.size()) {
+        const auto count = pread(file.Fd, destination.data() + readBytes,
+            destination.size() - readBytes, off_t(IncomingSnapshotStageHeaderBytes + readBytes));
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return false;
+        readBytes += size_t(count);
+    }
+    return true;
+}
+
+bool IncomingSnapshotPayloadHasSize(const std::string& directory, uint32_t id, uint64_t size) {
+    if (!size) return true;
+    const auto path = IncomingSnapshotStagePath(directory, id, ".payload");
+    const auto fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return false;
+    struct TFdGuard {
+        int Fd;
+        ~TFdGuard() { if (Fd >= 0) close(Fd); }
+    } file{fd};
+    struct stat info;
+    return fstat(file.Fd, &info) == 0 && S_ISREG(info.st_mode) &&
+        info.st_size >= 0 && uint64_t(info.st_size) == size;
+}
+
+void RemoveIncomingSnapshotStage(const std::string& directory, uint32_t id) noexcept {
+    for (const auto suffix : {".state.tmp", ".state", ".payload"})
+        (void)unlink(IncomingSnapshotStagePath(directory, id, suffix).c_str());
+    const auto fd = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd >= 0) {
+        (void)SyncStage(fd);
+        close(fd);
+    }
+}
+} // namespace
+#endif
+
 class TRaft::TIncomingSnapshotFile final : public TSnapshotDataSource, public ISnapshotDataHeapUsage {
 public:
     TIncomingSnapshotFile(const std::string& directory, size_t size)
@@ -1017,9 +1231,37 @@ public:
 #endif
     }
 
+#ifdef __linux__
+    TIncomingSnapshotFile(const std::string& path, size_t size, bool existing)
+        : SizeBytes(size) {
+        Fd = open(path.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK |
+            (existing ? 0 : O_CREAT | O_EXCL), 0600);
+        if (Fd < 0) throw std::runtime_error("Cannot open persistent snapshot staging file");
+        struct stat info;
+        if (fstat(Fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+            (existing ? uint64_t(info.st_size) != SizeBytes : ftruncate(Fd, off_t(SizeBytes)) != 0)) {
+            close(Fd);
+            Fd = -1;
+            if (!existing) unlink(path.c_str());
+            throw std::runtime_error("Invalid persistent snapshot staging file");
+        }
+        if (SizeBytes) {
+            void* mapped = mmap(nullptr, SizeBytes, PROT_READ, MAP_SHARED, Fd, 0);
+            if (mapped == MAP_FAILED || !mapped) {
+                if (mapped && mapped != MAP_FAILED) munmap(mapped, SizeBytes);
+                close(Fd);
+                Fd = -1;
+                if (!existing) unlink(path.c_str());
+                throw std::runtime_error("Cannot map persistent snapshot staging file");
+            }
+            Mapping = static_cast<const char*>(mapped);
+        }
+    }
+#endif
+
     ~TIncomingSnapshotFile() {
 #ifdef __linux__
-        munmap(const_cast<char*>(Mapping), SizeBytes);
+        if (Mapping) munmap(const_cast<char*>(Mapping), SizeBytes);
         close(Fd);
 #endif
     }
@@ -1059,10 +1301,20 @@ public:
 #endif
     }
 
+    bool Sync() const {
+#ifdef __linux__
+        int result;
+        do { result = fdatasync(Fd); } while (result < 0 && errno == EINTR);
+        return result == 0;
+#else
+        return false;
+#endif
+    }
+
 private:
     size_t SizeBytes;
     const char* Mapping = nullptr;
-    // A source-backed installed snapshot keeps this anonymous file alive. Keep
+    // A source-backed installed snapshot keeps this staged file alive. Keep
     // its disk quota lease for the same lifetime, including outstanding pins.
     std::shared_ptr<void> StagingReservation;
 #ifdef __linux__
@@ -1977,6 +2229,188 @@ void TRaft::Become(EState newStateName) {
     }
 }
 
+bool TRaft::SupportsDurableSnapshotTransferResume() const noexcept {
+#ifdef __linux__
+    if (LogLimits.SnapshotStagingDirectory.empty()) return false;
+    const auto fd = open(LogLimits.SnapshotStagingDirectory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return false;
+    close(fd);
+    return true;
+#else
+    return false;
+#endif
+}
+
+void TRaft::DiscardIncomingSnapshot() noexcept {
+#ifdef __linux__
+    if (!LogLimits.SnapshotStagingDirectory.empty())
+        RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+#endif
+    IncomingSnapshot.reset();
+    DurableStageLastProgress.reset();
+    DormantSnapshotStageReservation.reset();
+    DormantSnapshotStageReservationBytes = 0;
+}
+
+void TRaft::AccountDormantSnapshotStage(ITimeSource::Time now) noexcept {
+#ifdef __linux__
+    if (IncomingSnapshot || DurableStageLastProgress ||
+        !SupportsDurableSnapshotTransferResume()) return;
+    try {
+        auto record = ReadIncomingSnapshotStageRecord(LogLimits.SnapshotStagingDirectory, Id);
+        if (!record || record->ReceiverId != Id || !record->ReceivedBytes ||
+            record->ReceivedBytes >= record->Total ||
+            !IncomingSnapshotPayloadHasSize(LogLimits.SnapshotStagingDirectory, Id,
+                record->PayloadBytes)) {
+            RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+            return;
+        }
+        const auto& receiveBudget = LogLimits.SnapshotStagingBudget
+            ? LogLimits.SnapshotStagingBudget : SnapshotInstallBudget;
+        std::shared_ptr<void> reservation;
+        if (record->PayloadBytes) {
+            reservation = receiveBudget->TryReserve(record->PayloadBytes);
+            if (!reservation) {
+                // Do not retain an unaccounted persistent payload when this
+                // Raft instance cannot reacquire its staging quota.
+                RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+                return;
+            }
+        }
+        DormantSnapshotStageReservation = std::move(reservation);
+        DormantSnapshotStageReservationBytes = record->PayloadBytes;
+        DurableStageLastProgress = now;
+    } catch (...) {
+        RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+        DormantSnapshotStageReservation.reset();
+        DormantSnapshotStageReservationBytes = 0;
+        DurableStageLastProgress.reset();
+    }
+#else
+    (void)now;
+#endif
+}
+
+bool TRaft::PersistIncomingSnapshot() noexcept {
+#ifdef __linux__
+    if (!IncomingSnapshot || !IncomingSnapshot->DurableStaging || !IncomingSnapshot->Transfer)
+        return true;
+    try {
+        const auto& incoming = *IncomingSnapshot;
+        const auto& transfer = *incoming.Transfer;
+        if (incoming.File && !incoming.File->Sync()) return false;
+        const auto prefixBytes = size_t(std::min<uint64_t>(incoming.ReceivedBytes,
+            transfer.MetadataBytes));
+        if (prefixBytes > incoming.Bytes.size()) return false;
+        TIncomingSnapshotStageRecord record{
+            .ReceiverId = Id,
+            .LeaderId = incoming.Leader,
+            .Version = transfer.Version,
+            .Checksum = transfer.Checksum,
+            .Term = incoming.Term,
+            .Index = incoming.Index,
+            .BoundaryTerm = incoming.BoundaryTerm,
+            .Total = incoming.Total,
+            .MetadataBytes = transfer.MetadataBytes,
+            .PayloadBytes = transfer.PayloadBytes,
+            .ReceivedBytes = incoming.ReceivedBytes,
+            .MetadataPrefixBytes = prefixBytes,
+            .JointElectionFenceLeader = incoming.JointElectionFenceLeader,
+            .MetadataPrefix = std::string_view(incoming.Bytes.data(), prefixBytes),
+        };
+        if (!WriteIncomingSnapshotStageRecord(
+                LogLimits.SnapshotStagingDirectory, Id, record)) return false;
+        DurableStageLastProgress = incoming.LastProgress;
+        return true;
+    } catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+TRaft::EIncomingSnapshotRestore TRaft::RestoreIncomingSnapshot(ITimeSource::Time now,
+        const TInstallSnapshotRequest& request, const TSnapshotTransferIdentity& transfer,
+        bool jointElectionFenceLeader) {
+#ifdef __linux__
+    if (LogLimits.SnapshotStagingDirectory.empty() || request.Offset != 0)
+        return EIncomingSnapshotRestore::Missing;
+    auto metadataReservation = SnapshotInstallBudget->TryReserve(transfer.MetadataBytes);
+    if (!metadataReservation) return EIncomingSnapshotRestore::OverBudget;
+    auto record = ReadIncomingSnapshotStageRecord(LogLimits.SnapshotStagingDirectory, Id);
+    if (!record) {
+        RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+        return EIncomingSnapshotRestore::Missing;
+    }
+    if (record->ReceiverId != Id || record->LeaderId != request.LeaderId ||
+        record->Term > request.Term || record->Index != request.SnapshotIndex ||
+        record->BoundaryTerm != request.SnapshotTerm || record->Total != request.TotalBytes ||
+        record->Version != transfer.Version || record->MetadataBytes != transfer.MetadataBytes ||
+        record->PayloadBytes != transfer.PayloadBytes || record->Checksum != transfer.Checksum ||
+        record->ReceivedBytes == 0 || record->ReceivedBytes >= record->Total ||
+        jointElectionFenceLeader != record->JointElectionFenceLeader) {
+        RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+        return EIncomingSnapshotRestore::Invalid;
+    }
+
+    const auto& receiveBudget = LogLimits.SnapshotStagingBudget
+        ? LogLimits.SnapshotStagingBudget : SnapshotInstallBudget;
+    std::shared_ptr<void> payloadReservation;
+    if (DormantSnapshotStageReservation &&
+        DormantSnapshotStageReservationBytes == transfer.PayloadBytes) {
+        payloadReservation = DormantSnapshotStageReservation;
+    } else {
+        DormantSnapshotStageReservation.reset();
+        DormantSnapshotStageReservationBytes = 0;
+    }
+    if (transfer.PayloadBytes) {
+        if (!payloadReservation) payloadReservation = receiveBudget->TryReserve(transfer.PayloadBytes);
+        if (!payloadReservation) return EIncomingSnapshotRestore::OverBudget;
+    }
+
+    std::string metadata;
+    std::shared_ptr<TIncomingSnapshotFile> file;
+    try {
+        metadata.resize(size_t(transfer.MetadataBytes));
+        if (record->MetadataPrefixBytes && !ReadIncomingSnapshotMetadataPrefix(
+                LogLimits.SnapshotStagingDirectory, Id,
+                std::span<char>(metadata.data(), size_t(record->MetadataPrefixBytes))))
+            throw std::runtime_error("Cannot read persistent snapshot metadata prefix");
+        if (transfer.PayloadBytes) {
+            const auto path = IncomingSnapshotStagePath(
+                LogLimits.SnapshotStagingDirectory, Id, ".payload");
+            file = std::make_shared<TIncomingSnapshotFile>(path,
+                size_t(transfer.PayloadBytes), true);
+        }
+    } catch (const std::bad_alloc&) {
+        return EIncomingSnapshotRestore::OverBudget;
+    } catch (...) {
+        RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+        return EIncomingSnapshotRestore::Invalid;
+    }
+
+    TIncomingSnapshot incoming{request.Term, request.SnapshotIndex, request.SnapshotTerm,
+        request.TotalBytes, request.LeaderId, now, std::move(metadata), record->ReceivedBytes,
+        true, std::move(metadataReservation), {}, 0, std::move(file)};
+    incoming.Transfer = transfer;
+    incoming.PayloadReservation = std::move(payloadReservation);
+    incoming.JointElectionFenceLeader = record->JointElectionFenceLeader;
+    incoming.DurableStaging = true;
+    IncomingSnapshot = std::move(incoming);
+    DurableStageLastProgress = now;
+    DormantSnapshotStageReservation.reset();
+    DormantSnapshotStageReservationBytes = 0;
+    return EIncomingSnapshotRestore::Restored;
+#else
+    (void)now;
+    (void)request;
+    (void)transfer;
+    (void)jointElectionFenceLeader;
+    return EIncomingSnapshotRestore::Missing;
+#endif
+}
+
 void TRaft::AdvanceTerm(ITimeSource::Time now, uint64_t term, bool preserveIncomingSnapshot) {
     if (term <= State->CurrentTerm) return;
     State->CurrentTerm = term;
@@ -1989,7 +2423,7 @@ void TRaft::AdvanceTerm(ITimeSource::Time now, uint64_t term, bool preserveIncom
     VolatileState->PreVoteTerm = 0;
     VolatileState->Votes.clear();
     VolatileState->LeadershipTransfer.reset();
-    if (!preserveIncomingSnapshot) IncomingSnapshot.reset();
+    if (!preserveIncomingSnapshot) DiscardIncomingSnapshot();
     VolatileState->SnapshotRpcs.clear();
     EncodedSnapshot.reset();
     EncodedSnapshotIndex = 0;
@@ -2469,7 +2903,14 @@ void TRaft::CandidateTimeout(ITimeSource::Time now) {
 
 void TRaft::StartPreVote(ITimeSource::Time now) {
     if (State->CurrentTerm == UINT64_MAX) throw std::overflow_error("Raft term exhausted");
-    IncomingSnapshot.reset();
+    if (IncomingSnapshot && IncomingSnapshot->DurableStaging && DurableStageLastProgress) {
+        DormantSnapshotStageReservation = std::move(IncomingSnapshot->PayloadReservation);
+        DormantSnapshotStageReservationBytes = IncomingSnapshot->Transfer
+            ? IncomingSnapshot->Transfer->PayloadBytes : 0;
+        IncomingSnapshot.reset(); // Keep the synced cursor for a subsequent leader retry.
+    } else if (!DurableStageLastProgress) {
+        DiscardIncomingSnapshot();
+    }
     auto next = std::make_unique<TVolatileState>();
     next->CommitIndex = VolatileState->CommitIndex;
     next->LeaderContactDue = VolatileState->LeaderContactDue;
@@ -2630,7 +3071,13 @@ void TRaft::ProcessTimeout(ITimeSource::Time now) {
     // independently of role and ordinary heartbeat activity.
     if (IncomingSnapshot && now >= IncomingSnapshot->LastProgress &&
         now - IncomingSnapshot->LastProgress >= TTimeout::SnapshotTransferIdle)
-        IncomingSnapshot.reset();
+        DiscardIncomingSnapshot();
+    if (!IncomingSnapshot) {
+        AccountDormantSnapshotStage(now);
+        if (DurableStageLastProgress && now >= *DurableStageLastProgress &&
+            now - *DurableStageLastProgress >= TTimeout::SnapshotTransferIdle)
+            DiscardIncomingSnapshot();
+    }
     if (!IsVoter(Id)) return;
     if (StateName == EState::CANDIDATE && VolatileState->PreVoting &&
         VotingQuorum->HasQuorum(VolatileState->Votes, Id))
@@ -3091,7 +3538,7 @@ void TRaft::TransferLeadership(uint32_t target, ITimeSource::Time now) {
     VolatileState->SnapshotRpcs.clear();
     VolatileState->PendingAppendRpcs.clear();
     VolatileState->ConfigurationBarrierRpcs.clear();
-    IncomingSnapshot.reset();
+    DiscardIncomingSnapshot();
     EncodedSnapshot.reset();
     EncodedSnapshotIndex = 0;
     (void)Nodes.at(target)->TrySend(std::move(request));
@@ -3759,6 +4206,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         // membership header has been validated. Keep the validated assembly
         // alive while clearing all state from the previous term.
         AdvanceTerm(now, request->Term, true);
+        if (IncomingSnapshot) IncomingSnapshot->Term = request->Term;
         Become(EState::FOLLOWER);
         VolatileState->PreVoting = false;
         VolatileState->PreVoteTerm = 0;
@@ -3782,7 +4230,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         if (!same) {
             if (request->Offset != 0 || (IncomingSnapshot && IncomingSnapshot->Term == request->Term &&
                 IncomingSnapshot->Index > request->SnapshotIndex)) { reply(false, false, 0); return; }
-            IncomingSnapshot.reset(); // Release the superseded assembly before reserving its replacement.
+            DiscardIncomingSnapshot(); // Release the superseded assembly before reserving its replacement.
             IncomingSnapshot = TIncomingSnapshot{request->Term, request->SnapshotIndex, request->SnapshotTerm,
                 request->TotalBytes, request->LeaderId, now, {}};
             IncomingSnapshot->JointElectionFenceLeader = jointElectionFenceLeader;
@@ -3807,7 +4255,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         if (request->Offset < receivedBytes) {
             if (count > receivedBytes - request->Offset ||
                 std::string_view(prefix + request->Offset, count) != std::string_view(request->Data, count)) {
-                IncomingSnapshot.reset(); reply(false, false, 0); return;
+                DiscardIncomingSnapshot(); reply(false, false, 0); return;
             }
             const std::string_view receivedPrefix(prefix, size_t(receivedBytes));
             probe = ProbeSnapshotMetadata(receivedPrefix, request->TotalBytes,
@@ -3820,17 +4268,17 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
                 if (receivedBytes) candidatePrefix.append(prefix, size_t(receivedBytes));
                 candidatePrefix.append(request->Data, count);
             } catch (const std::bad_alloc&) {
-                IncomingSnapshot.reset(); reply(false, false, 0); return;
+                DiscardIncomingSnapshot(); reply(false, false, 0); return;
             }
             if (!IsSupportedSnapshotMagicPrefix(candidatePrefix)) {
-                IncomingSnapshot.reset(); reply(false, false, 0); return;
+                DiscardIncomingSnapshot(); reply(false, false, 0); return;
             }
             probe = ProbeSnapshotMetadata(candidatePrefix, request->TotalBytes,
                 request->SnapshotIndex, request->SnapshotTerm, snapshotVoters, knownSnapshot.get(),
                 committedConfiguration, pendingConfiguration, false, allowStaleStoreRecovery,
                 request->LeaderId, Id);
             if (probe.Complete && !probe.Supported) {
-                IncomingSnapshot.reset(); reply(false, false, 0); return;
+                DiscardIncomingSnapshot(); reply(false, false, 0); return;
             }
             const auto bufferedCount = probe.Complete ? probe.Need - receivedBytes : count;
             const auto needed = size_t(receivedBytes) + bufferedCount;
@@ -3845,7 +4293,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
                         capacity = needed;
                         reservation = SnapshotInstallBudget->TryReserve(capacity);
                     }
-                    if (!reservation) { IncomingSnapshot.reset(); reply(false, false, 0); return; }
+                    if (!reservation) { DiscardIncomingSnapshot(); reply(false, false, 0); return; }
                     auto replacement = std::make_unique_for_overwrite<char[]>(capacity);
                     if (receivedBytes) memcpy(replacement.get(), prefix, size_t(receivedBytes));
                     incoming.CoveredPrefix = std::move(replacement);
@@ -3853,13 +4301,13 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
                     incoming.ReceiveReservation = std::move(reservation);
                     prefix = incoming.CoveredPrefix.get();
                 } catch (const std::bad_alloc&) {
-                    IncomingSnapshot.reset(); reply(false, false, 0); return;
+                    DiscardIncomingSnapshot(); reply(false, false, 0); return;
                 }
             }
             if (incoming.File) {
                 if (!incoming.File->Write(size_t(receivedBytes),
                         std::string_view(request->Data, bufferedCount))) {
-                    IncomingSnapshot.reset(); reply(false, false, 0); return;
+                    DiscardIncomingSnapshot(); reply(false, false, 0); return;
                 }
             } else {
                 auto* destination = incoming.Preallocated ? incoming.Bytes.data() : incoming.CoveredPrefix.get();
@@ -3870,11 +4318,11 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         }
         const std::string_view receivedPrefix(prefix, size_t(receivedBytes));
         if (!IsSupportedSnapshotMagicPrefix(receivedPrefix)) {
-            IncomingSnapshot.reset(); reply(false, false, 0); return;
+            DiscardIncomingSnapshot(); reply(false, false, 0); return;
         }
         if (SnapshotNeedsJointElectionFence(receivedPrefix) &&
             !incoming.JointElectionFenceLeader) {
-            IncomingSnapshot.reset(); reply(false, false, 0); return;
+            DiscardIncomingSnapshot(); reply(false, false, 0); return;
         }
         if (!probe.Complete) {
             // Once the base voter lists authenticate this sender, record its
@@ -3885,7 +4333,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             reply(true, false, receivedBytes);
             return;
         }
-        IncomingSnapshot.reset();
+        DiscardIncomingSnapshot();
         if (probe.Supported) acceptLeaderContact();
         reply(probe.Supported, probe.Supported, probe.Supported ? request->TotalBytes : 0);
         return;
@@ -3914,7 +4362,24 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             request->TotalBytes > SnapshotInstallBudget->LimitBytes()) {
             reply(false, false, 0); return;
         }
-        IncomingSnapshot.reset(); // Release a superseded image before reserving its replacement.
+        bool restored = false;
+#ifdef __linux__
+        if (!IncomingSnapshot && separateManifestParts && SupportsDurableSnapshotTransferResume()) {
+            const auto status = RestoreIncomingSnapshot(now, *request.Mes, *transfer,
+                jointElectionFenceLeader);
+            if (status == EIncomingSnapshotRestore::OverBudget) {
+                reply(false, false, 0);
+                return;
+            }
+            restored = status == EIncomingSnapshotRestore::Restored;
+        }
+#endif
+        if (!restored) {
+            DiscardIncomingSnapshot(); // Release the superseded assembly before reserving its replacement.
+#ifdef __linux__
+            if (separateManifestParts && !SupportsDurableSnapshotTransferResume())
+                RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+#endif
         const auto& receiveBudget = LogLimits.SnapshotStagingBudget ?
             LogLimits.SnapshotStagingBudget : SnapshotInstallBudget;
         std::string image;
@@ -3935,8 +4400,17 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
                     if (transfer->PayloadBytes) {
                         payloadReservation = receiveBudget->TryReserve(transfer->PayloadBytes);
                         if (!payloadReservation) { reply(false, false, 0); return; }
-                        file = std::make_shared<TIncomingSnapshotFile>(
-                            LogLimits.SnapshotStagingDirectory, size_t(transfer->PayloadBytes));
+#ifdef __linux__
+                        if (SupportsDurableSnapshotTransferResume()) {
+                            file = std::make_shared<TIncomingSnapshotFile>(
+                                IncomingSnapshotStagePath(LogLimits.SnapshotStagingDirectory, Id, ".payload"),
+                                size_t(transfer->PayloadBytes), false);
+                        } else
+#endif
+                        {
+                            file = std::make_shared<TIncomingSnapshotFile>(
+                                LogLimits.SnapshotStagingDirectory, size_t(transfer->PayloadBytes));
+                        }
                     }
                 }
                 image.resize(size_t(transfer->MetadataBytes));
@@ -3952,6 +4426,10 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
                 }
             }
         } catch (const std::exception&) {
+#ifdef __linux__
+            if (separateManifestParts && SupportsDurableSnapshotTransferResume())
+                RemoveIncomingSnapshotStage(LogLimits.SnapshotStagingDirectory, Id);
+#endif
             reply(false, false, 0);
             return;
         }
@@ -3963,6 +4441,9 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         IncomingSnapshot->Payload = std::move(payload);
         IncomingSnapshot->HeapReceiveReservation = std::move(heapReservation);
         IncomingSnapshot->JointElectionFenceLeader = jointElectionFenceLeader;
+        IncomingSnapshot->DurableStaging = separateManifestParts &&
+            SupportsDurableSnapshotTransferResume();
+        }
     }
     auto& incoming = *IncomingSnapshot;
     const auto count = request->Len - sizeof(TInstallSnapshotRequest);
@@ -3993,22 +4474,22 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         const std::string_view chunk(request->Data, count);
         if (request->Offset < receivedBytes) {
             if (count > receivedBytes - request->Offset || !matches(request->Offset, chunk)) {
-                IncomingSnapshot.reset(); reply(false, false, 0); return;
+                DiscardIncomingSnapshot(); reply(false, false, 0); return;
             }
         } else if (request->Offset < identity.MetadataBytes) {
             if (count > identity.MetadataBytes - request->Offset) {
-                IncomingSnapshot.reset(); reply(false, false, 0); return;
+                DiscardIncomingSnapshot(); reply(false, false, 0); return;
             }
             memcpy(incoming.Bytes.data() + size_t(request->Offset), request->Data, count);
             receivedBytes += count;
         } else if (request->Offset < imageOffset) {
             if (count > imageOffset - request->Offset) {
-                IncomingSnapshot.reset(); reply(false, false, 0); return;
+                DiscardIncomingSnapshot(); reply(false, false, 0); return;
             }
             const auto payloadOffset = size_t(request->Offset - identity.MetadataBytes);
             if (incoming.File) {
                 if (!incoming.File->Write(payloadOffset, chunk)) {
-                    IncomingSnapshot.reset(); reply(false, false, 0); return;
+                    DiscardIncomingSnapshot(); reply(false, false, 0); return;
                 }
             } else {
                 memcpy(incoming.Payload.data() + payloadOffset, request->Data, count);
@@ -4016,7 +4497,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             receivedBytes += count;
         } else {
             if (!matches(request->Offset, chunk)) {
-                IncomingSnapshot.reset(); reply(false, false, 0); return;
+                DiscardIncomingSnapshot(); reply(false, false, 0); return;
             }
             receivedBytes += count;
         }
@@ -4028,12 +4509,12 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         if (request->Offset < receivedBytes) {
             if (count > receivedBytes - request->Offset ||
                 std::string_view(bytes + request->Offset, count) != std::string_view(request->Data, count)) {
-                IncomingSnapshot.reset(); reply(false, false, 0); return;
+                DiscardIncomingSnapshot(); reply(false, false, 0); return;
             }
         } else {
             if (incoming.File) {
                 if (!incoming.File->Write(size_t(receivedBytes), std::string_view(request->Data, count))) {
-                    IncomingSnapshot.reset(); reply(false, false, 0); return;
+                    DiscardIncomingSnapshot(); reply(false, false, 0); return;
                 }
             } else {
                 memcpy(incoming.Bytes.data() + receivedBytes, request->Data, count);
@@ -4044,11 +4525,11 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         receivedImage = std::string_view(bytes, size_t(receivedBytes));
     }
     if (!IsSupportedSnapshotMagicPrefix(receivedImage)) {
-        IncomingSnapshot.reset(); reply(false, false, 0); return;
+        DiscardIncomingSnapshot(); reply(false, false, 0); return;
     }
     if (SnapshotNeedsJointElectionFence(receivedImage) &&
         !incoming.JointElectionFenceLeader) {
-        IncomingSnapshot.reset(); reply(false, false, 0); return;
+        DiscardIncomingSnapshot(); reply(false, false, 0); return;
     }
     const auto knownSnapshot = State->GetSnapshot();
     const auto* committedConfiguration = Configuration ? &Configuration->Committed : nullptr;
@@ -4067,6 +4548,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         StateName == EState::FOLLOWER && VolatileState->LeaderId == request->LeaderId &&
         incoming.ValidatedMetadata == metadataContext) {
         acceptLeaderContact();
+        if (!PersistIncomingSnapshot()) { reply(false, false, 0); return; }
         reply(true, false, receivedBytes);
         return;
     }
@@ -4081,15 +4563,19 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         // Term observation is independent of leader recognition: retain the
         // transfer after its base voter lists authenticate the sender, while
         // deferring LeaderId and timer changes until full metadata validation.
-        if (probe.TermValidated && request->Term > State->CurrentTerm)
+        if (probe.TermValidated && request->Term > State->CurrentTerm) {
             AdvanceTerm(now, request->Term, true);
+            if (IncomingSnapshot) IncomingSnapshot->Term = request->Term;
+        }
+        if (!PersistIncomingSnapshot()) { reply(false, false, 0); return; }
         reply(true, false, receivedBytes);
         return;
     }
-    if (!probe.Supported) { IncomingSnapshot.reset(); reply(false, false, 0); return; }
+    if (!probe.Supported) { DiscardIncomingSnapshot(); reply(false, false, 0); return; }
     acceptLeaderContact();
     if (receivedBytes < request->TotalBytes) {
         incoming.ValidatedMetadata = metadataContext;
+        if (!PersistIncomingSnapshot()) { reply(false, false, 0); return; }
         reply(true, false, receivedBytes);
         return;
     }
@@ -4136,7 +4622,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             if (sourceBackedInstall)
                 incoming.File->RetainStagingReservation(std::move(incoming.ReceiveReservation));
         }
-        IncomingSnapshot.reset();
+        DiscardIncomingSnapshot();
         auto inheritTrustedLineage = [&](const TConfigurationHistory& history) {
             if (snapshot.HasConfigurationMetadata() && history.IsJoint() &&
                 !history.PreviousVoters().empty() &&
@@ -4301,7 +4787,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
         }
         snapshot.HeapReservation = std::move(installationReservation);
     } catch (const std::exception&) {
-        IncomingSnapshot.reset(); reply(false, false, 0); return;
+        DiscardIncomingSnapshot(); reply(false, false, 0); return;
     }
     std::shared_ptr<const TSnapshot> installedSnapshot;
     try {
@@ -4325,7 +4811,7 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             : TConfigurationHistory::Stable(installedSnapshot->Voters, 0, 0,
                 installedSnapshot->Index, installedSnapshot->Term);
     RefreshConfiguration(VolatileState->CommitIndex);
-    IncomingSnapshot.reset();
+    DiscardIncomingSnapshot();
     reply(true, true, request->TotalBytes);
 }
 

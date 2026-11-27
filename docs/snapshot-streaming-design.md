@@ -165,16 +165,22 @@ advertise the full heap limit; staged transfers advertise limits derived from
 their staging and heap budgets. The advertised receive limit follows the
 manifest-transfer capability of each peer connection.
 
-On Linux, set `TRaft::TLogLimits::SnapshotStagingDirectory` to stage full
-incoming images in a directory on a filesystem that supports anonymous
-temporary files (`O_TMPFILE`). Durable KV servers expose the option as
-`--snapshot-staging-dir PATH`. Use a disk-backed directory to avoid placing the
-receive buffer in the process heap or on a RAM-backed filesystem. Chunks are
-written at their validated offsets, and Raft reads the received bytes through
-a read-only mapping for duplicate, metadata and checksum checks. Staged files
+On Linux, set `TRaft::TLogLimits::SnapshotStagingDirectory` to stage incoming
+images in a directory on a local filesystem. Durable KV servers expose the
+option as `--snapshot-staging-dir PATH`. Legacy whole-image receives and capture
+may use anonymous temporary files (`O_TMPFILE`); negotiated manifest transfers
+use a per-node named payload file and an atomically replaced transfer-state
+record. Each accepted range is synced before the cursor record is published and
+synced, so the receiver never acknowledges a prefix that is ahead of durable
+data. Use a disk-backed directory to avoid placing the receive buffer in the
+process heap or on a RAM-backed filesystem. Raft reads staged bytes through a
+read-only mapping for duplicate, metadata and checksum checks. Staged files
 reserve their declared sizes against a separate 256 MiB process-wide quota.
 Embedders can share a custom quota through `TLogLimits::SnapshotStagingBudget`.
-The staging quota lease covers an in-flight assembly. When a streaming install
+The staging quota lease covers an in-flight or persisted dormant assembly. On
+startup, Raft reacquires that lease before restoring the saved cursor; if the
+quota is unavailable, it drops the unaccounted stage. Dormant cursors expire
+after the same idle interval as live transfers. When a streaming install
 RSM lets Raft retain the staged file as the snapshot's range source, the lease
 moves to that source and remains charged until the snapshot is replaced and all
 transfer pins release it. Materializing installs release the disk lease after
@@ -194,18 +200,22 @@ The standalone `TSnapshotStore::Load()` path also returns a mapped source.
 The SQL RSM uses its streaming installer for both received and recovered
 snapshots. Legacy RSMs, receives without staging, older embedded durable images,
 and non-Linux `TDiskState` recovery may still materialize the payload. The
-active snapshot pins its anonymous receive file or durable snapshot mapping
-until replaced and all transfer pins are released. Retained anonymous receive
-files remain charged to the shared staging quota; durable storage's own snapshot
-files are governed by its storage and filesystem capacity. Partial transfers
-restart at offset zero after process restart. On connections that negotiate
-`SnapshotTransferResume`, a sender that restarts its volatile cursor at zero can
-accept the receiver's correlated forward `NextOffset` and continue from the
-already staged prefix. This does not recover a prefix after the receiver itself
-restarts; its staging file and cursor remain volatile. Peers without that
-capability still require each successful ACK to match the end of the chunk just
-sent. Publication, application-installation and acknowledgement ordering stay
-the same; the versioned and compatibility limits are described above.
+active snapshot pins its receive file or durable snapshot mapping until replaced
+and all transfer pins are released. Retained receive files remain charged to the
+shared staging quota; durable storage's own snapshot files are governed by its
+storage and filesystem capacity. With configured Linux staging and
+`SnapshotTransferDurableResume`, a receiver restores a partial manifest transfer
+after restart only when the receiver ID, leader, snapshot boundary, manifest
+identity and saved metadata prefix match. It reacquires the normal heap and disk
+reservations and probes membership metadata again before accepting progress.
+The sender starts at offset zero and receives the persisted forward offset.
+Without that capability, partial transfers restart at zero after receiver
+restart. `SnapshotTransferResume` also lets a sender that lost its volatile
+cursor resume from a live receiver's retained prefix; peers without that
+capability require each successful ACK to match the end of the chunk just sent.
+Legacy full-image transfers do not persist their partial prefix. Publication,
+application-installation and acknowledgement ordering stay the same; the
+versioned and compatibility limits are described above.
 `TLogLimits::MaxSnapshotImageBytes` can lower the per-node image ceiling for
 capture and receive admission. Values above 128 MiB require a peer that
 negotiates the manifest range protocol; the default per-node limit is 128 MiB
@@ -245,8 +255,10 @@ requires a configured generation resolver when the selected sidecar is
 metadata-only. Payload bytes still traverse the same bounded Raft stream; the
 new negotiated protocol separates them from the manifest on the wire. The
 receiver keeps metadata and payload as separate objects: on Linux, a configured
-`SnapshotStagingDirectory` puts payload ranges directly into an anonymous file;
-without one, it uses a separately budgeted heap buffer. Both paths decode
+`SnapshotStagingDirectory` puts manifest payload ranges directly into a named
+per-node staging file and persists the acknowledged cursor; legacy receive
+staging continues to use anonymous files. Without a staging directory, manifest
+transfers use a separately budgeted heap buffer. Both manifest paths decode
 against the payload source without rebuilding the full encoded image. Legacy
 snapshot RPCs retain the complete-image compatibility path and its 128 MiB cap.
 

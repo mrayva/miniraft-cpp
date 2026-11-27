@@ -295,6 +295,7 @@ void test_peer_capability_probe_and_legacy_fallback(void**) {
     assert_int_equal(state->ProbeWrites, 1);
     assert_true(state->ProbeFeatures & TPeerCapabilitiesRequest::SnapshotTransferManifest);
     assert_true(state->ProbeFeatures & TPeerCapabilitiesRequest::SnapshotTransferResume);
+    assert_true(state->ProbeFeatures & TPeerCapabilitiesRequest::SnapshotTransferDurableResume);
     auto response = NewHoldedMessage<TPeerCapabilitiesResponse>();
     response->Features = TPeerCapabilitiesRequest::ExtendedForwarding |
         TPeerCapabilitiesRequest::SessionizedForwarding;
@@ -302,19 +303,21 @@ void test_peer_capability_probe_and_legacy_fallback(void**) {
     assert_false(node.CompleteCapabilityNegotiation(response, node.GetConnectionGeneration()));
     assert_true(node.IsCapabilityNegotiating());
     response->ConnectionId = node.GetConnectionGeneration();
-    response->Features = uint64_t(1) << 4;
+    response->Features = uint64_t(1) << 5;
     assert_false(node.CompleteCapabilityNegotiation(response, node.GetConnectionGeneration()));
     assert_true(node.IsCapabilityNegotiating());
     response->Features = TPeerCapabilitiesRequest::ExtendedForwarding |
         TPeerCapabilitiesRequest::SessionizedForwarding |
         TPeerCapabilitiesRequest::SnapshotTransferManifest |
-        TPeerCapabilitiesRequest::SnapshotTransferResume;
+        TPeerCapabilitiesRequest::SnapshotTransferResume |
+        TPeerCapabilitiesRequest::SnapshotTransferDurableResume;
     response->ConnectionId = node.GetConnectionGeneration();
     assert_true(node.CompleteCapabilityNegotiation(response, node.GetConnectionGeneration()));
     assert_true(node.SupportsExtendedForwarding());
     assert_true(node.SupportsSessionizedForwarding());
     assert_true(node.SupportsSnapshotTransferManifest());
     assert_true(node.SupportsSnapshotTransferResume());
+    assert_true(node.SupportsDurableSnapshotTransferResume());
 
     auto generation = node.GetConnectionGeneration();
     node.Disconnect(generation);
@@ -322,6 +325,7 @@ void test_peer_capability_probe_and_legacy_fallback(void**) {
     assert_false(node.SupportsSessionizedForwarding());
     assert_false(node.SupportsSnapshotTransferManifest());
     assert_false(node.SupportsSnapshotTransferResume());
+    assert_false(node.SupportsDurableSnapshotTransferResume());
     node.Drain(); poller.Tick();
     generation = node.GetConnectionGeneration();
     assert_true(node.IsCapabilityNegotiating());

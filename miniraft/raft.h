@@ -40,6 +40,7 @@ struct INode {
 struct ISnapshotTransferResumeNode {
     virtual ~ISnapshotTransferResumeNode() = default;
     virtual bool SupportsSnapshotTransferResume() const = 0;
+    virtual bool SupportsDurableSnapshotTransferResume() const { return false; }
 };
 
 // Immutable, range-readable application snapshot data. A source must remain
@@ -619,9 +620,10 @@ public:
         // whether the application can install from a source-backed snapshot.
         std::shared_ptr<TSnapshotInstallBudget> SnapshotInstallBudget;
         // On Linux, stage streamed captures, legacy captures, complete legacy
-        // snapshot images, and negotiated snapshot payloads in anonymous files
-        // in this directory. Without a directory, negotiated transfers keep
-        // metadata and payload in separately accounted heap buffers.
+        // snapshot images, and negotiated snapshot payloads in files in this
+        // directory. Partial negotiated transfers are synced with an atomic
+        // cursor record so they can resume after receiver restart. Without a
+        // directory, negotiated transfers use separately budgeted heap buffers.
         std::string SnapshotStagingDirectory;
         // Share this separately from SnapshotInstallBudget to limit staged
         // file bytes. Defaults to a separate 256 MiB process-wide budget.
@@ -650,6 +652,7 @@ public:
 
     void Process(ITimeSource::Time now, TMessageHolder<TMessage> message, const std::shared_ptr<INode>& replyTo = {});
     void ProcessTimeout(ITimeSource::Time now);
+    bool SupportsDurableSnapshotTransferResume() const noexcept;
 
     // Local proposals require leader state. Role rejection leaves storage and
     // the supplied entry unchanged; followers receive entries through Process.
@@ -896,8 +899,19 @@ private:
         bool JointElectionFenceLeader = false;
         std::string Payload;
         std::shared_ptr<TSnapshotInstallBudget::TReservation> HeapReceiveReservation;
+        bool DurableStaging = false;
     };
     std::optional<TIncomingSnapshot> IncomingSnapshot;
+    std::optional<ITimeSource::Time> DurableStageLastProgress;
+    std::shared_ptr<void> DormantSnapshotStageReservation;
+    uint64_t DormantSnapshotStageReservationBytes = 0;
+    enum class EIncomingSnapshotRestore { Missing, Invalid, OverBudget, Restored };
+    void DiscardIncomingSnapshot() noexcept;
+    void AccountDormantSnapshotStage(ITimeSource::Time now) noexcept;
+    bool PersistIncomingSnapshot() noexcept;
+    EIncomingSnapshotRestore RestoreIncomingSnapshot(ITimeSource::Time now,
+        const TInstallSnapshotRequest& request, const TSnapshotTransferIdentity& transfer,
+        bool jointElectionFenceLeader);
     std::shared_ptr<const TSnapshotEncoding> EncodedSnapshot;
     uint64_t EncodedSnapshotIndex = 0;
     std::shared_ptr<const TSnapshotEncoding> EncodedSnapshotExtendedHistory;

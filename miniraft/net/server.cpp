@@ -61,6 +61,9 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(
                         TPeerCapabilitiesRequest::SessionizedForwarding |
                         TPeerCapabilitiesRequest::SnapshotTransferManifest |
                         TPeerCapabilitiesRequest::SnapshotTransferResume) : 0;
+                if (compatible && Raft->SupportsDurableSnapshotTransferResume() &&
+                    (request->Features & TPeerCapabilitiesRequest::SnapshotTransferDurableResume))
+                    response->Features |= TPeerCapabilitiesRequest::SnapshotTransferDurableResume;
                 response->ConnectionId = request->ConnectionId;
                 client->Send(std::move(response));
                 handledCapabilities = true;

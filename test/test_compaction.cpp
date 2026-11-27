@@ -4754,6 +4754,218 @@ void test_file_staged_snapshot_install_accepts_every_small_fixed_chunk_size(void
     assert_true(std::filesystem::is_empty(files.Directory));
 }
 
+void test_manifest_snapshot_transfer_resumes_after_receiver_restart(void**) {
+    TFiles files;
+    TKv source;
+    source.Write(source.Prepare(Command("restart", std::string(60000, 'r'))), 1);
+    source.Write(source.Prepare(Command("second", std::string(60000, 's'))), 2);
+    const TSnapshot snapshot{2, 1, {1, 2}, source.SaveSnapshot()};
+    const auto manifest = PrepareSnapshotTransferManifest(snapshot);
+    auto diskBudget = std::make_shared<TSnapshotInstallBudget>(2 * manifest.PayloadBytes);
+    auto heapBudget = std::make_shared<TSnapshotInstallBudget>();
+    TRaft::TLogLimits limits{.SnapshotInstallBudget = heapBudget,
+        .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingBudget = diskBudget};
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
+    auto makePeer = [&] {
+        return std::make_shared<TEndpoint>([&](auto message) {
+            if (auto response = message.template Maybe<TInstallSnapshotResponse>())
+                responses.push_back(response.Cast());
+        });
+    };
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 3;
+    const auto first = RangeChunk(snapshot, manifest,
+        TInstallSnapshotRangeRequest::EPhase::Metadata, 0,
+        std::string_view(manifest.Metadata).substr(0, 8), 1);
+    {
+        auto peer = makePeer();
+        TNodeDict peers{{1, peer}};
+        auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{}, limits);
+        auto app = std::make_shared<TApplication>();
+        TRequestProcessor processor(raft, app, peers);
+        assert_true(raft->SupportsDurableSnapshotTransferResume());
+        raft->Process({}, first);
+        assert_int_equal(responses.size(), 1);
+        assert_true(responses.back()->Success);
+        assert_false(responses.back()->Installed);
+        assert_int_equal(responses.back()->NextOffset, 8);
+        assert_true(std::filesystem::exists(files.Directory / "miniraft-incoming-2.state"));
+        assert_true(std::filesystem::exists(files.Directory / "miniraft-incoming-2.payload"));
+    }
+    assert_int_equal(diskBudget->UsedBytes(), 0);
+
+    responses.clear();
+    auto peer = makePeer();
+    TNodeDict peers{{1, peer}};
+    auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{}, limits);
+    auto app = std::make_shared<TApplication>();
+    TRequestProcessor processor(raft, app, peers);
+    auto replay = RangeChunk(snapshot, manifest,
+        TInstallSnapshotRangeRequest::EPhase::Metadata, 0,
+        std::string_view(manifest.Metadata).substr(0, 8), 2);
+    raft->Process({}, replay);
+    assert_int_equal(responses.size(), 1);
+    assert_true(responses.back()->Success);
+    assert_false(responses.back()->Installed);
+    assert_int_equal(responses.back()->NextOffset, 8);
+    assert_int_equal(diskBudget->UsedBytes(), manifest.PayloadBytes);
+
+    uint64_t cursor = responses.back()->NextOffset;
+    uint64_t sequence = 3;
+    const auto payloadStart = uint64_t(manifest.Metadata.size());
+    const auto checksumStart = payloadStart + manifest.PayloadBytes;
+    const auto total = checksumStart + 4;
+    while (cursor < total) {
+        TInstallSnapshotRangeRequest::EPhase phase;
+        uint64_t phaseOffset;
+        std::string_view bytes;
+        std::string checksum;
+        if (cursor < payloadStart) {
+            phase = TInstallSnapshotRangeRequest::EPhase::Metadata;
+            phaseOffset = cursor;
+            const auto count = size_t(std::min<uint64_t>(
+                TInstallSnapshotRangeRequest::MaxChunkBytes, payloadStart - cursor));
+            bytes = std::string_view(manifest.Metadata).substr(size_t(cursor), count);
+        } else if (cursor < checksumStart) {
+            phase = TInstallSnapshotRangeRequest::EPhase::Payload;
+            phaseOffset = cursor - payloadStart;
+            const auto count = size_t(std::min<uint64_t>(
+                TInstallSnapshotRangeRequest::MaxChunkBytes, checksumStart - cursor));
+            bytes = std::string_view(snapshot.Data).substr(size_t(phaseOffset), count);
+        } else {
+            phase = TInstallSnapshotRangeRequest::EPhase::Checksum;
+            phaseOffset = 0;
+            checksum.resize(4);
+            for (unsigned i = 0; i < 4; ++i) checksum[i] = char(manifest.Checksum >> (8 * i));
+            bytes = checksum;
+        }
+        const auto expectedResponses = responses.size() + 1;
+        raft->Process({}, RangeChunk(snapshot, manifest, phase, phaseOffset, bytes, sequence++));
+        assert_int_equal(responses.size(), expectedResponses);
+        assert_true(responses.back()->Success);
+        cursor = responses.back()->NextOffset;
+        if (cursor == total) assert_true(responses.back()->Installed);
+        else assert_false(responses.back()->Installed);
+    }
+    assert_int_equal(state->SnapshotIndex, snapshot.Index);
+    assert_int_equal(app->Loads, 1);
+    assert_true(Read(*app, "restart") == std::string(60000, 'r'));
+    assert_true(std::filesystem::is_empty(files.Directory));
+}
+
+void test_manifest_snapshot_restart_rejects_cursor_bound_to_another_leader(void**) {
+    TFiles files;
+    TKv source;
+    source.Write(source.Prepare(Command("identity", std::string(60000, 'i'))), 1);
+    source.Write(source.Prepare(Command("second", std::string(60000, 'j'))), 2);
+    const TSnapshot snapshot{2, 1, {1, 2}, source.SaveSnapshot()};
+    const auto manifest = PrepareSnapshotTransferManifest(snapshot);
+    auto diskBudget = std::make_shared<TSnapshotInstallBudget>(2 * manifest.PayloadBytes);
+    auto heapBudget = std::make_shared<TSnapshotInstallBudget>();
+    TRaft::TLogLimits limits{.SnapshotInstallBudget = heapBudget,
+        .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingBudget = diskBudget};
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
+    auto makePeer = [&] {
+        return std::make_shared<TEndpoint>([&](auto message) {
+            if (auto response = message.template Maybe<TInstallSnapshotResponse>())
+                responses.push_back(response.Cast());
+        });
+    };
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 3;
+    const auto first = RangeChunk(snapshot, manifest,
+        TInstallSnapshotRangeRequest::EPhase::Metadata, 0,
+        std::string_view(manifest.Metadata).substr(0, 8), 1);
+    const auto second = RangeChunk(snapshot, manifest,
+        TInstallSnapshotRangeRequest::EPhase::Metadata, 8,
+        std::string_view(manifest.Metadata).substr(8, 8), 2);
+    {
+        auto peer = makePeer();
+        TNodeDict peers{{1, peer}};
+        auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{}, limits);
+        auto app = std::make_shared<TApplication>();
+        TRequestProcessor processor(raft, app, peers);
+        raft->Process({}, first);
+        assert_true(responses.back()->Success);
+        assert_int_equal(responses.back()->NextOffset, 8);
+        raft->Process({}, second);
+        assert_true(responses.back()->Success);
+        assert_int_equal(responses.back()->NextOffset, 16);
+    }
+    assert_int_equal(diskBudget->UsedBytes(), 0);
+    {
+        std::fstream cursor(files.Directory / "miniraft-incoming-2.state",
+            std::ios::in | std::ios::out | std::ios::binary);
+        assert_true(cursor.is_open());
+        cursor.seekp(12);
+        const char otherLeader[4] = {9, 0, 0, 0};
+        cursor.write(otherLeader, sizeof(otherLeader));
+        assert_true(cursor.good());
+    }
+
+    responses.clear();
+    auto peer = makePeer();
+    TNodeDict peers{{1, peer}};
+    auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{}, limits);
+    auto app = std::make_shared<TApplication>();
+    TRequestProcessor processor(raft, app, peers);
+    raft->Process({}, first);
+    assert_int_equal(responses.size(), 1);
+    assert_true(responses.back()->Success);
+    assert_false(responses.back()->Installed);
+    assert_int_equal(responses.back()->NextOffset, 8);
+}
+
+void test_durable_manifest_stage_is_accounted_and_expires_after_receiver_restart(void**) {
+    TFiles files;
+    TKv source;
+    source.Write(source.Prepare(Command("expiry", std::string(60000, 'e'))), 1);
+    const TSnapshot snapshot{1, 1, {1, 2}, source.SaveSnapshot()};
+    const auto manifest = PrepareSnapshotTransferManifest(snapshot);
+    auto diskBudget = std::make_shared<TSnapshotInstallBudget>(2 * manifest.PayloadBytes);
+    auto heapBudget = std::make_shared<TSnapshotInstallBudget>();
+    TRaft::TLogLimits limits{.SnapshotInstallBudget = heapBudget,
+        .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingBudget = diskBudget};
+    std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
+    auto makePeer = [&] {
+        return std::make_shared<TEndpoint>([&](auto message) {
+            if (auto response = message.template Maybe<TInstallSnapshotResponse>())
+                responses.push_back(response.Cast());
+        });
+    };
+    auto state = std::make_shared<TState>();
+    state->CurrentTerm = 3;
+    const auto first = RangeChunk(snapshot, manifest,
+        TInstallSnapshotRangeRequest::EPhase::Metadata, 0,
+        std::string_view(manifest.Metadata).substr(0, 8), 1);
+    {
+        auto peer = makePeer();
+        TNodeDict peers{{1, peer}};
+        auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{}, limits);
+        auto app = std::make_shared<TApplication>();
+        TRequestProcessor processor(raft, app, peers);
+        raft->Process({}, first);
+        assert_int_equal(responses.size(), 1);
+        assert_true(responses.back()->Success);
+    }
+    assert_int_equal(diskBudget->UsedBytes(), 0);
+    assert_true(std::filesystem::exists(files.Directory / "miniraft-incoming-2.state"));
+
+    responses.clear();
+    auto peer = makePeer();
+    TNodeDict peers{{1, peer}};
+    auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{}, limits);
+    auto app = std::make_shared<TApplication>();
+    TRequestProcessor processor(raft, app, peers);
+    const ITimeSource::Time start{};
+    raft->ProcessTimeout(start);
+    assert_int_equal(diskBudget->UsedBytes(), manifest.PayloadBytes);
+    assert_true(std::filesystem::exists(files.Directory / "miniraft-incoming-2.state"));
+    raft->ProcessTimeout(start + TTimeout::SnapshotTransferIdle);
+    assert_int_equal(diskBudget->UsedBytes(), 0);
+    assert_true(std::filesystem::is_empty(files.Directory));
+}
+
 void test_file_staging_failure_releases_snapshot_reservation(void**) {
     TFiles files;
     auto budget = std::make_shared<TSnapshotInstallBudget>();
@@ -5426,6 +5638,9 @@ int main() {
         cmocka_unit_test(test_memory_snapshot_boundary_retains_matching_suffix_and_replaces_conflict),
 #ifdef __linux__
         cmocka_unit_test(test_file_staged_snapshot_install_accepts_every_small_fixed_chunk_size),
+        cmocka_unit_test(test_manifest_snapshot_transfer_resumes_after_receiver_restart),
+        cmocka_unit_test(test_manifest_snapshot_restart_rejects_cursor_bound_to_another_leader),
+        cmocka_unit_test(test_durable_manifest_stage_is_accounted_and_expires_after_receiver_restart),
         cmocka_unit_test(test_incremental_snapshot_capture_uses_disk_staging_quota),
         cmocka_unit_test(test_disk_staged_capture_becomes_durable_snapshot_across_restart),
         cmocka_unit_test(test_durable_application_snapshot_generation_is_published_before_raft_and_restored),
