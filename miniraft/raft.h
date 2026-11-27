@@ -614,6 +614,17 @@ public:
             CursorRenamed,
             CursorDirectorySynced,
         };
+        enum class ESnapshotTransferIoOperation {
+            PayloadWrite,
+            PayloadSync,
+            CursorTempCreate,
+            CursorHeaderWrite,
+            CursorPrefixWrite,
+            CursorFileSync,
+            CursorRename,
+            CursorDirectoryOpen,
+            CursorDirectorySync,
+        };
         uint64_t MaxUncommittedBytes = 256ull * 1024 * 1024;
         size_t MaxUncommittedEntries = 65536;
         // Keep one entry's worth of room for a leader's current-term no-op.
@@ -648,6 +659,9 @@ public:
         // Optional deterministic crash-test hook for durable manifest cursor
         // publication. Leave empty in normal deployments.
         std::function<void(ESnapshotTransferStage)> SnapshotTransferStageHook;
+        // Optional I/O failure injector. Returning true makes the selected
+        // operation fail as if its syscall had returned an error.
+        std::function<bool(ESnapshotTransferIoOperation)> SnapshotTransferIoFailureHook;
     };
 
     // Nodes contains every configured replication peer; learners may include

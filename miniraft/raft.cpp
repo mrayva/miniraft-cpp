@@ -1056,15 +1056,23 @@ bool SyncStage(int fd) {
 }
 
 using ESnapshotTransferStage = TRaft::TLogLimits::ESnapshotTransferStage;
+using ESnapshotTransferIoOperation = TRaft::TLogLimits::ESnapshotTransferIoOperation;
 
 void NotifySnapshotTransferStage(
         const std::function<void(ESnapshotTransferStage)>& hook, ESnapshotTransferStage stage) {
     if (hook) hook(stage);
 }
 
+bool FailSnapshotTransferIo(
+        const std::function<bool(ESnapshotTransferIoOperation)>& hook,
+        ESnapshotTransferIoOperation operation) {
+    return hook && hook(operation);
+}
+
 bool WriteIncomingSnapshotStageRecord(const std::string& directory, uint32_t id,
         const TIncomingSnapshotStageRecord& record,
-        const std::function<void(ESnapshotTransferStage)>& hook) {
+        const std::function<void(ESnapshotTransferStage)>& hook,
+        const std::function<bool(ESnapshotTransferIoOperation)>& failIo) {
     if (record.MetadataPrefix.size() != record.MetadataPrefixBytes ||
         record.MetadataPrefixBytes > record.MetadataBytes ||
         record.ReceivedBytes > record.Total)
@@ -1086,6 +1094,8 @@ bool WriteIncomingSnapshotStageRecord(const std::string& directory, uint32_t id,
 
     const auto statePath = IncomingSnapshotStagePath(directory, id, ".state");
     const auto tempPath = IncomingSnapshotStagePath(directory, id, ".state.tmp");
+    if (FailSnapshotTransferIo(failIo, ESnapshotTransferIoOperation::CursorTempCreate))
+        return false;
     const auto tempFd = open(tempPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC |
         O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
     if (tempFd < 0) return false;
@@ -1099,24 +1109,32 @@ bool WriteIncomingSnapshotStageRecord(const std::string& directory, uint32_t id,
         return false;
     }
     NotifySnapshotTransferStage(hook, ESnapshotTransferStage::CursorTempCreated);
-    if (!WriteStageAll(temp.Fd, bytes) || !WriteStageAll(temp.Fd, record.MetadataPrefix)) {
+    if (FailSnapshotTransferIo(failIo, ESnapshotTransferIoOperation::CursorHeaderWrite) ||
+        !WriteStageAll(temp.Fd, bytes) ||
+        FailSnapshotTransferIo(failIo, ESnapshotTransferIoOperation::CursorPrefixWrite) ||
+        !WriteStageAll(temp.Fd, record.MetadataPrefix)) {
         unlink(tempPath.c_str());
         return false;
     }
     NotifySnapshotTransferStage(hook, ESnapshotTransferStage::CursorTempWritten);
-    if (!SyncStage(temp.Fd)) {
+    if (FailSnapshotTransferIo(failIo, ESnapshotTransferIoOperation::CursorFileSync) ||
+        !SyncStage(temp.Fd)) {
         unlink(tempPath.c_str());
         return false;
     }
     NotifySnapshotTransferStage(hook, ESnapshotTransferStage::CursorTempSynced);
-    if (rename(tempPath.c_str(), statePath.c_str()) != 0) {
+    if (FailSnapshotTransferIo(failIo, ESnapshotTransferIoOperation::CursorRename) ||
+        rename(tempPath.c_str(), statePath.c_str()) != 0) {
         unlink(tempPath.c_str());
         return false;
     }
     NotifySnapshotTransferStage(hook, ESnapshotTransferStage::CursorRenamed);
+    if (FailSnapshotTransferIo(failIo, ESnapshotTransferIoOperation::CursorDirectoryOpen))
+        return false;
     const auto directoryFd = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (directoryFd < 0) return false;
-    const bool synced = SyncStage(directoryFd);
+    const bool synced = !FailSnapshotTransferIo(
+        failIo, ESnapshotTransferIoOperation::CursorDirectorySync) && SyncStage(directoryFd);
     close(directoryFd);
     if (synced) NotifySnapshotTransferStage(hook, ESnapshotTransferStage::CursorDirectorySynced);
     return synced;
@@ -2318,7 +2336,8 @@ bool TRaft::PersistIncomingSnapshot() noexcept {
         const auto& incoming = *IncomingSnapshot;
         const auto& transfer = *incoming.Transfer;
         if (incoming.File) {
-            if (!incoming.File->Sync()) return false;
+            if (FailSnapshotTransferIo(LogLimits.SnapshotTransferIoFailureHook,
+                    ESnapshotTransferIoOperation::PayloadSync) || !incoming.File->Sync()) return false;
             NotifySnapshotTransferStage(LogLimits.SnapshotTransferStageHook,
                 ESnapshotTransferStage::PayloadSynced);
         }
@@ -2343,7 +2362,8 @@ bool TRaft::PersistIncomingSnapshot() noexcept {
         };
         if (!WriteIncomingSnapshotStageRecord(
                 LogLimits.SnapshotStagingDirectory, Id, record,
-                LogLimits.SnapshotTransferStageHook)) return false;
+                LogLimits.SnapshotTransferStageHook,
+                LogLimits.SnapshotTransferIoFailureHook)) return false;
         DurableStageLastProgress = incoming.LastProgress;
         return true;
     } catch (...) {
@@ -4512,7 +4532,9 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
             }
             const auto payloadOffset = size_t(request->Offset - identity.MetadataBytes);
             if (incoming.File) {
-                if (!incoming.File->Write(payloadOffset, chunk)) {
+                if (FailSnapshotTransferIo(LogLimits.SnapshotTransferIoFailureHook,
+                        ESnapshotTransferIoOperation::PayloadWrite) ||
+                    !incoming.File->Write(payloadOffset, chunk)) {
                     DiscardIncomingSnapshot(); reply(false, false, 0); return;
                 }
             } else {

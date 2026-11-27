@@ -5061,6 +5061,93 @@ void test_manifest_snapshot_cursor_crash_boundaries_never_ack_unsynced_progress(
         assert_int_equal(responses.back()->NextOffset, expectedOffset);
     }
 }
+
+void test_manifest_snapshot_io_failures_do_not_ack_unpublished_cursor(void**) {
+    using TIo = TRaft::TLogLimits::ESnapshotTransferIoOperation;
+    const std::array operations{TIo::PayloadWrite, TIo::PayloadSync, TIo::CursorTempCreate,
+        TIo::CursorHeaderWrite, TIo::CursorPrefixWrite, TIo::CursorFileSync,
+        TIo::CursorRename, TIo::CursorDirectoryOpen, TIo::CursorDirectorySync};
+    for (const auto operation : operations) {
+        TFiles files;
+        TKv source;
+        source.Write(source.Prepare(Command("io-failure", std::string(60000, 'f'))), 1);
+        source.Write(source.Prepare(Command("second", std::string(60000, 'g'))), 2);
+        const TSnapshot snapshot{2, 1, {1, 2}, source.SaveSnapshot()};
+        const auto manifest = PrepareSnapshotTransferManifest(snapshot);
+        auto diskBudget = std::make_shared<TSnapshotInstallBudget>(2 * manifest.PayloadBytes);
+        auto heapBudget = std::make_shared<TSnapshotInstallBudget>();
+        TRaft::TLogLimits limits{.SnapshotInstallBudget = heapBudget,
+            .SnapshotStagingDirectory = files.Directory.string(), .SnapshotStagingBudget = diskBudget};
+        const auto metadataChunk = RangeChunk(snapshot, manifest,
+            TInstallSnapshotRangeRequest::EPhase::Metadata, 0, manifest.Metadata, 1);
+        constexpr size_t PayloadChunkBytes = 64;
+        const auto payloadChunk = RangeChunk(snapshot, manifest,
+            TInstallSnapshotRangeRequest::EPhase::Payload, 0,
+            std::string_view(snapshot.Data).substr(0, PayloadChunkBytes), 2);
+        auto state = std::make_shared<TState>();
+        state->CurrentTerm = 3;
+        {
+            std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
+            auto peer = std::make_shared<TEndpoint>([&](auto message) {
+                if (auto response = message.template Maybe<TInstallSnapshotResponse>())
+                    responses.push_back(response.Cast());
+            });
+            TNodeDict peers{{1, peer}};
+            auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{}, limits);
+            auto app = std::make_shared<TApplication>();
+            TRequestProcessor processor(raft, app, peers);
+            raft->Process({}, metadataChunk);
+            assert_int_equal(responses.size(), 1);
+            assert_true(responses.back()->Success);
+            assert_int_equal(responses.back()->NextOffset, manifest.Metadata.size());
+        }
+
+        {
+            bool inject = false;
+            auto failingLimits = limits;
+            failingLimits.SnapshotTransferIoFailureHook = [&](auto point) {
+                return inject && point == operation;
+            };
+            std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
+            auto peer = std::make_shared<TEndpoint>([&](auto message) {
+                if (auto response = message.template Maybe<TInstallSnapshotResponse>())
+                    responses.push_back(response.Cast());
+            });
+            TNodeDict peers{{1, peer}};
+            auto raft = std::make_shared<TRaft>(state, 2, peers,
+                std::vector<uint32_t>{}, failingLimits);
+            auto app = std::make_shared<TApplication>();
+            TRequestProcessor processor(raft, app, peers);
+            raft->Process({}, metadataChunk);
+            assert_int_equal(responses.size(), 1);
+            assert_true(responses.back()->Success);
+            assert_int_equal(responses.back()->NextOffset, manifest.Metadata.size());
+            inject = true;
+            raft->Process({}, payloadChunk);
+            assert_int_equal(responses.size(), 2);
+            assert_false(responses.back()->Success);
+        }
+
+        const bool renamed = operation == TIo::CursorDirectoryOpen ||
+            operation == TIo::CursorDirectorySync;
+        const auto expectedOffset = uint64_t(manifest.Metadata.size()) +
+            (renamed ? PayloadChunkBytes : 0);
+        std::vector<TMessageHolder<TInstallSnapshotResponse>> responses;
+        auto peer = std::make_shared<TEndpoint>([&](auto message) {
+            if (auto response = message.template Maybe<TInstallSnapshotResponse>())
+                responses.push_back(response.Cast());
+        });
+        TNodeDict peers{{1, peer}};
+        auto raft = std::make_shared<TRaft>(state, 2, peers, std::vector<uint32_t>{}, limits);
+        auto app = std::make_shared<TApplication>();
+        TRequestProcessor processor(raft, app, peers);
+        raft->Process({}, metadataChunk);
+        assert_int_equal(responses.size(), 1);
+        assert_true(responses.back()->Success);
+        assert_false(responses.back()->Installed);
+        assert_int_equal(responses.back()->NextOffset, expectedOffset);
+    }
+}
 #endif
 
 void test_file_staging_failure_releases_snapshot_reservation(void**) {
@@ -5739,6 +5826,7 @@ int main() {
         cmocka_unit_test(test_manifest_snapshot_restart_rejects_cursor_bound_to_another_leader),
         cmocka_unit_test(test_durable_manifest_stage_is_accounted_and_expires_after_receiver_restart),
         cmocka_unit_test(test_manifest_snapshot_cursor_crash_boundaries_never_ack_unsynced_progress),
+        cmocka_unit_test(test_manifest_snapshot_io_failures_do_not_ack_unpublished_cursor),
         cmocka_unit_test(test_incremental_snapshot_capture_uses_disk_staging_quota),
         cmocka_unit_test(test_disk_staged_capture_becomes_durable_snapshot_across_restart),
         cmocka_unit_test(test_durable_application_snapshot_generation_is_published_before_raft_and_restored),
