@@ -589,11 +589,47 @@ void test_server_binds_peer_rpc_source_to_authenticated_identity(void**) {
         !mismatchedEndpoint->IsCapabilityNegotiating() &&
         !dynamicEndpoint->IsConnected() &&
         !dynamicEndpoint->IsCapabilityNegotiating();
+
+    // A connected replacement endpoint must be checked before replacing the
+    // registered target or retiring its response reader. This candidate is
+    // trusted by the same CA but presents peer 2's identity instead of peer 5.
+    auto mismatchedReplacement = makeOutboundPeer("replacement-peer-5");
+    mismatchedReplacement->Drain();
+    const auto replacementConnectDeadline = NNet::TClock::now() + 3s;
+    while (!mismatchedReplacement->IsConnected() &&
+            NNet::TClock::now() < replacementConnectDeadline)
+        loop.Step();
+    bool mismatchReplacementRejected = false;
+    auto resolutionsBeforeReplacement = outboundIdentityResolutions.load(std::memory_order_relaxed);
+    if (mismatchedReplacement->IsConnected()) {
+        resolutionsBeforeReplacement = outboundIdentityResolutions.load(std::memory_order_relaxed);
+        try {
+            outboundServer.ReplacePeerTarget(5, mismatchedReplacement);
+        } catch (const std::invalid_argument&) {
+            mismatchReplacementRejected = true;
+        }
+    }
+    const bool wrongReplacementIdentityRejected = mismatchedReplacement->IsConnected() &&
+        mismatchReplacementRejected && !dynamicEndpoint->IsRetired() &&
+        outboundIdentityResolutions.load(std::memory_order_relaxed) ==
+            resolutionsBeforeReplacement + 1;
+    mismatchedReplacement->Retire();
+    mismatchedReplacement->Drain();
+    const auto replacementRetireDeadline = NNet::TClock::now() + 3s;
+    while (!mismatchedReplacement->RetirementComplete() &&
+            NNet::TClock::now() < replacementRetireDeadline) {
+        loop.Step();
+        mismatchedReplacement->Drain();
+    }
+    const bool replacementRetired = mismatchedReplacement->RetirementComplete();
+
     bool outboundStopped = false;
     StopServerAndMark(outboundServer, outboundStopped);
     const auto outboundStopDeadline = NNet::TClock::now() + 3s;
     while (!outboundStopped && NNet::TClock::now() < outboundStopDeadline) loop.Step();
     assert_true(outboundStopped);
+    assert_true(wrongReplacementIdentityRejected);
+    assert_true(replacementRetired);
 
     // A TLS client without a certificate must be disconnected before any Raft
     // response is produced. TLS 1.3 may let the client finish its side of the
