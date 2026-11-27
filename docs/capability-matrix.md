@@ -78,6 +78,10 @@ design notes. This is a capability summary, not a production-readiness claim.
 The membership, compaction, transfer and legacy disk-publication paths have deterministic regression
 coverage described in their design notes. Joint-election tests also enumerate
 every reply ordering for overlapping and disjoint voter sets, checking each
-delivery prefix before both majorities are present. This coverage does not
-establish hardware power-loss behavior, authenticate peers, or replace
-independent review.
+delivery prefix before both majorities are present. Durable-state tests stop a
+child process at each ordinary-publication and snapshot-install publication
+hook, and inject `RLIMIT_FSIZE` write errors during append and snapshot
+installation; recovery checks that only manifest-selected state survives and
+incomplete snapshot files are reclaimed. These tests do not establish hardware
+power-loss behavior or cover every filesystem failure. They also do not
+authenticate peers or replace independent review.

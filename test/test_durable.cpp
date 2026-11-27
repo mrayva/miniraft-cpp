@@ -972,7 +972,7 @@ void test_write_error_is_fatal_and_preserves_image(void**) {
             TDurableState state(files.Name, 1);
             struct rlimit limit;
             if (getrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(76);
-            limit.rlim_cur = 0;
+            limit.rlim_cur = 1;
             if (setrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(76);
             std::signal(SIGXFSZ, SIG_IGN);
             state.Append(Entry(3, "must not be acknowledged"));
@@ -982,6 +982,38 @@ void test_write_error_is_fatal_and_preserves_image(void**) {
     Wait(child, 73);
     TDurableState recovered(files.Name, 1);
     Check(recovered, EOperation::Append, false);
+}
+
+void test_snapshot_install_write_error_is_fatal_and_preserves_old_state(void**) {
+    TFiles files;
+    files.Seed();
+    const auto child = fork();
+    assert_true(child >= 0);
+    if (child == 0) {
+        std::set_terminate([] { _exit(73); });
+        try {
+            TDurableState state(files.Name, 1);
+            struct rlimit limit;
+            if (getrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(76);
+            limit.rlim_cur = 1;
+            if (setrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(76);
+            std::signal(SIGXFSZ, SIG_IGN);
+            state.InstallSnapshot(TSnapshot{2, 2, {1, 2}, "failed snapshot"});
+        } catch (...) { _exit(74); }
+        _exit(75);
+    }
+    Wait(child, 73);
+    TDurableState recovered(files.Name, 1);
+    assert_int_equal(recovered.CurrentTerm, 3);
+    assert_int_equal(recovered.VotedFor, 2);
+    assert_int_equal(recovered.LastLogIndex, 2);
+    assert_int_equal(recovered.CommitIndex, 0);
+    assert_false(bool(recovered.GetSnapshot()));
+    assert_string_equal(Data(recovered, 1).c_str(), "first");
+    assert_string_equal(Data(recovered, 2).c_str(), "second");
+    const auto imageBase = files.Image().string();
+    assert_false(fs::exists(imageBase + ".snapshot.2.2"));
+    assert_false(fs::exists(imageBase + ".snapshot.2.2.tmp"));
 }
 
 void test_interrupted_initialization_is_not_reset(void**) {
@@ -2043,6 +2075,7 @@ int main() {
         cmocka_unit_test(test_live_publication_failure_is_fatal),
         cmocka_unit_test(test_mid_payload_failure_is_fatal_and_preserves_image),
         cmocka_unit_test(test_write_error_is_fatal_and_preserves_image),
+        cmocka_unit_test(test_snapshot_install_write_error_is_fatal_and_preserves_old_state),
         cmocka_unit_test(test_interrupted_initialization_is_not_reset),
         cmocka_unit_test(test_corrupt_images_are_rejected),
         cmocka_unit_test(test_single_writer_lock),
