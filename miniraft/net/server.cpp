@@ -32,7 +32,7 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(
             auto mes = co_await TMessageReader(client->Sock(), {}, InboundMessageBudget).Read();
             InboundLastActivity[client] = CurrentTime();
             if (ResolvePeerIdentity && !peerIdentityResolved) {
-                authenticatedPeerId = ResolvePeerIdentity(client->Sock());
+                authenticatedPeerId = (*ResolvePeerIdentity)(client->Sock());
                 peerIdentityResolved = true;
             }
             if (ResolvePeerIdentity) {
@@ -201,6 +201,7 @@ void TRaftServer<TSocket>::RegisterPeerTargetImpl(
     typename TRaftServer<TSocket>::TSerializedAccessGuard lock(*this);
     if (Stopping) throw std::logic_error("Cannot register peers on a stopped Raft server");
     if (!node || node->IsRetired()) throw std::invalid_argument("Invalid peer target endpoint");
+    ValidatePeerIdentity(id, node);
     auto [peer, insertedPeer] = PeerNodes.emplace(id, node);
     if (!insertedPeer) throw std::invalid_argument("Duplicate network peer ID");
 
@@ -222,6 +223,7 @@ void TRaftServer<TSocket>::RegisterPeerTargetImpl(
         PeerNodes.erase(peer);
         throw;
     }
+    BindPeerIdentity(id, node);
     // Routing and Raft target registration is already committed. A reader
     // launch failure must not report this operation as failed; Idle retries
     // readers whose reservation was rolled back by reconciliation.
@@ -243,6 +245,7 @@ std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::ReplacePeerTarget(
     if (peer == PeerNodes.end()) throw std::invalid_argument("Unknown network peer target");
     auto previous = peer->second;
     if (previous == node) throw std::invalid_argument("Peer endpoint is already registered");
+    ValidatePeerIdentity(id, node);
 
     const bool readerStarted = PeerResponseReaders.contains(id);
     if (readerStarted && !previous->SupportsRetirement())
@@ -272,6 +275,7 @@ std::shared_ptr<TNode<TSocket>> TRaftServer<TSocket>::ReplacePeerTarget(
         throw;
     }
 
+    BindPeerIdentity(id, node);
     Nodes.swap(nodes);
     PeerNodes.swap(peerNodes);
     RetiredPeerNodes.swap(retiredPeerNodes);

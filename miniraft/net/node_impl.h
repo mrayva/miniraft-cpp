@@ -302,6 +302,20 @@ NNet::TVoidSuspendedTask TNode<TSocket>::DoConnect() {
                 ShutdownSocket();
                 break;
             }
+            if (OutboundPeerIdentityResolver) {
+                std::optional<uint32_t> authenticatedPeerId;
+                try {
+                    authenticatedPeerId = (*OutboundPeerIdentityResolver)(Socket);
+                } catch (...) {
+                    ShutdownSocket();
+                    throw;
+                }
+                if (!authenticatedPeerId || *authenticatedPeerId != ExpectedPeerId) {
+                    ShutdownSocket();
+                    throw std::runtime_error(
+                        "Connected peer identity does not match configured node ID");
+                }
+            }
             if constexpr (requires(TSocket& socket, char* buffer) { socket.ReadSome(buffer, size_t{}); }) {
                 const bool skipProbe = SkipNextCapabilityProbe;
                 SkipNextCapabilityProbe = false;

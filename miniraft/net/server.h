@@ -597,6 +597,7 @@ struct THost {
 template<typename TSocket>
 class TNode: public INode, public ISnapshotTransferResumeNode {
 public:
+    using TPeerIdentityResolver = std::function<std::optional<uint32_t>(const TSocket&)>;
     static constexpr size_t MaxQueuedDataMessages = 128;
     static constexpr uint64_t MaxQueuedDataBytes = 16 * 1024 * 1024;
     // Four pending control messages; queued retries are coalesced by traffic
@@ -698,6 +699,18 @@ public:
             (PeerFeatures & TPeerCapabilitiesRequest::SnapshotTransferDurableResume);
     }
     bool IsCapabilityNegotiating() const { return CapabilityNegotiating; }
+    void ValidateExpectedPeerIdentity(uint32_t peerId,
+            const TPeerIdentityResolver& resolver) const {
+        if (!Connected) return;
+        const auto authenticatedId = resolver(Socket);
+        if (!authenticatedId || *authenticatedId != peerId)
+            throw std::invalid_argument("Connected peer identity does not match configured node ID");
+    }
+    void SetExpectedPeerIdentity(uint32_t peerId,
+            std::shared_ptr<const TPeerIdentityResolver> resolver) noexcept {
+        ExpectedPeerId = peerId;
+        OutboundPeerIdentityResolver = std::move(resolver);
+    }
     bool ExpireCapabilityNegotiation(
             ITimeSource::Time now, ITimeSource::Time::duration timeout) {
         if (timeout <= ITimeSource::Time::duration::zero())
@@ -821,6 +834,8 @@ private:
     bool ResponseReaderActive = false;
     bool RetiredCleaned = false;
     uint64_t ConnectionGeneration = 0;
+    uint32_t ExpectedPeerId = 0;
+    std::shared_ptr<const TPeerIdentityResolver> OutboundPeerIdentityResolver;
 
     std::coroutine_handle<> Drainer;
     std::coroutine_handle<> Connector;
@@ -841,10 +856,11 @@ private:
 template<typename TSocket>
 class TRaftServer {
 public:
-    // Return the node ID authenticated by the transport for an accepted
-    // connection. Return nullopt for client connections. This resolver must
-    // derive identity from credentials, not from the message's claimed Src.
-    using TPeerIdentityResolver = std::function<std::optional<uint32_t>(const TSocket&)>;
+    // Return the node ID authenticated by the transport. Inbound connections
+    // use it to bind message Src; outbound connections use it to check the
+    // configured endpoint ID. Return nullopt for client or unrecognized
+    // credentials. This must derive identity from credentials, not message Src.
+    using TPeerIdentityResolver = typename TNode<TSocket>::TPeerIdentityResolver;
 
     // A shared process-memory root ties transport and snapshot heap buffers to
     // one cap. Legacy domain aggregate roots are attached to that root before
@@ -888,7 +904,9 @@ public:
             processInboundMessageBudget, processInboundMessageBudget ? nullptr : ProcessMemoryBudget))
         , RequestProcessor(std::make_shared<TRequestProcessor>(raft, rsm, nodes,
             admissionLimits, WorkerTimeSource))
-        , ResolvePeerIdentity(std::move(peerIdentityResolver))
+        , ResolvePeerIdentity(peerIdentityResolver
+            ? std::make_shared<const TPeerIdentityResolver>(std::move(peerIdentityResolver))
+            : std::shared_ptr<const TPeerIdentityResolver>{})
         , RaftWorker(RaftAccessMutex)
     {
         if ((processOutboundQueueBudget &&
@@ -896,6 +914,12 @@ public:
             (processInboundMessageBudget &&
                 !processInboundMessageBudget->BindProcessMemoryBudget(ProcessMemoryBudget)))
             throw std::invalid_argument("Server budget roots must share its process memory budget");
+        if (ResolvePeerIdentity) {
+            for (const auto& [id, node] : nodes) {
+                if (auto realNode = std::dynamic_pointer_cast<TNode<TSocket>>(node))
+                    realNode->ValidateExpectedPeerIdentity(id, *ResolvePeerIdentity);
+            }
+        }
         try {
             for (const auto& [id, node] : nodes) {
                 if (!Nodes.insert(node).second)
@@ -910,6 +934,10 @@ public:
                 if (auto realNode = std::dynamic_pointer_cast<TNode<TSocket>>(node))
                     realNode->DetachQueueBudget(OutboundQueueBudget);
             throw;
+        }
+        if (ResolvePeerIdentity) {
+            for (const auto& [id, node] : PeerNodes)
+                node->SetExpectedPeerIdentity(id, ResolvePeerIdentity);
         }
     }
 
@@ -1120,6 +1148,12 @@ private:
     void DebugPrint();
     void RegisterPeerTargetImpl(uint32_t id, std::shared_ptr<TNode<TSocket>> node, bool stageLearner);
     std::shared_ptr<TNode<TSocket>> UnregisterPeerTargetImpl(uint32_t id, bool requireLeader);
+    void ValidatePeerIdentity(uint32_t id, const std::shared_ptr<TNode<TSocket>>& node) const {
+        if (ResolvePeerIdentity) node->ValidateExpectedPeerIdentity(id, *ResolvePeerIdentity);
+    }
+    void BindPeerIdentity(uint32_t id, const std::shared_ptr<TNode<TSocket>>& node) const noexcept {
+        if (ResolvePeerIdentity) node->SetExpectedPeerIdentity(id, ResolvePeerIdentity);
+    }
 
     typename TSocket::TPoller& Poller;
     TSocket Socket;
@@ -1138,7 +1172,7 @@ private:
     std::unordered_set<uint32_t> PeerResponseReaders;
     std::unordered_set<std::shared_ptr<TNode<TSocket>>> RetiredPeerNodes;
     std::unordered_map<std::shared_ptr<TNode<TSocket>>, ITimeSource::Time> InboundLastActivity;
-    TPeerIdentityResolver ResolvePeerIdentity;
+    std::shared_ptr<const TPeerIdentityResolver> ResolvePeerIdentity;
     bool Serving = false;
     bool Stopping = false;
     size_t ActiveTasks = 0;

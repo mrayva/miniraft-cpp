@@ -540,6 +540,61 @@ void test_server_binds_peer_rpc_source_to_authenticated_identity(void**) {
 
     authenticated.Close();
 
+    // A trusted but misrouted server certificate must not satisfy the
+    // configured peer-3 endpoint. The server at this address presents peer 2's
+    // certificate; the outbound TNode must reject it before sending its
+    // capability probe or marking the connection usable.
+    NNet::TSocket outboundListener(NNet::TAddress{"127.0.0.1", 0}, loop.Poller());
+    outboundListener.Bind();
+    outboundListener.Listen();
+    std::atomic<uint32_t> outboundIdentityResolutions{0};
+    const auto makeOutboundPeer = [&](const std::string& name) {
+        return std::make_shared<TNode<TTlsSocket>>(
+            [&](const NNet::TAddress& peerAddress) {
+                return TTlsSocket(NNet::TSocket(peerAddress, loop.Poller()), *clientContext);
+            },
+            name, address, timeSource);
+    };
+    auto mismatchedEndpoint = makeOutboundPeer("expected-peer-3");
+    auto dynamicEndpoint = makeOutboundPeer("expected-peer-5");
+    TNodeDict outboundPeers{{3, mismatchedEndpoint}};
+    auto outboundRaft = std::make_shared<TRaft>(std::make_shared<TState>(), 1, outboundPeers);
+    auto outboundResolver = [&](const TTlsSocket& socket) -> std::optional<uint32_t> {
+        outboundIdentityResolutions.fetch_add(1, std::memory_order_relaxed);
+        auto certificate = socket.GetPeerCertificate();
+        if (!certificate) return std::nullopt;
+        char commonName[16]{};
+        const auto nameSize = X509_NAME_get_text_by_NID(
+            X509_get_subject_name(certificate.get()), NID_commonName,
+            commonName, sizeof(commonName));
+        if (nameSize != 1 || commonName[0] != '2') return std::nullopt;
+        return uint32_t{2};
+    };
+    TRaftServer<TTlsSocket> outboundServer(loop.Poller(),
+        TTlsSocket(std::move(outboundListener), *serverContext), outboundRaft,
+        std::make_shared<TDummyRsm>(), outboundPeers, timeSource,
+        TRequestProcessor::TAdmissionLimits{}, TOutboundQueueLimits{},
+        TInboundMessageBudgetLimits{}, outboundResolver);
+    outboundServer.Serve();
+    // Runtime peer registration must receive the same target-ID check as peers
+    // present when the server was constructed.
+    outboundServer.RegisterPeerTarget(5, dynamicEndpoint);
+    const auto outboundIdentityDeadline = NNet::TClock::now() + 3s;
+    while (outboundIdentityResolutions.load(std::memory_order_relaxed) < 2 &&
+            NNet::TClock::now() < outboundIdentityDeadline)
+        loop.Step();
+    const bool wrongEndpointIdentitiesRejected =
+        outboundIdentityResolutions.load(std::memory_order_relaxed) >= 2 &&
+        !mismatchedEndpoint->IsConnected() &&
+        !mismatchedEndpoint->IsCapabilityNegotiating() &&
+        !dynamicEndpoint->IsConnected() &&
+        !dynamicEndpoint->IsCapabilityNegotiating();
+    bool outboundStopped = false;
+    StopServerAndMark(outboundServer, outboundStopped);
+    const auto outboundStopDeadline = NNet::TClock::now() + 3s;
+    while (!outboundStopped && NNet::TClock::now() < outboundStopDeadline) loop.Step();
+    assert_true(outboundStopped);
+
     // A TLS client without a certificate must be disconnected before any Raft
     // response is produced. TLS 1.3 may let the client finish its side of the
     // handshake before the server processes the missing-certificate alert, so
@@ -568,6 +623,7 @@ void test_server_binds_peer_rpc_source_to_authenticated_identity(void**) {
     assert_true(stopped);
     assert_true(matchingRequestReachedRaft);
     assert_true(resolverSawBothConnections);
+    assert_true(wrongEndpointIdentitiesRejected);
     assert_true(missingCertificateRejected);
     assert_true(identityResolutions.load(std::memory_order_relaxed) == 2);
 }

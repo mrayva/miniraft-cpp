@@ -103,9 +103,10 @@ int main(int argc, char** argv) {
     std::function<std::optional<uint32_t>(const TPeerSocket&)> peerIdentityResolver;
     if (mtls) {
         // The trusted certificate's Common Name is the authenticated peer ID.
-        // Reject ambiguous names, malformed IDs, and IDs outside this node's
-        // configured peer set before the Raft server routes any RPC.
-        peerIdentityResolver = [peers = nodes](const TPeerSocket& socket) -> std::optional<uint32_t> {
+        // Reject ambiguous names and malformed IDs; outbound Raft connections
+        // also require the certificate ID to match the configured endpoint.
+        // The CA is the identity issuer, so later learner IDs are supported.
+        peerIdentityResolver = [](const TPeerSocket& socket) -> std::optional<uint32_t> {
             auto certificate = socket.GetPeerCertificate();
             if (!certificate) return std::nullopt;
             X509_NAME* subject = X509_get_subject_name(certificate.get());
@@ -119,7 +120,7 @@ int main(int argc, char** argv) {
             if (!text || length <= 0) return std::nullopt;
             uint32_t peerId = 0;
             const auto [end, error] = std::from_chars(text, text + length, peerId);
-            if (error != std::errc{} || end != text + length || !peers.contains(peerId))
+            if (error != std::errc{} || end != text + length || !peerId)
                 return std::nullopt;
             return peerId;
         };
