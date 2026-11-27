@@ -156,9 +156,10 @@ int main(int argc, char** argv)
     if (!snapshotStagingDirectory.empty()) {
 #ifdef __linux__
         std::error_code error;
-        if (snapshotStagingNamespace.empty() || !server || !durable ||
+        if (!TRaft::TLogLimits::IsValidSnapshotStagingNamespace(snapshotStagingNamespace) ||
+            !server || !durable ||
             !std::filesystem::is_directory(snapshotStagingDirectory, error)) {
-            std::cerr << "--snapshot-staging-dir requires --server --durable, a group namespace, and an existing directory\n";
+            std::cerr << "--snapshot-staging-dir requires --server --durable, a valid group namespace, and an existing directory\n";
             return 1;
         }
 #else

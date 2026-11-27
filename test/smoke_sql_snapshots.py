@@ -58,6 +58,9 @@ def main():
                                 ["--client", "--node", "not-an-endpoint"],
                                 ["--server", "--id", "1", "--node", ""],
                                 ["--client", "--snapshot-staging-dir", str(staging)],
+                                ["--server", "--durable", "--id", "1", "--node", node,
+                                 "--snapshot-staging-dir", str(staging),
+                                 "--snapshot-staging-namespace", "../unsafe"],
                                 ["--server", "--durable", "--snapshot-staging-dir"],
                                 ["--server", "--durable", "--snapshot-staging-dir",
                                     str(root / "missing-staging")]):
@@ -65,6 +68,8 @@ def main():
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                         timeout=5, preexec_fn=no_core)
                     assert rejected.returncode == 1, (options, rejected.returncode, rejected.stdout)
+                assert not (root / "sql_state.durable.1").exists(), \
+                    "invalid staging namespace must be rejected before durable state creation"
 
                 process = start(periodic=True)
                 wait_ready(process)

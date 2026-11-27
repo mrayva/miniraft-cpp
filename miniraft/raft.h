@@ -630,6 +630,15 @@ public:
     // stable successor. Repeated uncommitted terms may consume the finite
     // control reserve and require operator recovery to restore progress.
     struct TLogLimits {
+        static bool IsValidSnapshotStagingNamespace(std::string_view nameSpace) noexcept {
+            if (nameSpace.empty() || nameSpace.size() > 64) return false;
+            for (unsigned char c : nameSpace) {
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '_' || c == '-'))
+                    return false;
+            }
+            return true;
+        }
         enum class ESnapshotTransferStage {
             PayloadSynced,
             CursorTempCreated,

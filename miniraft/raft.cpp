@@ -1576,12 +1576,7 @@ TRaft::TRaft(std::shared_ptr<IState> state, uint32_t node, const TNodeDict& node
             throw std::invalid_argument("Snapshot staging budget requires a staging directory");
     } else {
         const auto& nameSpace = LogLimits.SnapshotStagingNamespace;
-        const bool safeNamespace = !nameSpace.empty() && nameSpace.size() <= 64 &&
-            std::all_of(nameSpace.begin(), nameSpace.end(), [](unsigned char c) {
-                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                    (c >= '0' && c <= '9') || c == '_' || c == '-';
-            });
-        if (!safeNamespace)
+        if (!TLogLimits::IsValidSnapshotStagingNamespace(nameSpace))
             throw std::invalid_argument("Snapshot staging requires a stable 1-64 character namespace");
         if (!LogLimits.SnapshotStagingBudget) {
             LogLimits.SnapshotStagingBudget = TSnapshotInstallBudget::DefaultStagingBudget();

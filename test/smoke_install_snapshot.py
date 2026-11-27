@@ -89,6 +89,15 @@ def main():
                                  for path, diagnostic, count in zip(log_paths, diagnostics, counts)), 5)
 
         try:
+            invalid_staging = subprocess.run(
+                [binary, "--server", "--durable", "--id", "1", "--node", endpoints[0],
+                 "--snapshot-staging-dir", str(staging_dir),
+                 "--snapshot-staging-namespace", "../unsafe"],
+                cwd=directories[0], capture_output=True, text=True, timeout=5)
+            assert invalid_staging.returncode == 1 and "valid group namespace" in invalid_staging.stderr, invalid_staging
+            assert not (directories[0] / "state.durable.1").exists(), \
+                "invalid staging namespace must be rejected before durable state creation"
+
             if learner_mode:
                 invalid_config = root / "invalid.conf"
                 invalid_args = [binary, "--server", "--durable", "--id", "1",
