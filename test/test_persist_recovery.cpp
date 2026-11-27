@@ -1576,6 +1576,49 @@ void test_disk_snapshot_metadata_write_failure_preserves_previous_generation(voi
     assert_false(fs::exists(partialMetadataPath));
 }
 
+void test_disk_snapshot_metadata_rename_failure_preserves_previous_generation(void**) {
+    TFiles files;
+    files.Seed();
+    const auto child = fork();
+    assert_true(child >= 0);
+    if (child == 0) {
+        std::set_terminate([] { _exit(73); });
+        try {
+            TDiskState state(files.Name, 1, [&files](TDiskState::ECommitStage stage) {
+                if (stage != TDiskState::ECommitStage::MetadataFileSynced) return;
+                std::error_code error;
+                if (!fs::remove(files.Name + ".state.1.tmp", error) || error) _exit(76);
+            });
+            state.InstallSnapshot(TSnapshot{1, 2, {1, 2}, "durable image"});
+        } catch (...) { _exit(74); }
+        _exit(75);
+    }
+
+    int status = 0;
+    assert_int_equal(waitpid(child, &status, 0), child);
+    assert_true(WIFEXITED(status));
+    assert_int_equal(WEXITSTATUS(status), 73);
+
+    assert_false(fs::exists(files.Name + ".state.1.tmp"));
+    assert_true(fs::exists(files.Name + ".entries.1.g1"));
+    assert_true(fs::exists(files.Name + ".index.1.g1"));
+    assert_true(fs::exists(files.Name + ".state.1.snapshot.g1"));
+
+    TDiskState recovered(files.Name, 1);
+    assert_true(!recovered.GetSnapshot());
+    assert_int_equal(recovered.SnapshotIndex, 0);
+    assert_int_equal(recovered.LastLogIndex, 2);
+    assert_int_equal(recovered.LastLogTerm, 5);
+    assert_int_equal(recovered.CommitIndex, 0);
+    assert_int_equal(recovered.Get(1)->Term, 2);
+    assert_int_equal(recovered.Get(2)->Term, 5);
+    assert_int_equal(recovered.CurrentTerm, 7);
+    assert_int_equal(recovered.VotedFor, 2);
+    assert_false(fs::exists(files.Name + ".entries.1.g1"));
+    assert_false(fs::exists(files.Name + ".index.1.g1"));
+    assert_false(fs::exists(files.Name + ".state.1.snapshot.g1"));
+}
+
 void test_live_storage_failure_is_fatal(void**) {
     TFiles files;
     files.Seed();
@@ -1668,6 +1711,7 @@ int main() {
         cmocka_unit_test(test_disk_snapshot_write_failure_preserves_previous_generation),
         cmocka_unit_test(test_disk_compacted_log_write_failure_preserves_previous_generation),
         cmocka_unit_test(test_disk_snapshot_metadata_write_failure_preserves_previous_generation),
+        cmocka_unit_test(test_disk_snapshot_metadata_rename_failure_preserves_previous_generation),
         cmocka_unit_test(test_live_storage_failure_is_fatal),
         cmocka_unit_test(test_live_invalid_log_term_is_fatal),
 #endif
