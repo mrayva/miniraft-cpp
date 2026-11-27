@@ -4820,14 +4820,33 @@ void test_snapshot_staging_namespace_rejects_concurrent_same_node_reuse(void**) 
     assert_false(conflictResponse->Success);
     conflicting.reset();
 
+    const auto child = fork();
+    assert_true(child >= 0);
+    if (!child) {
+        try {
+            auto childState = std::make_shared<TState>();
+            childState->CurrentTerm = 3;
+            TMessageHolder<TInstallSnapshotResponse> childResponse;
+            auto childRaft = deliver("shared", childState, 3, childResponse);
+            (void)childRaft;
+            _exit(childResponse && !childResponse->Success ? 0 : 1);
+        } catch (...) {
+            _exit(2);
+        }
+    }
+    int childStatus = 0;
+    assert_int_equal(waitpid(child, &childStatus, 0), child);
+    assert_true(WIFEXITED(childStatus));
+    assert_int_equal(WEXITSTATUS(childStatus), 0);
+
     TMessageHolder<TInstallSnapshotResponse> otherGroupResponse;
-    auto otherGroup = deliver("other", std::make_shared<TState>(), 3, otherGroupResponse);
+    auto otherGroup = deliver("other", std::make_shared<TState>(), 4, otherGroupResponse);
     assert_true(otherGroupResponse->Success);
     otherGroup.reset();
     first.reset();
 
     TMessageHolder<TInstallSnapshotResponse> restartResponse;
-    auto restarted = deliver("shared", state, 4, restartResponse);
+    auto restarted = deliver("shared", state, 5, restartResponse);
     assert_true(restartResponse->Success);
     assert_false(restartResponse->Installed);
     assert_int_equal(restartResponse->NextOffset, 8);
