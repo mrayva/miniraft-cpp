@@ -31,14 +31,16 @@ template<class F> void Reject(F action) {
     try { action(); } catch (const std::exception&) { rejected = true; }
     assert_true(rejected);
 }
-struct TEndpoint : INode {
+struct TEndpoint : INode, ISnapshotTransferResumeNode {
     std::function<void(TMessageHolder<TMessage>)> SendTo;
-    bool ManifestTransfer = false;
-    explicit TEndpoint(std::function<void(TMessageHolder<TMessage>)> send, bool manifestTransfer = false)
-        : SendTo(std::move(send)), ManifestTransfer(manifestTransfer) {}
+    bool ManifestTransfer = false, TransferResume = false;
+    explicit TEndpoint(std::function<void(TMessageHolder<TMessage>)> send,
+            bool manifestTransfer = false, bool transferResume = false)
+        : SendTo(std::move(send)), ManifestTransfer(manifestTransfer), TransferResume(transferResume) {}
     void Send(TMessageHolder<TMessage> message) override { SendTo(std::move(message)); }
     void Drain() override {}
     bool SupportsSnapshotTransferManifest() const override { return ManifestTransfer; }
+    bool SupportsSnapshotTransferResume() const override { return TransferResume; }
 };
 TMessageHolder<TWriteKv> Command(const std::string& key, const std::string& value) {
     auto message = NewHoldedMessage<TWriteKv>(sizeof(TWriteKv) + key.size() + value.size());
@@ -1843,14 +1845,17 @@ struct TCluster {
     std::vector<uint32_t> Learners;
     bool ManifestTransfer = false;
     bool AsymmetricManifest = false;
+    bool SnapshotTransferResume = false;
     uint64_t MaxSnapshotImageBytes = TSnapshot::MaxBytes;
     std::string SnapshotStagingDirectory;
     explicit TCluster(std::vector<uint32_t> learners = {}, uint32_t nodeCount = 3,
             bool manifestTransfer = false, uint64_t maxSnapshotImageBytes = TSnapshot::MaxBytes,
-            std::string snapshotStagingDirectory = {}, bool asymmetricManifest = false)
+            std::string snapshotStagingDirectory = {}, bool asymmetricManifest = false,
+            bool snapshotTransferResume = false)
         : NodeCount(nodeCount), Nodes(nodeCount), Apps(nodeCount), Processors(nodeCount),
           Learners(std::move(learners)), ManifestTransfer(manifestTransfer),
-          AsymmetricManifest(asymmetricManifest), MaxSnapshotImageBytes(maxSnapshotImageBytes),
+          AsymmetricManifest(asymmetricManifest), SnapshotTransferResume(snapshotTransferResume),
+          MaxSnapshotImageBytes(maxSnapshotImageBytes),
           SnapshotStagingDirectory(std::move(snapshotStagingDirectory)) {
         for (uint32_t id = 1; id <= NodeCount; ++id) Build(id, std::make_shared<TState>());
     }
@@ -1859,7 +1864,8 @@ struct TCluster {
         for (uint32_t dst = 1; dst <= NodeCount; ++dst) if (dst != id) {
             const bool manifestTransfer = AsymmetricManifest ? dst == 1 : ManifestTransfer;
             peers[dst] = std::make_shared<TEndpoint>(
-                [this](auto message) { Packets.push_back(std::move(message)); }, manifestTransfer);
+                [this](auto message) { Packets.push_back(std::move(message)); }, manifestTransfer,
+                SnapshotTransferResume);
         }
         Processors[id - 1].reset();
         TRaft::TLogLimits limits;
@@ -2575,6 +2581,52 @@ void test_snapshot_partial_ack_cannot_skip_unsent_bytes(void**) {
     assert_int_equal(next->Offset, end);
     cluster.AckChunk(next); cluster.Pump(1, 80, true);
     assert_int_equal(cluster.Apps[2]->Loads, 1);
+}
+void test_snapshot_sender_accepts_negotiated_retained_prefix_after_cursor_reset(void**) {
+    TCluster cluster({}, 3, false, TSnapshot::MaxBytes, {}, false, true);
+    cluster.Prepare();
+
+    auto first = cluster.SendChunk();
+    cluster.Deliver(first);
+    auto firstAck = cluster.Take(3, 1, EMessageType::INSTALL_SNAPSHOT_RESPONSE);
+    assert_true(firstAck.Cast<TInstallSnapshotResponse>()->Success);
+    cluster.Deliver(firstAck);
+
+    auto second = cluster.SendChunk();
+    cluster.Deliver(second);
+    auto secondAck = cluster.Take(3, 1, EMessageType::INSTALL_SNAPSHOT_RESPONSE)
+        .Cast<TInstallSnapshotResponse>();
+    assert_true(secondAck->Success);
+    assert_true(secondAck->NextOffset > first->Len - sizeof(TInstallSnapshotRequest));
+    assert_false(secondAck->Installed);
+
+    // Model a sender that lost its in-memory cursor after the receiver accepted
+    // more bytes. It starts again at zero with a fresh sequence number.
+    auto* progress = const_cast<TVolatileState*>(cluster.Nodes[0]->GetVolatileState());
+    auto& rpc = progress->SnapshotRpcs.at(3);
+    rpc.Offset = 0;
+    rpc.Seqno = 0;
+    progress->RpcDue[3] = {};
+    auto replay = cluster.SendChunk();
+    assert_int_equal(replay->Offset, 0);
+    cluster.Deliver(replay);
+    auto resumedAck = cluster.Take(3, 1, EMessageType::INSTALL_SNAPSHOT_RESPONSE);
+    assert_int_equal(resumedAck.Cast<TInstallSnapshotResponse>()->NextOffset,
+        secondAck->NextOffset);
+    cluster.Deliver(resumedAck);
+
+    auto next = cluster.SendChunk();
+    assert_int_equal(next->Offset, secondAck->NextOffset);
+    size_t chunks = 0;
+    while (true) {
+        assert_true(++chunks < 10);
+        auto ack = cluster.AckChunk(next);
+        if (ack->Installed) break;
+        next = cluster.SendChunk();
+        assert_int_equal(next->Offset, ack->NextOffset);
+    }
+    assert_int_equal(cluster.Apps[2]->Loads, 1);
+    assert_int_equal(cluster.Nodes[2]->GetState()->SnapshotIndex, first->SnapshotIndex);
 }
 void ExerciseDelayedSnapshotAcks(bool readTraffic) {
     for (auto learners : {std::vector<uint32_t>{}, std::vector<uint32_t>{3}}) {
@@ -5340,6 +5392,7 @@ int main() {
         cmocka_unit_test(test_simultaneous_startup_candidates_use_distinct_election_deadlines),
         cmocka_unit_test(test_partial_transfer_restart_and_delayed_ack_are_safe),
         cmocka_unit_test(test_snapshot_partial_ack_cannot_skip_unsent_bytes),
+        cmocka_unit_test(test_snapshot_sender_accepts_negotiated_retained_prefix_after_cursor_reset),
         cmocka_unit_test(test_snapshot_timeout_retries_do_not_starve_delayed_acks),
         cmocka_unit_test(test_snapshot_read_traffic_does_not_starve_delayed_acks),
         cmocka_unit_test(test_compaction_during_each_chunk_cannot_restart_snapshot_catchup),

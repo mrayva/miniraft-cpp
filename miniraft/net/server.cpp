@@ -59,7 +59,8 @@ NNet::TVoidTask TRaftServer<TSocket>::InboundConnection(
                 response->Features = compatible
                     ? request->Features & (TPeerCapabilitiesRequest::ExtendedForwarding |
                         TPeerCapabilitiesRequest::SessionizedForwarding |
-                        TPeerCapabilitiesRequest::SnapshotTransferManifest) : 0;
+                        TPeerCapabilitiesRequest::SnapshotTransferManifest |
+                        TPeerCapabilitiesRequest::SnapshotTransferResume) : 0;
                 response->ConnectionId = request->ConnectionId;
                 client->Send(std::move(response));
                 handledCapabilities = true;

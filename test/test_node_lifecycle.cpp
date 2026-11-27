@@ -294,6 +294,7 @@ void test_peer_capability_probe_and_legacy_fallback(void**) {
     assert_true(node.IsCapabilityNegotiating());
     assert_int_equal(state->ProbeWrites, 1);
     assert_true(state->ProbeFeatures & TPeerCapabilitiesRequest::SnapshotTransferManifest);
+    assert_true(state->ProbeFeatures & TPeerCapabilitiesRequest::SnapshotTransferResume);
     auto response = NewHoldedMessage<TPeerCapabilitiesResponse>();
     response->Features = TPeerCapabilitiesRequest::ExtendedForwarding |
         TPeerCapabilitiesRequest::SessionizedForwarding;
@@ -301,23 +302,26 @@ void test_peer_capability_probe_and_legacy_fallback(void**) {
     assert_false(node.CompleteCapabilityNegotiation(response, node.GetConnectionGeneration()));
     assert_true(node.IsCapabilityNegotiating());
     response->ConnectionId = node.GetConnectionGeneration();
-    response->Features = uint64_t(1) << 3;
+    response->Features = uint64_t(1) << 4;
     assert_false(node.CompleteCapabilityNegotiation(response, node.GetConnectionGeneration()));
     assert_true(node.IsCapabilityNegotiating());
     response->Features = TPeerCapabilitiesRequest::ExtendedForwarding |
         TPeerCapabilitiesRequest::SessionizedForwarding |
-        TPeerCapabilitiesRequest::SnapshotTransferManifest;
+        TPeerCapabilitiesRequest::SnapshotTransferManifest |
+        TPeerCapabilitiesRequest::SnapshotTransferResume;
     response->ConnectionId = node.GetConnectionGeneration();
     assert_true(node.CompleteCapabilityNegotiation(response, node.GetConnectionGeneration()));
     assert_true(node.SupportsExtendedForwarding());
     assert_true(node.SupportsSessionizedForwarding());
     assert_true(node.SupportsSnapshotTransferManifest());
+    assert_true(node.SupportsSnapshotTransferResume());
 
     auto generation = node.GetConnectionGeneration();
     node.Disconnect(generation);
     assert_false(node.SupportsExtendedForwarding());
     assert_false(node.SupportsSessionizedForwarding());
     assert_false(node.SupportsSnapshotTransferManifest());
+    assert_false(node.SupportsSnapshotTransferResume());
     node.Drain(); poller.Tick();
     generation = node.GetConnectionGeneration();
     assert_true(node.IsCapabilityNegotiating());

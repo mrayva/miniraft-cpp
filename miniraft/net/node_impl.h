@@ -311,7 +311,8 @@ NNet::TVoidSuspendedTask TNode<TSocket>::DoConnect() {
                     auto probe = NewHoldedMessage<TPeerCapabilitiesRequest>();
                     probe->Features = TPeerCapabilitiesRequest::ExtendedForwarding |
                         TPeerCapabilitiesRequest::SessionizedForwarding |
-                        TPeerCapabilitiesRequest::SnapshotTransferManifest;
+                        TPeerCapabilitiesRequest::SnapshotTransferManifest |
+                        TPeerCapabilitiesRequest::SnapshotTransferResume;
                     probe->ConnectionId = ConnectionGeneration;
                     co_await TMessageWriter(Socket).Write(std::move(probe));
                 }

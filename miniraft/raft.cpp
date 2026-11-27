@@ -3700,8 +3700,14 @@ void TRaft::OnInstallSnapshot(ITimeSource::Time now, TMessageHolder<TInstallSnap
     auto& rpc = found->second;
     if (!rpc.Seqno || response->Seqno != rpc.Seqno || response->SnapshotIndex != rpc.Snapshot->Index) return;
     const auto totalBytes = SnapshotEncodingSize(*rpc.Encoding);
+    const auto peer = Nodes.find(response->Src);
+    const auto* resumePeer = peer == Nodes.end() ? nullptr :
+        dynamic_cast<const ISnapshotTransferResumeNode*>(peer->second.get());
+    const bool supportsResume = resumePeer && resumePeer->SupportsSnapshotTransferResume();
     if (response->Success && ((response->Installed && response->NextOffset != totalBytes) ||
-        (!response->Installed && (response->NextOffset != rpc.SentEnd || response->NextOffset >= totalBytes))))
+        (!response->Installed && (response->NextOffset < rpc.SentEnd ||
+            (!supportsResume && response->NextOffset != rpc.SentEnd) ||
+            response->NextOffset >= totalBytes))))
         return;
     RecordLeadershipResponse(now, response->Src);
     if (!response->Success) {

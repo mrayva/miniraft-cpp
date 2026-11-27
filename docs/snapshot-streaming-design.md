@@ -198,9 +198,14 @@ active snapshot pins its anonymous receive file or durable snapshot mapping
 until replaced and all transfer pins are released. Retained anonymous receive
 files remain charged to the shared staging quota; durable storage's own snapshot
 files are governed by its storage and filesystem capacity. Partial transfers
-restart at offset zero after process restart. Publication,
-application-installation and acknowledgement ordering stay the same; the
-versioned and compatibility limits are described above.
+restart at offset zero after process restart. On connections that negotiate
+`SnapshotTransferResume`, a sender that restarts its volatile cursor at zero can
+accept the receiver's correlated forward `NextOffset` and continue from the
+already staged prefix. This does not recover a prefix after the receiver itself
+restarts; its staging file and cursor remain volatile. Peers without that
+capability still require each successful ACK to match the end of the chunk just
+sent. Publication, application-installation and acknowledgement ordering stay
+the same; the versioned and compatibility limits are described above.
 `TLogLimits::MaxSnapshotImageBytes` can lower the per-node image ceiling for
 capture and receive admission. Values above 128 MiB require a peer that
 negotiates the manifest range protocol; the default per-node limit is 128 MiB

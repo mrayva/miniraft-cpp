@@ -595,7 +595,7 @@ struct THost {
 };
 
 template<typename TSocket>
-class TNode: public INode {
+class TNode: public INode, public ISnapshotTransferResumeNode {
 public:
     static constexpr size_t MaxQueuedDataMessages = 128;
     static constexpr uint64_t MaxQueuedDataBytes = 16 * 1024 * 1024;
@@ -689,6 +689,10 @@ public:
         return Connected && !CapabilityNegotiating &&
             (PeerFeatures & TPeerCapabilitiesRequest::SnapshotTransferManifest);
     }
+    bool SupportsSnapshotTransferResume() const override {
+        return Connected && !CapabilityNegotiating &&
+            (PeerFeatures & TPeerCapabilitiesRequest::SnapshotTransferResume);
+    }
     bool IsCapabilityNegotiating() const { return CapabilityNegotiating; }
     bool ExpireCapabilityNegotiation(
             ITimeSource::Time now, ITimeSource::Time::duration timeout) {
@@ -717,7 +721,8 @@ public:
             (!response->Version && response->Features) ||
             (response->Features & ~(TPeerCapabilitiesRequest::ExtendedForwarding |
                 TPeerCapabilitiesRequest::SessionizedForwarding |
-                TPeerCapabilitiesRequest::SnapshotTransferManifest)))
+                TPeerCapabilitiesRequest::SnapshotTransferManifest |
+                TPeerCapabilitiesRequest::SnapshotTransferResume)))
             return false;
         PeerFeatures = response->Version == TPeerCapabilitiesRequest::CurrentVersion
             ? response->Features : 0;

@@ -392,6 +392,9 @@ struct TPeerCapabilitiesRequest: public TMessage {
     static constexpr uint64_t ExtendedForwarding = uint64_t(1) << 0;
     static constexpr uint64_t SessionizedForwarding = uint64_t(1) << 1;
     static constexpr uint64_t SnapshotTransferManifest = uint64_t(1) << 2;
+    // Allows a sender to accept a receiver's retained prefix offset when a
+    // transfer is restarted from byte zero after losing its volatile cursor.
+    static constexpr uint64_t SnapshotTransferResume = uint64_t(1) << 3;
     uint32_t MinVersion = CurrentVersion;
     uint32_t MaxVersion = CurrentVersion;
     uint64_t Features = 0;

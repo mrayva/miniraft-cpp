@@ -35,6 +35,13 @@ struct INode {
     virtual bool SupportsSnapshotTransferManifest() const { return false; }
 };
 
+// Optional transport contract for peers that report retained partial-snapshot
+// progress when a sender restarts its volatile transfer cursor.
+struct ISnapshotTransferResumeNode {
+    virtual ~ISnapshotTransferResumeNode() = default;
+    virtual bool SupportsSnapshotTransferResume() const = 0;
+};
+
 // Immutable, range-readable application snapshot data. A source must remain
 // stable until released and represent the requested applied index. Read returns
 // the number of bytes copied; zero before Size() is reached is an error.
