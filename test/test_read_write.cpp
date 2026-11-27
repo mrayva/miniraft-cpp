@@ -602,7 +602,7 @@ void test_server_binds_peer_rpc_source_to_authenticated_identity(void**) {
     auto unauthenticatedContext = std::make_shared<NNet::TSslContext>(NNet::TSslContext::Client());
     TTlsSocket unauthenticated(NNet::TSocket(address, loop.Poller()), *unauthenticatedContext);
     bool missingCertificateRejected = false;
-    auto unauthenticatedExchange = [&](TTlsSocket& socket, bool& rejected) -> NNet::TFuture<void> {
+    const auto unauthenticatedExchange = [&](TTlsSocket& socket, bool& rejected) -> NNet::TFuture<void> {
         try {
             co_await socket.Connect(NNet::TClock::now() + 3s);
             co_await TMessageWriter(socket).Write(makePreVote(2));
@@ -612,9 +612,11 @@ void test_server_binds_peer_rpc_source_to_authenticated_identity(void**) {
         } catch (const std::exception&) {
             rejected = true;
         }
-    }(unauthenticated, missingCertificateRejected);
-    drive(unauthenticatedExchange);
-    unauthenticatedExchange.await_resume();
+    };
+    auto unauthenticatedExchangeTask = unauthenticatedExchange(
+        unauthenticated, missingCertificateRejected);
+    drive(unauthenticatedExchangeTask);
+    unauthenticatedExchangeTask.await_resume();
 
     bool stopped = false;
     StopServerAndMark(server, stopped);
